@@ -174,6 +174,7 @@ impl AppUI {
         loop {
             // Check if active track finished and auto-advance queue
             if self.player.is_track_finished() {
+                self.player.reset_finished();
                 self.play_next_track();
             }
 
@@ -210,8 +211,16 @@ impl AppUI {
                             self.active_tab = 2;
                         }
                         (KeyCode::Char(' '), KeyModifiers::NONE) => {
-                            let paused = self.player.toggle_pause()?;
-                            self.status_message = if paused { "Paused" } else { "Playing" }.to_string();
+                            if !self.player.is_playing() && !self.player.is_paused() {
+                                if !self.queue.is_empty() {
+                                    self.play_current_track();
+                                } else {
+                                    self.status_message = "No tracks in queue".to_string();
+                                }
+                            } else {
+                                let paused = self.player.toggle_pause()?;
+                                self.status_message = if paused { "Paused" } else { "Playing" }.to_string();
+                            }
                         }
                         (KeyCode::Char('s'), KeyModifiers::NONE) => {
                             self.player.stop()?;
@@ -358,7 +367,12 @@ impl AppUI {
                                 }
                             } else if let Ok(meta) = crate::metadata::extract_metadata(path) {
                                 self.queue.add_track(meta.clone());
-                                self.status_message = format!("Added {}", meta.display_title());
+                                if !self.player.is_playing() && !self.player.is_paused() {
+                                    self.queue.current_index = self.queue.len().saturating_sub(1);
+                                    self.play_current_track();
+                                } else {
+                                    self.status_message = format!("Added {}", meta.display_title());
+                                }
                             }
                         }
                     }

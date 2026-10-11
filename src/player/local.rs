@@ -1,27 +1,37 @@
-//! High-performance, glitch-free audio playback using mpv JSON IPC with ffplay fallback.
+//! High-performance, glitch-free audio playback using an async mpv JSON IPC client with ffplay fallback.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use super::AudioPlayer;
 use crate::paths;
 
+#[derive(Debug, Default)]
+struct SharedState {
+    position: Mutex<f64>,
+    duration: Mutex<f64>,
+    is_paused: AtomicBool,
+    is_playing: AtomicBool,
+    is_finished: AtomicBool,
+}
+
 pub struct LocalPlayer {
     backend: String,
     mpv_child: Option<Child>,
-    ipc_stream: Option<UnixStream>,
+    ipc_writer: Option<UnixStream>,
     socket_path: PathBuf,
     current_file: Option<PathBuf>,
-    duration: f64,
     volume: u8,
-    is_paused: bool,
-    is_stopped: bool,
-    last_known_pos: f64,
+    shared_state: Arc<SharedState>,
+    stop_signal: Arc<AtomicBool>,
+    reader_thread: Option<thread::JoinHandle<()>>,
     // ffplay fallback state
     ffplay_child: Option<Child>,
     start_time: Option<Instant>,
@@ -36,14 +46,13 @@ impl LocalPlayer {
         Self {
             backend: backend.to_string(),
             mpv_child: None,
-            ipc_stream: None,
+            ipc_writer: None,
             socket_path,
             current_file: None,
-            duration: 0.0,
             volume: 50,
-            is_paused: false,
-            is_stopped: true,
-            last_known_pos: 0.0,
+            shared_state: Arc::new(SharedState::default()),
+            stop_signal: Arc::new(AtomicBool::new(false)),
+            reader_thread: None,
             ffplay_child: None,
             start_time: None,
             accumulated_offset: 0.0,
@@ -57,11 +66,17 @@ impl LocalPlayer {
             .map(|c| c.try_wait().ok().flatten().is_none())
             .unwrap_or(false);
 
-        if is_running && self.ipc_stream.is_some() {
+        if is_running && self.ipc_writer.is_some() {
             return Ok(());
         }
 
-        // Clean up old socket file if present
+        // Clean up old resources if any
+        self.stop_signal.store(true, Ordering::SeqCst);
+        if let Some(t) = self.reader_thread.take() {
+            let _ = t.join();
+        }
+        self.ipc_writer = None;
+
         if self.socket_path.exists() {
             let _ = fs::remove_file(&self.socket_path);
         }
@@ -69,7 +84,7 @@ impl LocalPlayer {
             let _ = fs::create_dir_all(parent);
         }
 
-        // Spawn mpv in headless idle mode with IPC server enabled
+        // Spawn mpv in headless idle mode with IPC socket server
         let mut cmd = Command::new("mpv");
         cmd.arg("--no-video")
             .arg("--idle")
@@ -77,85 +92,153 @@ impl LocalPlayer {
             .arg(format!("--volume={}", self.volume))
             .arg("--audio-display=no")
             .arg("--terminal=no")
+            .arg("--msg-level=all=no")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
         let child = cmd.spawn()?;
         self.mpv_child = Some(child);
 
-        // Connect Unix domain socket with retry
-        let mut stream = None;
-        for _ in 0..15 {
+        // Connect to socket with retry loop
+        let mut writer_stream = None;
+        for _ in 0..30 {
             thread::sleep(Duration::from_millis(50));
             if self.socket_path.exists() {
                 if let Ok(s) = UnixStream::connect(&self.socket_path) {
-                    let _ = s.set_read_timeout(Some(Duration::from_millis(80)));
-                    let _ = s.set_write_timeout(Some(Duration::from_millis(80)));
-                    stream = Some(s);
+                    writer_stream = Some(s);
                     break;
                 }
             }
         }
 
-        self.ipc_stream = stream;
-        if self.ipc_stream.is_none() {
-            anyhow::bail!("Failed to connect to mpv IPC socket at {:?}", self.socket_path);
-        }
+        let mut writer = match writer_stream {
+            Some(w) => w,
+            None => anyhow::bail!("Failed to connect to mpv IPC socket at {:?}", self.socket_path),
+        };
+
+        let reader_stream = writer.try_clone()?;
+        let _ = reader_stream.set_read_timeout(Some(Duration::from_millis(400)));
+
+        // Send observe_property commands so mpv streams property changes asynchronously
+        let _ = writer.write_all(b"{\"command\": [\"observe_property\", 1, \"time-pos\"]}\n");
+        let _ = writer.write_all(b"{\"command\": [\"observe_property\", 2, \"pause\"]}\n");
+        let _ = writer.write_all(b"{\"command\": [\"observe_property\", 3, \"eof-reached\"]}\n");
+        let _ = writer.write_all(b"{\"command\": [\"observe_property\", 4, \"duration\"]}\n");
+        let _ = writer.flush();
+
+        self.ipc_writer = Some(writer);
+        self.stop_signal = Arc::new(AtomicBool::new(false));
+
+        // Spawn dedicated background reader thread
+        let shared = Arc::clone(&self.shared_state);
+        let stop = Arc::clone(&self.stop_signal);
+
+        self.reader_thread = Some(thread::spawn(move || {
+            let mut reader = BufReader::new(reader_stream);
+            let mut line = String::new();
+
+            while !stop.load(Ordering::Relaxed) {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break, // Socket closed
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                            if let Some(event) = val.get("event").and_then(|e| e.as_str()) {
+                                match event {
+                                    "property-change" => {
+                                        if let Some(name) = val.get("name").and_then(|n| n.as_str()) {
+                                            match name {
+                                                "time-pos" => {
+                                                    if let Some(pos) = val.get("data").and_then(|d| d.as_f64()) {
+                                                        *shared.position.lock().unwrap() = pos;
+                                                    }
+                                                }
+                                                "duration" => {
+                                                    if let Some(dur) = val.get("data").and_then(|d| d.as_f64()) {
+                                                        *shared.duration.lock().unwrap() = dur;
+                                                    }
+                                                }
+                                                "pause" => {
+                                                    if let Some(p) = val.get("data").and_then(|d| d.as_bool()) {
+                                                        shared.is_paused.store(p, Ordering::SeqCst);
+                                                    }
+                                                }
+                                                "eof-reached" => {
+                                                    if let Some(eof) = val.get("data").and_then(|d| d.as_bool()) {
+                                                        if eof {
+                                                            shared.is_finished.store(true, Ordering::SeqCst);
+                                                            shared.is_playing.store(false, Ordering::SeqCst);
+                                                        }
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    "end-file" => {
+                                        if let Some(reason) = val.get("reason").and_then(|r| r.as_str()) {
+                                            if reason == "eof" {
+                                                shared.is_finished.store(true, Ordering::SeqCst);
+                                                shared.is_playing.store(false, Ordering::SeqCst);
+                                            }
+                                        }
+                                    }
+                                    "playback-restart" | "file-loaded" => {
+                                        shared.is_playing.store(true, Ordering::SeqCst);
+                                        shared.is_finished.store(false, Ordering::SeqCst);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => {
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }));
 
         Ok(())
     }
 
-    fn send_mpv_command(&mut self, json_str: &str) -> Option<serde_json::Value> {
-        let stream = self.ipc_stream.as_mut()?;
-        let _ = stream.write_all(json_str.as_bytes());
-        let _ = stream.write_all(b"\n");
-        let _ = stream.flush();
-
-        let mut reader = BufReader::new(stream.try_clone().ok()?);
-        let mut line = String::new();
-        while reader.read_line(&mut line).is_ok() {
-            if line.trim().is_empty() {
-                break;
-            }
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                // If it's a response with "error" field, return it
-                if val.get("error").is_some() {
-                    return Some(val);
-                }
-            }
-            line.clear();
+    fn send_command(&mut self, json_str: &str) -> anyhow::Result<()> {
+        if let Some(stream) = self.ipc_writer.as_mut() {
+            stream.write_all(json_str.as_bytes())?;
+            stream.write_all(b"\n")?;
+            stream.flush()?;
+            Ok(())
+        } else {
+            anyhow::bail!("No active mpv IPC connection");
         }
-        None
     }
 
     pub fn is_track_finished(&mut self) -> bool {
-        if self.is_stopped || self.current_file.is_none() {
-            return false;
-        }
-
         if self.backend == "mpv" {
-            let cmd = r#"{"command": ["get_property", "idle-active"]}"#;
-            if let Some(resp) = self.send_mpv_command(cmd) {
-                if let Some(data) = resp.get("data").and_then(|d| d.as_bool()) {
-                    return data;
-                }
-            }
-            false
+            self.shared_state.is_finished.load(Ordering::SeqCst)
+        } else if let Some(child) = self.ffplay_child.as_mut() {
+            child.try_wait().ok().flatten().is_some()
         } else {
-            // ffplay check
-            if let Some(child) = self.ffplay_child.as_mut() {
-                child.try_wait().ok().flatten().is_some()
-            } else {
-                false
-            }
+            false
         }
+    }
+
+    pub fn reset_finished(&self) {
+        self.shared_state.is_finished.store(false, Ordering::SeqCst);
     }
 }
 
 impl Drop for LocalPlayer {
     fn drop(&mut self) {
+        self.stop_signal.store(true, Ordering::SeqCst);
         if self.backend == "mpv" {
-            let _ = self.send_mpv_command(r#"{"command": ["quit"]}"#);
+            let _ = self.send_command(r#"{"command": ["quit"]}"#);
         }
         if let Some(mut child) = self.mpv_child.take() {
             let _ = child.kill();
@@ -175,13 +258,15 @@ impl AudioPlayer for LocalPlayer {
     fn play(&mut self, filepath: &Path) -> anyhow::Result<()> {
         self.current_file = Some(filepath.to_path_buf());
         if let Ok(meta) = crate::metadata::extract_metadata(filepath) {
-            self.duration = meta.duration_seconds;
+            *self.shared_state.duration.lock().unwrap() = meta.duration_seconds;
         } else {
-            self.duration = 0.0;
+            *self.shared_state.duration.lock().unwrap() = 0.0;
         }
-        self.is_stopped = false;
-        self.is_paused = false;
-        self.last_known_pos = 0.0;
+
+        *self.shared_state.position.lock().unwrap() = 0.0;
+        self.shared_state.is_finished.store(false, Ordering::SeqCst);
+        self.shared_state.is_playing.store(true, Ordering::SeqCst);
+        self.shared_state.is_paused.store(false, Ordering::SeqCst);
 
         if self.backend == "mpv" {
             self.ensure_mpv_daemon()?;
@@ -190,8 +275,8 @@ impl AudioPlayer for LocalPlayer {
                 "command": ["loadfile", file_str, "replace"]
             })
             .to_string();
-            self.send_mpv_command(&json_cmd);
-            self.send_mpv_command(r#"{"command": ["set_property", "pause", false]}"#);
+            self.send_command(&json_cmd)?;
+            self.send_command(r#"{"command": ["set_property", "pause", false]}"#)?;
             Ok(())
         } else {
             // ffplay fallback
@@ -214,12 +299,13 @@ impl AudioPlayer for LocalPlayer {
     }
 
     fn pause(&mut self) -> anyhow::Result<()> {
-        if self.is_stopped {
+        if !self.is_playing() {
             return Ok(());
         }
-        self.is_paused = true;
+        self.shared_state.is_paused.store(true, Ordering::SeqCst);
+
         if self.backend == "mpv" {
-            self.send_mpv_command(r#"{"command": ["set_property", "pause", true]}"#);
+            self.send_command(r#"{"command": ["set_property", "pause", true]}"#)?;
         } else if let Some(mut child) = self.ffplay_child.take() {
             self.accumulated_offset = self.position_seconds();
             let _ = child.kill();
@@ -229,12 +315,10 @@ impl AudioPlayer for LocalPlayer {
     }
 
     fn resume(&mut self) -> anyhow::Result<()> {
-        if self.is_stopped {
-            return Ok(());
-        }
-        self.is_paused = false;
+        self.shared_state.is_paused.store(false, Ordering::SeqCst);
+
         if self.backend == "mpv" {
-            self.send_mpv_command(r#"{"command": ["set_property", "pause", false]}"#);
+            self.send_command(r#"{"command": ["set_property", "pause", false]}"#)?;
             Ok(())
         } else if let Some(file) = self.current_file.clone() {
             let mut cmd = Command::new("ffplay");
@@ -255,7 +339,7 @@ impl AudioPlayer for LocalPlayer {
     }
 
     fn toggle_pause(&mut self) -> anyhow::Result<bool> {
-        if self.is_paused {
+        if self.is_paused() {
             self.resume()?;
             Ok(false)
         } else {
@@ -265,13 +349,14 @@ impl AudioPlayer for LocalPlayer {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
-        self.is_stopped = true;
-        self.is_paused = false;
         self.current_file = None;
-        self.last_known_pos = 0.0;
+        self.shared_state.is_playing.store(false, Ordering::SeqCst);
+        self.shared_state.is_paused.store(false, Ordering::SeqCst);
+        self.shared_state.is_finished.store(false, Ordering::SeqCst);
+        *self.shared_state.position.lock().unwrap() = 0.0;
 
         if self.backend == "mpv" {
-            self.send_mpv_command(r#"{"command": ["stop"]}"#);
+            let _ = self.send_command(r#"{"command": ["stop"]}"#);
         }
         if let Some(mut child) = self.ffplay_child.take() {
             let _ = child.kill();
@@ -281,21 +366,17 @@ impl AudioPlayer for LocalPlayer {
     }
 
     fn seek(&mut self, delta_seconds: f64) -> anyhow::Result<()> {
-        if self.is_stopped {
-            return Ok(());
-        }
         if self.backend == "mpv" {
             let json_cmd = serde_json::json!({
                 "command": ["seek", delta_seconds, "relative"]
             })
             .to_string();
-            self.send_mpv_command(&json_cmd);
+            self.send_command(&json_cmd)?;
             Ok(())
         } else {
-            // ffplay: restart at new offset
             let new_pos = (self.position_seconds() + delta_seconds).max(0.0);
             self.accumulated_offset = new_pos;
-            if !self.is_paused {
+            if !self.is_paused() {
                 if let Some(file) = self.current_file.clone() {
                     if let Some(mut child) = self.ffplay_child.take() {
                         let _ = child.kill();
@@ -325,7 +406,7 @@ impl AudioPlayer for LocalPlayer {
                 "command": ["set_property", "volume", self.volume]
             })
             .to_string();
-            self.send_mpv_command(&json_cmd);
+            self.send_command(&json_cmd)?;
         }
         Ok(())
     }
@@ -335,50 +416,26 @@ impl AudioPlayer for LocalPlayer {
     }
 
     fn is_playing(&self) -> bool {
-        !self.is_stopped && !self.is_paused
+        self.shared_state.is_playing.load(Ordering::SeqCst) && !self.is_paused()
     }
 
     fn is_paused(&self) -> bool {
-        self.is_paused
+        self.shared_state.is_paused.load(Ordering::SeqCst)
     }
 
     fn position_seconds(&self) -> f64 {
-        if self.is_stopped {
-            return 0.0;
-        }
-
         if self.backend == "mpv" {
-            // For position, send command if we have an active stream
-            if let Some(stream) = &self.ipc_stream {
-                let mut stream_clone = match stream.try_clone() {
-                    Ok(s) => s,
-                    Err(_) => return self.last_known_pos,
-                };
-                let _ = stream_clone.set_read_timeout(Some(Duration::from_millis(30)));
-                let _ = stream_clone.set_write_timeout(Some(Duration::from_millis(30)));
-                let cmd = b"{\"command\": [\"get_property\", \"time-pos\"]}\n";
-                if stream_clone.write_all(cmd).is_ok() {
-                    let mut reader = BufReader::new(stream_clone);
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).is_ok() {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                            if let Some(pos) = val.get("data").and_then(|d| d.as_f64()) {
-                                return pos;
-                            }
-                        }
-                    }
-                }
-            }
-            self.last_known_pos
+            *self.shared_state.position.lock().unwrap()
         } else if let Some(start) = self.start_time {
             let elapsed = start.elapsed().as_secs_f64();
-            (self.accumulated_offset + elapsed).min(self.duration)
+            let dur = *self.shared_state.duration.lock().unwrap();
+            (self.accumulated_offset + elapsed).min(dur)
         } else {
             self.accumulated_offset
         }
     }
 
     fn duration_seconds(&self) -> f64 {
-        self.duration
+        *self.shared_state.duration.lock().unwrap()
     }
 }
