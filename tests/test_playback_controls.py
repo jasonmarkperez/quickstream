@@ -63,6 +63,10 @@ class TestPlaybackControls(unittest.TestCase):
         self.transcoder = mock.MagicMock(spec=AudioTranscoder)
         self.transcoder.is_available.return_value = False
 
+        self.load_bm_patcher = mock.patch("quickstream.browser.load_bookmarks", return_value=[])
+        self.load_bm_patcher.start()
+        self.addCleanup(self.load_bm_patcher.stop)
+
         self.app = AppTUI(
             device_manager=self.device_manager,
             queue=self.queue,

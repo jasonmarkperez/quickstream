@@ -5,24 +5,26 @@ import threading
 from typing import Dict, List, Optional, Set, Tuple
 
 from quickstream.metadata import AudioMetadata, extract_metadata, is_supported_audio_file
+from quickstream.paths import get_bookmarks_path
 
 
-def load_bookmarks() -> List[str]:
-    path = Path.home() / ".quickstream_bookmarks.json"
-    if path.exists():
+def load_bookmarks(path: Optional[Path] = None) -> List[str]:
+    bm_path = path or get_bookmarks_path()
+    if bm_path.exists():
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(bm_path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             pass
     return []
 
 
-def save_bookmarks(bookmarks: List[str]) -> None:
-    path = Path.home() / ".quickstream_bookmarks.json"
+def save_bookmarks(bookmarks: List[str], path: Optional[Path] = None) -> None:
+    bm_path = path or get_bookmarks_path()
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(bookmarks, f)
+        bm_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(bm_path, "w", encoding="utf-8") as f:
+            json.dump(bookmarks, f, indent=2)
     except Exception:
         pass
 
@@ -30,18 +32,27 @@ def save_bookmarks(bookmarks: List[str]) -> None:
 class FileBrowser:
     """In-app file and directory browser with persistent bookmarks and metadata view."""
 
-    def __init__(self, start_dir: Optional[Path] = None, metadata_view: bool = True):
+    def __init__(
+        self,
+        start_dir: Optional[Path] = None,
+        metadata_view: bool = True,
+        bookmarks_path: Optional[Path] = None,
+    ):
         self.current_dir = (start_dir or Path.cwd()).resolve()
         self.entries: List[Tuple[str, Path, bool]] = []
         self.cursor_idx = 0
         self.scroll_offset = 0
-        self.bookmarks = load_bookmarks()
+        self.bookmarks_path = bookmarks_path
+        self.bookmarks = load_bookmarks(self.bookmarks_path)
         self.in_bookmarks_view = False
         self.metadata_view = metadata_view
         self.metadata_cache: Dict[str, AudioMetadata] = {}
         self._fetching_paths: Set[str] = set()
         self._fetch_lock = threading.Lock()
         self._refresh_entries()
+
+    def _save_bookmarks(self) -> None:
+        save_bookmarks(self.bookmarks, self.bookmarks_path)
 
     def set_metadata_view(self, enabled: bool) -> None:
         """Toggle or set metadata display mode and update labels."""
@@ -293,18 +304,18 @@ class FileBrowser:
                 path_str = str(self.current_dir)
                 if path_str in self.bookmarks:
                     self.bookmarks.remove(path_str)
-                    save_bookmarks(self.bookmarks)
+                    self._save_bookmarks()
                     return False, None, f"Removed '{self.current_dir.name}' from Music Homes"
                 else:
                     self.bookmarks.append(path_str)
-                    save_bookmarks(self.bookmarks)
+                    self._save_bookmarks()
                     return False, None, f"Added '{self.current_dir.name}' to Music Homes"
             else:
                 if self.cursor_idx > 0:
                     b_idx = self.cursor_idx - 1
                     if 0 <= b_idx < len(self.bookmarks):
                         removed_str = self.bookmarks.pop(b_idx)
-                        save_bookmarks(self.bookmarks)
+                        self._save_bookmarks()
                         self._refresh_entries()
                         if self.cursor_idx >= len(self.entries):
                             self.cursor_idx = max(0, len(self.entries) - 1)
@@ -318,7 +329,7 @@ class FileBrowser:
                     b_idx = self.cursor_idx - 1
                     if 0 <= b_idx < len(self.bookmarks):
                         removed_str = self.bookmarks.pop(b_idx)
-                        save_bookmarks(self.bookmarks)
+                        self._save_bookmarks()
                         self._refresh_entries()
                         if self.cursor_idx >= len(self.entries):
                             self.cursor_idx = max(0, len(self.entries) - 1)

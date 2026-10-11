@@ -64,6 +64,7 @@ quickstream_debug.log
 
 # Temporary and local user files
 .quickstream_bookmarks.json
+.quickstream_config.json
 *.wav
 *.mp3
 *.flac

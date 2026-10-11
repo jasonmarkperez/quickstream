@@ -39,13 +39,15 @@ quickstream/
 ├── transcoder.py         # On-the-fly ffmpeg pipeline to 16-bit PCM WAV
 ├── metadata.py           # Native ID3v2, FLAC, RIFF WAV, AIFF metadata parser
 ├── waveform.py           # Braille-based 2D high-resolution audio waveform generator
-└── settings.py           # User preferences and persistence (~/.quickstream_config.json)
+├── paths.py              # XDG Base Directory resolution and backward-compatible migration
+└── settings.py           # User preferences and persistence (~/.config/quickstream/config.json)
 
 tests/
 ├── test_browser.py           # FileBrowser navigation, bookmark management, and metadata view
 ├── test_discovery.py         # SSDP packet parsing and device extraction tests
 ├── test_local_player.py      # LocalPlayerClient subprocess and lifecycle tests
 ├── test_metadata.py          # Audio header parsing and duration calculation tests
+├── test_paths.py             # XDG Base Directory resolution and legacy migration tests
 ├── test_playback_controls.py # TUI playback orchestration, hotkeys, seeking, and server tests
 ├── test_queue.py             # Queue operations, wrapping, and indexing tests
 ├── test_server.py            # HTTP byte ranges, 206 Partial Content, DLNA headers
@@ -62,7 +64,7 @@ tests/
 - **Header**: Tab bar (`[1] Queue` | `[2] Devices` | `[3] Settings`).
 - **Main View Area (`0` to `max_y - 5`)**:
   - **Tab 0 (Queue)**: Split-pane layout.
-    - **Left Pane (`browser`)**: Bounded `FileBrowser` showing directory tree, music homes/bookmarks (`~/.quickstream_bookmarks.json`), and metadata view toggle (`[v]`).
+    - **Left Pane (`browser`)**: Bounded `FileBrowser` showing directory tree, music homes/bookmarks (`~/.config/quickstream/bookmarks.json`), and metadata view toggle (`[v]`).
     - **Right Pane (`queue`)**: `PlaybackQueue` showing queued songs, duration, and track status.
     - Focus toggled between panes with `h` and `l`.
   - **Tab 1 (Devices)**: Discovered DLNA MediaRenderers and `Local Audio`.

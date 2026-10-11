@@ -27,7 +27,7 @@ class TestFileBrowser(unittest.TestCase):
 
         # Mock bookmarks file path to temp directory
         self.bm_path = self.root / "bookmarks.json"
-        self.bm_patcher = mock.patch("quickstream.browser.Path.home", return_value=self.root)
+        self.bm_patcher = mock.patch("quickstream.browser.get_bookmarks_path", return_value=self.bm_path)
         self.bm_patcher.start()
 
         self.browser = FileBrowser(start_dir=self.root, metadata_view=False)
