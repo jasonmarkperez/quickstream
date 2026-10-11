@@ -38,7 +38,8 @@ quickstream/
 ├── server.py             # Custom HTTP byte-range server with DLNA profile headers
 ├── transcoder.py         # On-the-fly ffmpeg pipeline to 16-bit PCM WAV
 ├── metadata.py           # Native ID3v2, FLAC, RIFF WAV, AIFF metadata parser
-└── waveform.py           # Braille-based 2D high-resolution audio waveform generator
+├── waveform.py           # Braille-based 2D high-resolution audio waveform generator
+└── settings.py           # User preferences and persistence (~/.quickstream_config.json)
 
 tests/
 ├── test_discovery.py         # SSDP packet parsing and device extraction tests
@@ -47,6 +48,7 @@ tests/
 ├── test_playback_controls.py # TUI playback orchestration, hotkeys, seeking, and server tests
 ├── test_queue.py             # Queue operations, wrapping, and indexing tests
 ├── test_server.py            # HTTP byte ranges, 206 Partial Content, DLNA headers
+├── test_settings.py          # Configuration loading, saving, cycling, and defaults
 ├── test_upnp.py              # SOAP XML generation and response parsing tests
 └── test_waveform.py          # Waveform sample extraction and Braille plotting tests
 ```
@@ -56,13 +58,14 @@ tests/
 ## 3. TUI & Curses Guidelines
 
 ### Layout Structure
-- **Header**: Tab bar (`[1] Queue` | `[2] Devices`).
+- **Header**: Tab bar (`[1] Queue` | `[2] Devices` | `[3] Settings`).
 - **Main View Area (`0` to `max_y - 5`)**:
   - **Tab 0 (Queue)**: Split-pane layout.
-    - **Left Pane (`browser`)**: Bounded `FileBrowser` showing directory tree, music homes/bookmarks (`~/.quickstream_bookmarks.json`).
+    - **Left Pane (`browser`)**: Bounded `FileBrowser` showing directory tree, music homes/bookmarks (`~/.quickstream_bookmarks.json`), and metadata view toggle (`[v]`).
     - **Right Pane (`queue`)**: `PlaybackQueue` showing queued songs, duration, and track status.
     - Focus toggled between panes with `h` and `l`.
   - **Tab 1 (Devices)**: Discovered DLNA MediaRenderers and `Local Audio`.
+  - **Tab 2 (Settings)**: Configurable application settings (metadata view, default output, seek interval, volume step, queue mode, transcode).
 - **Persistent Bottom Playback Bar (`max_y - 5` to `max_y`)**:
   - Always rendered across all tabs.
   - Displays: State badge (`▶`, `⏸`, `⏹`), track title, artist, format, volume/mute, Braille/ASCII progress bar, and elapsed/total time.

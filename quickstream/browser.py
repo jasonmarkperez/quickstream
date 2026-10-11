@@ -1,40 +1,111 @@
-import json
 import curses
+import json
 from pathlib import Path
-from typing import List, Optional, Tuple
-from quickstream.metadata import is_supported_audio_file
+import threading
+from typing import Dict, List, Optional, Set, Tuple
 
-def load_bookmarks():
+from quickstream.metadata import AudioMetadata, extract_metadata, is_supported_audio_file
+
+
+def load_bookmarks() -> List[str]:
     path = Path.home() / ".quickstream_bookmarks.json"
     if path.exists():
         try:
-            with open(path, "r") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             pass
     return []
 
-def save_bookmarks(bookmarks):
+
+def save_bookmarks(bookmarks: List[str]) -> None:
     path = Path.home() / ".quickstream_bookmarks.json"
-    with open(path, "w") as f:
-        json.dump(bookmarks, f)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(bookmarks, f)
+    except Exception:
+        pass
+
 
 class FileBrowser:
-    """In-app file and directory browser for selecting audio media."""
+    """In-app file and directory browser with persistent bookmarks and metadata view."""
 
-    def __init__(self, start_dir: Optional[Path] = None):
+    def __init__(self, start_dir: Optional[Path] = None, metadata_view: bool = True):
         self.current_dir = (start_dir or Path.cwd()).resolve()
         self.entries: List[Tuple[str, Path, bool]] = []
         self.cursor_idx = 0
         self.scroll_offset = 0
         self.bookmarks = load_bookmarks()
         self.in_bookmarks_view = False
+        self.metadata_view = metadata_view
+        self.metadata_cache: Dict[str, AudioMetadata] = {}
+        self._fetching_paths: Set[str] = set()
+        self._fetch_lock = threading.Lock()
         self._refresh_entries()
 
+    def set_metadata_view(self, enabled: bool) -> None:
+        """Toggle or set metadata display mode and update labels."""
+        if self.metadata_view != enabled:
+            self.metadata_view = enabled
+            self._update_entry_labels()
+            if self.metadata_view:
+                self._trigger_metadata_extraction()
+
+    def _format_audio_label(self, path: Path) -> str:
+        """Format display label for an audio file depending on metadata_view."""
+        ext = path.suffix.upper().lstrip(".")
+        if self.metadata_view and str(path) in self.metadata_cache:
+            meta = self.metadata_cache[str(path)]
+            artist_part = f"{meta.artist} - " if meta.artist else ""
+            time_part = f" ({meta.duration_formatted})" if meta.duration_seconds > 0 else ""
+            title = meta.display_title
+            return f"🎵 [{ext}] {artist_part}{title}{time_part}"
+        return f"🎵 [{ext}] {path.name}"
+
+    def _update_entry_labels(self) -> None:
+        """Update display strings for all entries in the current listing."""
+        new_entries: List[Tuple[str, Path, bool]] = []
+        for name, path, is_dir in self.entries:
+            if is_dir:
+                new_entries.append((name, path, is_dir))
+            else:
+                new_entries.append((self._format_audio_label(path), path, False))
+        self.entries = new_entries
+
+    def _trigger_metadata_extraction(self) -> None:
+        """Asynchronously extract audio metadata for files in current view."""
+        if not self.metadata_view or self.in_bookmarks_view:
+            return
+
+        unfetched: List[Path] = []
+        with self._fetch_lock:
+            for _, path, is_dir in self.entries:
+                if not is_dir and str(path) not in self.metadata_cache and str(path) not in self._fetching_paths:
+                    unfetched.append(path)
+                    self._fetching_paths.add(str(path))
+
+        if not unfetched:
+            return
+
+        def _worker():
+            for p in unfetched:
+                try:
+                    meta = extract_metadata(p)
+                    self.metadata_cache[str(p)] = meta
+                except Exception:
+                    pass
+                finally:
+                    with self._fetch_lock:
+                        self._fetching_paths.discard(str(p))
+            # Refresh entry labels with newly fetched metadata
+            self._update_entry_labels()
+
+        threading.Thread(target=_worker, daemon=True, name="MetadataExtractor").start()
+
     def _refresh_entries(self) -> None:
-        """Scan current directory or bookmarks."""
+        """Scan current directory or bookmarks and schedule metadata fetching."""
         self.entries = []
-        
+
         if self.in_bookmarks_view:
             self.entries.append((".. [Back to File System]", self.current_dir, True))
             for b in self.bookmarks:
@@ -42,7 +113,6 @@ class FileBrowser:
                 if b_path.is_dir():
                     self.entries.append((f"📁 {b_path.name}/", b_path, True))
                 else:
-                    # Stale bookmark? Just show it
                     self.entries.append((f"📁 {b_path.name} (Not found)/", b_path, True))
             self.cursor_idx = 0
             self.scroll_offset = 0
@@ -50,7 +120,7 @@ class FileBrowser:
 
         try:
             self.entries.append(("★ Music Homes", Path("___MUSIC_HOMES___"), True))
-            
+
             if self.current_dir.parent != self.current_dir:
                 self.entries.append((".. [Parent Directory]", self.current_dir.parent, True))
 
@@ -63,19 +133,19 @@ class FileBrowser:
                 if p.is_dir():
                     dirs.append((f"📁 {p.name}/", p, True))
                 elif p.is_file() and is_supported_audio_file(p):
-                    ext = p.suffix.upper().lstrip(".")
-                    files.append((f"🎵 [{ext}] {p.name}", p, False))
+                    files.append((self._format_audio_label(p), p, False))
 
             self.entries.extend(dirs)
             self.entries.extend(files)
         except Exception:
             self.entries = [
                 ("★ Music Homes", Path("___MUSIC_HOMES___"), True),
-                (".. [Parent Directory]", self.current_dir.parent, True)
+                (".. [Parent Directory]", self.current_dir.parent, True),
             ]
 
         self.cursor_idx = 0
         self.scroll_offset = 0
+        self._trigger_metadata_extraction()
 
     def navigate_into(self, path: Path) -> None:
         """Change current directory and reload entries."""
@@ -83,10 +153,10 @@ class FileBrowser:
             self.in_bookmarks_view = True
             self._refresh_entries()
             return
-            
+
         if self.in_bookmarks_view:
             self.in_bookmarks_view = False
-            
+
         if path.is_dir():
             self.current_dir = path.resolve()
             self._refresh_entries()
@@ -96,12 +166,10 @@ class FileBrowser:
         cyan = curses.color_pair(1)
         green = curses.color_pair(2)
         yellow = curses.color_pair(3)
-        magenta = curses.color_pair(5)
-        
-        # Determine attributes based on focus
+
         base_attr = curses.A_NORMAL if is_focused else curses.A_DIM
         bold = curses.A_BOLD if is_focused else curses.A_NORMAL
-        
+
         # Clear background
         for y in range(start_y, start_y + height):
             try:
@@ -109,8 +177,9 @@ class FileBrowser:
             except curses.error:
                 pass
 
-        # Title
-        title = " BROWSER " if is_focused else " browser "
+        # Title with mode indicator
+        mode_tag = " [TAGS]" if self.metadata_view else " [FILES]"
+        title = f" BROWSER{mode_tag} " if is_focused else f" browser{mode_tag} "
         try:
             stdscr.attron(cyan | bold)
             stdscr.addstr(start_y, start_x + 1, title)
@@ -123,7 +192,7 @@ class FileBrowser:
             path_str = "Location: ★ Music Homes"
         else:
             path_str = f"Location: {self.current_dir.name}"
-            
+
         try:
             stdscr.addstr(start_y + 1, start_x + 1, path_str[: width - 2], curses.A_DIM)
             stdscr.addstr(start_y + 2, start_x + 1, "─" * min(width - 2, 76), curses.A_DIM)
@@ -132,13 +201,13 @@ class FileBrowser:
 
         # List
         list_height = max(1, height - 5)
-        
+
         # Ensure cursor is visible
         if self.cursor_idx < self.scroll_offset:
             self.scroll_offset = self.cursor_idx
         elif self.cursor_idx >= self.scroll_offset + list_height:
             self.scroll_offset = self.cursor_idx - list_height + 1
-            
+
         visible_entries = self.entries[self.scroll_offset : self.scroll_offset + list_height]
 
         if not self.entries:
@@ -152,9 +221,9 @@ class FileBrowser:
                 row = start_y + 3 + idx
                 if row >= start_y + height - 2:
                     break
-                    
+
                 is_selected = (actual_idx == self.cursor_idx) and is_focused
-                
+
                 prefix = " > " if is_selected else "   "
                 display_line = f"{prefix}{name}"[: width - 2]
 
@@ -174,7 +243,7 @@ class FileBrowser:
         footer_row = start_y + height - 2
         try:
             stdscr.addstr(footer_row, start_x + 1, "─" * min(width - 2, 76), curses.A_DIM)
-            controls = "[Enter] Open/Add  [b] Bookmark  [a] Add All"
+            controls = "[Enter] Open/Add  [v] View Mode  [b] Bookmark  [a] All"
             stdscr.addstr(footer_row + 1, start_x + 1, controls[: width - 2], base_attr)
         except curses.error:
             pass
@@ -202,11 +271,17 @@ class FileBrowser:
                 else:
                     self.cursor_idx = 0
 
+        # Toggle Metadata / Filename View
+        elif key in (ord("v"), ord("V")):
+            self.set_metadata_view(not self.metadata_view)
+            mode_desc = "Metadata (Tags)" if self.metadata_view else "Filename"
+            return False, None, f"Browser display: {mode_desc}"
+
         # Refresh
         elif key in (ord("r"), ord("R")):
             self._refresh_entries()
             return False, None, "Refreshed folder"
-            
+
         # Bookmark
         elif key in (ord("b"), ord("B")):
             if not self.in_bookmarks_view:

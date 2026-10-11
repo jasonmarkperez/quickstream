@@ -14,6 +14,7 @@ from quickstream.server import StreamServerManager
 from quickstream.transcoder import AudioTranscoder
 from quickstream.upnp import PositionInfo, TransportInfo, UPnPClient, format_seconds_to_upnp_time
 from quickstream.local_player import LocalPlayerClient
+from quickstream.settings import SettingsManager
 
 logger = logging.getLogger("quickstream.tui")
 
@@ -34,6 +35,11 @@ class AppTUI:
         self.server_manager = server_manager
         self.transcoder = transcoder
 
+        # Settings manager & active configuration
+        self.settings_manager = SettingsManager()
+        self.settings = self.settings_manager.settings
+        self.settings_cursor = 0
+
         self.client = None
         if initial_device:
             self.device_manager.set_active_device(initial_device)
@@ -42,7 +48,7 @@ class AppTUI:
             else:
                 self.client = UPnPClient(initial_device)
 
-        # Tabs: 0 = Now Playing, 1 = PlaybackQueue, 2 = Devices
+        # Tabs: 0 = Queue, 1 = Devices, 2 = Settings
         self.active_tab = 0
         self.show_help_modal = False
         self.file_browser: Optional[FileBrowser] = None
@@ -60,7 +66,7 @@ class AppTUI:
         self.playback_stream_offset: float = 0.0
         self.paused_position: float = 0.0
         self.user_stopped: bool = False
-        self.force_transcode: bool = False
+        self.force_transcode: bool = self.settings.force_transcode
         self.stereo_supports_upnp_seek: bool = True
         
         # Accumulated seeking state
@@ -77,7 +83,7 @@ class AppTUI:
         self.status_message: str = "Welcome to Quickstream"
         self.status_timestamp: float = time.time()
         self.running: bool = True
-        self.file_browser = FileBrowser()
+        self.file_browser = FileBrowser(metadata_view=self.settings.metadata_view)
         self.queue_focus = "queue"  # or "browser"
 
     def set_status(self, message: str) -> None:
@@ -249,6 +255,7 @@ class AppTUI:
         tab_defs = [
             (0, f"[1] Queue ({len(self.queue)})"),
             (1, f"[2] Devices ({len(self.device_manager.devices)})" + (" [SCANNING...]" if self.device_manager.is_scanning else "")),
+            (2, "[3] Settings"),
         ]
 
         col = 16
@@ -332,10 +339,12 @@ class AppTUI:
 
                 duration = track.duration_formatted
                 fmt = track.format_name
-                t_title = track.display_title
-                artist = f" - {track.artist}" if track.artist else ""
-
-                item_line = f" {cursor_badge} [{play_badge}] {actual_idx + 1:2d}. {t_title}{artist} ({duration})"
+                if self.settings.metadata_view:
+                    t_title = track.display_title
+                    artist = f" - {track.artist}" if track.artist else ""
+                    item_line = f" {cursor_badge} [{play_badge}] {actual_idx + 1:2d}. {t_title}{artist} ({duration})"
+                else:
+                    item_line = f" {cursor_badge} [{play_badge}] {actual_idx + 1:2d}. {track.filename} ({duration})"
 
                 if is_cursor:
                     self._safe_addstr(stdscr, row, q_start_x, item_line.ljust(q_width), bold | curses.A_REVERSE)
@@ -396,6 +405,45 @@ class AppTUI:
                     self._safe_addstr(stdscr, row, 2, dev_line, green | bold)
                 else:
                     self._safe_addstr(stdscr, row, 2, dev_line)
+
+    def _render_settings(self, stdscr: curses.window, max_y: int, max_x: int) -> None:
+        """Render Tab 3: Application Settings."""
+        bold = curses.A_BOLD
+        cyan = curses.color_pair(1)
+        yellow = curses.color_pair(3)
+
+        self._safe_addstr(stdscr, 3, 2, "Application Settings & Preferences:", bold | cyan)
+        self._safe_addstr(stdscr, 4, 2, "─" * min(max_x - 4, 76), curses.A_DIM)
+
+        defs = self.settings_manager.definitions
+        start_row = 5
+        for idx, defn in enumerate(defs):
+            row = start_row + idx
+            if row >= max_y - 6:
+                break
+            is_cursor = (idx == self.settings_cursor)
+            cursor_badge = ">" if is_cursor else " "
+            val_str = self.settings_manager.get_display_value(idx)
+
+            line_str = f" {cursor_badge} [{defn.label:<24}] : < {val_str} >"
+            if is_cursor:
+                self._safe_addstr(stdscr, row, 2, line_str.ljust(min(max_x - 4, 76)), bold | curses.A_REVERSE)
+            else:
+                self._safe_addstr(stdscr, row, 2, line_str[: max_x - 4], curses.A_NORMAL)
+
+        # Description box
+        desc_row = start_row + len(defs) + 1
+        if desc_row < max_y - 4:
+            self._safe_addstr(stdscr, desc_row, 2, "─" * min(max_x - 4, 76), curses.A_DIM)
+            if 0 <= self.settings_cursor < len(defs):
+                curr_defn = defs[self.settings_cursor]
+                self._safe_addstr(stdscr, desc_row + 1, 2, f"Setting: {curr_defn.label}", bold | yellow)
+                self._safe_addstr(stdscr, desc_row + 2, 2, curr_defn.description[: max_x - 4], curses.A_DIM)
+
+        # Navigation hint
+        hint_row = max_y - 2
+        hints = "[↑/↓] Select   [←/→] / [Enter] Cycle Value   [r] Reset Defaults"
+        self._safe_addstr(stdscr, hint_row, 2, hints[: max_x - 4], curses.A_DIM)
 
     def _render_persistent_playback(self, stdscr: curses.window, start_y: int, max_x: int) -> None:
         """Render persistent Now Playing bar at the bottom."""
@@ -458,13 +506,17 @@ class AppTUI:
             "   [Space] Play/Pause               ",
             "   [s] Stop                         ",
             "   [←/→] Prev/Next Track            ",
-            "   [Shift+←/→] Seek -10s/+10s       ",
+            "   [Shift+←/→] Seek relative        ",
             "   [+/-] Volume Up/Down             ",
             "   [m] Mute Toggle                  ",
             "   [t] Toggle Transcoding           ",
             "                                    ",
+            " Display & View:                    ",
+            "   [v] Toggle Metadata/Filename View",
+            "                                    ",
             " Navigation:                        ",
-            "   [Tab] Switch Main Tabs           ",
+            "   [Tab] Switch Main Tabs (1/2/3)   ",
+            "   [1/2/3] Jump to Queue/Dev/Setting",
             "   [h/l] Switch Panes in Queue      ",
             "   [?] Close Help                   ",
             "   [q] Quit                         ",
@@ -500,6 +552,8 @@ class AppTUI:
             self._render_queue(stdscr, view_max_y, max_x)
         elif self.active_tab == 1:
             self._render_devices(stdscr, view_max_y, max_x)
+        elif self.active_tab == 2:
+            self._render_settings(stdscr, view_max_y, max_x)
 
         self._render_persistent_playback(stdscr, view_max_y, max_x)
 
@@ -558,10 +612,19 @@ class AppTUI:
                             and prev_state.upper() == "PLAYING"
                             and "STOP" in t_info.state.upper()
                             and near_end
-                            and self.queue.has_next()
                         ):
-                            self.set_status("Track finished. Advancing to next track...")
-                            self.play_track(self.queue.current_index + 1)
+                            mode = getattr(self.settings, "queue_mode", "loop")
+                            if mode == "repeat_one":
+                                self.set_status("Repeating current track...")
+                                self.play_track(self.queue.current_index)
+                            elif self.queue.has_next():
+                                self.set_status("Track finished. Advancing to next track...")
+                                self.play_track(self.queue.current_index + 1)
+                            elif mode == "loop" and len(self.queue) > 0:
+                                self.set_status("Queue finished. Looping to start...")
+                                self.play_track(0)
+                            else:
+                                self.set_status("Queue finished. Playback stopped.")
 
                     if not getattr(self.client, "is_paused_via_stop", False) and not self.user_stopped:
                         p_info = self.client.get_position_info(timeout=1.2)
@@ -853,14 +916,25 @@ class AppTUI:
             return
 
 
-        # Global Seek Forward 10s (Shift+→)
-        if key in (curses.KEY_SRIGHT, getattr(curses, "KEY_SF", -1)):
-            self._seek_relative(10.0)
+        # Toggle Metadata / Filename View
+        if key in (ord("v"), ord("V")):
+            new_val = not self.settings.metadata_view
+            self.settings_manager.set_value("metadata_view", new_val)
+            self.settings = self.settings_manager.settings
+            if self.file_browser:
+                self.file_browser.set_metadata_view(new_val)
+            mode_desc = "Metadata (Tags)" if new_val else "Filename"
+            self.set_status(f"Display mode: {mode_desc}")
             return
 
-        # Global Seek Backward 10s (Shift+←)
+        # Global Seek Forward (Shift+→)
+        if key in (curses.KEY_SRIGHT, getattr(curses, "KEY_SF", -1)):
+            self._seek_relative(self.settings.seek_step_seconds)
+            return
+
+        # Global Seek Backward (Shift+←)
         if key in (curses.KEY_SLEFT, getattr(curses, "KEY_SR", -1)):
-            self._seek_relative(-10.0)
+            self._seek_relative(-self.settings.seek_step_seconds)
             return
 
         # Global Seek Forward 30s ('PageDown', ']')
@@ -921,7 +995,8 @@ class AppTUI:
         # Global Volume Up ('+', '=')
         if key in (ord("+"), ord("=")):
             if self.client:
-                new_vol = min(100, self.current_volume + 2)
+                step = self.settings.volume_step
+                new_vol = min(100, self.current_volume + step)
                 if self.client.set_volume(new_vol):
                     self.current_volume = new_vol
                     self.set_status(f"Volume: {new_vol}%")
@@ -930,7 +1005,8 @@ class AppTUI:
         # Global Volume Down ('-', '_')
         if key in (ord("-"), ord("_")):
             if self.client:
-                new_vol = max(0, self.current_volume - 2)
+                step = self.settings.volume_step
+                new_vol = max(0, self.current_volume - step)
                 if self.client.set_volume(new_vol):
                     self.current_volume = new_vol
                     self.set_status(f"Volume: {new_vol}%")
@@ -1058,6 +1134,8 @@ class AppTUI:
             self._handle_queue_keys(key)
         elif self.active_tab == 1:
             self._handle_device_keys(key)
+        elif self.active_tab == 2:
+            self._handle_settings_keys(key)
 
     def _handle_queue_keys(self, key: int) -> None:
         """Keys for Tab 1: Queue & Media Manager."""
@@ -1167,3 +1245,62 @@ class AppTUI:
                 timeout=3.5,
                 on_complete=lambda devs: self.set_status(f"Scan complete: found {len(devs)} stereos"),
             )
+
+    def _handle_settings_keys(self, key: int) -> None:
+        """Keys for Tab 3: Settings."""
+        defs = self.settings_manager.definitions
+        max_idx = len(defs) - 1
+
+        # Move cursor up
+        if key in (curses.KEY_UP, ord("k"), ord("K")):
+            if self.settings_cursor > 0:
+                self.settings_cursor -= 1
+            else:
+                self.settings_cursor = max_idx
+
+        # Move cursor down
+        elif key in (curses.KEY_DOWN, ord("j"), ord("J")):
+            if self.settings_cursor < max_idx:
+                self.settings_cursor += 1
+            else:
+                self.settings_cursor = 0
+
+        # Cycle previous option
+        elif key in (curses.KEY_LEFT, ord("h"), ord("H")):
+            self._cycle_and_apply_setting(forward=False)
+
+        # Cycle next option
+        elif key in (curses.KEY_RIGHT, ord("l"), ord("L"), curses.KEY_ENTER, 10, 13, ord(" ")):
+            self._cycle_and_apply_setting(forward=True)
+
+        # Reset defaults
+        elif key in (ord("r"), ord("R")):
+            self.settings = self.settings_manager.reset_defaults()
+            self._apply_all_settings()
+            self.set_status("All settings reset to defaults")
+
+    def _cycle_and_apply_setting(self, forward: bool = True) -> None:
+        """Cycle the active setting and apply immediately to runtime."""
+        defn = self.settings_manager.definitions[self.settings_cursor]
+        self.settings_manager.cycle_setting(self.settings_cursor, forward=forward)
+        self.settings = self.settings_manager.settings
+        self._apply_setting(defn.key)
+        new_label = self.settings_manager.get_display_value(self.settings_cursor)
+        self.set_status(f"Set {defn.label}: {new_label}")
+
+    def _apply_setting(self, key: str) -> None:
+        """Apply a single setting change immediately."""
+        if key == "metadata_view":
+            if self.file_browser:
+                self.file_browser.set_metadata_view(self.settings.metadata_view)
+        elif key == "force_transcode":
+            self.force_transcode = self.settings.force_transcode
+            mode = "16-bit PCM WAV" if self.force_transcode else "Direct Native"
+            if self.queue.current_index >= 0 and self.transport_info.state == "PLAYING":
+                self.play_track(self.queue.current_index)
+
+    def _apply_all_settings(self) -> None:
+        """Apply all settings to active components."""
+        if self.file_browser:
+            self.file_browser.set_metadata_view(self.settings.metadata_view)
+        self.force_transcode = self.settings.force_transcode

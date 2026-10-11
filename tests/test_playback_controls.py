@@ -71,6 +71,9 @@ class TestPlaybackControls(unittest.TestCase):
             initial_device=self.device,
         )
         self.app.client = self.client
+        self.save_patcher = mock.patch.object(self.app.settings_manager, "save", return_value=True)
+        self.save_patcher.start()
+        self.addCleanup(self.save_patcher.stop)
 
     def test_play_action_success(self):
         """Verify Play sends correct UPnP request and returns True."""
@@ -418,6 +421,58 @@ class TestPlaybackControls(unittest.TestCase):
         # Calling in bounds should catch curses.error silently without throwing
         self.app._safe_addstr(mock_stdscr, 10, 10, "test")
         mock_stdscr.addstr.assert_called_once()
+
+    def test_tab_switching_includes_settings(self):
+        """Verify Tab cycles 0 -> 1 -> 2 -> 0, and keys 1, 2, 3 jump directly."""
+        self.app.active_tab = 0
+        self.app._handle_key(ord("\t"))
+        self.assertEqual(self.app.active_tab, 1)
+
+        self.app._handle_key(ord("\t"))
+        self.assertEqual(self.app.active_tab, 2)
+
+        self.app._handle_key(ord("\t"))
+        self.assertEqual(self.app.active_tab, 0)
+
+        # Direct jumps
+        self.app._handle_key(ord("3"))
+        self.assertEqual(self.app.active_tab, 2)
+
+        self.app._handle_key(ord("1"))
+        self.assertEqual(self.app.active_tab, 0)
+
+        self.app._handle_key(ord("2"))
+        self.assertEqual(self.app.active_tab, 1)
+
+    def test_metadata_view_toggle_hotkey(self):
+        """Verify pressing 'v' toggles metadata_view setting and file browser mode."""
+        self.assertTrue(self.app.settings.metadata_view)
+        self.assertTrue(self.app.file_browser.metadata_view)
+
+        self.app._handle_key(ord("v"))
+        self.assertFalse(self.app.settings.metadata_view)
+        self.assertFalse(self.app.file_browser.metadata_view)
+        self.assertIn("Filename", self.app.status_message)
+
+        self.app._handle_key(ord("v"))
+        self.assertTrue(self.app.settings.metadata_view)
+        self.assertTrue(self.app.file_browser.metadata_view)
+        self.assertIn("Metadata", self.app.status_message)
+
+    def test_settings_tab_navigation_and_cycling(self):
+        """Verify navigation and value cycling within Tab 3 (Settings)."""
+        import curses
+        self.app.active_tab = 2
+        self.app.settings_cursor = 0  # metadata_view
+
+        # Cycle value with Enter
+        self.assertTrue(self.app.settings.metadata_view)
+        self.app._handle_key(10)  # Enter
+        self.assertFalse(self.app.settings.metadata_view)
+
+        # Move down cursor to default_device
+        self.app._handle_key(curses.KEY_DOWN)
+        self.assertEqual(self.app.settings_cursor, 1)
 
 
 if __name__ == "__main__":

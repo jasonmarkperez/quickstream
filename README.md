@@ -10,8 +10,9 @@ Stream **MP3**, **FLAC**, **WAV**, and **AIFF** files directly to your network s
 
 - **Zero External Python Dependencies**: Built 100% on standard library Python 3.10+ (requires system `ffmpeg`/`ffplay`).
 - **All-in-One Interactive Terminal Interface**:
-  - **Tab 1: Queue & Library**: Split-pane interface featuring an in-place **File Browser** on the left with persistent directory bookmarks ("Music Homes"), and the **Playback Queue** on the right.
+  - **Tab 1: Queue & Library**: Split-pane interface featuring an in-place **File Browser** on the left with persistent directory bookmarks ("Music Homes") and metadata tag toggle (`[v]`), and the **Playback Queue** on the right.
   - **Tab 2: Network Devices**: Discovers DLNA/UPnP stereos on your local network alongside standard **Local Audio**.
+  - **Tab 3: Settings & Preferences**: Configure file display mode, default audio device, seek interval, volume step size, queue loop mode, and transcoding.
   - **Persistent Bottom Playback Bar**: Always-visible playback status, track metadata, volume, and progress bar across all tabs without obscuring the active view.
   - **Interactive Help Modal**: Press `[?]` anytime to bring up an overlay cheat-sheet with full keyboard shortcuts.
 - **Dual Playback Engines**:
@@ -83,10 +84,11 @@ Press `[?]` at any time inside the app to view the interactive help modal.
 ### Navigation & Panes
 | Key | Action |
 | --- | --- |
-| `[Tab]` | Switch between **Queue** and **Devices** tabs |
-| `[1]` / `[2]` | Jump directly to tab 1 (Queue) or tab 2 (Devices) |
+| `[Tab]` | Switch between **Queue**, **Devices**, and **Settings** tabs |
+| `[1]` / `[2]` / `[3]` | Jump directly to tab 1 (Queue), tab 2 (Devices), or tab 3 (Settings) |
 | `[h]` / `[l]` | Switch focus between **Browser** and **Queue** panes |
-| `[↑]` / `[↓]` | Navigate items in list (with circular wraparound) |
+| `[↑]` / `[↓]` | Navigate items in list / settings (with circular wraparound) |
+| `[v]` | Toggle between **Metadata (Tags)** and **Filename** view |
 | `[?]` | Toggle Help modal overlay |
 | `[q]` / `[Esc]` | Clean exit |
 
@@ -94,6 +96,7 @@ Press `[?]` at any time inside the app to view the interactive help modal.
 | Key | Action |
 | --- | --- |
 | `[Enter]` | Enter directory / Add highlighted file to queue / Play selected track |
+| `[v]` | Toggle file list display mode (Metadata vs Filename) |
 | `[a]` | Add all audio files in current browser directory to queue |
 | `[b]` | Bookmark ("Music Home") current folder |
 | `[B]` | Jump to bookmarked folder |
