@@ -1,0 +1,247 @@
+//! User preferences, configuration definitions, and JSON persistence.
+
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::paths;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Settings {
+    pub metadata_view: bool,
+    pub default_device: String,
+    pub seek_step_seconds: f64,
+    pub volume_step: u8,
+    pub queue_mode: String,
+    pub force_transcode: bool,
+    pub player_backend: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            metadata_view: true,
+            default_device: "local-audio".to_string(),
+            seek_step_seconds: 10.0,
+            volume_step: 5,
+            queue_mode: "loop".to_string(),
+            force_transcode: false,
+            player_backend: "mpv".to_string(),
+        }
+    }
+}
+
+pub struct SettingDefinition {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+}
+
+pub const SETTING_DEFINITIONS: &[SettingDefinition] = &[
+    SettingDefinition {
+        key: "metadata_view",
+        label: "File List Display",
+        description: "Display extracted ID3/FLAC tag metadata (Artist - Title) instead of filenames.",
+    },
+    SettingDefinition {
+        key: "player_backend",
+        label: "Local Playback Engine",
+        description: "Audio player binary used for local playback (mpv with IPC or ffplay).",
+    },
+    SettingDefinition {
+        key: "seek_step_seconds",
+        label: "Seek Jump Interval",
+        description: "Amount of time to jump forward/backward when using Shift+Arrow keys.",
+    },
+    SettingDefinition {
+        key: "volume_step",
+        label: "Volume Step Size",
+        description: "Percentage to increase or decrease volume per hotkey press (+/-).",
+    },
+    SettingDefinition {
+        key: "queue_mode",
+        label: "Queue Playback Mode",
+        description: "Playback behavior when reaching the end of the queue.",
+    },
+    SettingDefinition {
+        key: "force_transcode",
+        label: "Audio Transcoding",
+        description: "Transcode audio into 16-bit PCM WAV via ffmpeg for legacy DLNA renderers.",
+    },
+];
+
+pub struct SettingsManager {
+    pub path: PathBuf,
+    pub settings: Settings,
+}
+
+impl Default for SettingsManager {
+    fn default() -> Self {
+        let path = paths::get_config_path();
+        let settings = Self::load_from(&path).unwrap_or_default();
+        Self { path, settings }
+    }
+}
+
+impl SettingsManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_path(path: PathBuf) -> Self {
+        let settings = Self::load_from(&path).unwrap_or_default();
+        Self { path, settings }
+    }
+
+    pub fn load_from(path: &Path) -> Option<Settings> {
+        if !path.exists() {
+            return None;
+        }
+        let content = fs::read_to_string(path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
+    pub fn save(&self) -> bool {
+        if let Some(parent) = self.path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&self.settings) {
+            return fs::write(&self.path, json).is_ok();
+        }
+        false
+    }
+
+    pub fn cycle_setting(&mut self, index: usize, forward: bool) {
+        match index {
+            0 => {
+                // metadata_view
+                self.settings.metadata_view = !self.settings.metadata_view;
+            }
+            1 => {
+                // player_backend: "mpv", "ffplay"
+                self.settings.player_backend = if self.settings.player_backend == "mpv" {
+                    "ffplay".to_string()
+                } else {
+                    "mpv".to_string()
+                };
+            }
+            2 => {
+                // seek_step_seconds: [5.0, 10.0, 15.0, 30.0]
+                let options = [5.0, 10.0, 15.0, 30.0];
+                let current_idx = options
+                    .iter()
+                    .position(|&v| (v - self.settings.seek_step_seconds).abs() < 0.1)
+                    .unwrap_or(1);
+                let next_idx = if forward {
+                    (current_idx + 1) % options.len()
+                } else {
+                    (current_idx + options.len() - 1) % options.len()
+                };
+                self.settings.seek_step_seconds = options[next_idx];
+            }
+            3 => {
+                // volume_step: [2, 5, 10]
+                let options = [2u8, 5, 10];
+                let current_idx = options
+                    .iter()
+                    .position(|&v| v == self.settings.volume_step)
+                    .unwrap_or(1);
+                let next_idx = if forward {
+                    (current_idx + 1) % options.len()
+                } else {
+                    (current_idx + options.len() - 1) % options.len()
+                };
+                self.settings.volume_step = options[next_idx];
+            }
+            4 => {
+                // queue_mode: "loop", "stop", "repeat_one"
+                let options = ["loop", "stop", "repeat_one"];
+                let current_idx = options
+                    .iter()
+                    .position(|&v| v == self.settings.queue_mode)
+                    .unwrap_or(0);
+                let next_idx = if forward {
+                    (current_idx + 1) % options.len()
+                } else {
+                    (current_idx + options.len() - 1) % options.len()
+                };
+                self.settings.queue_mode = options[next_idx].to_string();
+            }
+            5 => {
+                // force_transcode
+                self.settings.force_transcode = !self.settings.force_transcode;
+            }
+            _ => {}
+        }
+        self.save();
+    }
+
+    pub fn get_display_value(&self, index: usize) -> String {
+        match index {
+            0 => if self.settings.metadata_view { "Metadata (Tags)" } else { "Filename" }.to_string(),
+            1 => if self.settings.player_backend == "mpv" { "MPV (IPC socket)" } else { "FFplay (subprocess)" }.to_string(),
+            2 => format!("{} seconds", self.settings.seek_step_seconds),
+            3 => format!("{}%", self.settings.volume_step),
+            4 => match self.settings.queue_mode.as_str() {
+                "loop" => "Continuous (Loop Queue)",
+                "stop" => "Stop at End",
+                "repeat_one" => "Repeat Current Track",
+                other => other,
+            }.to_string(),
+            5 => if self.settings.force_transcode { "Force 16-bit PCM WAV" } else { "Direct Stream (Auto)" }.to_string(),
+            _ => String::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn test_default_settings() {
+        let s = Settings::default();
+        assert!(s.metadata_view);
+        assert_eq!(s.player_backend, "mpv");
+        assert_eq!(s.seek_step_seconds, 10.0);
+        assert_eq!(s.volume_step, 5);
+        assert_eq!(s.queue_mode, "loop");
+    }
+
+    #[test]
+    fn test_save_and_load_roundtrip() {
+        let temp_dir = env::temp_dir().join(format!("quickstream_test_settings_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let path = temp_dir.join("test_config.json");
+
+        let mut mgr = SettingsManager::with_path(path.clone());
+        mgr.settings.metadata_view = false;
+        mgr.settings.volume_step = 10;
+        assert!(mgr.save());
+
+        let loaded = SettingsManager::load_from(&path).expect("should load");
+        assert!(!loaded.metadata_view);
+        assert_eq!(loaded.volume_step, 10);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_cycle_settings() {
+        let temp_dir = env::temp_dir().join(format!("quickstream_test_cycle_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let path = temp_dir.join("test_config.json");
+        let mut mgr = SettingsManager::with_path(path);
+
+        assert!(mgr.settings.metadata_view);
+        mgr.cycle_setting(0, true);
+        assert!(!mgr.settings.metadata_view);
+
+        assert_eq!(mgr.settings.player_backend, "mpv");
+        mgr.cycle_setting(1, true);
+        assert_eq!(mgr.settings.player_backend, "ffplay");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+}

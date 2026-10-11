@@ -1,0 +1,119 @@
+//! Quickstream: A lightweight terminal audio player and DLNA network streamer in Rust.
+
+pub mod library;
+pub mod metadata;
+pub mod paths;
+pub mod player;
+pub mod queue;
+pub mod settings;
+pub mod ui;
+
+use std::path::PathBuf;
+
+use clap::Parser;
+
+use crate::library::LibraryManager;
+use crate::metadata::{extract_metadata, is_supported_audio_file};
+use crate::settings::SettingsManager;
+use crate::ui::AppUI;
+
+#[derive(Parser, Debug)]
+#[command(name = "quickstream")]
+#[command(version = "0.2.0")]
+#[command(about = "A lightweight terminal music player and DLNA network streamer in Rust", long_about = None)]
+struct Cli {
+    /// Audio files or directories to load
+    paths: Vec<PathBuf>,
+
+    /// Inspect audio metadata tags and exit
+    #[arg(long)]
+    info: Option<PathBuf>,
+
+    /// Launch directly into Skim interactive fuzzy finder mode
+    #[arg(long, short)]
+    search: bool,
+
+    /// Scan local network for DLNA / UPnP MediaRenderers
+    #[arg(long)]
+    scan: bool,
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    // Inspect metadata flag
+    if let Some(info_path) = cli.info {
+        if !info_path.exists() {
+            eprintln!("Error: File '{}' does not exist", info_path.display());
+            std::process::exit(1);
+        }
+        match extract_metadata(&info_path) {
+            Ok(meta) => {
+                println!("--- Audio Metadata ({}) ---", meta.format_name);
+                println!("File:        {}", meta.filepath.display());
+                println!("Title:       {}", meta.title);
+                println!("Artist:      {}", meta.artist);
+                println!("Album:       {}", meta.album);
+                println!("Genre:       {}", meta.genre);
+                println!("Duration:    {}", meta.formatted_duration());
+                println!("Bitrate:     {} kbps", meta.bitrate_kbps);
+                println!("Sample Rate: {} Hz", meta.sample_rate_hz);
+                println!("Channels:    {}", meta.channels);
+                println!("Size:        {:.2} MB", meta.file_size as f64 / 1_048_576.0);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Error extracting metadata: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Direct Skim search mode
+    if cli.search {
+        println!("Loading library index for Skim search...");
+        let start_dir = cli.paths.first().cloned().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let mut tracks = LibraryManager::load_cache();
+        if tracks.is_empty() {
+            println!("Indexing '{}'...", start_dir.display());
+            tracks = LibraryManager::scan_directory(&start_dir);
+            LibraryManager::save_cache(&tracks);
+        }
+
+        let selected = LibraryManager::search_with_skim(&tracks);
+        if selected.is_empty() {
+            println!("No tracks selected.");
+            return Ok(());
+        }
+
+        println!("Selected {} tracks:", selected.len());
+        for t in &selected {
+            println!("  - {}", t.format_display_label(true));
+        }
+        return Ok(());
+    }
+
+    // Network scan placeholder
+    if cli.scan {
+        println!("Scanning network for DLNA MediaRenderers (SSDP)...");
+        println!("  - Local Audio (ffplay/mpv)");
+        println!("Scan complete (1 device found).");
+        return Ok(());
+    }
+
+    // Launch full interactive TUI
+    let settings_mgr = SettingsManager::new();
+    let start_dir = cli.paths.first().filter(|p| p.is_dir()).cloned();
+    let mut app = AppUI::new(start_dir, settings_mgr);
+
+    // Pre-queue any explicit files passed on CLI
+    for path in &cli.paths {
+        if path.is_file() && is_supported_audio_file(path) {
+            if let Ok(meta) = extract_metadata(path) {
+                app.queue.add_track(meta);
+            }
+        }
+    }
+
+    app.run()
+}

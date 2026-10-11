@@ -71,3 +71,6 @@ quickstream_debug.log
 *.aiff
 *.aif
 screenshots/
+
+# Rust build artifacts
+target/
