@@ -243,7 +243,12 @@ class FileBrowser:
         footer_row = start_y + height - 2
         try:
             stdscr.addstr(footer_row, start_x + 1, "─" * min(width - 2, 76), curses.A_DIM)
-            controls = "[Enter] Open/Add  [v] View Mode  [b] Bookmark  [a] All"
+            if self.in_bookmarks_view:
+                controls = "[Enter] Open  [d/x] Remove Bookmark  [r] Refresh"
+            else:
+                is_bm = str(self.current_dir) in self.bookmarks
+                bm_label = "[b] Unbookmark" if is_bm else "[b] Bookmark"
+                controls = f"[Enter] Open/Add  [v] Mode  {bm_label}  [a] All"
             stdscr.addstr(footer_row + 1, start_x + 1, controls[: width - 2], base_attr)
         except curses.error:
             pass
@@ -282,16 +287,43 @@ class FileBrowser:
             self._refresh_entries()
             return False, None, "Refreshed folder"
 
-        # Bookmark
+        # Bookmark / Unbookmark toggle
         elif key in (ord("b"), ord("B")):
             if not self.in_bookmarks_view:
                 path_str = str(self.current_dir)
-                if path_str not in self.bookmarks:
+                if path_str in self.bookmarks:
+                    self.bookmarks.remove(path_str)
+                    save_bookmarks(self.bookmarks)
+                    return False, None, f"Removed '{self.current_dir.name}' from Music Homes"
+                else:
                     self.bookmarks.append(path_str)
                     save_bookmarks(self.bookmarks)
-                    return False, None, "Added to Music Homes"
-                else:
-                    return False, None, "Already in Music Homes"
+                    return False, None, f"Added '{self.current_dir.name}' to Music Homes"
+            else:
+                if self.cursor_idx > 0:
+                    b_idx = self.cursor_idx - 1
+                    if 0 <= b_idx < len(self.bookmarks):
+                        removed_str = self.bookmarks.pop(b_idx)
+                        save_bookmarks(self.bookmarks)
+                        self._refresh_entries()
+                        if self.cursor_idx >= len(self.entries):
+                            self.cursor_idx = max(0, len(self.entries) - 1)
+                        return False, None, f"Removed '{Path(removed_str).name}' from Music Homes"
+                return False, None, "Select a bookmark to remove"
+
+        # Remove bookmark with d/x/Delete in Music Homes view
+        elif key in (ord("d"), ord("D"), ord("x"), ord("X"), curses.KEY_DC):
+            if self.in_bookmarks_view:
+                if self.cursor_idx > 0:
+                    b_idx = self.cursor_idx - 1
+                    if 0 <= b_idx < len(self.bookmarks):
+                        removed_str = self.bookmarks.pop(b_idx)
+                        save_bookmarks(self.bookmarks)
+                        self._refresh_entries()
+                        if self.cursor_idx >= len(self.entries):
+                            self.cursor_idx = max(0, len(self.entries) - 1)
+                        return False, None, f"Removed '{Path(removed_str).name}' from Music Homes"
+                return False, None, "Select a bookmark to remove"
 
         # Add all in folder
         elif key in (ord("a"), ord("A")):

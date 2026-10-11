@@ -42,6 +42,7 @@ quickstream/
 └── settings.py           # User preferences and persistence (~/.quickstream_config.json)
 
 tests/
+├── test_browser.py           # FileBrowser navigation, bookmark management, and metadata view
 ├── test_discovery.py         # SSDP packet parsing and device extraction tests
 ├── test_local_player.py      # LocalPlayerClient subprocess and lifecycle tests
 ├── test_metadata.py          # Audio header parsing and duration calculation tests

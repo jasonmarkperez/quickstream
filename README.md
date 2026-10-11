@@ -98,9 +98,8 @@ Press `[?]` at any time inside the app to view the interactive help modal.
 | `[Enter]` | Enter directory / Add highlighted file to queue / Play selected track |
 | `[v]` | Toggle file list display mode (Metadata vs Filename) |
 | `[a]` | Add all audio files in current browser directory to queue |
-| `[b]` | Bookmark ("Music Home") current folder |
-| `[B]` | Jump to bookmarked folder |
-| `[d]` / `[x]` | Remove highlighted track from queue |
+| `[b]` | Bookmark or unbookmark current folder (or remove highlighted bookmark in Music Homes) |
+| `[d]` / `[x]` | Remove highlighted track from queue, or remove selected bookmark in Music Homes |
 | `[c]` | Clear entire queue |
 
 ---
