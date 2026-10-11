@@ -12,6 +12,7 @@ pub trait AudioPlayer: Send + Sync {
     fn stop(&mut self) -> anyhow::Result<()>;
     fn seek(&mut self, delta_seconds: f64) -> anyhow::Result<()>;
     fn set_volume(&mut self, volume: u8) -> anyhow::Result<()>;
+    fn volume(&self) -> u8;
     fn is_playing(&self) -> bool;
     fn is_paused(&self) -> bool;
     fn position_seconds(&self) -> f64;

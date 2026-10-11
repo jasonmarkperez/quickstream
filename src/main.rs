@@ -1,5 +1,6 @@
 //! Quickstream: A lightweight terminal audio player and DLNA network streamer in Rust.
 
+pub mod discovery;
 pub mod library;
 pub mod metadata;
 pub mod paths;
@@ -9,6 +10,7 @@ pub mod settings;
 pub mod ui;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 
@@ -93,11 +95,17 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Network scan placeholder
+    // Network scan
     if cli.scan {
         println!("Scanning network for DLNA MediaRenderers (SSDP)...");
-        println!("  - Local Audio (ffplay/mpv)");
-        println!("Scan complete (1 device found).");
+        let devices = discovery::discover_devices(Duration::from_millis(3000));
+        println!("Discovered audio outputs:");
+        println!("  [0] Local Audio (mpv/ffplay)");
+        for (i, dev) in devices.iter().enumerate() {
+            println!("  [{}] {} ({}:{})", i + 1, dev.display_label(), dev.host, dev.port);
+            println!("      Control: {}", dev.av_transport_control_url);
+        }
+        println!("\nScan complete ({} device(s) found).", devices.len() + 1);
         return Ok(());
     }
 

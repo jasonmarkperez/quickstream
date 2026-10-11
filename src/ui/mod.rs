@@ -13,6 +13,7 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
+use crate::discovery::DeviceManager;
 use crate::library::LibraryManager;
 use crate::metadata::is_supported_audio_file;
 use crate::paths;
@@ -28,6 +29,7 @@ pub struct AppUI {
     pub browser_entries: Vec<(String, PathBuf, bool)>, // (display_name, path, is_dir)
     pub browser_cursor: usize,
     pub queue_cursor: usize,
+    pub devices_cursor: usize,
     pub settings_cursor: usize,
     pub bookmarks: Vec<String>,
     pub in_bookmarks_view: bool,
@@ -35,6 +37,7 @@ pub struct AppUI {
     pub status_message: String,
     pub queue: PlaybackQueue,
     pub player: LocalPlayer,
+    pub device_manager: DeviceManager,
     pub settings_mgr: SettingsManager,
 }
 
@@ -43,6 +46,8 @@ impl AppUI {
         let cwd = start_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         let backend = settings_mgr.settings.player_backend.clone();
         let bookmarks = Self::load_bookmarks();
+        let device_manager = DeviceManager::new();
+        device_manager.start_background_scan();
 
         let mut app = Self {
             active_tab: 0,
@@ -51,6 +56,7 @@ impl AppUI {
             browser_entries: Vec::new(),
             browser_cursor: 0,
             queue_cursor: 0,
+            devices_cursor: 0,
             settings_cursor: 0,
             bookmarks,
             in_bookmarks_view: false,
@@ -58,6 +64,7 @@ impl AppUI {
             status_message: "Welcome to Quickstream (Rust)".to_string(),
             queue: PlaybackQueue::new(),
             player: LocalPlayer::new(&backend),
+            device_manager,
             settings_mgr,
         };
         app.refresh_browser();
@@ -165,6 +172,11 @@ impl AppUI {
 
     fn event_loop<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> anyhow::Result<()> {
         loop {
+            // Check if active track finished and auto-advance queue
+            if self.player.is_track_finished() {
+                self.play_next_track();
+            }
+
             terminal.draw(|f| self.render(f))?;
 
             if event::poll(Duration::from_millis(100))? {
@@ -222,12 +234,16 @@ impl AppUI {
                             self.status_message = format!("Seek -{:.0}s", step);
                         }
                         (KeyCode::Char('+') | KeyCode::Char('='), KeyModifiers::NONE) => {
-                            let new_vol = self.settings_mgr.settings.volume_step;
-                            self.status_message = format!("Volume +{}%", new_vol);
+                            let step = self.settings_mgr.settings.volume_step;
+                            let new_vol = self.player.volume().saturating_add(step).min(100);
+                            let _ = self.player.set_volume(new_vol);
+                            self.status_message = format!("Volume {}%", new_vol);
                         }
                         (KeyCode::Char('-'), KeyModifiers::NONE) => {
-                            let new_vol = self.settings_mgr.settings.volume_step;
-                            self.status_message = format!("Volume -{}%", new_vol);
+                            let step = self.settings_mgr.settings.volume_step;
+                            let new_vol = self.player.volume().saturating_sub(step);
+                            let _ = self.player.set_volume(new_vol);
+                            self.status_message = format!("Volume {}%", new_vol);
                         }
                         (KeyCode::Char('v'), KeyModifiers::NONE) => {
                             self.settings_mgr.cycle_setting(0, true);
@@ -395,6 +411,38 @@ impl AppUI {
             }
             1 => {
                 // Devices Tab
+                let devices = self.device_manager.get_devices();
+                let total_devices = 1 + devices.len(); // 0 is Local Audio, 1.. are DLNA renderers
+                match code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if self.devices_cursor > 0 {
+                            self.devices_cursor -= 1;
+                        } else {
+                            self.devices_cursor = total_devices.saturating_sub(1);
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if self.devices_cursor + 1 < total_devices {
+                            self.devices_cursor += 1;
+                        } else {
+                            self.devices_cursor = 0;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if self.devices_cursor == 0 {
+                            self.device_manager.set_active_device(None);
+                            self.status_message = "Active output: Local Audio".to_string();
+                        } else if let Some(dev) = devices.get(self.devices_cursor - 1) {
+                            self.device_manager.set_active_device(Some(dev.clone()));
+                            self.status_message = format!("Active output: {}", dev.friendly_name);
+                        }
+                    }
+                    KeyCode::Char('r') => {
+                        self.device_manager.start_background_scan();
+                        self.status_message = "Scanning for DLNA MediaRenderers...".to_string();
+                    }
+                    _ => {}
+                }
             }
             2 => {
                 // Settings Tab
@@ -570,11 +618,54 @@ impl AppUI {
     }
 
     fn render_devices_tab(&self, f: &mut Frame, area: Rect) {
-        let block = Block::default().borders(Borders::ALL).title(" AUDIO OUTPUT DEVICES ");
-        let items = vec![
-            ListItem::new("● Local Audio (Active)").style(Style::default().fg(Color::Green)),
-            ListItem::new("○ Network Stereos (Scanning...)").style(Style::default().fg(Color::DarkGray)),
-        ];
+        let is_scanning = self.device_manager.is_scanning();
+        let title = if is_scanning {
+            " AUDIO OUTPUT DEVICES (Scanning...) "
+        } else {
+            " AUDIO OUTPUT DEVICES "
+        };
+        let block = Block::default().borders(Borders::ALL).title(title);
+
+        let active_dev = self.device_manager.get_active_device();
+        let devices = self.device_manager.get_devices();
+
+        let mut items = Vec::new();
+
+        // [0] Local Audio
+        let is_local_active = active_dev.is_none();
+        let local_bullet = if is_local_active { "●" } else { "○" };
+        let local_status = if is_local_active { " (Active)" } else { "" };
+        let local_text = format!("{} Local Audio (mpv/ffplay){}", local_bullet, local_status);
+        let local_style = if self.devices_cursor == 0 {
+            Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+        } else if is_local_active {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        items.push(ListItem::new(local_text).style(local_style));
+
+        // [1..] Discovered Network Renderers
+        for (idx, dev) in devices.iter().enumerate() {
+            let cursor_idx = idx + 1;
+            let is_active = active_dev.as_ref().map(|d| d.udn == dev.udn).unwrap_or(false);
+            let bullet = if is_active { "●" } else { "○" };
+            let status = if is_active { " (Active)" } else { "" };
+            let text = format!("{} {} [{}:{}]{}", bullet, dev.display_label(), dev.host, dev.port, status);
+            let style = if self.devices_cursor == cursor_idx {
+                Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+            } else if is_active {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            items.push(ListItem::new(text).style(style));
+        }
+
+        if devices.is_empty() && is_scanning {
+            items.push(ListItem::new("  (Searching for DLNA / UPnP MediaRenderers...)").style(Style::default().fg(Color::DarkGray)));
+        }
+
         let list = List::new(items).block(block);
         f.render_widget(list, area);
     }
@@ -626,21 +717,34 @@ impl AppUI {
             .map(|t| t.display_title())
             .unwrap_or("No Track Loaded");
 
-        let status_text = format!("{} │ {} │ {}", state, title, self.status_message);
+        let active_dev_name = self
+            .device_manager
+            .get_active_device()
+            .map(|d| d.friendly_name)
+            .unwrap_or_else(|| "Local Audio".to_string());
+
+        let vol = self.player.volume();
+        let status_text = format!(
+            "{} │ {} │ Vol: {}% │ Out: {} │ {}",
+            state, title, vol, active_dev_name, self.status_message
+        );
         f.render_widget(
             Paragraph::new(status_text).style(Style::default().fg(Color::Yellow)),
             inner[0],
         );
 
-        // Progress bar
+        // Progress bar with formatted MM:SS / MM:SS
         let pos = self.player.position_seconds();
         let dur = self.player.duration_seconds();
         let pct = if dur > 0.0 { (pos / dur).min(1.0) } else { 0.0 };
 
+        let pos_str = format_time(pos);
+        let dur_str = format_time(dur);
+
         let gauge = Gauge::default()
             .gauge_style(Style::default().fg(Color::Cyan))
             .ratio(pct)
-            .label(format!("{:.0}s / {:.0}s", pos, dur));
+            .label(format!("{} / {}", pos_str, dur_str));
         f.render_widget(gauge, inner[1]);
     }
 
@@ -696,4 +800,11 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+fn format_time(seconds: f64) -> String {
+    let total = seconds.round().max(0.0) as u64;
+    let mins = total / 60;
+    let secs = total % 60;
+    format!("{:02}:{:02}", mins, secs)
 }
