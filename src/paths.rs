@@ -10,8 +10,8 @@ pub fn get_config_dir() -> PathBuf {
             return PathBuf::from(val.trim()).join("quickstream");
         }
     }
-    if let Some(proj) = directories::BaseDirs::new() {
-        return proj.config_dir().join("quickstream");
+    if let Some(base) = directories::BaseDirs::new() {
+        return base.home_dir().join(".config").join("quickstream");
     }
     PathBuf::from(".config").join("quickstream")
 }
@@ -23,8 +23,8 @@ pub fn get_cache_dir() -> PathBuf {
             return PathBuf::from(val.trim()).join("quickstream");
         }
     }
-    if let Some(proj) = directories::BaseDirs::new() {
-        return proj.cache_dir().join("quickstream");
+    if let Some(base) = directories::BaseDirs::new() {
+        return base.home_dir().join(".cache").join("quickstream");
     }
     PathBuf::from(".cache").join("quickstream")
 }
@@ -36,13 +36,13 @@ pub fn get_data_dir() -> PathBuf {
             return PathBuf::from(val.trim()).join("quickstream");
         }
     }
-    if let Some(proj) = directories::BaseDirs::new() {
-        return proj.data_local_dir().join("quickstream");
+    if let Some(base) = directories::BaseDirs::new() {
+        return base.home_dir().join(".local").join("share").join("quickstream");
     }
     PathBuf::from(".local").join("share").join("quickstream")
 }
 
-/// Migrate a legacy dotfile to the new target path if target does not already exist.
+/// Migrate a legacy file to the new target path if target does not already exist.
 fn migrate_file(target: &Path, legacy: &Path) -> PathBuf {
     if target.exists() {
         return target.to_path_buf();
@@ -63,7 +63,16 @@ fn migrate_file(target: &Path, legacy: &Path) -> PathBuf {
 /// Get path to configuration file (config.json) with auto-migration.
 pub fn get_config_path() -> PathBuf {
     let target = get_config_dir().join("config.json");
+    if target.exists() {
+        return target;
+    }
     if let Some(base) = directories::BaseDirs::new() {
+        // First check macOS ~/Library/Application Support/quickstream/config.json
+        let app_support = base.config_dir().join("quickstream").join("config.json");
+        if app_support.exists() {
+            return migrate_file(&target, &app_support);
+        }
+        // Then check legacy ~/.quickstream_config.json
         let legacy = base.home_dir().join(".quickstream_config.json");
         return migrate_file(&target, &legacy);
     }
@@ -73,7 +82,16 @@ pub fn get_config_path() -> PathBuf {
 /// Get path to bookmarks file (bookmarks.json) with auto-migration.
 pub fn get_bookmarks_path() -> PathBuf {
     let target = get_config_dir().join("bookmarks.json");
+    if target.exists() {
+        return target;
+    }
     if let Some(base) = directories::BaseDirs::new() {
+        // First check macOS ~/Library/Application Support/quickstream/bookmarks.json
+        let app_support = base.config_dir().join("quickstream").join("bookmarks.json");
+        if app_support.exists() {
+            return migrate_file(&target, &app_support);
+        }
+        // Then check legacy ~/.quickstream_bookmarks.json
         let legacy = base.home_dir().join(".quickstream_bookmarks.json");
         return migrate_file(&target, &legacy);
     }

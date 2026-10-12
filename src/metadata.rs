@@ -82,7 +82,7 @@ pub fn extract_metadata(path: &Path) -> anyhow::Result<AudioMetadata> {
         .to_uppercase();
 
     // Probe and parse with lofty
-    let tagged_file = Probe::open(path)?.read()?;
+    let tagged_file = Probe::open(path)?.guess_file_type()?.read()?;
     let properties = tagged_file.properties();
 
     let duration_seconds = properties.duration().as_secs_f64();

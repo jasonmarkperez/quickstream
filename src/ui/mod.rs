@@ -39,6 +39,7 @@ pub struct AppUI {
     pub player: LocalPlayer,
     pub device_manager: DeviceManager,
     pub settings_mgr: SettingsManager,
+    pub metadata_cache: std::collections::HashMap<PathBuf, crate::metadata::AudioMetadata>,
 }
 
 impl AppUI {
@@ -66,6 +67,7 @@ impl AppUI {
             player: LocalPlayer::new(&backend),
             device_manager,
             settings_mgr,
+            metadata_cache: std::collections::HashMap::new(),
         };
         app.refresh_browser();
         app
@@ -94,6 +96,7 @@ impl AppUI {
     }
 
     pub fn refresh_browser(&mut self) {
+        let old_cursor = self.browser_cursor;
         self.browser_entries.clear();
 
         if self.in_bookmarks_view {
@@ -108,7 +111,7 @@ impl AppUI {
                 };
                 self.browser_entries.push((label, p, true));
             }
-            self.browser_cursor = 0;
+            self.browser_cursor = old_cursor.min(self.browser_entries.len().saturating_sub(1));
             return;
         }
 
@@ -135,14 +138,24 @@ impl AppUI {
                 if p.is_dir() {
                     dirs.push((format!("📁 {}/", name), p, true));
                 } else if p.is_file() && is_supported_audio_file(&p) {
+                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase();
                     let label = if self.settings_mgr.settings.metadata_view {
-                        if let Ok(meta) = crate::metadata::extract_metadata(&p) {
-                            meta.format_display_label(true)
-                        } else {
-                            format!("🎵 {}", name)
+                        let meta = match self.metadata_cache.get(&p) {
+                            Some(m) => Some(m.clone()),
+                            None => match crate::metadata::extract_metadata(&p) {
+                                Ok(m) => {
+                                    self.metadata_cache.insert(p.clone(), m.clone());
+                                    Some(m)
+                                }
+                                Err(_) => None,
+                            },
+                        };
+                        match meta {
+                            Some(m) => m.format_display_label(true),
+                            None => format!("🎵 [{}] {}", ext, name),
                         }
                     } else {
-                        format!("🎵 {}", name)
+                        format!("🎵 [{}] {}", ext, name)
                     };
                     files.push((label, p, false));
                 }
@@ -151,7 +164,7 @@ impl AppUI {
 
         self.browser_entries.extend(dirs);
         self.browser_entries.extend(files);
-        self.browser_cursor = 0;
+        self.browser_cursor = old_cursor.min(self.browser_entries.len().saturating_sub(1));
     }
 
     pub fn run(&mut self) -> anyhow::Result<()> {
@@ -259,7 +272,11 @@ impl AppUI {
                             self.refresh_browser();
                             self.status_message = format!(
                                 "Display mode: {}",
-                                self.settings_mgr.get_display_value(0)
+                                if self.settings_mgr.settings.metadata_view {
+                                    "Metadata Tags (Artist - Title) [TAGS]"
+                                } else {
+                                    "Filenames [FILES]"
+                                }
                             );
                         }
                         (KeyCode::Char('/') | KeyCode::Char('f'), KeyModifiers::NONE) => {
@@ -365,13 +382,17 @@ impl AppUI {
                                         self.refresh_browser();
                                     }
                                 }
-                            } else if let Ok(meta) = crate::metadata::extract_metadata(path) {
-                                self.queue.add_track(meta.clone());
-                                if !self.player.is_playing() && !self.player.is_paused() {
-                                    self.queue.current_index = self.queue.len().saturating_sub(1);
-                                    self.play_current_track();
-                                } else {
-                                    self.status_message = format!("Added {}", meta.display_title());
+                            } else {
+                                let meta_opt = self.metadata_cache.get(path).cloned()
+                                    .or_else(|| crate::metadata::extract_metadata(path).ok());
+                                if let Some(meta) = meta_opt {
+                                    self.queue.add_track(meta.clone());
+                                    if !self.player.is_playing() && !self.player.is_paused() {
+                                        self.queue.current_index = self.queue.len().saturating_sub(1);
+                                        self.play_current_track();
+                                    } else {
+                                        self.status_message = format!("Added {}", meta.display_title());
+                                    }
                                 }
                             }
                         }
@@ -380,7 +401,9 @@ impl AppUI {
                         let mut added = 0;
                         for (_, path, is_dir) in &self.browser_entries {
                             if !is_dir {
-                                if let Ok(meta) = crate::metadata::extract_metadata(path) {
+                                let meta_opt = self.metadata_cache.get(path).cloned()
+                                    .or_else(|| crate::metadata::extract_metadata(path).ok());
+                                if let Some(meta) = meta_opt {
                                     self.queue.add_track(meta);
                                     added += 1;
                                 }
@@ -477,6 +500,17 @@ impl AppUI {
                     }
                     KeyCode::Enter | KeyCode::Char(' ') => {
                         self.settings_mgr.cycle_setting(self.settings_cursor, true);
+                        if self.settings_cursor == 0 {
+                            self.refresh_browser();
+                        } else if self.settings_cursor == 1 {
+                            let backend = self.settings_mgr.settings.player_backend.clone();
+                            self.player = LocalPlayer::new(&backend);
+                        }
+                        self.status_message = format!(
+                            "{}: {}",
+                            SETTING_DEFINITIONS[self.settings_cursor].label,
+                            self.settings_mgr.get_display_value(self.settings_cursor)
+                        );
                     }
                     _ => {}
                 }
@@ -563,14 +597,19 @@ impl AppUI {
             .split(area);
 
         // Left Pane: File Browser
-        let browser_title = if self.in_bookmarks_view {
-            " BROWSER [★ Music Homes] "
+        let mode_tag = if self.settings_mgr.settings.metadata_view {
+            "[TAGS]"
         } else {
-            " BROWSER [File System] "
+            "[FILES]"
+        };
+        let browser_title = if self.in_bookmarks_view {
+            format!(" BROWSER [★ Music Homes] {} ", mode_tag)
+        } else {
+            format!(" BROWSER [File System] {} ", mode_tag)
         };
         let browser_block = Block::default()
             .borders(Borders::ALL)
-            .title(browser_title)
+            .title(browser_title.as_str())
             .border_style(if !self.queue_focus {
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
             } else {

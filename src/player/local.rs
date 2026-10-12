@@ -11,7 +11,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::AudioPlayer;
-use crate::paths;
 
 #[derive(Debug, Default)]
 struct SharedState {
@@ -41,7 +40,7 @@ pub struct LocalPlayer {
 impl LocalPlayer {
     pub fn new(backend: &str) -> Self {
         let sock_name = format!("mpv_{}.sock", std::process::id());
-        let socket_path = paths::get_cache_dir().join(sock_name);
+        let socket_path = PathBuf::from("/tmp").join(sock_name);
 
         Self {
             backend: backend.to_string(),
@@ -92,6 +91,7 @@ impl LocalPlayer {
             .arg(format!("--volume={}", self.volume))
             .arg("--audio-display=no")
             .arg("--terminal=no")
+            .arg("--ao=auto,null")
             .arg("--msg-level=all=no")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
