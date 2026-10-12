@@ -99,9 +99,9 @@ impl LocalPlayer {
         let child = cmd.spawn()?;
         self.mpv_child = Some(child);
 
-        // Connect to socket with retry loop
+        // Connect to socket with retry loop (up to 3s)
         let mut writer_stream = None;
-        for _ in 0..30 {
+        for _ in 0..60 {
             thread::sleep(Duration::from_millis(50));
             if self.socket_path.exists() {
                 if let Ok(s) = UnixStream::connect(&self.socket_path) {
