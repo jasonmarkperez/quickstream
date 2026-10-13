@@ -42,6 +42,9 @@ pub struct AppUI {
     pub device_manager: DeviceManager,
     pub settings_mgr: SettingsManager,
     pub metadata_cache: std::collections::HashMap<PathBuf, crate::metadata::AudioMetadata>,
+    pub metadata_tx: std::sync::mpsc::Sender<crate::metadata::AudioMetadata>,
+    pub metadata_rx: std::sync::mpsc::Receiver<crate::metadata::AudioMetadata>,
+    pub metadata_worker_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub browser_state: ListState,
     pub queue_state: ListState,
     pub devices_state: ListState,
@@ -78,6 +81,9 @@ impl AppUI {
             (None, None)
         };
 
+        let (metadata_tx, metadata_rx) = std::sync::mpsc::channel();
+        let metadata_cache = crate::library::LibraryManager::load_cache_map();
+
         let mut app = Self {
             active_tab: 0,
             queue_focus: false,
@@ -95,7 +101,10 @@ impl AppUI {
             player: LocalPlayer::new(&backend),
             device_manager,
             settings_mgr,
-            metadata_cache: std::collections::HashMap::new(),
+            metadata_cache,
+            metadata_tx,
+            metadata_rx,
+            metadata_worker_stop: None,
             browser_state: ListState::default(),
             queue_state: ListState::default(),
             devices_state: ListState::default(),
@@ -168,41 +177,50 @@ impl AppUI {
 
         let mut dirs = Vec::new();
         let mut files = Vec::new();
+        let mut unfetched_tracks = Vec::new();
 
         if let Ok(entries) = fs::read_dir(&self.browser_dir) {
-            let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
-            paths.sort();
-
-            for p in paths {
-                let name = p.file_name().unwrap_or_default().to_string_lossy();
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                let name = file_name.to_string_lossy();
                 if name.starts_with('.') {
                     continue;
                 }
-                if p.is_dir() {
-                    dirs.push((format!("📁 {}/", name), p, true));
-                } else if p.is_file() && is_supported_audio_file(&p) {
-                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase();
+                let path = entry.path();
+                let ft = entry.file_type();
+                let is_dir = match ft {
+                    Ok(ft) => {
+                        if ft.is_dir() {
+                            true
+                        } else if ft.is_symlink() {
+                            path.is_dir()
+                        } else {
+                            false
+                        }
+                    }
+                    Err(_) => path.is_dir(),
+                };
+
+                if is_dir {
+                    dirs.push((format!("📁 {}/", name), path, true));
+                } else if is_supported_audio_file(&path) {
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase();
                     let label = if self.settings_mgr.settings.metadata_view {
-                        let meta = match self.metadata_cache.get(&p) {
-                            Some(m) => Some(m.clone()),
-                            None => match crate::metadata::extract_metadata(&p) {
-                                Ok(m) => {
-                                    self.metadata_cache.insert(p.clone(), m.clone());
-                                    Some(m)
-                                }
-                                Err(_) => None,
-                            },
-                        };
-                        match meta {
-                            Some(m) => m.format_display_label(true),
-                            None => format!("🎵 [{}] {}", ext, name),
+                        if let Some(m) = self.metadata_cache.get(&path) {
+                            m.format_display_label(true)
+                        } else {
+                            unfetched_tracks.push(path.clone());
+                            format!("🎵 [{}] {}", ext, name)
                         }
                     } else {
                         format!("🎵 [{}] {}", ext, name)
                     };
-                    files.push((label, p, false));
+                    files.push((label, path, false));
                 }
             }
+
+            dirs.sort_by_key(|a| a.0.to_lowercase());
+            files.sort_by_key(|a| a.0.to_lowercase());
         }
 
         self.browser_entries.extend(dirs);
@@ -212,9 +230,58 @@ impl AppUI {
             self.browser_state = ListState::default();
             self.browser_state.select(Some(0));
         }
+
+        if !unfetched_tracks.is_empty() && self.settings_mgr.settings.metadata_view {
+            self.start_background_metadata_fetch(unfetched_tracks);
+        } else if let Some(stop) = self.metadata_worker_stop.take() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub fn start_background_metadata_fetch(&mut self, paths: Vec<PathBuf>) {
+        if let Some(stop) = self.metadata_worker_stop.take() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.metadata_worker_stop = Some(stop.clone());
+        let tx = self.metadata_tx.clone();
+
+        std::thread::spawn(move || {
+            for path in paths {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                if let Ok(meta) = crate::metadata::extract_metadata(&path) {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    crate::library::LibraryManager::append_to_cache(&meta);
+                    let _ = tx.send(meta);
+                }
+            }
+        });
+    }
+
+    pub fn poll_background_metadata(&mut self) {
+        while let Ok(meta) = self.metadata_rx.try_recv() {
+            let path = meta.filepath.clone();
+            self.metadata_cache.insert(path.clone(), meta.clone());
+
+            if self.settings_mgr.settings.metadata_view && !self.in_bookmarks_view {
+                for (label, p, is_dir) in &mut self.browser_entries {
+                    if !*is_dir && p == &path {
+                        *label = meta.format_display_label(true);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     pub fn navigate_browser(&mut self, path: PathBuf) {
+        self.browser_spotlight = None;
+
         if path.to_string_lossy() == "___MUSIC_HOMES___" {
             self.in_bookmarks_view = true;
             self.browser_cursor = 0;
@@ -278,19 +345,19 @@ impl AppUI {
         let mut prefix_matches = Vec::new();
         let mut substring_matches = Vec::new();
 
-        for (idx, (_, path, is_dir)) in self.browser_entries.iter().enumerate() {
+        for (idx, (name, path, is_dir)) in self.browser_entries.iter().enumerate() {
             if !*is_dir || path.to_string_lossy() == "___MUSIC_HOMES___" {
                 continue;
             }
-            let folder_name = path
-                .file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_default()
-                .to_lowercase();
+            let clean_name = name
+                .strip_prefix("📁 ")
+                .and_then(|s| s.strip_suffix('/'))
+                .unwrap_or(name.as_str());
+            let lower = clean_name.to_lowercase();
 
-            if folder_name.starts_with(&query) {
+            if lower.starts_with(&query) {
                 prefix_matches.push(idx);
-            } else if folder_name.contains(&query) {
+            } else if lower.contains(&query) {
                 substring_matches.push(idx);
             }
         }
@@ -445,6 +512,9 @@ impl AppUI {
 
             // Synchronize web server live state
             self.update_web_state();
+
+            // Poll background metadata extraction
+            self.poll_background_metadata();
 
             if let Some(ref mut modal) = self.search_modal {
                 modal.poll_background_scan();
@@ -1318,13 +1388,19 @@ impl AppUI {
                 Style::default().fg(Color::DarkGray)
             });
 
+        let match_set: std::collections::HashSet<usize> = if self.browser_spotlight.is_some() {
+            spotlight_matches.iter().copied().collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
         let browser_items: Vec<ListItem> = self
             .browser_entries
             .iter()
             .enumerate()
             .map(|(idx, (name, _, is_dir))| {
                 let is_selected = idx == self.browser_cursor && !self.queue_focus;
-                let is_spotlight_match = self.browser_spotlight.is_some() && spotlight_matches.contains(&idx);
+                let is_spotlight_match = match_set.contains(&idx);
 
                 let style = if is_selected {
                     if self.browser_spotlight.is_some() {

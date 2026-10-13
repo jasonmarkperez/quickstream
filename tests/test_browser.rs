@@ -45,6 +45,20 @@ fn test_browser_metadata_view_toggle() {
 
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
 
+    // Wait for background metadata worker to extract tags and poll
+    for _ in 0..50 {
+        app.poll_background_metadata();
+        if app
+            .browser_entries
+            .iter()
+            .any(|(l, p, is_dir)| !*is_dir && p == &song1 && (l.contains("01:00") || l.contains("00:01")))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    app.poll_background_metadata();
+
     // Verify song1 is found in browser_entries
     let label_meta = {
         let entry = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song1);
@@ -71,6 +85,68 @@ fn test_browser_metadata_view_toggle() {
     // With metadata_view = false, label displays clean filename
     assert_eq!(label_filename, "🎵 [WAV] test_track.wav");
     assert_ne!(label_meta.as_str(), label_filename.as_str());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_browser_non_blocking_navigation_large_directory() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_fast_nav_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let music_dir = temp_dir.join("Music");
+    fs::create_dir_all(&music_dir).unwrap();
+
+    // Create 30 subfolders
+    for i in 0..30 {
+        fs::create_dir_all(music_dir.join(format!("Artist_{:02}", i))).unwrap();
+    }
+    // Create 30 audio tracks
+    for i in 0..30 {
+        create_dummy_wav(&music_dir.join(format!("track_{:02}.wav", i)));
+    }
+
+    let config_path = temp_dir.join("config.json");
+    let mut settings_mgr = SettingsManager::with_path(config_path);
+    settings_mgr.settings.metadata_view = true;
+
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    let start = std::time::Instant::now();
+    app.navigate_browser(music_dir.clone());
+    let nav_elapsed = start.elapsed();
+
+    // Navigation must be instantaneous (under 200ms) with zero UI freeze
+    assert!(
+        nav_elapsed < std::time::Duration::from_millis(200),
+        "Navigation took too long: {:?}",
+        nav_elapsed
+    );
+
+    // All 30 folders and 30 tracks + Homes + Parent must be immediately present
+    assert_eq!(app.browser_entries.len(), 62);
+
+    // Initial labels for uncached tracks should be fast filenames
+    let first_track = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p.ends_with("track_00.wav"));
+    assert!(first_track.is_some());
+
+    // Allow background worker to populate metadata
+    for _ in 0..50 {
+        app.poll_background_metadata();
+        if app.browser_entries.iter().any(|(l, p, is_dir)| !*is_dir && p.ends_with("track_00.wav") && (l.contains("00:01") || l.contains("01:00"))) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    app.poll_background_metadata();
+
+    let updated_track = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p.ends_with("track_00.wav")).unwrap();
+    assert!(
+        updated_track.0.contains("00:01") || updated_track.0.contains("01:00"),
+        "Track label should be updated by background worker: {}",
+        updated_track.0
+    );
 
     let _ = fs::remove_dir_all(&temp_dir);
 }

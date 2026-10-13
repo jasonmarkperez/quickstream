@@ -134,6 +134,19 @@ impl LibraryManager {
         false
     }
 
+    /// Append a single track's metadata to cached music_index.jsonl.
+    pub fn append_to_cache(track: &AudioMetadata) {
+        let path = paths::get_music_index_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+            if let Ok(json) = serde_json::to_string(track) {
+                let _ = writeln!(file, "{}", json);
+            }
+        }
+    }
+
     /// Scan a directory recursively using walkdir and extract metadata.
     pub fn scan_directory(dir: &Path) -> Vec<AudioMetadata> {
         Self::scan_directory_scoped(dir)
