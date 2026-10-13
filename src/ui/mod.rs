@@ -144,6 +144,7 @@ impl AppUI {
     }
 
     pub fn refresh_browser(&mut self) {
+        let _timer = crate::log_perf!("browser", "refresh_browser for '{}'", self.browser_dir.display());
         let old_cursor = self.browser_cursor;
         self.browser_entries.clear();
 
@@ -239,6 +240,12 @@ impl AppUI {
     }
 
     pub fn start_background_metadata_fetch(&mut self, paths: Vec<PathBuf>) {
+        crate::log_info!(
+            "browser",
+            "Queuing {} tracks for background metadata extraction in '{}'",
+            paths.len(),
+            self.browser_dir.display()
+        );
         if let Some(stop) = self.metadata_worker_stop.take() {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -525,6 +532,10 @@ impl AppUI {
             if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
                     if self.show_help_modal {
+                        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+                            self.player.stop()?;
+                            return Ok(());
+                        }
                         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')) {
                             self.show_help_modal = false;
                         }
@@ -533,6 +544,13 @@ impl AppUI {
 
                     if let Some(ref mut modal) = self.search_modal {
                         match (key.code, key.modifiers) {
+                            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                                if let Some(mut m) = self.search_modal.take() {
+                                    m.close();
+                                }
+                                self.player.stop()?;
+                                return Ok(());
+                            }
                             (KeyCode::Esc, _) => {
                                 if let Some(mut m) = self.search_modal.take() {
                                     m.close();
@@ -602,6 +620,11 @@ impl AppUI {
 
                     if self.browser_spotlight.is_some() {
                         match (key.code, key.modifiers) {
+                            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                                self.close_spotlight();
+                                self.player.stop()?;
+                                return Ok(());
+                            }
                             (KeyCode::Esc, _) => {
                                 self.close_spotlight();
                             }
@@ -613,7 +636,15 @@ impl AppUI {
                                         self.navigate_browser(path);
                                     } else {
                                         let meta_opt = self.metadata_cache.get(&path).cloned()
-                                            .or_else(|| crate::metadata::extract_metadata(&path).ok());
+                                            .or_else(|| {
+                                                if let Ok(m) = crate::metadata::extract_metadata(&path) {
+                                                    self.metadata_cache.insert(path.clone(), m.clone());
+                                                    Some(m)
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .or_else(|| Some(crate::metadata::fallback_metadata(&path)));
                                         if let Some(meta) = meta_opt {
                                             self.queue.add_track(meta);
                                             self.queue.current_index = self.queue.len().saturating_sub(1);
@@ -647,7 +678,10 @@ impl AppUI {
 
                     // Global hotkeys
                     match (key.code, key.modifiers) {
-                        (KeyCode::Char('q'), KeyModifiers::NONE) | (KeyCode::Esc, KeyModifiers::NONE) => {
+                        (KeyCode::Char('q'), KeyModifiers::NONE)
+                        | (KeyCode::Esc, KeyModifiers::NONE)
+                        | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                            crate::log_info!("ui", "Quit requested by user");
                             self.player.stop()?;
                             return Ok(());
                         }
@@ -885,7 +919,15 @@ impl AppUI {
                                 self.navigate_browser(path);
                             } else {
                                 let meta_opt = self.metadata_cache.get(&path).cloned()
-                                    .or_else(|| crate::metadata::extract_metadata(&path).ok());
+                                    .or_else(|| {
+                                        if let Ok(m) = crate::metadata::extract_metadata(&path) {
+                                            self.metadata_cache.insert(path.clone(), m.clone());
+                                            Some(m)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .or_else(|| Some(crate::metadata::fallback_metadata(&path)));
                                 if let Some(meta) = meta_opt {
                                     self.queue.add_track(meta);
                                     self.queue.current_index = self.queue.len().saturating_sub(1);
@@ -899,7 +941,15 @@ impl AppUI {
                         for (_, path, is_dir) in &self.browser_entries {
                             if !is_dir {
                                 let meta_opt = self.metadata_cache.get(path).cloned()
-                                    .or_else(|| crate::metadata::extract_metadata(path).ok());
+                                    .or_else(|| {
+                                        if let Ok(m) = crate::metadata::extract_metadata(path) {
+                                            self.metadata_cache.insert(path.clone(), m.clone());
+                                            Some(m)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .or_else(|| Some(crate::metadata::fallback_metadata(path)));
                                 if let Some(meta) = meta_opt {
                                     self.queue.add_track(meta);
                                     added += 1;

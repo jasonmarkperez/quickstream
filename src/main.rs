@@ -2,6 +2,7 @@
 
 pub mod discovery;
 pub mod library;
+pub mod logger;
 pub mod metadata;
 pub mod paths;
 pub mod player;
@@ -50,6 +51,17 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Initialize logging and signal handler
+    let log_path = crate::logger::init();
+    crate::log_info!("main", "Starting Quickstream v0.2.0 (PID {}, log: {})", std::process::id(), log_path.display());
+
+    let _ = ctrlc::set_handler(move || {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let mut stdout = std::io::stdout();
+        let _ = crossterm::execute!(stdout, crossterm::terminal::LeaveAlternateScreen, crossterm::cursor::Show);
+        std::process::exit(0);
+    });
+
     let cli = Cli::parse();
 
     // Inspect metadata flag

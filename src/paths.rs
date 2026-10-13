@@ -103,6 +103,11 @@ pub fn get_music_index_path() -> PathBuf {
     get_cache_dir().join("music_index.jsonl")
 }
 
+/// Get path to the application log file (quickstream.log).
+pub fn get_log_path() -> PathBuf {
+    get_cache_dir().join("quickstream.log")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +122,11 @@ mod tests {
     fn test_cache_dir_resolution() {
         let dir = get_cache_dir();
         assert!(dir.ends_with("quickstream"));
+    }
+
+    #[test]
+    fn test_log_path_resolution() {
+        let path = get_log_path();
+        assert!(path.ends_with("quickstream.log"));
     }
 }

@@ -1,5 +1,6 @@
 pub mod discovery;
 pub mod library;
+pub mod logger;
 pub mod metadata;
 pub mod paths;
 pub mod player;

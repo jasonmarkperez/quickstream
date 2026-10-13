@@ -69,11 +69,9 @@ impl LocalPlayer {
             return Ok(());
         }
 
-        // Clean up old resources if any
+        // Clean up old resources if any without blocking UI thread on socket join
         self.stop_signal.store(true, Ordering::SeqCst);
-        if let Some(t) = self.reader_thread.take() {
-            let _ = t.join();
-        }
+        self.reader_thread = None;
         self.ipc_writer = None;
 
         if self.socket_path.exists() {
@@ -278,14 +276,16 @@ impl Drop for LocalPlayer {
 
 impl AudioPlayer for LocalPlayer {
     fn play(&mut self, filepath: &Path) -> anyhow::Result<()> {
-        let abs_path = filepath.canonicalize().unwrap_or_else(|_| filepath.to_path_buf());
-        self.current_file = Some(abs_path.clone());
-        if let Ok(meta) = crate::metadata::extract_metadata(&abs_path) {
-            *self.shared_state.duration.lock().unwrap() = meta.duration_seconds;
+        let _timer = crate::log_perf!("player", "LocalPlayer::play '{}' via {}", filepath.display(), self.backend);
+        let abs_path = if filepath.is_absolute() {
+            filepath.to_path_buf()
         } else {
-            *self.shared_state.duration.lock().unwrap() = 0.0;
-        }
+            filepath.canonicalize().unwrap_or_else(|_| filepath.to_path_buf())
+        };
+        self.current_file = Some(abs_path.clone());
 
+        // Do not block UI thread on synchronous tag extraction!
+        // Duration is streamed asynchronously via IPC ("observe_property", "duration").
         *self.shared_state.position.lock().unwrap() = 0.0;
         self.shared_state.is_finished.store(false, Ordering::SeqCst);
         self.shared_state.is_playing.store(true, Ordering::SeqCst);
@@ -304,8 +304,9 @@ impl AudioPlayer for LocalPlayer {
                 Ok(())
             })();
 
-            if mpv_res.is_err() {
+            if let Err(e) = &mpv_res {
                 // If mpv fails to spawn or connect, seamlessly fall back to ffplay
+                crate::log_warn!("player", "mpv playback error ({:?}), falling back to ffplay", e);
                 return self.play_ffplay(&abs_path);
             }
             mpv_res
@@ -468,7 +469,11 @@ impl AudioPlayer for LocalPlayer {
             if let Some(start) = self.start_time {
                 let elapsed = start.elapsed().as_secs_f64();
                 let dur = *self.shared_state.duration.lock().unwrap();
-                (self.accumulated_offset + elapsed).min(dur)
+                if dur > 0.0 {
+                    (self.accumulated_offset + elapsed).min(dur)
+                } else {
+                    self.accumulated_offset + elapsed
+                }
             } else {
                 self.accumulated_offset
             }

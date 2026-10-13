@@ -1,5 +1,6 @@
 //! Native audio metadata extraction wrapping lofty (pure Rust, zero subprocesses).
 
+use lofty::config::ParseOptions;
 use lofty::prelude::*;
 use lofty::probe::Probe;
 use serde::{Deserialize, Serialize};
@@ -81,14 +82,26 @@ pub fn extract_metadata(path: &Path) -> anyhow::Result<AudioMetadata> {
         .unwrap_or("UNKNOWN")
         .to_uppercase();
 
-    // Probe and parse with lofty
-    let tagged_file = Probe::open(path)?.guess_file_type()?.read()?;
+    let file_size_mb = file_size as f64 / 1_048_576.0;
+    let _timer = crate::log_perf!("metadata", "extract_metadata '{}' ({:.2} MB)", filename, file_size_mb);
+
+    // Probe and parse with lofty, skipping cover art to avoid multi-megabyte image reads
+    let parse_opts = ParseOptions::new().read_cover_art(false);
+    let tagged_file = Probe::open(path)?
+        .options(parse_opts)
+        .guess_file_type()?
+        .read()?;
     let properties = tagged_file.properties();
 
-    let duration_seconds = properties.duration().as_secs_f64();
+    let mut duration_seconds = properties.duration().as_secs_f64();
     let bitrate_kbps = properties.audio_bitrate().unwrap_or(0);
     let sample_rate_hz = properties.sample_rate().unwrap_or(0);
     let channels = properties.channels().unwrap_or(2);
+
+    // If duration couldn't be determined from headers, estimate from bitrate and file size
+    if duration_seconds <= 0.0 && bitrate_kbps > 0 && file_size > 0 {
+        duration_seconds = (file_size as f64 * 8.0) / (bitrate_kbps as f64 * 1000.0);
+    }
 
     let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag());
 
@@ -130,6 +143,44 @@ pub fn extract_metadata(path: &Path) -> anyhow::Result<AudioMetadata> {
         sample_rate_hz,
         channels,
     })
+}
+
+/// Create fast fallback metadata directly from filepath and file size without reading tags.
+pub fn fallback_metadata(path: &Path) -> AudioMetadata {
+    let filename = path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+    let title = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| filename.clone());
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("UNKNOWN")
+        .to_uppercase();
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let duration_seconds = if file_size > 0 {
+        (file_size as f64 * 8.0) / (320.0 * 1000.0)
+    } else {
+        0.0
+    };
+
+    AudioMetadata {
+        filepath: path.to_path_buf(),
+        filename,
+        title,
+        artist: String::new(),
+        album: String::new(),
+        genre: String::new(),
+        format_name: ext,
+        duration_seconds,
+        file_size,
+        bitrate_kbps: 320,
+        sample_rate_hz: 44100,
+        channels: 2,
+    }
 }
 
 /// Extract cover artwork from an audio file.
