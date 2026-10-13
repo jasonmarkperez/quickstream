@@ -939,6 +939,9 @@ impl AppUI {
                     let _ = self.player.set_volume(vol);
                     self.status_message = format!("Volume {}% (web)", vol);
                 }
+                crate::web::WebCommand::SeekTo(target) => {
+                    let _ = self.player.seek_to(target);
+                }
                 crate::web::WebCommand::SeekRelative(delta) => {
                     let _ = self.player.seek(delta);
                 }

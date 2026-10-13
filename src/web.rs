@@ -72,6 +72,7 @@ pub enum WebCommand {
     Prev,
     SetVolume(u8),
     SeekRelative(f64),
+    SeekTo(f64),
 }
 
 #[derive(Deserialize)]
@@ -282,6 +283,11 @@ fn handle_client(
                     }
                 }
                 "seek" => {
+                    if let Some(target) = payload.value {
+                        let _ = cmd_tx.send(WebCommand::SeekTo(target));
+                    }
+                }
+                "seek_relative" => {
                     if let Some(delta) = payload.value {
                         let _ = cmd_tx.send(WebCommand::SeekRelative(delta));
                     }
@@ -518,6 +524,11 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     .progress-container {
       width: 100%;
       margin-bottom: 1.5rem;
+      cursor: pointer;
+      padding: 10px 0;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: none;
     }
 
     .progress-bar-bg {
@@ -525,9 +536,12 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       height: 6px;
       background: rgba(255, 255, 255, 0.08);
       border-radius: 4px;
-      overflow: hidden;
       position: relative;
-      cursor: pointer;
+      transition: height 0.15s ease;
+    }
+    .progress-container:hover .progress-bar-bg,
+    .progress-container.scrubbing .progress-bar-bg {
+      height: 8px;
     }
 
     .progress-bar-fill {
@@ -535,7 +549,24 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       width: 0%;
       background: var(--accent-grad);
       border-radius: 4px;
-      transition: width 0.2s linear;
+      position: relative;
+    }
+    .progress-bar-fill::after {
+      content: '';
+      position: absolute;
+      right: -6px;
+      top: 50%;
+      transform: translateY(-50%) scale(0);
+      width: 14px;
+      height: 14px;
+      background: #ffffff;
+      border-radius: 50%;
+      box-shadow: 0 0 10px rgba(0, 210, 255, 0.9);
+      transition: transform 0.15s ease;
+    }
+    .progress-container:hover .progress-bar-fill::after,
+    .progress-container.scrubbing .progress-bar-fill::after {
+      transform: translateY(-50%) scale(1);
     }
 
     .time-labels {
@@ -672,7 +703,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       <span class="badge" id="queueBadge">Track 0 of 0</span>
     </div>
 
-    <div class="progress-container">
+    <div class="progress-container" id="progressContainer">
       <div class="progress-bar-bg" id="progressBar">
         <div class="progress-bar-fill" id="progressFill"></div>
       </div>
@@ -690,6 +721,14 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
         </svg>
       </button>
 
+      <button class="btn btn-secondary" id="btnSeekBack" title="Seek Backward 10s">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path>
+          <path d="M3 3v5h5"></path>
+          <text x="12" y="15.5" font-size="8" font-family="sans-serif" font-weight="bold" fill="currentColor" stroke="none" text-anchor="middle">10</text>
+        </svg>
+      </button>
+
       <button class="btn btn-primary" id="btnPlayPause" title="Play / Pause">
         <svg id="playIcon" width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
           <polygon points="6 4 20 12 6 20 6 4"></polygon>
@@ -697,6 +736,14 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
         <svg id="pauseIcon" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" style="display:none;">
           <rect x="6" y="4" width="4" height="16"></rect>
           <rect x="14" y="4" width="4" height="16"></rect>
+        </svg>
+      </button>
+
+      <button class="btn btn-secondary" id="btnSeekFwd" title="Seek Forward 10s">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12a9 9 0 1 1-9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
+          <path d="M21 3v5h-5"></path>
+          <text x="12" y="15.5" font-size="8" font-family="sans-serif" font-weight="bold" fill="currentColor" stroke="none" text-anchor="middle">10</text>
         </svg>
       </button>
 
@@ -732,6 +779,8 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     let isPlaying = false;
     let lastPollTime = Date.now();
     let currentTrackPath = "";
+    let isScrubbing = false;
+    let scrubPosition = 0;
 
     function formatTime(seconds) {
       if (!seconds || isNaN(seconds) || seconds < 0) return "00:00";
@@ -767,10 +816,14 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     }
 
     function renderStatus(data) {
-      isPlaying = data.is_playing && !data.is_paused;
-      localPosition = data.position_seconds || 0;
-      localDuration = data.duration_seconds || 0;
-      lastPollTime = Date.now();
+      if (!isScrubbing) {
+        isPlaying = data.is_playing && !data.is_paused;
+        localPosition = data.position_seconds || 0;
+        localDuration = data.duration_seconds || 0;
+        lastPollTime = Date.now();
+      } else {
+        if (data.duration_seconds) localDuration = data.duration_seconds;
+      }
 
       // Track titles
       document.getElementById('title').textContent = data.title || "No Track Loaded";
@@ -844,16 +897,83 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
 
     function updateProgressUI() {
       let currentPos = localPosition;
-      if (isPlaying) {
+      if (isScrubbing) {
+        currentPos = scrubPosition;
+      } else if (isPlaying) {
         const elapsed = (Date.now() - lastPollTime) / 1000;
         currentPos = Math.min(localDuration, localPosition + elapsed);
       }
 
       const pct = localDuration > 0 ? (currentPos / localDuration) * 100 : 0;
-      document.getElementById('progressFill').style.width = pct + "%";
+      document.getElementById('progressFill').style.width = Math.min(100, Math.max(0, pct)) + "%";
       document.getElementById('elapsedTime').textContent = formatTime(currentPos);
       document.getElementById('durationTime').textContent = formatTime(localDuration);
     }
+
+    // Scrubbing and seeking
+    function getSeekPositionFromEvent(e) {
+      const bar = document.getElementById('progressBar');
+      const rect = bar.getBoundingClientRect();
+      let clientX = e.clientX;
+      if (clientX === undefined) {
+        if (e.touches && e.touches.length > 0) clientX = e.touches[0].clientX;
+        else if (e.changedTouches && e.changedTouches.length > 0) clientX = e.changedTouches[0].clientX;
+        else clientX = 0;
+      }
+      const offsetX = Math.max(0, Math.min(clientX - rect.left, rect.width));
+      const ratio = rect.width > 0 ? offsetX / rect.width : 0;
+      return ratio * localDuration;
+    }
+
+    const progressContainer = document.getElementById('progressContainer');
+
+    function onScrubStart(e) {
+      if (localDuration <= 0) return;
+      isScrubbing = true;
+      progressContainer.classList.add('scrubbing');
+      scrubPosition = getSeekPositionFromEvent(e);
+      updateProgressUI();
+    }
+
+    function onScrubMove(e) {
+      if (!isScrubbing) return;
+      scrubPosition = getSeekPositionFromEvent(e);
+      updateProgressUI();
+    }
+
+    function onScrubEnd(e) {
+      if (!isScrubbing) return;
+      isScrubbing = false;
+      progressContainer.classList.remove('scrubbing');
+      const target = getSeekPositionFromEvent(e);
+      localPosition = target;
+      lastPollTime = Date.now();
+      updateProgressUI();
+      sendAction('seek', target);
+    }
+
+    progressContainer.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      onScrubStart(e);
+
+      function onPointerMove(ev) {
+        onScrubMove(ev);
+      }
+      function onPointerUp(ev) {
+        window.removeEventListener('pointermove', onPointerMove);
+        window.removeEventListener('pointerup', onPointerUp);
+        window.removeEventListener('pointercancel', onPointerUp);
+        onScrubEnd(ev);
+      }
+
+      window.addEventListener('pointermove', onPointerMove);
+      window.addEventListener('pointerup', onPointerUp);
+      window.addEventListener('pointercancel', onPointerUp);
+    });
+
+    // Seek buttons
+    document.getElementById('btnSeekBack').addEventListener('click', () => sendAction('seek_relative', -10));
+    document.getElementById('btnSeekFwd').addEventListener('click', () => sendAction('seek_relative', 10));
 
     // Interactive event listeners
     document.getElementById('btnPlayPause').addEventListener('click', () => sendAction('toggle_pause'));
@@ -862,6 +982,21 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
 
     document.getElementById('volumeSlider').addEventListener('change', (e) => {
       sendAction('volume', parseFloat(e.target.value));
+    });
+
+    // Keyboard shortcuts
+    window.addEventListener('keydown', (e) => {
+      if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
+      if (e.code === 'Space') {
+        e.preventDefault();
+        sendAction('toggle_pause');
+      } else if (e.code === 'ArrowLeft') {
+        e.preventDefault();
+        sendAction('seek_relative', -10);
+      } else if (e.code === 'ArrowRight') {
+        e.preventDefault();
+        sendAction('seek_relative', 10);
+      }
     });
 
     // Smooth UI interpolation loop (100ms)

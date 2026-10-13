@@ -181,10 +181,15 @@ fn test_web_server_action_commands() {
     assert_eq!(status, 200);
     assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::Prev);
 
-    // 5. Seek
-    let (status, _, _) = http_post(port, "/api/action", r#"{"action":"seek","value":15.0}"#);
+    // 5. Seek (Absolute)
+    let (status, _, _) = http_post(port, "/api/action", r#"{"action":"seek","value":45.0}"#);
     assert_eq!(status, 200);
-    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::SeekRelative(15.0));
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::SeekTo(45.0));
+
+    // 6. Seek Relative
+    let (status, _, _) = http_post(port, "/api/action", r#"{"action":"seek_relative","value":-10.0}"#);
+    assert_eq!(status, 200);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::SeekRelative(-10.0));
 
     handle.stop();
 }

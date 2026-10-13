@@ -386,9 +386,20 @@ impl AudioPlayer for LocalPlayer {
     }
 
     fn seek(&mut self, delta_seconds: f64) -> anyhow::Result<()> {
+        let new_pos = (self.position_seconds() + delta_seconds).max(0.0);
+        self.seek_to(new_pos)
+    }
+
+    fn seek_to(&mut self, position_seconds: f64) -> anyhow::Result<()> {
+        let dur = self.duration_seconds();
+        let target = if dur > 0.0 {
+            position_seconds.clamp(0.0, dur)
+        } else {
+            position_seconds.max(0.0)
+        };
+
         if self.ffplay_child.is_some() {
-            let new_pos = (self.position_seconds() + delta_seconds).max(0.0);
-            self.accumulated_offset = new_pos;
+            self.accumulated_offset = target;
             if !self.is_paused() {
                 if let Some(file) = self.current_file.clone() {
                     if let Some(mut child) = self.ffplay_child.take() {
@@ -401,7 +412,7 @@ impl AudioPlayer for LocalPlayer {
                         .arg("-loglevel")
                         .arg("error")
                         .arg("-ss")
-                        .arg(format!("{:.2}", new_pos))
+                        .arg(format!("{:.2}", target))
                         .arg("-volume")
                         .arg(format!("{}", self.volume))
                         .arg(file);
@@ -413,10 +424,11 @@ impl AudioPlayer for LocalPlayer {
             Ok(())
         } else if self.backend == "mpv" {
             let json_cmd = serde_json::json!({
-                "command": ["seek", delta_seconds, "relative"]
+                "command": ["seek", target, "absolute"]
             })
             .to_string();
             self.send_command(&json_cmd)?;
+            *self.shared_state.position.lock().unwrap() = target;
             Ok(())
         } else {
             Ok(())
