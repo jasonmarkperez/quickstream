@@ -691,13 +691,6 @@ impl AppUI {
         let browser_list = List::new(browser_items).block(browser_block);
         f.render_stateful_widget(browser_list, split[0], &mut self.browser_state);
 
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("▲"))
-            .end_symbol(Some("▼"));
-        let mut browser_scroll_state = ScrollbarState::new(self.browser_entries.len().saturating_sub(1))
-            .position(self.browser_cursor);
-        f.render_stateful_widget(scrollbar.clone(), split[0], &mut browser_scroll_state);
-
         // Right Pane: Queue
         let queue_block = Block::default()
             .borders(Borders::ALL)
@@ -732,10 +725,6 @@ impl AppUI {
         self.queue_state.select(Some(self.queue_cursor));
         let queue_list = List::new(queue_items).block(queue_block);
         f.render_stateful_widget(queue_list, split[1], &mut self.queue_state);
-
-        let mut queue_scroll_state = ScrollbarState::new(self.queue.len().saturating_sub(1))
-            .position(self.queue_cursor);
-        f.render_stateful_widget(scrollbar, split[1], &mut queue_scroll_state);
     }
 
     fn render_devices_tab(&mut self, f: &mut Frame, area: Rect) {
@@ -790,13 +779,6 @@ impl AppUI {
         self.devices_state.select(Some(self.devices_cursor));
         let list = List::new(items).block(block);
         f.render_stateful_widget(list, area, &mut self.devices_state);
-
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("▲"))
-            .end_symbol(Some("▼"));
-        let mut scroll_state = ScrollbarState::new((devices.len() + 1).saturating_sub(1))
-            .position(self.devices_cursor);
-        f.render_stateful_widget(scrollbar, area, &mut scroll_state);
     }
 
     fn render_settings_tab(&mut self, f: &mut Frame, area: Rect) {
@@ -897,13 +879,6 @@ impl AppUI {
             .border_style(Style::default().fg(Color::DarkGray));
         let results_list = List::new(results_items).block(results_block);
         f.render_stateful_widget(results_list, content_split[0], &mut modal.list_state);
-
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("▲"))
-            .end_symbol(Some("▼"));
-        let mut scroll_state = ScrollbarState::new(modal.filtered.len().saturating_sub(1))
-            .position(modal.selected_index);
-        f.render_stateful_widget(scrollbar, content_split[0], &mut scroll_state);
 
         // Track detail card
         let detail_block = Block::default()
