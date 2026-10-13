@@ -1,4 +1,4 @@
-//! In-App Recursive Fuzzy Search Modal State and Scoring Engine.
+//! In-App Recursive Fuzzy Search Modal State and Field-Isolated Scoring Engine.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,12 +11,22 @@ use ratatui::widgets::ListState;
 
 use crate::metadata::AudioMetadata;
 
-/// Precomputed search indexing data for a single track.
+/// Precomputed search indexing data for a single track with field boundary isolation.
 #[derive(Clone)]
 pub struct SearchItem {
     pub track_idx: usize,
-    pub haystack: String,
-    pub lower_haystack: String,
+    pub title: String,
+    pub lower_title: String,
+    pub artist: String,
+    pub lower_artist: String,
+    pub album: String,
+    pub lower_album: String,
+    pub filename: String,
+    pub lower_filename: String,
+    pub rel_path: String,
+    pub lower_rel_path: String,
+    pub path_components: Vec<String>,
+    pub lower_path_components: Vec<String>,
     pub sort_key: String,
 }
 
@@ -77,28 +87,50 @@ impl SearchModalState {
 
         for track in new_tracks {
             let idx = self.all_tracks.len();
-            let rel_path = track
+            let rel_path_buf = track
                 .filepath
                 .strip_prefix(&self.root_dir)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
+                .unwrap_or(&track.filepath)
+                .to_path_buf();
+            let rel_path = rel_path_buf.to_string_lossy().to_string();
+            let lower_rel_path = rel_path.to_lowercase();
 
-            let haystack = format!(
-                "{} {} {} {} {}",
-                track.artist, track.album, track.title, track.filename, rel_path
-            );
-            let lower_haystack = haystack.to_lowercase();
+            let mut path_components = Vec::new();
+            let mut lower_path_components = Vec::new();
+            if let Some(parent) = rel_path_buf.parent() {
+                for comp in parent.components() {
+                    let s = comp.as_os_str().to_string_lossy().to_string();
+                    if !s.is_empty() {
+                        lower_path_components.push(s.to_lowercase());
+                        path_components.push(s);
+                    }
+                }
+            }
+
+            let lower_title = track.title.to_lowercase();
+            let lower_artist = track.artist.to_lowercase();
+            let lower_album = track.album.to_lowercase();
+            let lower_filename = track.filename.to_lowercase();
+
             let sort_key = format!(
                 "{} - {} - {}",
-                track.artist.to_lowercase(),
-                track.title.to_lowercase(),
-                track.filename.to_lowercase()
+                lower_artist, lower_title, lower_filename
             );
 
             self.search_items.push(SearchItem {
                 track_idx: idx,
-                haystack,
-                lower_haystack,
+                title: track.title.clone(),
+                lower_title,
+                artist: track.artist.clone(),
+                lower_artist,
+                album: track.album.clone(),
+                lower_album,
+                filename: track.filename.clone(),
+                lower_filename,
+                rel_path,
+                lower_rel_path,
+                path_components,
+                lower_path_components,
                 sort_key,
             });
             self.all_tracks.push(track);
@@ -178,31 +210,50 @@ impl SearchModalState {
                 .collect();
         } else {
             let matcher = SkimMatcherV2::default();
-            let tokens: Vec<String> = trimmed
+            let prepared_tokens: Vec<(String, String, bool)> = trimmed
                 .split_whitespace()
-                .map(|s| s.to_lowercase())
+                .map(|s| (s.to_string(), s.to_lowercase(), s.contains('/')))
                 .collect();
 
             let mut scored = Vec::new();
 
             for item in &self.search_items {
-                // Nanosecond subsequence pre-filter: all tokens must be present in sequence
-                let mut matches_all = true;
-                for token in &tokens {
-                    if !contains_subsequence(&item.lower_haystack, token) {
-                        matches_all = false;
-                        break;
-                    }
-                }
-                if !matches_all {
-                    continue;
-                }
-
-                // High-precision fuzzy scoring on surviving candidates
                 let mut total_score = 0i64;
-                for token in &tokens {
-                    if let Some(score) = matcher.fuzzy_match(&item.haystack, token) {
-                        total_score += score;
+                let mut matches_all = true;
+
+                for (token, lower_token, has_slash) in &prepared_tokens {
+                    let score_title = score_field(&matcher, &item.title, &item.lower_title, token, lower_token);
+                    let score_artist = score_field(&matcher, &item.artist, &item.lower_artist, token, lower_token);
+                    let score_album = score_field(&matcher, &item.album, &item.lower_album, token, lower_token);
+                    let score_filename = score_field(&matcher, &item.filename, &item.lower_filename, token, lower_token);
+
+                    let score_comp = item
+                        .path_components
+                        .iter()
+                        .zip(&item.lower_path_components)
+                        .filter_map(|(raw, lower)| score_field(&matcher, raw, lower, token, lower_token))
+                        .max();
+
+                    let score_rel = if *has_slash {
+                        score_field(&matcher, &item.rel_path, &item.lower_rel_path, token, lower_token)
+                    } else {
+                        None
+                    };
+
+                    let best_token_score = [
+                        score_title.map(|s| s + 30),  // boost title match
+                        score_artist.map(|s| s + 20), // boost artist match
+                        score_album.map(|s| s + 10),  // boost album match
+                        score_filename,
+                        score_comp,
+                        score_rel,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .max();
+
+                    if let Some(s) = best_token_score {
+                        total_score += s;
                     } else {
                         matches_all = false;
                         break;
@@ -270,6 +321,25 @@ impl SearchModalState {
     pub fn all_filtered_tracks(&self) -> Vec<AudioMetadata> {
         self.filtered.iter().map(|(_, t)| t.clone()).collect()
     }
+}
+
+/// Score a single isolated metadata field against a token.
+#[inline(always)]
+fn score_field(
+    matcher: &SkimMatcherV2,
+    raw_field: &str,
+    lower_field: &str,
+    token: &str,
+    lower_token: &str,
+) -> Option<i64> {
+    if raw_field.is_empty() {
+        return None;
+    }
+    // Fast screening: characters of lower_token must appear in order in lower_field
+    if !contains_subsequence(lower_field, lower_token) {
+        return None;
+    }
+    matcher.fuzzy_match(raw_field, token)
 }
 
 /// Fast subsequence check: verifies that all characters of query appear in order in haystack.

@@ -237,13 +237,13 @@ impl AppUI {
                                     self.status_message = format!("Playing: {}", track.display_title());
                                 }
                             }
-                            (KeyCode::Char('a'), KeyModifiers::NONE) => {
+                            (KeyCode::Tab, KeyModifiers::NONE) => {
                                 if let Some(track) = modal.selected_track().cloned() {
                                     self.queue.add_track(track.clone());
                                     self.status_message = format!("Added to queue: {}", track.display_title());
                                 }
                             }
-                            (KeyCode::Char('A'), _) => {
+                            (KeyCode::BackTab, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
                                 let tracks = modal.all_filtered_tracks();
                                 let count = tracks.len();
                                 if let Some(mut m) = self.search_modal.take() {
@@ -1021,9 +1021,9 @@ impl AppUI {
         let action_spans = vec![
             Span::styled(" [Enter] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::raw("Play Now  │  "),
-            Span::styled(" [a] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" [Tab] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             Span::raw("Add to Queue  │  "),
-            Span::styled(" [Shift+A] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" [Shift+Tab] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::raw(format!("Add All ({})  │  ", match_count)),
             Span::styled(" [Esc] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
             Span::raw("Cancel"),
