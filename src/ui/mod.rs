@@ -149,6 +149,10 @@ impl AppUI {
                 self.browser_entries.push((label, p, true));
             }
             self.browser_cursor = old_cursor.min(self.browser_entries.len().saturating_sub(1));
+            if self.browser_cursor == 0 {
+                self.browser_state = ListState::default();
+                self.browser_state.select(Some(0));
+            }
             return;
         }
 
@@ -202,6 +206,56 @@ impl AppUI {
         self.browser_entries.extend(dirs);
         self.browser_entries.extend(files);
         self.browser_cursor = old_cursor.min(self.browser_entries.len().saturating_sub(1));
+        if self.browser_cursor == 0 {
+            self.browser_state = ListState::default();
+            self.browser_state.select(Some(0));
+        }
+    }
+
+    pub fn navigate_browser(&mut self, path: PathBuf) {
+        if path.to_string_lossy() == "___MUSIC_HOMES___" {
+            self.in_bookmarks_view = true;
+            self.browser_cursor = 0;
+            self.browser_state = ListState::default();
+            self.browser_state.select(Some(0));
+            self.refresh_browser();
+            return;
+        }
+
+        if self.in_bookmarks_view {
+            if path.is_dir() {
+                self.in_bookmarks_view = false;
+                self.browser_dir = path;
+                self.browser_cursor = 0;
+                self.browser_state = ListState::default();
+                self.browser_state.select(Some(0));
+                self.refresh_browser();
+            } else {
+                self.status_message = "Bookmarked directory not found".to_string();
+            }
+            return;
+        }
+
+        if path.is_dir() {
+            let prev_dir = self.browser_dir.clone();
+            let is_parent = prev_dir.parent().map(|p| p == path).unwrap_or(false);
+
+            self.browser_dir = path;
+            self.browser_cursor = 0;
+            self.browser_state = ListState::default();
+            self.browser_state.select(Some(0));
+            self.refresh_browser();
+
+            if is_parent {
+                if let Some(pos) = self.browser_entries.iter().position(|(name, p, is_dir)| {
+                    *is_dir && p == &prev_dir && name.starts_with("📁 ")
+                }) {
+                    self.browser_cursor = pos;
+                    self.browser_state = ListState::default();
+                    self.browser_state.select(Some(pos));
+                }
+            }
+        }
     }
 
     pub fn page_down_browser(&mut self) {
@@ -237,6 +291,8 @@ impl AppUI {
     pub fn home_browser(&mut self) {
         if !self.browser_entries.is_empty() {
             self.browser_cursor = 0;
+            self.browser_state = ListState::default();
+            self.browser_state.select(Some(0));
         }
     }
 
@@ -626,23 +682,12 @@ impl AppUI {
                             self.queue.current_index = self.queue_cursor;
                             self.play_current_track();
                         } else if self.browser_cursor < self.browser_entries.len() {
-                            let (_, path, is_dir) = &self.browser_entries[self.browser_cursor];
-                            if *is_dir {
-                                if path.to_string_lossy() == "___MUSIC_HOMES___" {
-                                    self.in_bookmarks_view = true;
-                                    self.refresh_browser();
-                                } else {
-                                    if self.in_bookmarks_view {
-                                        self.in_bookmarks_view = false;
-                                    }
-                                    if path.is_dir() {
-                                        self.browser_dir = path.clone();
-                                        self.refresh_browser();
-                                    }
-                                }
+                            let (_, path, is_dir) = self.browser_entries[self.browser_cursor].clone();
+                            if is_dir {
+                                self.navigate_browser(path);
                             } else {
-                                let meta_opt = self.metadata_cache.get(path).cloned()
-                                    .or_else(|| crate::metadata::extract_metadata(path).ok());
+                                let meta_opt = self.metadata_cache.get(&path).cloned()
+                                    .or_else(|| crate::metadata::extract_metadata(&path).ok());
                                 if let Some(meta) = meta_opt {
                                     self.queue.add_track(meta);
                                     self.queue.current_index = self.queue.len().saturating_sub(1);

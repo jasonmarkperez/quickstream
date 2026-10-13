@@ -214,3 +214,96 @@ fn test_browser_paging_and_jump_shortcuts() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_browser_navigate_into_folder_resets_cursor_and_offset() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_nav_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    // 1. Create 40 subfolders in parent dir
+    for i in 0..40 {
+        let sub = temp_dir.join(format!("folder_{:02}", i));
+        fs::create_dir_all(&sub).unwrap();
+    }
+
+    // 2. In folder_35, create 15 child subfolders
+    let target_sub = temp_dir.join("folder_35");
+    for j in 0..15 {
+        let child = target_sub.join(format!("child_{:02}", j));
+        fs::create_dir_all(&child).unwrap();
+    }
+
+    let config_path = temp_dir.join("config.json");
+    let settings_mgr = SettingsManager::with_path(config_path);
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    let backend = ratatui::backend::TestBackend::new(80, 20);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+    // Initial render
+    terminal.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.browser_cursor, 0);
+    assert_eq!(app.browser_state.offset(), 0);
+
+    // Find index of folder_35 in browser entries
+    let folder_35_idx = app
+        .browser_entries
+        .iter()
+        .position(|(_name, p, is_dir)| *is_dir && p == &target_sub)
+        .expect("folder_35 should exist");
+    assert!(folder_35_idx >= 30, "folder_35 index should be >= 30");
+
+    // Move cursor down to folder_35
+    for _ in 0..folder_35_idx {
+        app.handle_tab_key(crossterm::event::KeyCode::Down);
+    }
+    assert_eq!(app.browser_cursor, folder_35_idx);
+
+    // Draw frame so ListState scrolls down and offset advances
+    terminal.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.browser_state.offset() > 0,
+        "Offset should have advanced when scrolling down to index {}",
+        folder_35_idx
+    );
+
+    // Press Enter to navigate into folder_35
+    app.handle_tab_key(crossterm::event::KeyCode::Enter);
+
+    // VERIFY:
+    // 1. Current directory changed
+    assert_eq!(app.browser_dir, target_sub);
+
+    // 2. Cursor MUST reset to 0 (top of the directory), NOT be clamped to the last element (16)
+    assert_eq!(
+        app.browser_cursor, 0,
+        "Browser cursor must reset to 0 when navigating into a subfolder"
+    );
+
+    // 3. Render frame: offset must be 0 so the first entries are visible at the top
+    terminal.draw(|f| app.render(f)).unwrap();
+    assert_eq!(
+        app.browser_state.offset(),
+        0,
+        "ListState offset must reset to 0 so the folder starts at the top, not at the last element"
+    );
+
+    // 4. Test navigating back up to parent directory:
+    // Cursor is currently at 0 (Music Homes). Move down 1 to index 1: ".. [Parent Directory]"
+    app.handle_tab_key(crossterm::event::KeyCode::Down);
+    assert_eq!(app.browser_cursor, 1);
+    assert_eq!(app.browser_entries[1].0, ".. [Parent Directory]");
+
+    // Press Enter to go up to parent
+    app.handle_tab_key(crossterm::event::KeyCode::Enter);
+    assert_eq!(app.browser_dir, temp_dir);
+
+    // When returning to parent, cursor should cleanly restore to folder_35
+    assert_eq!(
+        app.browser_cursor, folder_35_idx,
+        "Going up to parent directory should restore cursor to the folder we just exited"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
