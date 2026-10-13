@@ -29,6 +29,7 @@ pub struct CachedDir {
     pub dirs: Vec<(String, PathBuf, bool)>,
     pub files: Vec<(String, PathBuf, bool)>,
     pub unfetched_tracks: Vec<PathBuf>,
+    pub is_complete: bool,
 }
 
 #[derive(Debug)]
@@ -226,33 +227,38 @@ impl AppUI {
 
         // Cache hit: instantaneous display with zero filesystem overhead!
         if let Some(cached) = self.browser_dir_cache.get(&self.browser_dir).cloned() {
-            self.browser_loading = false;
-            self.browser_load_start = None;
-            self.browser_entries.extend(cached.dirs);
-            self.browser_entries.extend(cached.files);
+            if cached.is_complete {
+                self.browser_loading = false;
+                self.browser_load_start = None;
+                self.browser_entries.extend(cached.dirs);
+                self.browser_entries.extend(cached.files);
 
-            if let Some(target_sub) = self.pending_parent_restore.take() {
-                if let Some(pos) = self.browser_entries.iter().position(|(name, p, is_dir)| {
-                    *is_dir && p == &target_sub && name.starts_with("📁 ")
-                }) {
-                    self.browser_cursor = pos;
-                    self.browser_state = ListState::default();
-                    self.browser_state.select(Some(pos));
-                    return;
+                if let Some(target_sub) = self.pending_parent_restore.take() {
+                    if let Some(pos) = self.browser_entries.iter().position(|(name, p, is_dir)| {
+                        *is_dir && p == &target_sub && name.starts_with("📁 ")
+                    }) {
+                        self.browser_cursor = pos;
+                        self.browser_state = ListState::default();
+                        self.browser_state.select(Some(pos));
+                        return;
+                    }
                 }
-            }
 
-            self.browser_cursor = old_cursor.min(self.browser_entries.len().saturating_sub(1));
-            if self.browser_cursor == 0 {
-                self.browser_state = ListState::default();
-                self.browser_state.select(Some(0));
-            }
+                self.browser_cursor = old_cursor.min(self.browser_entries.len().saturating_sub(1));
+                if self.browser_cursor == 0 {
+                    self.browser_state = ListState::default();
+                    self.browser_state.select(Some(0));
+                }
 
-            if !cached.unfetched_tracks.is_empty() && self.settings_mgr.settings.metadata_view {
-                self.start_background_metadata_fetch(cached.unfetched_tracks);
+                if !cached.unfetched_tracks.is_empty() && self.settings_mgr.settings.metadata_view {
+                    self.start_background_metadata_fetch(cached.unfetched_tracks);
+                }
+                return;
             }
-            return;
         }
+
+        // Incomplete or uncached directory: clear any partial cache entry so fresh scan is clean
+        self.browser_dir_cache.remove(&self.browser_dir);
 
         self.browser_cursor = old_cursor.min(self.browser_entries.len().saturating_sub(1));
         if self.browser_cursor == 0 {
@@ -279,34 +285,26 @@ impl AppUI {
                     let mut batch_dirs = Vec::new();
                     let mut batch_files = Vec::new();
                     let mut batch_unfetched = Vec::new();
+                    let mut last_flush = std::time::Instant::now();
+                    let mut total_sent = 0;
 
-                    for entry in entries.flatten() {
+                    for entry_res in entries {
                         if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
                             return;
                         }
+                        let entry = match entry_res {
+                            Ok(e) => e,
+                            Err(_) => continue,
+                        };
                         let file_name = entry.file_name();
                         let name = file_name.to_string_lossy();
                         if name.starts_with('.') {
                             continue;
                         }
                         let path = entry.path();
-                        let ft = entry.file_type();
-                        let is_dir = match ft {
-                            Ok(ft) => {
-                                if ft.is_dir() {
-                                    true
-                                } else if ft.is_symlink() {
-                                    path.is_dir()
-                                } else {
-                                    false
-                                }
-                            }
-                            Err(_) => path.is_dir(),
-                        };
 
-                        if is_dir {
-                            batch_dirs.push((format!("📁 {}/", name), path, true));
-                        } else if is_supported_audio_file(&path) {
+                        // Optimization: Check supported audio file by extension first to avoid expensive stat calls
+                        if is_supported_audio_file(&path) {
                             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase();
                             let label = if metadata_view {
                                 if let Some(m) = cached_map.get(&path) {
@@ -319,12 +317,37 @@ impl AppUI {
                                 format!("🎵 [{}] {}", ext, name)
                             };
                             batch_files.push((label, path, false));
+                        } else {
+                            let ft_res = entry.file_type();
+                            let is_dir = match ft_res {
+                                Ok(ft) => {
+                                    if ft.is_dir() {
+                                        true
+                                    } else if ft.is_symlink() {
+                                        path.is_dir()
+                                    } else {
+                                        false
+                                    }
+                                }
+                                Err(_) => path.is_dir(),
+                            };
+
+                            if is_dir {
+                                batch_dirs.push((format!("📁 {}/", name), path, true));
+                            }
                         }
 
-                        if batch_dirs.len() + batch_files.len() >= 50 {
+                        let pending = batch_dirs.len() + batch_files.len();
+                        let should_flush = (total_sent == 0 && pending >= 5)
+                            || pending >= 40
+                            || (pending > 0 && last_flush.elapsed() >= std::time::Duration::from_millis(80));
+
+                        if should_flush {
                             if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
                                 return;
                             }
+                            total_sent += pending;
+                            last_flush = std::time::Instant::now();
                             let _ = tx.send(DirScanEvent::Batch {
                                 scan_id,
                                 dir: scan_dir.clone(),
@@ -366,11 +389,12 @@ impl AppUI {
             }
         });
 
-        // Fast path for immediate local reads: process any events available within 50ms
+        // Fast path for immediate local reads: process any events available within up to 150ms
+        let fast_path_start = std::time::Instant::now();
         while let Ok(event) = self.dir_scan_rx.recv_timeout(std::time::Duration::from_millis(50)) {
             let is_complete = matches!(event, DirScanEvent::Complete { .. } | DirScanEvent::Error { .. });
             self.handle_dir_scan_event(event);
-            if is_complete {
+            if is_complete || fast_path_start.elapsed() >= std::time::Duration::from_millis(150) {
                 break;
             }
         }
@@ -393,9 +417,24 @@ impl AppUI {
                 cached.dirs.extend(dirs.clone());
                 cached.files.extend(files.clone());
                 cached.unfetched_tracks.extend(unfetched_tracks.clone());
+                cached.is_complete = false;
 
                 self.browser_entries.extend(dirs);
                 self.browser_entries.extend(files);
+
+                // Incremental sort so streamed entries are always alphabetical
+                let header_count = if self.browser_dir.parent().is_some() { 2 } else { 1 };
+                if self.browser_entries.len() > header_count {
+                    let mut content_entries = self.browser_entries.split_off(header_count);
+                    content_entries.sort_by(|a, b| {
+                        match (a.2, b.2) {
+                            (true, false) => std::cmp::Ordering::Less,
+                            (false, true) => std::cmp::Ordering::Greater,
+                            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+                        }
+                    });
+                    self.browser_entries.extend(content_entries);
+                }
 
                 if let Some(ref target_sub) = self.pending_parent_restore {
                     if let Some(pos) = self.browser_entries.iter().position(|(name, p, is_dir)| {
@@ -404,7 +443,6 @@ impl AppUI {
                         self.browser_cursor = pos;
                         self.browser_state = ListState::default();
                         self.browser_state.select(Some(pos));
-                        self.pending_parent_restore = None;
                     }
                 }
             }
@@ -431,6 +469,7 @@ impl AppUI {
                 if let Some(cached) = self.browser_dir_cache.get_mut(&dir) {
                     cached.dirs.sort_by_key(|a| a.0.to_lowercase());
                     cached.files.sort_by_key(|a| a.0.to_lowercase());
+                    cached.is_complete = true;
                 }
 
                 if let Some(target_sub) = self.pending_parent_restore.take() {
@@ -1725,8 +1764,15 @@ impl AppUI {
             .collect();
 
         if self.browser_loading {
+            let header_count = if self.browser_dir.parent().is_some() { 2 } else { 1 };
+            let content_count = self.browser_entries.len().saturating_sub(header_count);
+            let loading_text = if content_count > 0 {
+                format!("  ⏳ Reading directory contents... ({} items loaded)", content_count)
+            } else {
+                "  ⏳ Reading directory contents...".to_string()
+            };
             browser_items.push(
-                ListItem::new("  ⏳ Reading directory contents...").style(
+                ListItem::new(loading_text).style(
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::ITALIC),

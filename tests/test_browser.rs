@@ -616,4 +616,56 @@ fn test_browser_cache_instant_back_navigation() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_browser_small_folder_streaming_and_incremental_sorting() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_small_folder_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let album_dir = temp_dir.join("Album");
+    fs::create_dir_all(&album_dir).unwrap();
+
+    // Create 1 subfolder and 2 tracks (fewer than 5 items, like The Darkest Knight)
+    fs::create_dir_all(album_dir.join("Bonus_Discs")).unwrap();
+    create_dummy_wav(&album_dir.join("02_Track_B.wav"));
+    create_dummy_wav(&album_dir.join("01_Track_A.wav"));
+
+    let config_path = temp_dir.join("config.json");
+    let settings_mgr = SettingsManager::with_path(config_path);
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    let start = std::time::Instant::now();
+    app.navigate_browser(album_dir.clone());
+    let elapsed = start.elapsed();
+
+    // Fast-path should load all items quickly
+    assert!(elapsed < std::time::Duration::from_millis(200));
+    assert_eq!(app.browser_dir, album_dir);
+    assert!(!app.browser_loading);
+
+    // Verify all 3 items + 2 headers are present: Homes, Parent, Bonus_Discs, Track_A, Track_B
+    assert_eq!(app.browser_entries.len(), 5);
+    assert_eq!(app.browser_entries[0].0, "★ Music Homes");
+    assert_eq!(app.browser_entries[1].0, ".. [Parent Directory]");
+    assert!(app.browser_entries[2].0.contains("Bonus_Discs"));
+    assert!(app.browser_entries[3].0.contains("01_Track_A"));
+    assert!(app.browser_entries[4].0.contains("02_Track_B"));
+
+    // Verify cache has is_complete == true
+    let cached = app.browser_dir_cache.get(&album_dir).expect("Cache should contain album_dir");
+    assert!(cached.is_complete, "Cache should be marked complete");
+
+    // Incomplete cache test: if is_complete is false, refresh_browser removes partial cache and rescans
+    if let Some(c) = app.browser_dir_cache.get_mut(&album_dir) {
+        c.is_complete = false;
+        c.dirs.clear();
+        c.files.clear();
+    }
+    app.refresh_browser();
+    // After refresh_browser, it should rescan and complete
+    assert_eq!(app.browser_entries.len(), 5);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
 
