@@ -47,6 +47,7 @@ pub struct AppUI {
     pub devices_state: ListState,
     pub settings_state: ListState,
     pub search_modal: Option<SearchModalState>,
+    pub browser_spotlight: Option<String>,
     pub browser_page_height: usize,
     pub queue_page_height: usize,
     pub web_server: Option<crate::web::WebServerHandle>,
@@ -100,6 +101,7 @@ impl AppUI {
             devices_state: ListState::default(),
             settings_state: ListState::default(),
             search_modal: None,
+            browser_spotlight: None,
             browser_page_height: 15,
             queue_page_height: 15,
             web_server,
@@ -255,6 +257,76 @@ impl AppUI {
                     self.browser_state.select(Some(pos));
                 }
             }
+        }
+    }
+
+    pub fn open_spotlight(&mut self) {
+        self.browser_spotlight = Some(String::new());
+        self.status_message = "Spotlight: type to jump to subfolder (Esc to exit, Enter to open)".to_string();
+    }
+
+    pub fn close_spotlight(&mut self) {
+        self.browser_spotlight = None;
+    }
+
+    pub fn spotlight_matches(&self) -> Vec<usize> {
+        let query = match &self.browser_spotlight {
+            Some(q) if !q.is_empty() => q.to_lowercase(),
+            _ => return Vec::new(),
+        };
+
+        let mut prefix_matches = Vec::new();
+        let mut substring_matches = Vec::new();
+
+        for (idx, (_, path, is_dir)) in self.browser_entries.iter().enumerate() {
+            if !*is_dir || path.to_string_lossy() == "___MUSIC_HOMES___" {
+                continue;
+            }
+            let folder_name = path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default()
+                .to_lowercase();
+
+            if folder_name.starts_with(&query) {
+                prefix_matches.push(idx);
+            } else if folder_name.contains(&query) {
+                substring_matches.push(idx);
+            }
+        }
+
+        prefix_matches.extend(substring_matches);
+        prefix_matches
+    }
+
+    pub fn jump_spotlight_to_first_match(&mut self) {
+        let matches = self.spotlight_matches();
+        if let Some(&first_idx) = matches.first() {
+            self.browser_cursor = first_idx;
+        }
+    }
+
+    pub fn spotlight_next_match(&mut self) {
+        let matches = self.spotlight_matches();
+        if matches.is_empty() {
+            return;
+        }
+        if let Some(&next_idx) = matches.iter().find(|&&i| i > self.browser_cursor) {
+            self.browser_cursor = next_idx;
+        } else if let Some(&first_idx) = matches.first() {
+            self.browser_cursor = first_idx;
+        }
+    }
+
+    pub fn spotlight_prev_match(&mut self) {
+        let matches = self.spotlight_matches();
+        if matches.is_empty() {
+            return;
+        }
+        if let Some(&prev_idx) = matches.iter().rev().find(|&&i| i < self.browser_cursor) {
+            self.browser_cursor = prev_idx;
+        } else if let Some(&last_idx) = matches.last() {
+            self.browser_cursor = last_idx;
         }
     }
 
@@ -458,6 +530,51 @@ impl AppUI {
                         continue;
                     }
 
+                    if self.browser_spotlight.is_some() {
+                        match (key.code, key.modifiers) {
+                            (KeyCode::Esc, _) => {
+                                self.close_spotlight();
+                            }
+                            (KeyCode::Enter, KeyModifiers::NONE) => {
+                                self.close_spotlight();
+                                if self.browser_cursor < self.browser_entries.len() {
+                                    let (_, path, is_dir) = self.browser_entries[self.browser_cursor].clone();
+                                    if is_dir {
+                                        self.navigate_browser(path);
+                                    } else {
+                                        let meta_opt = self.metadata_cache.get(&path).cloned()
+                                            .or_else(|| crate::metadata::extract_metadata(&path).ok());
+                                        if let Some(meta) = meta_opt {
+                                            self.queue.add_track(meta);
+                                            self.queue.current_index = self.queue.len().saturating_sub(1);
+                                            self.play_current_track();
+                                        }
+                                    }
+                                }
+                            }
+                            (KeyCode::Down, _) | (KeyCode::Tab, KeyModifiers::NONE) => {
+                                self.spotlight_next_match();
+                            }
+                            (KeyCode::Up, _) | (KeyCode::BackTab, _) => {
+                                self.spotlight_prev_match();
+                            }
+                            (KeyCode::Backspace, _) => {
+                                if let Some(ref mut q) = self.browser_spotlight {
+                                    q.pop();
+                                }
+                                self.jump_spotlight_to_first_match();
+                            }
+                            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                                if let Some(ref mut q) = self.browser_spotlight {
+                                    q.push(c);
+                                }
+                                self.jump_spotlight_to_first_match();
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // Global hotkeys
                     match (key.code, key.modifiers) {
                         (KeyCode::Char('q'), KeyModifiers::NONE) | (KeyCode::Esc, KeyModifiers::NONE) => {
@@ -535,7 +652,14 @@ impl AppUI {
                                 }
                             );
                         }
-                        (KeyCode::Char('/') | KeyCode::Char('f'), KeyModifiers::NONE) => {
+                        (KeyCode::Char('/'), KeyModifiers::NONE) => {
+                            if self.active_tab == 0 && !self.queue_focus {
+                                self.open_spotlight();
+                            } else {
+                                self.open_fuzzy_search();
+                            }
+                        }
+                        (KeyCode::Char('f'), KeyModifiers::NONE) => {
                             self.open_fuzzy_search();
                         }
                         _ => {
@@ -609,7 +733,7 @@ impl AppUI {
                 match (code, modifiers) {
                     (KeyCode::Char('h'), KeyModifiers::NONE) => self.queue_focus = false,
                     (KeyCode::Char('l'), KeyModifiers::NONE) => self.queue_focus = true,
-                    (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                    (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
                         if self.queue_focus {
                             if !self.queue.is_empty() {
                                 if self.queue_cursor > 0 {
@@ -626,7 +750,7 @@ impl AppUI {
                             }
                         }
                     }
-                    (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+                    (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
                         if self.queue_focus {
                             if !self.queue.is_empty() {
                                 if self.queue_cursor + 1 < self.queue.len() {
@@ -646,7 +770,9 @@ impl AppUI {
                     (KeyCode::PageUp, _)
                     | (KeyCode::Char('u'), KeyModifiers::CONTROL)
                     | (KeyCode::Char('b'), KeyModifiers::CONTROL)
-                    | (KeyCode::Char('K'), _) => {
+                    | (KeyCode::Char('K'), _)
+                    | (KeyCode::Up, KeyModifiers::SHIFT)
+                    | (KeyCode::Char('['), KeyModifiers::NONE) => {
                         if self.queue_focus {
                             self.page_up_queue();
                         } else {
@@ -656,7 +782,9 @@ impl AppUI {
                     (KeyCode::PageDown, _)
                     | (KeyCode::Char('d'), KeyModifiers::CONTROL)
                     | (KeyCode::Char('f'), KeyModifiers::CONTROL)
-                    | (KeyCode::Char('J'), _) => {
+                    | (KeyCode::Char('J'), _)
+                    | (KeyCode::Down, KeyModifiers::SHIFT)
+                    | (KeyCode::Char(']'), KeyModifiers::NONE) => {
                         if self.queue_focus {
                             self.page_down_queue();
                         } else {
@@ -752,14 +880,14 @@ impl AppUI {
                 let devices = self.device_manager.get_devices();
                 let total_devices = 1 + devices.len(); // 0 is Local Audio, 1.. are DLNA renderers
                 match (code, modifiers) {
-                    (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                    (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
                         if self.devices_cursor > 0 {
                             self.devices_cursor -= 1;
                         } else {
                             self.devices_cursor = total_devices.saturating_sub(1);
                         }
                     }
-                    (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+                    (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
                         if self.devices_cursor + 1 < total_devices {
                             self.devices_cursor += 1;
                         } else {
@@ -768,7 +896,9 @@ impl AppUI {
                     }
                     (KeyCode::PageUp, _)
                     | (KeyCode::Char('u'), KeyModifiers::CONTROL)
-                    | (KeyCode::Char('K'), _) => {
+                    | (KeyCode::Char('K'), _)
+                    | (KeyCode::Up, KeyModifiers::SHIFT)
+                    | (KeyCode::Char('['), KeyModifiers::NONE) => {
                         let step = 10;
                         if self.devices_cursor >= step {
                             self.devices_cursor -= step;
@@ -780,7 +910,9 @@ impl AppUI {
                     }
                     (KeyCode::PageDown, _)
                     | (KeyCode::Char('d'), KeyModifiers::CONTROL)
-                    | (KeyCode::Char('J'), _) => {
+                    | (KeyCode::Char('J'), _)
+                    | (KeyCode::Down, KeyModifiers::SHIFT)
+                    | (KeyCode::Char(']'), KeyModifiers::NONE) => {
                         let step = 10;
                         if self.devices_cursor + step < total_devices {
                             self.devices_cursor += step;
@@ -815,14 +947,14 @@ impl AppUI {
             2 => {
                 // Settings Tab
                 match (code, modifiers) {
-                    (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                    (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
                         if self.settings_cursor > 0 {
                             self.settings_cursor -= 1;
                         } else {
                             self.settings_cursor = SETTING_DEFINITIONS.len() - 1;
                         }
                     }
-                    (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+                    (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
                         if self.settings_cursor + 1 < SETTING_DEFINITIONS.len() {
                             self.settings_cursor += 1;
                         } else {
@@ -832,13 +964,17 @@ impl AppUI {
                     (KeyCode::PageUp, _)
                     | (KeyCode::Home, _)
                     | (KeyCode::Char('g'), KeyModifiers::NONE)
-                    | (KeyCode::Char('K'), _) => {
+                    | (KeyCode::Char('K'), _)
+                    | (KeyCode::Up, KeyModifiers::SHIFT)
+                    | (KeyCode::Char('['), KeyModifiers::NONE) => {
                         self.settings_cursor = 0;
                     }
                     (KeyCode::PageDown, _)
                     | (KeyCode::End, _)
                     | (KeyCode::Char('G'), _)
-                    | (KeyCode::Char('J'), _) => {
+                    | (KeyCode::Char('J'), _)
+                    | (KeyCode::Down, KeyModifiers::SHIFT)
+                    | (KeyCode::Char(']'), KeyModifiers::NONE) => {
                         self.settings_cursor = SETTING_DEFINITIONS.len() - 1;
                     }
                     (KeyCode::Enter, KeyModifiers::NONE) | (KeyCode::Char(' '), KeyModifiers::NONE) => {
@@ -1094,13 +1230,66 @@ impl AppUI {
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(area);
 
-        let inner_browser_h = split[0].height.saturating_sub(2) as usize;
+        // Left Pane: File Browser (with optional inline Spotlight Search bar)
+        let spotlight_matches = self.spotlight_matches();
+        let (browser_area, spotlight_area) = if self.browser_spotlight.is_some() {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(1)])
+                .split(split[0]);
+            (chunks[1], Some(chunks[0]))
+        } else {
+            (split[0], None)
+        };
+
+        let inner_browser_h = browser_area.height.saturating_sub(2) as usize;
         self.browser_page_height = inner_browser_h.max(1);
 
         let inner_queue_h = split[1].height.saturating_sub(2) as usize;
         self.queue_page_height = inner_queue_h.max(1);
 
-        // Left Pane: File Browser
+        if let Some(s_area) = spotlight_area {
+            let query = self.browser_spotlight.as_deref().unwrap_or("");
+            let match_text = if query.is_empty() {
+                let subfolder_count = self
+                    .browser_entries
+                    .iter()
+                    .filter(|(_, p, is_dir)| *is_dir && p.to_string_lossy() != "___MUSIC_HOMES___")
+                    .count();
+                format!("Type to jump ({} subfolders)", subfolder_count)
+            } else if spotlight_matches.is_empty() {
+                "No matching subfolders".to_string()
+            } else {
+                let current_match_pos = spotlight_matches
+                    .iter()
+                    .position(|&i| i == self.browser_cursor)
+                    .map(|p| p + 1)
+                    .unwrap_or(1);
+                format!("{} of {} matching subfolders", current_match_pos, spotlight_matches.len())
+            };
+
+            let spotlight_block = Block::default()
+                .borders(Borders::ALL)
+                .title(" 🔍 SPOTLIGHT SUBFOLDER JUMP (Esc exit, Enter open) ")
+                .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+
+            let status_style = if spotlight_matches.is_empty() && !query.is_empty() {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
+            let spotlight_text = Line::from(vec![
+                Span::styled(" > ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(query, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled("█", Style::default().fg(Color::Yellow)),
+                Span::raw("   "),
+                Span::styled(format!("[{}]", match_text), status_style),
+            ]);
+            let spotlight_widget = Paragraph::new(spotlight_text).block(spotlight_block);
+            f.render_widget(spotlight_widget, s_area);
+        }
+
         let mode_tag = if self.settings_mgr.settings.metadata_view {
             "[TAGS]"
         } else {
@@ -1120,7 +1309,11 @@ impl AppUI {
             .borders(Borders::ALL)
             .title(browser_title.as_str())
             .border_style(if !self.queue_focus {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                if self.browser_spotlight.is_some() {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                }
             } else {
                 Style::default().fg(Color::DarkGray)
             });
@@ -1130,8 +1323,17 @@ impl AppUI {
             .iter()
             .enumerate()
             .map(|(idx, (name, _, is_dir))| {
-                let style = if idx == self.browser_cursor && !self.queue_focus {
-                    Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+                let is_selected = idx == self.browser_cursor && !self.queue_focus;
+                let is_spotlight_match = self.browser_spotlight.is_some() && spotlight_matches.contains(&idx);
+
+                let style = if is_selected {
+                    if self.browser_spotlight.is_some() {
+                        Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+                    }
+                } else if is_spotlight_match {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
                 } else if *is_dir {
                     Style::default().fg(Color::Cyan)
                 } else {
@@ -1143,7 +1345,7 @@ impl AppUI {
 
         self.browser_state.select(Some(self.browser_cursor));
         let browser_list = List::new(browser_items).block(browser_block);
-        f.render_stateful_widget(browser_list, split[0], &mut self.browser_state);
+        f.render_stateful_widget(browser_list, browser_area, &mut self.browser_state);
 
         // Right Pane: Queue
         let queue_title = if self.queue.is_empty() {
@@ -1527,10 +1729,11 @@ impl AppUI {
             Line::from("[Tab] / [1,2,3]  : Switch Active Tab"),
             Line::from("[h] / [l]        : Focus Browser vs Queue"),
             Line::from("[j] / [k]        : Move Selection Up / Down (wraps around)"),
-            Line::from("[PgDn] / [PgUp]  : Page Down / Up through list (also Ctrl+d/u, J/K)"),
+            Line::from("[Shift+Up/Dn] / []: Page Up / Down (MacBook friendly, also PgUp/Dn, Ctrl+u/d)"),
             Line::from("[Home] / [End]   : Jump to Start / End of list (also g / G)"),
             Line::from("[Enter]          : Open folder / Add file to queue / Play track"),
-            Line::from("[/] or [f]       : Fuzzy Search current folder & subfolders"),
+            Line::from("[/]              : Spotlight jump to subfolders as you type"),
+            Line::from("[f]              : Full Library fuzzy search"),
             Line::from("[a]              : Add all audio files in folder to queue"),
             Line::from("[b]              : Bookmark / Unbookmark folder in Music Homes"),
             Line::from("[d] / [x]        : Remove item from queue or bookmarks"),

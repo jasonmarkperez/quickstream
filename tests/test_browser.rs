@@ -211,6 +211,28 @@ fn test_browser_paging_and_jump_shortcuts() {
     app.handle_tab_key(crossterm::event::KeyCode::Home);
     assert_eq!(app.browser_cursor, 0);
 
+    // 11. MacBook friendly: Shift + Down jumps down by page height (10)
+    app.handle_tab_key_with_modifiers(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::SHIFT,
+    );
+    assert_eq!(app.browser_cursor, 10);
+
+    // 12. MacBook friendly: ']' bracket key jumps down by page height (10 -> 20)
+    app.handle_tab_key(crossterm::event::KeyCode::Char(']'));
+    assert_eq!(app.browser_cursor, 20);
+
+    // 13. MacBook friendly: '[' bracket key jumps up by page height (20 -> 10)
+    app.handle_tab_key(crossterm::event::KeyCode::Char('['));
+    assert_eq!(app.browser_cursor, 10);
+
+    // 14. MacBook friendly: Shift + Up jumps up by page height (10 -> 0)
+    app.handle_tab_key_with_modifiers(
+        crossterm::event::KeyCode::Up,
+        crossterm::event::KeyModifiers::SHIFT,
+    );
+    assert_eq!(app.browser_cursor, 0);
+
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
@@ -303,6 +325,84 @@ fn test_browser_navigate_into_folder_resets_cursor_and_offset() {
         app.browser_cursor, folder_35_idx,
         "Going up to parent directory should restore cursor to the folder we just exited"
     );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_browser_spotlight_subfolder_jump() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_spotlight_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let folders = vec![
+        "Ambient Works",
+        "Audio Bullys",
+        "Audioslave",
+        "Austin Wintory",
+        "Beatles",
+        "Bonobo",
+    ];
+    for f in &folders {
+        fs::create_dir_all(temp_dir.join(f)).unwrap();
+    }
+
+    let config_path = temp_dir.join("config.json");
+    let settings_mgr = SettingsManager::with_path(config_path);
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    let ambient_idx = app.browser_entries.iter().position(|(name, _, _)| name.contains("Ambient Works")).unwrap();
+    let audio_bullys_idx = app.browser_entries.iter().position(|(name, _, _)| name.contains("Audio Bullys")).unwrap();
+    let audioslave_idx = app.browser_entries.iter().position(|(name, _, _)| name.contains("Audioslave")).unwrap();
+    let austin_wintory_idx = app.browser_entries.iter().position(|(name, _, _)| name.contains("Austin Wintory")).unwrap();
+    let beatles_idx = app.browser_entries.iter().position(|(name, _, _)| name.contains("Beatles")).unwrap();
+
+    // 1. Initially spotlight is not active
+    assert!(app.browser_spotlight.is_none());
+
+    // 2. Open spotlight
+    app.open_spotlight();
+    assert_eq!(app.browser_spotlight.as_deref(), Some(""));
+
+    // 3. Type 'A': jumps to first 'A' folder (Ambient Works)
+    app.browser_spotlight = Some("A".to_string());
+    app.jump_spotlight_to_first_match();
+    assert_eq!(app.browser_cursor, ambient_idx);
+
+    // 4. Type 'u' (query is now "Au"): jumps to Audio Bullys
+    app.browser_spotlight = Some("Au".to_string());
+    app.jump_spotlight_to_first_match();
+    assert_eq!(app.browser_cursor, audio_bullys_idx);
+
+    // 5. Next match: jumps to Audioslave
+    app.spotlight_next_match();
+    assert_eq!(app.browser_cursor, audioslave_idx);
+
+    // 6. Next match: jumps to Austin Wintory
+    app.spotlight_next_match();
+    assert_eq!(app.browser_cursor, austin_wintory_idx);
+
+    // 7. Next match wraps around to Audio Bullys
+    app.spotlight_next_match();
+    assert_eq!(app.browser_cursor, audio_bullys_idx);
+
+    // 8. Prev match wraps backwards to Austin Wintory
+    app.spotlight_prev_match();
+    assert_eq!(app.browser_cursor, austin_wintory_idx);
+
+    // 9. Type "b": jumps to Beatles
+    app.browser_spotlight = Some("b".to_string());
+    app.jump_spotlight_to_first_match();
+    assert_eq!(app.browser_cursor, beatles_idx);
+
+    // 10. Verify render with active Spotlight does not panic and renders input bar
+    let backend = ratatui::backend::TestBackend::new(80, 20);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| app.render(f)).unwrap();
+
+    // 11. Close spotlight
+    app.close_spotlight();
+    assert!(app.browser_spotlight.is_none());
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
