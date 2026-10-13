@@ -139,12 +139,12 @@ fn main() -> anyhow::Result<()> {
         settings_mgr.settings.web_server_port = port;
         settings_mgr.settings.web_server_enabled = true;
     }
-    let start_dir = cli.paths.first().filter(|p| p.is_dir()).cloned();
+    let start_dir = cli.paths.first().filter(|p| !is_supported_audio_file(p)).cloned();
     let mut app = AppUI::new(start_dir, settings_mgr);
 
     // Pre-queue any explicit files passed on CLI
     for path in &cli.paths {
-        if path.is_file() && is_supported_audio_file(path) {
+        if is_supported_audio_file(path) {
             if let Ok(meta) = extract_metadata(path) {
                 app.queue.add_track(meta);
             }

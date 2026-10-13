@@ -483,3 +483,90 @@ fn test_browser_spotlight_subfolder_jump() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_browser_bookmarks_instant_load_no_stat() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_bookmarks_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let config_path = temp_dir.join("config.json");
+    let settings_mgr = SettingsManager::with_path(config_path);
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    // Set bookmarks that simulate remote or non-existent network mount paths
+    app.bookmarks = vec![
+        "/Volumes/Music".to_string(),
+        "/Volumes/home/Drive/Mixes".to_string(),
+        "/NonExistent/DeadShare".to_string(),
+    ];
+
+    // Navigate to Music Homes
+    app.navigate_browser(std::path::PathBuf::from("___MUSIC_HOMES___"));
+
+    assert!(app.in_bookmarks_view);
+    assert_eq!(app.browser_entries.len(), 4); // Back + 3 bookmarks
+    assert_eq!(app.browser_entries[0].0, ".. [Back to File System]");
+    assert_eq!(app.browser_entries[1].0, "📁 Music/");
+    assert_eq!(app.browser_entries[2].0, "📁 Mixes/");
+    assert_eq!(app.browser_entries[3].0, "📁 DeadShare/");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_browser_async_scanner_nonexistent_directory() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_nonexistent_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let config_path = temp_dir.join("config.json");
+    let settings_mgr = SettingsManager::with_path(config_path);
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    let nonexistent = temp_dir.join("nonexistent_subdir");
+    app.navigate_browser(nonexistent.clone());
+
+    // Wait for the background worker to finish and report the error
+    for _ in 0..50 {
+        app.poll_background_dir_scan();
+        if !app.browser_loading {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert!(!app.browser_loading);
+    assert!(app.status_message.contains("Error reading directory"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_browser_cancellation_on_navigation() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_cancel_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let dir_a = temp_dir.join("DirA");
+    let dir_b = temp_dir.join("DirB");
+    fs::create_dir_all(&dir_a).unwrap();
+    fs::create_dir_all(&dir_b).unwrap();
+
+    let config_path = temp_dir.join("config.json");
+    let settings_mgr = SettingsManager::with_path(config_path);
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    // Navigate to DirA, starting scan
+    app.navigate_browser(dir_a.clone());
+    let stop_a = app.dir_scan_stop.clone().expect("Stop flag should be set for active scan");
+
+    // Immediately navigate to DirB
+    app.navigate_browser(dir_b.clone());
+
+    // Old scan's stop flag must be signaled
+    assert!(stop_a.load(std::sync::atomic::Ordering::Relaxed), "DirA scan should be cancelled");
+    assert_eq!(app.browser_dir, dir_b);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+

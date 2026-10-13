@@ -79,9 +79,7 @@ impl LibraryManager {
                     continue;
                 }
                 if let Ok(track) = serde_json::from_str::<AudioMetadata>(&line) {
-                    if track.filepath.exists() {
-                        tracks.push(track);
-                    }
+                    tracks.push(track);
                 }
             }
         }

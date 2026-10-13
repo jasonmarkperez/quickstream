@@ -24,12 +24,29 @@ use crate::player::AudioPlayer;
 use crate::queue::PlaybackQueue;
 use crate::settings::{SettingsManager, SETTING_DEFINITIONS};
 
+#[derive(Debug)]
+pub struct DirScanResult {
+    pub scan_id: u64,
+    pub dir: PathBuf,
+    pub dirs: Vec<(String, PathBuf, bool)>,
+    pub files: Vec<(String, PathBuf, bool)>,
+    pub unfetched_tracks: Vec<PathBuf>,
+    pub error: Option<String>,
+}
+
 pub struct AppUI {
     pub active_tab: usize,
     pub queue_focus: bool, // false = browser, true = queue
     pub browser_dir: PathBuf,
     pub browser_entries: Vec<(String, PathBuf, bool)>, // (display_name, path, is_dir)
     pub browser_cursor: usize,
+    pub browser_loading: bool,
+    pub browser_load_start: Option<std::time::Instant>,
+    pub dir_scan_tx: std::sync::mpsc::Sender<DirScanResult>,
+    pub dir_scan_rx: std::sync::mpsc::Receiver<DirScanResult>,
+    pub dir_scan_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub dir_scan_id: u64,
+    pub pending_parent_restore: Option<PathBuf>,
     pub queue_cursor: usize,
     pub devices_cursor: usize,
     pub settings_cursor: usize,
@@ -83,6 +100,7 @@ impl AppUI {
 
         let (metadata_tx, metadata_rx) = std::sync::mpsc::channel();
         let metadata_cache = crate::library::LibraryManager::load_cache_map();
+        let (dir_scan_tx, dir_scan_rx) = std::sync::mpsc::channel();
 
         let mut app = Self {
             active_tab: 0,
@@ -90,6 +108,13 @@ impl AppUI {
             browser_dir: cwd,
             browser_entries: Vec::new(),
             browser_cursor: 0,
+            browser_loading: false,
+            browser_load_start: None,
+            dir_scan_tx,
+            dir_scan_rx,
+            dir_scan_stop: None,
+            dir_scan_id: 0,
+            pending_parent_restore: None,
             queue_cursor: 0,
             devices_cursor: 0,
             settings_cursor: 0,
@@ -146,18 +171,22 @@ impl AppUI {
     pub fn refresh_browser(&mut self) {
         let _timer = crate::log_perf!("browser", "refresh_browser for '{}'", self.browser_dir.display());
         let old_cursor = self.browser_cursor;
+
+        if let Some(stop) = self.dir_scan_stop.take() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
         self.browser_entries.clear();
 
         if self.in_bookmarks_view {
+            self.browser_loading = false;
+            self.browser_load_start = None;
             self.browser_entries
                 .push((".. [Back to File System]".to_string(), self.browser_dir.clone(), true));
             for b in &self.bookmarks {
                 let p = PathBuf::from(b);
-                let label = if p.is_dir() {
-                    format!("📁 {}/", p.file_name().unwrap_or_default().to_string_lossy())
-                } else {
-                    format!("📁 {} (Not found)/", p.file_name().unwrap_or_default().to_string_lossy())
-                };
+                let name = p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| b.clone());
+                let label = format!("📁 {}/", name);
                 self.browser_entries.push((label, p, true));
             }
             self.browser_cursor = old_cursor.min(self.browser_entries.len().saturating_sub(1));
@@ -176,66 +205,155 @@ impl AppUI {
                 .push((".. [Parent Directory]".to_string(), parent.to_path_buf(), true));
         }
 
-        let mut dirs = Vec::new();
-        let mut files = Vec::new();
-        let mut unfetched_tracks = Vec::new();
-
-        if let Ok(entries) = fs::read_dir(&self.browser_dir) {
-            for entry in entries.flatten() {
-                let file_name = entry.file_name();
-                let name = file_name.to_string_lossy();
-                if name.starts_with('.') {
-                    continue;
-                }
-                let path = entry.path();
-                let ft = entry.file_type();
-                let is_dir = match ft {
-                    Ok(ft) => {
-                        if ft.is_dir() {
-                            true
-                        } else if ft.is_symlink() {
-                            path.is_dir()
-                        } else {
-                            false
-                        }
-                    }
-                    Err(_) => path.is_dir(),
-                };
-
-                if is_dir {
-                    dirs.push((format!("📁 {}/", name), path, true));
-                } else if is_supported_audio_file(&path) {
-                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase();
-                    let label = if self.settings_mgr.settings.metadata_view {
-                        if let Some(m) = self.metadata_cache.get(&path) {
-                            m.format_display_label(true)
-                        } else {
-                            unfetched_tracks.push(path.clone());
-                            format!("🎵 [{}] {}", ext, name)
-                        }
-                    } else {
-                        format!("🎵 [{}] {}", ext, name)
-                    };
-                    files.push((label, path, false));
-                }
-            }
-
-            dirs.sort_by_key(|a| a.0.to_lowercase());
-            files.sort_by_key(|a| a.0.to_lowercase());
-        }
-
-        self.browser_entries.extend(dirs);
-        self.browser_entries.extend(files);
         self.browser_cursor = old_cursor.min(self.browser_entries.len().saturating_sub(1));
         if self.browser_cursor == 0 {
             self.browser_state = ListState::default();
             self.browser_state.select(Some(0));
         }
 
-        if !unfetched_tracks.is_empty() && self.settings_mgr.settings.metadata_view {
-            self.start_background_metadata_fetch(unfetched_tracks);
+        self.browser_loading = true;
+        self.browser_load_start = Some(std::time::Instant::now());
+
+        self.dir_scan_id += 1;
+        let scan_id = self.dir_scan_id;
+        let scan_dir = self.browser_dir.clone();
+        let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.dir_scan_stop = Some(stop_flag.clone());
+        let tx = self.dir_scan_tx.clone();
+        let metadata_view = self.settings_mgr.settings.metadata_view;
+        let cached_map = self.metadata_cache.clone();
+
+        std::thread::spawn(move || {
+            let _t = crate::log_perf!("browser", "background dir scan for '{}'", scan_dir.display());
+            match std::fs::read_dir(&scan_dir) {
+                Ok(entries) => {
+                    let mut dirs = Vec::new();
+                    let mut files = Vec::new();
+                    let mut unfetched = Vec::new();
+
+                    for entry in entries.flatten() {
+                        if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        let file_name = entry.file_name();
+                        let name = file_name.to_string_lossy();
+                        if name.starts_with('.') {
+                            continue;
+                        }
+                        let path = entry.path();
+                        let ft = entry.file_type();
+                        let is_dir = match ft {
+                            Ok(ft) => {
+                                if ft.is_dir() {
+                                    true
+                                } else if ft.is_symlink() {
+                                    path.is_dir()
+                                } else {
+                                    false
+                                }
+                            }
+                            Err(_) => path.is_dir(),
+                        };
+
+                        if is_dir {
+                            dirs.push((format!("📁 {}/", name), path, true));
+                        } else if is_supported_audio_file(&path) {
+                            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase();
+                            let label = if metadata_view {
+                                if let Some(m) = cached_map.get(&path) {
+                                    m.format_display_label(true)
+                                } else {
+                                    unfetched.push(path.clone());
+                                    format!("🎵 [{}] {}", ext, name)
+                                }
+                            } else {
+                                format!("🎵 [{}] {}", ext, name)
+                            };
+                            files.push((label, path, false));
+                        }
+                    }
+
+                    dirs.sort_by_key(|a| a.0.to_lowercase());
+                    files.sort_by_key(|a| a.0.to_lowercase());
+
+                    if !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = tx.send(DirScanResult {
+                            scan_id,
+                            dir: scan_dir,
+                            dirs,
+                            files,
+                            unfetched_tracks: unfetched,
+                            error: None,
+                        });
+                    }
+                }
+                Err(err) => {
+                    if !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = tx.send(DirScanResult {
+                            scan_id,
+                            dir: scan_dir,
+                            dirs: Vec::new(),
+                            files: Vec::new(),
+                            unfetched_tracks: Vec::new(),
+                            error: Some(err.to_string()),
+                        });
+                    }
+                }
+            }
+        });
+
+        // Fast path for fast local filesystem reads: receive result if ready within 50ms
+        if let Ok(res) = self.dir_scan_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            self.apply_dir_scan_result(res);
+        }
+    }
+
+    fn apply_dir_scan_result(&mut self, res: DirScanResult) {
+        if res.scan_id != self.dir_scan_id || res.dir != self.browser_dir {
+            return;
+        }
+        self.browser_loading = false;
+        self.browser_load_start = None;
+
+        if let Some(err) = res.error {
+            self.status_message = format!("Error reading directory '{}': {}", res.dir.display(), err);
+            return;
+        }
+
+        self.browser_entries.extend(res.dirs);
+        self.browser_entries.extend(res.files);
+
+        if let Some(target_sub) = self.pending_parent_restore.take() {
+            if let Some(pos) = self.browser_entries.iter().position(|(name, p, is_dir)| {
+                *is_dir && p == &target_sub && name.starts_with("📁 ")
+            }) {
+                self.browser_cursor = pos;
+                self.browser_state = ListState::default();
+                self.browser_state.select(Some(pos));
+            }
+        }
+
+        if !res.unfetched_tracks.is_empty() && self.settings_mgr.settings.metadata_view {
+            self.start_background_metadata_fetch(res.unfetched_tracks);
         } else if let Some(stop) = self.metadata_worker_stop.take() {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub fn poll_background_dir_scan(&mut self) {
+        while let Ok(res) = self.dir_scan_rx.try_recv() {
+            self.apply_dir_scan_result(res);
+        }
+
+        if self.browser_loading {
+            if let Some(start) = self.browser_load_start {
+                if start.elapsed() > std::time::Duration::from_secs(3) {
+                    self.status_message = format!(
+                        "Opening '{}' (filesystem may be slow or offline). Esc or '..' to go back",
+                        self.browser_dir.display()
+                    );
+                }
+            }
         }
     }
 
@@ -299,39 +417,29 @@ impl AppUI {
         }
 
         if self.in_bookmarks_view {
-            if path.is_dir() {
-                self.in_bookmarks_view = false;
-                self.browser_dir = path;
-                self.browser_cursor = 0;
-                self.browser_state = ListState::default();
-                self.browser_state.select(Some(0));
-                self.refresh_browser();
-            } else {
-                self.status_message = "Bookmarked directory not found".to_string();
-            }
-            return;
-        }
-
-        if path.is_dir() {
-            let prev_dir = self.browser_dir.clone();
-            let is_parent = prev_dir.parent().map(|p| p == path).unwrap_or(false);
-
+            self.in_bookmarks_view = false;
             self.browser_dir = path;
             self.browser_cursor = 0;
             self.browser_state = ListState::default();
             self.browser_state.select(Some(0));
             self.refresh_browser();
-
-            if is_parent {
-                if let Some(pos) = self.browser_entries.iter().position(|(name, p, is_dir)| {
-                    *is_dir && p == &prev_dir && name.starts_with("📁 ")
-                }) {
-                    self.browser_cursor = pos;
-                    self.browser_state = ListState::default();
-                    self.browser_state.select(Some(pos));
-                }
-            }
+            return;
         }
+
+        let prev_dir = self.browser_dir.clone();
+        let is_parent = prev_dir.parent().map(|p| p == path).unwrap_or(false);
+
+        if is_parent {
+            self.pending_parent_restore = Some(prev_dir);
+        } else {
+            self.pending_parent_restore = None;
+        }
+
+        self.browser_dir = path;
+        self.browser_cursor = 0;
+        self.browser_state = ListState::default();
+        self.browser_state.select(Some(0));
+        self.refresh_browser();
     }
 
     pub fn open_spotlight(&mut self) {
@@ -520,6 +628,9 @@ impl AppUI {
             // Synchronize web server live state
             self.update_web_state();
 
+            // Poll background directory scan
+            self.poll_background_dir_scan();
+
             // Poll background metadata extraction
             self.poll_background_metadata();
 
@@ -681,6 +792,15 @@ impl AppUI {
                         (KeyCode::Char('q'), KeyModifiers::NONE)
                         | (KeyCode::Esc, KeyModifiers::NONE)
                         | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                            if key.code == KeyCode::Esc && self.browser_loading {
+                                if let Some(stop) = self.dir_scan_stop.take() {
+                                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                self.browser_loading = false;
+                                self.browser_load_start = None;
+                                self.status_message = "Cancelled directory scan".to_string();
+                                continue;
+                            }
                             crate::log_info!("ui", "Quit requested by user");
                             self.player.stop()?;
                             return Ok(());
@@ -1420,10 +1540,11 @@ impl AppUI {
         } else {
             format!(" ({}/{})", self.browser_cursor + 1, self.browser_entries.len())
         };
+        let loading_tag = if self.browser_loading { " [LOADING...]" } else { "" };
         let browser_title = if self.in_bookmarks_view {
-            format!(" BROWSER [★ Music Homes]{} {} ", count_tag, mode_tag)
+            format!(" BROWSER [★ Music Homes]{}{} {} ", count_tag, loading_tag, mode_tag)
         } else {
-            format!(" BROWSER [File System]{} {} ", count_tag, mode_tag)
+            format!(" BROWSER [File System]{}{} {} ", count_tag, loading_tag, mode_tag)
         };
         let browser_block = Block::default()
             .borders(Borders::ALL)
@@ -1444,7 +1565,7 @@ impl AppUI {
             std::collections::HashSet::new()
         };
 
-        let browser_items: Vec<ListItem> = self
+        let mut browser_items: Vec<ListItem> = self
             .browser_entries
             .iter()
             .enumerate()
@@ -1468,6 +1589,16 @@ impl AppUI {
                 ListItem::new(name.clone()).style(style)
             })
             .collect();
+
+        if self.browser_loading {
+            browser_items.push(
+                ListItem::new("  ⏳ Reading directory contents...").style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            );
+        }
 
         self.browser_state.select(Some(self.browser_cursor));
         let browser_list = List::new(browser_items).block(browser_block);
