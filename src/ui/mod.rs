@@ -644,13 +644,9 @@ impl AppUI {
                                 let meta_opt = self.metadata_cache.get(path).cloned()
                                     .or_else(|| crate::metadata::extract_metadata(path).ok());
                                 if let Some(meta) = meta_opt {
-                                    self.queue.add_track(meta.clone());
-                                    if !self.player.is_playing() && !self.player.is_paused() {
-                                        self.queue.current_index = self.queue.len().saturating_sub(1);
-                                        self.play_current_track();
-                                    } else {
-                                        self.status_message = format!("Added {}", meta.display_title());
-                                    }
+                                    self.queue.add_track(meta);
+                                    self.queue.current_index = self.queue.len().saturating_sub(1);
+                                    self.play_current_track();
                                 }
                             }
                         }
@@ -827,8 +823,13 @@ impl AppUI {
         if let Some(track) = self.queue.current_track() {
             let path = track.filepath.clone();
             let title = track.display_title().to_string();
-            if self.player.play(&path).is_ok() {
-                self.status_message = format!("Playing: {}", title);
+            match self.player.play(&path) {
+                Ok(_) => {
+                    self.status_message = format!("Playing: {}", title);
+                }
+                Err(e) => {
+                    self.status_message = format!("Playback error: {}", e);
+                }
             }
         }
     }
@@ -838,8 +839,13 @@ impl AppUI {
         if let Some(track) = self.queue.next_track(&mode) {
             let path = track.filepath.clone();
             let title = track.display_title().to_string();
-            if self.player.play(&path).is_ok() {
-                self.status_message = format!("Playing: {}", title);
+            match self.player.play(&path) {
+                Ok(_) => {
+                    self.status_message = format!("Playing: {}", title);
+                }
+                Err(e) => {
+                    self.status_message = format!("Playback error: {}", e);
+                }
             }
         }
     }
@@ -848,8 +854,13 @@ impl AppUI {
         if let Some(track) = self.queue.prev_track() {
             let path = track.filepath.clone();
             let title = track.display_title().to_string();
-            if self.player.play(&path).is_ok() {
-                self.status_message = format!("Playing: {}", title);
+            match self.player.play(&path) {
+                Ok(_) => {
+                    self.status_message = format!("Playing: {}", title);
+                }
+                Err(e) => {
+                    self.status_message = format!("Playback error: {}", e);
+                }
             }
         }
     }

@@ -91,7 +91,6 @@ impl LocalPlayer {
             .arg(format!("--volume={}", self.volume))
             .arg("--audio-display=no")
             .arg("--terminal=no")
-            .arg("--ao=auto,null")
             .arg("--msg-level=all=no")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -185,6 +184,9 @@ impl LocalPlayer {
                                             if reason == "eof" {
                                                 shared.is_finished.store(true, Ordering::SeqCst);
                                                 shared.is_playing.store(false, Ordering::SeqCst);
+                                            } else if reason == "error" {
+                                                shared.is_finished.store(false, Ordering::SeqCst);
+                                                shared.is_playing.store(false, Ordering::SeqCst);
                                             }
                                         }
                                     }
@@ -220,10 +222,10 @@ impl LocalPlayer {
     }
 
     pub fn is_track_finished(&mut self) -> bool {
-        if self.backend == "mpv" {
-            self.shared_state.is_finished.load(Ordering::SeqCst)
-        } else if let Some(child) = self.ffplay_child.as_mut() {
+        if let Some(child) = self.ffplay_child.as_mut() {
             child.try_wait().ok().flatten().is_some()
+        } else if self.backend == "mpv" {
+            self.shared_state.is_finished.load(Ordering::SeqCst)
         } else {
             false
         }
@@ -231,6 +233,26 @@ impl LocalPlayer {
 
     pub fn reset_finished(&self) {
         self.shared_state.is_finished.store(false, Ordering::SeqCst);
+    }
+
+    fn play_ffplay(&mut self, filepath: &Path) -> anyhow::Result<()> {
+        if let Some(mut child) = self.ffplay_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let mut cmd = Command::new("ffplay");
+        cmd.arg("-nodisp")
+            .arg("-autoexit")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-volume")
+            .arg(format!("{}", self.volume))
+            .arg(filepath);
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        self.ffplay_child = Some(cmd.spawn()?);
+        self.start_time = Some(Instant::now());
+        self.accumulated_offset = 0.0;
+        Ok(())
     }
 }
 
@@ -256,8 +278,9 @@ impl Drop for LocalPlayer {
 
 impl AudioPlayer for LocalPlayer {
     fn play(&mut self, filepath: &Path) -> anyhow::Result<()> {
-        self.current_file = Some(filepath.to_path_buf());
-        if let Ok(meta) = crate::metadata::extract_metadata(filepath) {
+        let abs_path = filepath.canonicalize().unwrap_or_else(|_| filepath.to_path_buf());
+        self.current_file = Some(abs_path.clone());
+        if let Ok(meta) = crate::metadata::extract_metadata(&abs_path) {
             *self.shared_state.duration.lock().unwrap() = meta.duration_seconds;
         } else {
             *self.shared_state.duration.lock().unwrap() = 0.0;
@@ -269,32 +292,25 @@ impl AudioPlayer for LocalPlayer {
         self.shared_state.is_paused.store(false, Ordering::SeqCst);
 
         if self.backend == "mpv" {
-            self.ensure_mpv_daemon()?;
-            let file_str = filepath.to_string_lossy();
-            let json_cmd = serde_json::json!({
-                "command": ["loadfile", file_str, "replace"]
-            })
-            .to_string();
-            self.send_command(&json_cmd)?;
-            self.send_command(r#"{"command": ["set_property", "pause", false]}"#)?;
-            Ok(())
-        } else {
-            // ffplay fallback
-            if let Some(mut child) = self.ffplay_child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
+            let mpv_res = (|| -> anyhow::Result<()> {
+                self.ensure_mpv_daemon()?;
+                let file_str = abs_path.to_string_lossy();
+                let json_cmd = serde_json::json!({
+                    "command": ["loadfile", file_str, "replace"]
+                })
+                .to_string();
+                self.send_command(&json_cmd)?;
+                self.send_command(r#"{"command": ["set_property", "pause", false]}"#)?;
+                Ok(())
+            })();
+
+            if mpv_res.is_err() {
+                // If mpv fails to spawn or connect, seamlessly fall back to ffplay
+                return self.play_ffplay(&abs_path);
             }
-            let mut cmd = Command::new("ffplay");
-            cmd.arg("-nodisp")
-                .arg("-autoexit")
-                .arg("-loglevel")
-                .arg("error")
-                .arg(filepath);
-            cmd.stdout(Stdio::null()).stderr(Stdio::null());
-            self.ffplay_child = Some(cmd.spawn()?);
-            self.start_time = Some(Instant::now());
-            self.accumulated_offset = 0.0;
-            Ok(())
+            mpv_res
+        } else {
+            self.play_ffplay(&abs_path)
         }
     }
 
@@ -304,12 +320,14 @@ impl AudioPlayer for LocalPlayer {
         }
         self.shared_state.is_paused.store(true, Ordering::SeqCst);
 
-        if self.backend == "mpv" {
-            self.send_command(r#"{"command": ["set_property", "pause", true]}"#)?;
-        } else if let Some(mut child) = self.ffplay_child.take() {
+        if self.ffplay_child.is_some() {
             self.accumulated_offset = self.position_seconds();
-            let _ = child.kill();
-            let _ = child.wait();
+            if let Some(mut child) = self.ffplay_child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        } else if self.backend == "mpv" {
+            self.send_command(r#"{"command": ["set_property", "pause", true]}"#)?;
         }
         Ok(())
     }
@@ -317,23 +335,25 @@ impl AudioPlayer for LocalPlayer {
     fn resume(&mut self) -> anyhow::Result<()> {
         self.shared_state.is_paused.store(false, Ordering::SeqCst);
 
-        if self.backend == "mpv" {
-            self.send_command(r#"{"command": ["set_property", "pause", false]}"#)?;
-            Ok(())
-        } else if let Some(file) = self.current_file.clone() {
-            let mut cmd = Command::new("ffplay");
-            cmd.arg("-nodisp")
-                .arg("-autoexit")
-                .arg("-loglevel")
-                .arg("error")
-                .arg("-ss")
-                .arg(format!("{:.2}", self.accumulated_offset))
-                .arg(file);
-            cmd.stdout(Stdio::null()).stderr(Stdio::null());
-            self.ffplay_child = Some(cmd.spawn()?);
-            self.start_time = Some(Instant::now());
+        if self.ffplay_child.is_some() || self.backend != "mpv" {
+            if let Some(file) = self.current_file.clone() {
+                let mut cmd = Command::new("ffplay");
+                cmd.arg("-nodisp")
+                    .arg("-autoexit")
+                    .arg("-loglevel")
+                    .arg("error")
+                    .arg("-ss")
+                    .arg(format!("{:.2}", self.accumulated_offset))
+                    .arg("-volume")
+                    .arg(format!("{}", self.volume))
+                    .arg(file);
+                cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                self.ffplay_child = Some(cmd.spawn()?);
+                self.start_time = Some(Instant::now());
+            }
             Ok(())
         } else {
+            self.send_command(r#"{"command": ["set_property", "pause", false]}"#)?;
             Ok(())
         }
     }
@@ -355,25 +375,18 @@ impl AudioPlayer for LocalPlayer {
         self.shared_state.is_finished.store(false, Ordering::SeqCst);
         *self.shared_state.position.lock().unwrap() = 0.0;
 
-        if self.backend == "mpv" {
-            let _ = self.send_command(r#"{"command": ["stop"]}"#);
-        }
         if let Some(mut child) = self.ffplay_child.take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if self.backend == "mpv" {
+            let _ = self.send_command(r#"{"command": ["stop"]}"#);
         }
         Ok(())
     }
 
     fn seek(&mut self, delta_seconds: f64) -> anyhow::Result<()> {
-        if self.backend == "mpv" {
-            let json_cmd = serde_json::json!({
-                "command": ["seek", delta_seconds, "relative"]
-            })
-            .to_string();
-            self.send_command(&json_cmd)?;
-            Ok(())
-        } else {
+        if self.ffplay_child.is_some() {
             let new_pos = (self.position_seconds() + delta_seconds).max(0.0);
             self.accumulated_offset = new_pos;
             if !self.is_paused() {
@@ -389,6 +402,8 @@ impl AudioPlayer for LocalPlayer {
                         .arg("error")
                         .arg("-ss")
                         .arg(format!("{:.2}", new_pos))
+                        .arg("-volume")
+                        .arg(format!("{}", self.volume))
                         .arg(file);
                     cmd.stdout(Stdio::null()).stderr(Stdio::null());
                     self.ffplay_child = Some(cmd.spawn()?);
@@ -396,17 +411,26 @@ impl AudioPlayer for LocalPlayer {
                 }
             }
             Ok(())
+        } else if self.backend == "mpv" {
+            let json_cmd = serde_json::json!({
+                "command": ["seek", delta_seconds, "relative"]
+            })
+            .to_string();
+            self.send_command(&json_cmd)?;
+            Ok(())
+        } else {
+            Ok(())
         }
     }
 
     fn set_volume(&mut self, volume: u8) -> anyhow::Result<()> {
         self.volume = volume.min(100);
-        if self.backend == "mpv" {
+        if self.backend == "mpv" && self.ffplay_child.is_none() {
             let json_cmd = serde_json::json!({
                 "command": ["set_property", "volume", self.volume]
             })
             .to_string();
-            self.send_command(&json_cmd)?;
+            let _ = self.send_command(&json_cmd);
         }
         Ok(())
     }
@@ -416,7 +440,11 @@ impl AudioPlayer for LocalPlayer {
     }
 
     fn is_playing(&self) -> bool {
-        self.shared_state.is_playing.load(Ordering::SeqCst) && !self.is_paused()
+        if self.ffplay_child.is_some() {
+            !self.is_paused()
+        } else {
+            self.shared_state.is_playing.load(Ordering::SeqCst) && !self.is_paused()
+        }
     }
 
     fn is_paused(&self) -> bool {
@@ -424,14 +452,18 @@ impl AudioPlayer for LocalPlayer {
     }
 
     fn position_seconds(&self) -> f64 {
-        if self.backend == "mpv" {
+        if self.ffplay_child.is_some() {
+            if let Some(start) = self.start_time {
+                let elapsed = start.elapsed().as_secs_f64();
+                let dur = *self.shared_state.duration.lock().unwrap();
+                (self.accumulated_offset + elapsed).min(dur)
+            } else {
+                self.accumulated_offset
+            }
+        } else if self.backend == "mpv" {
             *self.shared_state.position.lock().unwrap()
-        } else if let Some(start) = self.start_time {
-            let elapsed = start.elapsed().as_secs_f64();
-            let dur = *self.shared_state.duration.lock().unwrap();
-            (self.accumulated_offset + elapsed).min(dur)
         } else {
-            self.accumulated_offset
+            0.0
         }
     }
 
