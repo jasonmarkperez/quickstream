@@ -74,3 +74,59 @@ fn test_browser_metadata_view_toggle() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_browser_scrolling_beyond_viewport() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_scroll_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    // Create 40 dummy tracks so list is much taller than terminal viewport
+    for i in 0..40 {
+        let f = temp_dir.join(format!("track_{:02}.wav", i));
+        create_dummy_wav(&f);
+    }
+
+    let config_path = temp_dir.join("config.json");
+    let settings_mgr = SettingsManager::with_path(config_path);
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    let total_entries = app.browser_entries.len();
+    assert!(total_entries >= 40, "Should have at least 40 entries, found {}", total_entries);
+
+    // Set up a mock terminal with height 20 (viewport fits ~12 list items)
+    let backend = ratatui::backend::TestBackend::new(80, 20);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+    terminal.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.browser_cursor, 0);
+    assert_eq!(app.browser_state.selected(), Some(0));
+    assert_eq!(app.browser_state.offset(), 0);
+
+    // Move cursor down 25 times
+    for _ in 0..25 {
+        app.handle_tab_key(crossterm::event::KeyCode::Down);
+    }
+    assert_eq!(app.browser_cursor, 25);
+
+    // Render frame: ListState offset must advance beyond 0 so item 25 is visible in viewport
+    terminal.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.browser_state.selected(), Some(25));
+    assert!(
+        app.browser_state.offset() > 0,
+        "ListState offset ({}) must advance beyond 0 to scroll item 25 into view",
+        app.browser_state.offset()
+    );
+
+    // Test wraparound: Up at index 0 wraps to last item
+    app.browser_cursor = 0;
+    app.handle_tab_key(crossterm::event::KeyCode::Up);
+    assert_eq!(app.browser_cursor, total_entries - 1);
+
+    // Down at last item wraps to 0
+    app.handle_tab_key(crossterm::event::KeyCode::Down);
+    assert_eq!(app.browser_cursor, 0);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+

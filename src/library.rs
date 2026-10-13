@@ -106,8 +106,24 @@ impl LibraryManager {
 
     /// Scan a directory recursively using walkdir and extract metadata.
     pub fn scan_directory(dir: &Path) -> Vec<AudioMetadata> {
+        Self::scan_directory_scoped(dir)
+    }
+
+    /// Scan a directory and all subdirectories, avoiding symlink loops and hidden directories.
+    pub fn scan_directory_scoped(dir: &Path) -> Vec<AudioMetadata> {
         let mut tracks = Vec::new();
-        for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(dir)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| {
+                let name = e.file_name().to_string_lossy();
+                if name.starts_with('.') && name != "." && name != ".." {
+                    return false;
+                }
+                true
+            })
+            .filter_map(|e| e.ok())
+        {
             let path = entry.path();
             if path.is_file() && is_supported_audio_file(path) {
                 if let Ok(meta) = extract_metadata(path) {

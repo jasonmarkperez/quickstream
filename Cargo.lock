@@ -1088,6 +1088,7 @@ dependencies = [
  "crossterm",
  "ctrlc",
  "directories",
+ "fuzzy-matcher",
  "libc",
  "lofty",
  "ratatui",

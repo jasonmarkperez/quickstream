@@ -19,6 +19,7 @@ crossterm = "0.28"
 
 # Interactive Fuzzy Finding & Live Previews (modeled on mpv-music)
 skim = "0.10"
+fuzzy-matcher = "0.3"
 
 # CLI Parsing (modeled on mpv-music)
 clap = { version = "4.5", features = ["derive"] }

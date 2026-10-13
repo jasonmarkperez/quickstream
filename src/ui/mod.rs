@@ -13,8 +13,10 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
+pub mod search;
+
+use self::search::SearchModalState;
 use crate::discovery::DeviceManager;
-use crate::library::LibraryManager;
 use crate::metadata::is_supported_audio_file;
 use crate::paths;
 use crate::player::local::LocalPlayer;
@@ -40,6 +42,11 @@ pub struct AppUI {
     pub device_manager: DeviceManager,
     pub settings_mgr: SettingsManager,
     pub metadata_cache: std::collections::HashMap<PathBuf, crate::metadata::AudioMetadata>,
+    pub browser_state: ListState,
+    pub queue_state: ListState,
+    pub devices_state: ListState,
+    pub settings_state: ListState,
+    pub search_modal: Option<SearchModalState>,
 }
 
 impl AppUI {
@@ -68,6 +75,11 @@ impl AppUI {
             device_manager,
             settings_mgr,
             metadata_cache: std::collections::HashMap::new(),
+            browser_state: ListState::default(),
+            queue_state: ListState::default(),
+            devices_state: ListState::default(),
+            settings_state: ListState::default(),
+            search_modal: None,
         };
         app.refresh_browser();
         app
@@ -202,6 +214,52 @@ impl AppUI {
                         continue;
                     }
 
+                    if let Some(ref mut modal) = self.search_modal {
+                        match (key.code, key.modifiers) {
+                            (KeyCode::Esc, _) => {
+                                self.search_modal = None;
+                            }
+                            (KeyCode::Enter, KeyModifiers::NONE) => {
+                                if let Some(track) = modal.selected_track().cloned() {
+                                    self.queue.add_track(track.clone());
+                                    self.queue.current_index = self.queue.len().saturating_sub(1);
+                                    self.play_current_track();
+                                    self.status_message = format!("Playing: {}", track.display_title());
+                                }
+                                self.search_modal = None;
+                            }
+                            (KeyCode::Char('a'), KeyModifiers::NONE) => {
+                                if let Some(track) = modal.selected_track().cloned() {
+                                    self.queue.add_track(track.clone());
+                                    self.status_message = format!("Added to queue: {}", track.display_title());
+                                }
+                            }
+                            (KeyCode::Char('A'), _) => {
+                                let tracks = modal.all_filtered_tracks();
+                                let count = tracks.len();
+                                for t in tracks {
+                                    self.queue.add_track(t);
+                                }
+                                self.status_message = format!("Added {} tracks to queue", count);
+                                self.search_modal = None;
+                            }
+                            (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                                modal.move_selection_up();
+                            }
+                            (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                                modal.move_selection_down();
+                            }
+                            (KeyCode::Backspace, _) => {
+                                modal.backspace();
+                            }
+                            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                                modal.append_char(c);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // Global hotkeys
                     match (key.code, key.modifiers) {
                         (KeyCode::Char('q'), KeyModifiers::NONE) | (KeyCode::Esc, KeyModifiers::NONE) => {
@@ -280,8 +338,7 @@ impl AppUI {
                             );
                         }
                         (KeyCode::Char('/') | KeyCode::Char('f'), KeyModifiers::NONE) => {
-                            // Skim interactive fuzzy search
-                            self.trigger_skim_search(terminal)?;
+                            self.open_fuzzy_search();
                         }
                         _ => {
                             // Tab specific key handling
@@ -293,36 +350,32 @@ impl AppUI {
         }
     }
 
-    fn trigger_skim_search<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> anyhow::Result<()> {
-        disable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, LeaveAlternateScreen)?;
-
-        let mut tracks = LibraryManager::load_cache();
-        if tracks.is_empty() {
-            tracks = LibraryManager::scan_directory(&self.browser_dir);
-            LibraryManager::save_cache(&tracks);
-        }
-
-        let selected = LibraryManager::search_with_skim(&tracks);
-
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
-        terminal.clear()?;
-
-        if !selected.is_empty() {
-            let count = selected.len();
-            for track in selected {
-                self.queue.add_track(track);
+    pub fn open_fuzzy_search(&mut self) {
+        let target_dir = if self.in_bookmarks_view {
+            if self.browser_cursor > 0 && self.browser_cursor <= self.bookmarks.len() {
+                PathBuf::from(&self.bookmarks[self.browser_cursor - 1])
+            } else {
+                self.browser_dir.clone()
             }
-            self.status_message = format!("Added {} tracks via Skim search", count);
+        } else {
+            self.browser_dir.clone()
+        };
+
+        let tracks = crate::library::LibraryManager::scan_directory_scoped(&target_dir);
+        for t in &tracks {
+            self.metadata_cache.insert(t.filepath.clone(), t.clone());
         }
 
-        Ok(())
+        self.status_message = format!(
+            "Fuzzy search: indexed {} tracks in {}",
+            tracks.len(),
+            target_dir.file_name().unwrap_or_default().to_string_lossy()
+        );
+        let modal = search::SearchModalState::new(target_dir, tracks);
+        self.search_modal = Some(modal);
     }
 
-    fn handle_tab_key(&mut self, code: KeyCode) {
+    pub fn handle_tab_key(&mut self, code: KeyCode) {
         match self.active_tab {
             0 => {
                 // Queue Tab (Split pane)
@@ -550,7 +603,7 @@ impl AppUI {
         }
     }
 
-    fn render(&self, f: &mut Frame) {
+    pub fn render(&mut self, f: &mut Frame) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -571,7 +624,9 @@ impl AppUI {
 
         self.render_bottom_bar(f, chunks[2]);
 
-        if self.show_help_modal {
+        if let Some(ref mut modal) = self.search_modal {
+            Self::render_search_modal(modal, f);
+        } else if self.show_help_modal {
             self.render_help_modal(f);
         }
     }
@@ -590,7 +645,7 @@ impl AppUI {
         f.render_widget(tabs, area);
     }
 
-    fn render_queue_tab(&self, f: &mut Frame, area: Rect) {
+    fn render_queue_tab(&mut self, f: &mut Frame, area: Rect) {
         let split = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -632,8 +687,16 @@ impl AppUI {
             })
             .collect();
 
+        self.browser_state.select(Some(self.browser_cursor));
         let browser_list = List::new(browser_items).block(browser_block);
-        f.render_widget(browser_list, split[0]);
+        f.render_stateful_widget(browser_list, split[0], &mut self.browser_state);
+
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("▲"))
+            .end_symbol(Some("▼"));
+        let mut browser_scroll_state = ScrollbarState::new(self.browser_entries.len().saturating_sub(1))
+            .position(self.browser_cursor);
+        f.render_stateful_widget(scrollbar.clone(), split[0], &mut browser_scroll_state);
 
         // Right Pane: Queue
         let queue_block = Block::default()
@@ -666,11 +729,16 @@ impl AppUI {
             })
             .collect();
 
+        self.queue_state.select(Some(self.queue_cursor));
         let queue_list = List::new(queue_items).block(queue_block);
-        f.render_widget(queue_list, split[1]);
+        f.render_stateful_widget(queue_list, split[1], &mut self.queue_state);
+
+        let mut queue_scroll_state = ScrollbarState::new(self.queue.len().saturating_sub(1))
+            .position(self.queue_cursor);
+        f.render_stateful_widget(scrollbar, split[1], &mut queue_scroll_state);
     }
 
-    fn render_devices_tab(&self, f: &mut Frame, area: Rect) {
+    fn render_devices_tab(&mut self, f: &mut Frame, area: Rect) {
         let is_scanning = self.device_manager.is_scanning();
         let title = if is_scanning {
             " AUDIO OUTPUT DEVICES (Scanning...) "
@@ -719,11 +787,19 @@ impl AppUI {
             items.push(ListItem::new("  (Searching for DLNA / UPnP MediaRenderers...)").style(Style::default().fg(Color::DarkGray)));
         }
 
+        self.devices_state.select(Some(self.devices_cursor));
         let list = List::new(items).block(block);
-        f.render_widget(list, area);
+        f.render_stateful_widget(list, area, &mut self.devices_state);
+
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("▲"))
+            .end_symbol(Some("▼"));
+        let mut scroll_state = ScrollbarState::new((devices.len() + 1).saturating_sub(1))
+            .position(self.devices_cursor);
+        f.render_stateful_widget(scrollbar, area, &mut scroll_state);
     }
 
-    fn render_settings_tab(&self, f: &mut Frame, area: Rect) {
+    fn render_settings_tab(&mut self, f: &mut Frame, area: Rect) {
         let block = Block::default().borders(Borders::ALL).title(" APPLICATION SETTINGS ");
 
         let items: Vec<ListItem> = SETTING_DEFINITIONS
@@ -741,8 +817,201 @@ impl AppUI {
             })
             .collect();
 
+        self.settings_state.select(Some(self.settings_cursor));
         let list = List::new(items).block(block);
-        f.render_widget(list, area);
+        f.render_stateful_widget(list, area, &mut self.settings_state);
+    }
+
+    fn render_search_modal(modal: &mut SearchModalState, f: &mut Frame) {
+        let area = centered_rect(84, 80, f.area());
+        f.render_widget(Clear, area);
+
+        let dir_name = modal
+            .root_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| modal.root_dir.to_string_lossy().to_string());
+
+        let outer_block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" [🔍 Fuzzy Search: {}] ", dir_name))
+            .border_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            );
+        let inner_area = outer_block.inner(area);
+        f.render_widget(outer_block, area);
+
+        let vertical = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // Search input bar
+                Constraint::Min(5),    // Results and detail split
+                Constraint::Length(3), // Action legend bar
+            ])
+            .split(inner_area);
+
+        // 1. Search Query Input Bar
+        let match_count = modal.filtered.len();
+        let total_count = modal.all_tracks.len();
+        let query_title = format!(" Search Query ({} of {} tracks matched) ", match_count, total_count);
+        let input_block = Block::default()
+            .borders(Borders::ALL)
+            .title(query_title)
+            .border_style(Style::default().fg(Color::Cyan));
+        let query_text = format!("🔍 {}█", modal.query);
+        let input_widget = Paragraph::new(query_text)
+            .block(input_block)
+            .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
+        f.render_widget(input_widget, vertical[0]);
+
+        // 2. Split Workspace: Results list on Left, Track detail card on Right
+        let content_split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(vertical[1]);
+
+        // Results list
+        let results_items: Vec<ListItem> = modal
+            .filtered
+            .iter()
+            .enumerate()
+            .map(|(idx, (_, track))| {
+                let label = track.format_display_label(true);
+                let style = if idx == modal.selected_index {
+                    Style::default()
+                        .bg(Color::Blue)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                ListItem::new(label).style(style)
+            })
+            .collect();
+
+        let results_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Ranked Matches ")
+            .border_style(Style::default().fg(Color::DarkGray));
+        let results_list = List::new(results_items).block(results_block);
+        f.render_stateful_widget(results_list, content_split[0], &mut modal.list_state);
+
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("▲"))
+            .end_symbol(Some("▼"));
+        let mut scroll_state = ScrollbarState::new(modal.filtered.len().saturating_sub(1))
+            .position(modal.selected_index);
+        f.render_stateful_widget(scrollbar, content_split[0], &mut scroll_state);
+
+        // Track detail card
+        let detail_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Track Details ")
+            .border_style(Style::default().fg(Color::DarkGray));
+
+        if let Some(track) = modal.selected_track() {
+            let rel_path = track
+                .filepath
+                .strip_prefix(&modal.root_dir)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| track.filepath.to_string_lossy().to_string());
+
+            let detail_lines = vec![
+                Line::from(vec![
+                    Span::styled("Title:    ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        track.display_title(),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Artist:   ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        if track.artist.is_empty() {
+                            "<Unknown>"
+                        } else {
+                            &track.artist
+                        },
+                        Style::default().fg(Color::White),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Album:    ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        if track.album.is_empty() {
+                            "<Unknown>"
+                        } else {
+                            &track.album
+                        },
+                        Style::default().fg(Color::White),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Duration: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        track.formatted_duration(),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Format:   ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "{} ({} kbps, {} Hz)",
+                            track.format_name, track.bitrate_kbps, track.sample_rate_hz
+                        ),
+                        Style::default().fg(Color::Green),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Channels: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}", track.channels),
+                        Style::default().fg(Color::White),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Size:     ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{:.2} MB", track.file_size as f64 / 1_048_576.0),
+                        Style::default().fg(Color::White),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    "Relative Path:",
+                    Style::default().fg(Color::DarkGray),
+                )]),
+                Line::from(vec![Span::styled(
+                    rel_path,
+                    Style::default().fg(Color::Blue),
+                )]),
+            ];
+            let detail_p = Paragraph::new(detail_lines).block(detail_block);
+            f.render_widget(detail_p, content_split[1]);
+        } else {
+            let empty_p = Paragraph::new("No tracks match your query.")
+                .block(detail_block)
+                .style(Style::default().fg(Color::DarkGray));
+            f.render_widget(empty_p, content_split[1]);
+        }
+
+        // 3. Action legend bar
+        let action_spans = vec![
+            Span::styled(" [Enter] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Play Now  │  "),
+            Span::styled(" [a] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw("Add to Queue  │  "),
+            Span::styled(" [Shift+A] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(format!("Add All ({})  │  ", match_count)),
+            Span::styled(" [Esc] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::raw("Cancel"),
+        ];
+        let action_block = Block::default().borders(Borders::ALL);
+        let action_p = Paragraph::new(Line::from(action_spans)).block(action_block);
+        f.render_widget(action_p, vertical[2]);
     }
 
     fn render_bottom_bar(&self, f: &mut Frame, area: Rect) {
@@ -812,7 +1081,7 @@ impl AppUI {
             Line::from("[h] / [l]        : Focus Browser vs Queue"),
             Line::from("[j] / [k]        : Move Selection Up / Down (wraps around)"),
             Line::from("[Enter]          : Open folder / Add file to queue / Play track"),
-            Line::from("[/] or [f]       : Skim Fuzzy Search across Library"),
+            Line::from("[/] or [f]       : Fuzzy Search current folder & subfolders"),
             Line::from("[a]              : Add all audio files in folder to queue"),
             Line::from("[b]              : Bookmark / Unbookmark folder in Music Homes"),
             Line::from("[d] / [x]        : Remove item from queue or bookmarks"),
