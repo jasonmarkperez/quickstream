@@ -512,6 +512,7 @@ class AppTUI:
             "   [t] Toggle Transcoding           ",
             "                                    ",
             " Browser & Queue:                   ",
+            "   [PgDn/PgUp] Page Up / Down List  ",
             "   [b] Bookmark / Unbookmark Folder ",
             "   [d/x] Remove Track or Bookmark   ",
             "   [a] Add All in Folder to Queue   ",
@@ -941,13 +942,13 @@ class AppTUI:
             self._seek_relative(-self.settings.seek_step_seconds)
             return
 
-        # Global Seek Forward 30s ('PageDown', ']')
-        if key in (curses.KEY_NPAGE, ord("]")):
+        # Global Seek Forward 30s (']')
+        if key == ord("]"):
             self._seek_relative(30.0)
             return
 
-        # Global Seek Backward 30s ('PageUp', '[')
-        if key in (curses.KEY_PPAGE, ord("[")):
+        # Global Seek Backward 30s ('[')
+        if key == ord("["):
             self._seek_relative(-30.0)
             return
 
@@ -1183,6 +1184,38 @@ class AppTUI:
                     self.queue_cursor += 1
                 else:
                     self.queue_cursor = 0
+
+        # Page Up
+        elif key in (getattr(curses, "KEY_PPAGE", 339), 21, 2, ord("K")):
+            step = 15
+            if len(self.queue) > 0:
+                if self.queue_cursor >= step:
+                    self.queue_cursor -= step
+                elif self.queue_cursor > 0:
+                    self.queue_cursor = 0
+                else:
+                    self.queue_cursor = max_idx
+
+        # Page Down
+        elif key in (getattr(curses, "KEY_NPAGE", 338), 4, 6, ord("J")):
+            step = 15
+            if len(self.queue) > 0:
+                if self.queue_cursor + step <= max_idx:
+                    self.queue_cursor += step
+                elif self.queue_cursor < max_idx:
+                    self.queue_cursor = max_idx
+                else:
+                    self.queue_cursor = 0
+
+        # Home
+        elif key in (getattr(curses, "KEY_HOME", -1), ord("g")):
+            if len(self.queue) > 0:
+                self.queue_cursor = 0
+
+        # End
+        elif key in (getattr(curses, "KEY_END", -1), ord("G")):
+            if len(self.queue) > 0:
+                self.queue_cursor = max_idx
 
         # Play highlighted track
         elif key in (curses.KEY_ENTER, 10, 13):

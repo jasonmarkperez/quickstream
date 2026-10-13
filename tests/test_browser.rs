@@ -130,3 +130,87 @@ fn test_browser_scrolling_beyond_viewport() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_browser_paging_and_jump_shortcuts() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_page_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    // Create 50 dummy tracks
+    for i in 0..50 {
+        let f = temp_dir.join(format!("track_{:02}.wav", i));
+        create_dummy_wav(&f);
+    }
+
+    let config_path = temp_dir.join("config.json");
+    let settings_mgr = SettingsManager::with_path(config_path);
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    app.browser_page_height = 10;
+
+    let total_entries = app.browser_entries.len();
+    assert!(total_entries >= 50, "Total entries should be at least 50");
+    let last_idx = total_entries - 1;
+
+    assert_eq!(app.browser_cursor, 0);
+
+    // 1. PageDown key jumps by page height (10)
+    app.handle_tab_key(crossterm::event::KeyCode::PageDown);
+    assert_eq!(app.browser_cursor, 10);
+
+    // 2. Ctrl+D jumps by page height (10 -> 20)
+    app.handle_tab_key_with_modifiers(
+        crossterm::event::KeyCode::Char('d'),
+        crossterm::event::KeyModifiers::CONTROL,
+    );
+    assert_eq!(app.browser_cursor, 20);
+
+    // 3. Shift+J (uppercase J) jumps by page height (20 -> 30)
+    app.handle_tab_key_with_modifiers(
+        crossterm::event::KeyCode::Char('J'),
+        crossterm::event::KeyModifiers::SHIFT,
+    );
+    assert_eq!(app.browser_cursor, 30);
+
+    // 4. Ctrl+F jumps by page height (30 -> 40)
+    app.handle_tab_key_with_modifiers(
+        crossterm::event::KeyCode::Char('f'),
+        crossterm::event::KeyModifiers::CONTROL,
+    );
+    assert_eq!(app.browser_cursor, 40);
+
+    // 5. End / G jumps directly to last item
+    app.handle_tab_key_with_modifiers(
+        crossterm::event::KeyCode::Char('G'),
+        crossterm::event::KeyModifiers::SHIFT,
+    );
+    assert_eq!(app.browser_cursor, last_idx);
+
+    // 6. PageDown at last item wraps to 0
+    app.handle_tab_key(crossterm::event::KeyCode::PageDown);
+    assert_eq!(app.browser_cursor, 0);
+
+    // 7. PageUp at 0 wraps to last item
+    app.handle_tab_key(crossterm::event::KeyCode::PageUp);
+    assert_eq!(app.browser_cursor, last_idx);
+
+    // 8. Ctrl+U jumps up by page height
+    app.handle_tab_key_with_modifiers(
+        crossterm::event::KeyCode::Char('u'),
+        crossterm::event::KeyModifiers::CONTROL,
+    );
+    assert_eq!(app.browser_cursor, last_idx - 10);
+
+    // 9. Shift+K jumps up by page height
+    app.handle_tab_key_with_modifiers(
+        crossterm::event::KeyCode::Char('K'),
+        crossterm::event::KeyModifiers::SHIFT,
+    );
+    assert_eq!(app.browser_cursor, last_idx - 20);
+
+    // 10. Home / g jumps directly to index 0
+    app.handle_tab_key(crossterm::event::KeyCode::Home);
+    assert_eq!(app.browser_cursor, 0);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+

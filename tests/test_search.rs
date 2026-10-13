@@ -369,4 +369,58 @@ fn test_flutter_vs_future_sound_of_london() {
     assert_eq!(modal.selected_track().unwrap().title, "Flutter");
 }
 
+#[test]
+fn test_search_modal_paging_and_jumping() {
+    let root = PathBuf::from("/music");
+    let tracks: Vec<AudioMetadata> = (0..30)
+        .map(|i| AudioMetadata {
+            filepath: root.join(format!("track_{:02}.flac", i)),
+            filename: format!("track_{:02}.flac", i),
+            title: format!("Track {:02}", i),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            genre: "Rock".to_string(),
+            format_name: "FLAC".to_string(),
+            duration_seconds: 120.0,
+            file_size: 1000,
+            bitrate_kbps: 900,
+            sample_rate_hz: 44100,
+            channels: 2,
+        })
+        .collect();
+
+    let mut modal = SearchModalState::new(root, tracks);
+    assert_eq!(modal.filtered.len(), 30);
+    assert_eq!(modal.selected_index, 0);
+
+    // Page down by 10
+    modal.page_down(10);
+    assert_eq!(modal.selected_index, 10);
+
+    // Page down by 10 again
+    modal.page_down(10);
+    assert_eq!(modal.selected_index, 20);
+
+    // End jumps to 29
+    modal.end();
+    assert_eq!(modal.selected_index, 29);
+
+    // Page down at last item wraps to 0
+    modal.page_down(10);
+    assert_eq!(modal.selected_index, 0);
+
+    // Page up at 0 wraps to 29
+    modal.page_up(10);
+    assert_eq!(modal.selected_index, 29);
+
+    // Page up by 10
+    modal.page_up(10);
+    assert_eq!(modal.selected_index, 19);
+
+    // Home jumps to 0
+    modal.home();
+    assert_eq!(modal.selected_index, 0);
+}
+
+
 

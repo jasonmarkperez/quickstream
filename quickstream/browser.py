@@ -199,10 +199,11 @@ class FileBrowser:
             pass
 
         # Path info
+        count_str = f" ({self.cursor_idx + 1}/{len(self.entries)})" if self.entries else ""
         if self.in_bookmarks_view:
-            path_str = "Location: ★ Music Homes"
+            path_str = f"Location: ★ Music Homes{count_str}"
         else:
-            path_str = f"Location: {self.current_dir.name}"
+            path_str = f"Location: {self.current_dir.name}{count_str}"
 
         try:
             stdscr.addstr(start_y + 1, start_x + 1, path_str[: width - 2], curses.A_DIM)
@@ -212,6 +213,7 @@ class FileBrowser:
 
         # List
         list_height = max(1, height - 5)
+        self.last_list_height = list_height
 
         # Ensure cursor is visible
         if self.cursor_idx < self.scroll_offset:
@@ -255,14 +257,47 @@ class FileBrowser:
         try:
             stdscr.addstr(footer_row, start_x + 1, "─" * min(width - 2, 76), curses.A_DIM)
             if self.in_bookmarks_view:
-                controls = "[Enter] Open  [d/x] Remove Bookmark  [r] Refresh"
+                controls = "[PgDn/PgUp] Page  [Enter] Open  [d/x] Remove  [r] Refresh"
             else:
                 is_bm = str(self.current_dir) in self.bookmarks
                 bm_label = "[b] Unbookmark" if is_bm else "[b] Bookmark"
-                controls = f"[Enter] Open/Add  [v] Mode  {bm_label}  [a] All"
+                controls = f"[PgDn/PgUp] Page  [Enter] Open/Add  [v] Mode  {bm_label}  [a] All"
             stdscr.addstr(footer_row + 1, start_x + 1, controls[: width - 2], base_attr)
         except curses.error:
             pass
+
+    def page_up(self, step: int = 15) -> None:
+        """Page up through entries."""
+        if not self.entries:
+            return
+        if self.cursor_idx >= step:
+            self.cursor_idx -= step
+        elif self.cursor_idx > 0:
+            self.cursor_idx = 0
+        else:
+            self.cursor_idx = len(self.entries) - 1
+
+    def page_down(self, step: int = 15) -> None:
+        """Page down through entries."""
+        if not self.entries:
+            return
+        max_idx = len(self.entries) - 1
+        if self.cursor_idx + step <= max_idx:
+            self.cursor_idx += step
+        elif self.cursor_idx < max_idx:
+            self.cursor_idx = max_idx
+        else:
+            self.cursor_idx = 0
+
+    def home(self) -> None:
+        """Jump to first entry."""
+        if self.entries:
+            self.cursor_idx = 0
+
+    def end(self) -> None:
+        """Jump to last entry."""
+        if self.entries:
+            self.cursor_idx = len(self.entries) - 1
 
     def handle_key(self, key: int) -> Tuple[bool, Optional[List[Path]], Optional[str]]:
         """
@@ -272,7 +307,7 @@ class FileBrowser:
         max_idx = max(0, len(self.entries) - 1)
 
         # Navigation Up
-        if key in (curses.KEY_UP, ord("k"), ord("K")):
+        if key in (curses.KEY_UP, ord("k")):
             if len(self.entries) > 0:
                 if self.cursor_idx > 0:
                     self.cursor_idx -= 1
@@ -280,12 +315,34 @@ class FileBrowser:
                     self.cursor_idx = max_idx
 
         # Navigation Down
-        elif key in (curses.KEY_DOWN, ord("j"), ord("J")):
+        elif key in (curses.KEY_DOWN, ord("j")):
             if len(self.entries) > 0:
                 if self.cursor_idx < max_idx:
                     self.cursor_idx += 1
                 else:
                     self.cursor_idx = 0
+
+        # Page Up
+        elif key in (getattr(curses, "KEY_PPAGE", 339), 21, 2, ord("K")):
+            step = getattr(self, "last_list_height", 15)
+            self.page_up(step)
+            return False, None, None
+
+        # Page Down
+        elif key in (getattr(curses, "KEY_NPAGE", 338), 4, 6, ord("J")):
+            step = getattr(self, "last_list_height", 15)
+            self.page_down(step)
+            return False, None, None
+
+        # Home
+        elif key in (getattr(curses, "KEY_HOME", -1), ord("g")):
+            self.home()
+            return False, None, None
+
+        # End
+        elif key in (getattr(curses, "KEY_END", -1), ord("G")):
+            self.end()
+            return False, None, None
 
         # Toggle Metadata / Filename View
         elif key in (ord("v"), ord("V")):

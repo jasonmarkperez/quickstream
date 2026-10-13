@@ -47,6 +47,8 @@ pub struct AppUI {
     pub devices_state: ListState,
     pub settings_state: ListState,
     pub search_modal: Option<SearchModalState>,
+    pub browser_page_height: usize,
+    pub queue_page_height: usize,
 }
 
 impl AppUI {
@@ -80,6 +82,8 @@ impl AppUI {
             devices_state: ListState::default(),
             settings_state: ListState::default(),
             search_modal: None,
+            browser_page_height: 15,
+            queue_page_height: 15,
         };
         app.refresh_browser();
         app
@@ -179,6 +183,90 @@ impl AppUI {
         self.browser_cursor = old_cursor.min(self.browser_entries.len().saturating_sub(1));
     }
 
+    pub fn page_down_browser(&mut self) {
+        if self.browser_entries.is_empty() {
+            return;
+        }
+        let len = self.browser_entries.len();
+        let step = self.browser_page_height.max(1);
+        if self.browser_cursor + step < len {
+            self.browser_cursor += step;
+        } else if self.browser_cursor < len - 1 {
+            self.browser_cursor = len - 1;
+        } else {
+            self.browser_cursor = 0;
+        }
+    }
+
+    pub fn page_up_browser(&mut self) {
+        if self.browser_entries.is_empty() {
+            return;
+        }
+        let len = self.browser_entries.len();
+        let step = self.browser_page_height.max(1);
+        if self.browser_cursor >= step {
+            self.browser_cursor -= step;
+        } else if self.browser_cursor > 0 {
+            self.browser_cursor = 0;
+        } else {
+            self.browser_cursor = len - 1;
+        }
+    }
+
+    pub fn home_browser(&mut self) {
+        if !self.browser_entries.is_empty() {
+            self.browser_cursor = 0;
+        }
+    }
+
+    pub fn end_browser(&mut self) {
+        if !self.browser_entries.is_empty() {
+            self.browser_cursor = self.browser_entries.len() - 1;
+        }
+    }
+
+    pub fn page_down_queue(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+        let len = self.queue.len();
+        let step = self.queue_page_height.max(1);
+        if self.queue_cursor + step < len {
+            self.queue_cursor += step;
+        } else if self.queue_cursor < len - 1 {
+            self.queue_cursor = len - 1;
+        } else {
+            self.queue_cursor = 0;
+        }
+    }
+
+    pub fn page_up_queue(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+        let len = self.queue.len();
+        let step = self.queue_page_height.max(1);
+        if self.queue_cursor >= step {
+            self.queue_cursor -= step;
+        } else if self.queue_cursor > 0 {
+            self.queue_cursor = 0;
+        } else {
+            self.queue_cursor = len - 1;
+        }
+    }
+
+    pub fn home_queue(&mut self) {
+        if !self.queue.is_empty() {
+            self.queue_cursor = 0;
+        }
+    }
+
+    pub fn end_queue(&mut self) {
+        if !self.queue.is_empty() {
+            self.queue_cursor = self.queue.len().saturating_sub(1);
+        }
+    }
+
     pub fn run(&mut self) -> anyhow::Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -259,6 +347,22 @@ impl AppUI {
                             }
                             (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
                                 modal.move_selection_down();
+                            }
+                            (KeyCode::PageUp, _)
+                            | (KeyCode::Char('u'), KeyModifiers::CONTROL)
+                            | (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+                                modal.page_up(15);
+                            }
+                            (KeyCode::PageDown, _)
+                            | (KeyCode::Char('d'), KeyModifiers::CONTROL)
+                            | (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+                                modal.page_down(15);
+                            }
+                            (KeyCode::Home, _) => {
+                                modal.home();
+                            }
+                            (KeyCode::End, _) => {
+                                modal.end();
                             }
                             (KeyCode::Backspace, _) => {
                                 modal.backspace();
@@ -353,7 +457,7 @@ impl AppUI {
                         }
                         _ => {
                             // Tab specific key handling
-                            self.handle_tab_key(key.code);
+                            self.handle_tab_key_with_modifiers(key.code, key.modifiers);
                         }
                     }
                 }
@@ -412,13 +516,17 @@ impl AppUI {
     }
 
     pub fn handle_tab_key(&mut self, code: KeyCode) {
+        self.handle_tab_key_with_modifiers(code, KeyModifiers::NONE);
+    }
+
+    pub fn handle_tab_key_with_modifiers(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         match self.active_tab {
             0 => {
                 // Queue Tab (Split pane)
-                match code {
-                    KeyCode::Char('h') => self.queue_focus = false,
-                    KeyCode::Char('l') => self.queue_focus = true,
-                    KeyCode::Up | KeyCode::Char('k') => {
+                match (code, modifiers) {
+                    (KeyCode::Char('h'), KeyModifiers::NONE) => self.queue_focus = false,
+                    (KeyCode::Char('l'), KeyModifiers::NONE) => self.queue_focus = true,
+                    (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
                         if self.queue_focus {
                             if !self.queue.is_empty() {
                                 if self.queue_cursor > 0 {
@@ -435,7 +543,7 @@ impl AppUI {
                             }
                         }
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
+                    (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
                         if self.queue_focus {
                             if !self.queue.is_empty() {
                                 if self.queue_cursor + 1 < self.queue.len() {
@@ -452,7 +560,41 @@ impl AppUI {
                             }
                         }
                     }
-                    KeyCode::Enter => {
+                    (KeyCode::PageUp, _)
+                    | (KeyCode::Char('u'), KeyModifiers::CONTROL)
+                    | (KeyCode::Char('b'), KeyModifiers::CONTROL)
+                    | (KeyCode::Char('K'), _) => {
+                        if self.queue_focus {
+                            self.page_up_queue();
+                        } else {
+                            self.page_up_browser();
+                        }
+                    }
+                    (KeyCode::PageDown, _)
+                    | (KeyCode::Char('d'), KeyModifiers::CONTROL)
+                    | (KeyCode::Char('f'), KeyModifiers::CONTROL)
+                    | (KeyCode::Char('J'), _) => {
+                        if self.queue_focus {
+                            self.page_down_queue();
+                        } else {
+                            self.page_down_browser();
+                        }
+                    }
+                    (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => {
+                        if self.queue_focus {
+                            self.home_queue();
+                        } else {
+                            self.home_browser();
+                        }
+                    }
+                    (KeyCode::End, _) | (KeyCode::Char('G'), _) => {
+                        if self.queue_focus {
+                            self.end_queue();
+                        } else {
+                            self.end_browser();
+                        }
+                    }
+                    (KeyCode::Enter, KeyModifiers::NONE) => {
                         if self.queue_focus {
                             self.queue.current_index = self.queue_cursor;
                             self.play_current_track();
@@ -486,7 +628,7 @@ impl AppUI {
                             }
                         }
                     }
-                    KeyCode::Char('a') if !self.in_bookmarks_view => {
+                    (KeyCode::Char('a'), KeyModifiers::NONE) if !self.in_bookmarks_view => {
                         let mut added = 0;
                         for (_, path, is_dir) in &self.browser_entries {
                             if !is_dir {
@@ -500,7 +642,7 @@ impl AppUI {
                         }
                         self.status_message = format!("Added {} tracks", added);
                     }
-                    KeyCode::Char('b') => {
+                    (KeyCode::Char('b'), KeyModifiers::NONE) => {
                         // Toggle bookmark
                         let path_str = self.browser_dir.to_string_lossy().to_string();
                         if self.bookmarks.contains(&path_str) {
@@ -513,7 +655,9 @@ impl AppUI {
                             self.status_message = "Saved bookmark".to_string();
                         }
                     }
-                    KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Delete => {
+                    (KeyCode::Char('d'), KeyModifiers::NONE)
+                    | (KeyCode::Char('x'), KeyModifiers::NONE)
+                    | (KeyCode::Delete, _) => {
                         if self.queue_focus {
                             if let Some(removed) = self.queue.remove_track(self.queue_cursor) {
                                 self.status_message = format!("Removed {}", removed.display_title());
@@ -528,7 +672,7 @@ impl AppUI {
                             }
                         }
                     }
-                    KeyCode::Char('c') if self.queue_focus => {
+                    (KeyCode::Char('c'), KeyModifiers::NONE) if self.queue_focus => {
                         self.queue.clear();
                         self.status_message = "Cleared queue".to_string();
                     }
@@ -539,22 +683,52 @@ impl AppUI {
                 // Devices Tab
                 let devices = self.device_manager.get_devices();
                 let total_devices = 1 + devices.len(); // 0 is Local Audio, 1.. are DLNA renderers
-                match code {
-                    KeyCode::Up | KeyCode::Char('k') => {
+                match (code, modifiers) {
+                    (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
                         if self.devices_cursor > 0 {
                             self.devices_cursor -= 1;
                         } else {
                             self.devices_cursor = total_devices.saturating_sub(1);
                         }
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
+                    (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
                         if self.devices_cursor + 1 < total_devices {
                             self.devices_cursor += 1;
                         } else {
                             self.devices_cursor = 0;
                         }
                     }
-                    KeyCode::Enter => {
+                    (KeyCode::PageUp, _)
+                    | (KeyCode::Char('u'), KeyModifiers::CONTROL)
+                    | (KeyCode::Char('K'), _) => {
+                        let step = 10;
+                        if self.devices_cursor >= step {
+                            self.devices_cursor -= step;
+                        } else if self.devices_cursor > 0 {
+                            self.devices_cursor = 0;
+                        } else {
+                            self.devices_cursor = total_devices.saturating_sub(1);
+                        }
+                    }
+                    (KeyCode::PageDown, _)
+                    | (KeyCode::Char('d'), KeyModifiers::CONTROL)
+                    | (KeyCode::Char('J'), _) => {
+                        let step = 10;
+                        if self.devices_cursor + step < total_devices {
+                            self.devices_cursor += step;
+                        } else if self.devices_cursor < total_devices.saturating_sub(1) {
+                            self.devices_cursor = total_devices.saturating_sub(1);
+                        } else {
+                            self.devices_cursor = 0;
+                        }
+                    }
+                    (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => {
+                        self.devices_cursor = 0;
+                    }
+                    (KeyCode::End, _) | (KeyCode::Char('G'), _) => {
+                        self.devices_cursor = total_devices.saturating_sub(1);
+                    }
+                    (KeyCode::Enter, KeyModifiers::NONE) => {
                         if self.devices_cursor == 0 {
                             self.device_manager.set_active_device(None);
                             self.status_message = "Active output: Local Audio".to_string();
@@ -563,7 +737,7 @@ impl AppUI {
                             self.status_message = format!("Active output: {}", dev.friendly_name);
                         }
                     }
-                    KeyCode::Char('r') => {
+                    (KeyCode::Char('r'), KeyModifiers::NONE) => {
                         self.device_manager.start_background_scan();
                         self.status_message = "Scanning for DLNA MediaRenderers...".to_string();
                     }
@@ -572,22 +746,34 @@ impl AppUI {
             }
             2 => {
                 // Settings Tab
-                match code {
-                    KeyCode::Up | KeyCode::Char('k') => {
+                match (code, modifiers) {
+                    (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
                         if self.settings_cursor > 0 {
                             self.settings_cursor -= 1;
                         } else {
                             self.settings_cursor = SETTING_DEFINITIONS.len() - 1;
                         }
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
+                    (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
                         if self.settings_cursor + 1 < SETTING_DEFINITIONS.len() {
                             self.settings_cursor += 1;
                         } else {
                             self.settings_cursor = 0;
                         }
                     }
-                    KeyCode::Enter | KeyCode::Char(' ') => {
+                    (KeyCode::PageUp, _)
+                    | (KeyCode::Home, _)
+                    | (KeyCode::Char('g'), KeyModifiers::NONE)
+                    | (KeyCode::Char('K'), _) => {
+                        self.settings_cursor = 0;
+                    }
+                    (KeyCode::PageDown, _)
+                    | (KeyCode::End, _)
+                    | (KeyCode::Char('G'), _)
+                    | (KeyCode::Char('J'), _) => {
+                        self.settings_cursor = SETTING_DEFINITIONS.len() - 1;
+                    }
+                    (KeyCode::Enter, KeyModifiers::NONE) | (KeyCode::Char(' '), KeyModifiers::NONE) => {
                         self.settings_mgr.cycle_setting(self.settings_cursor, true);
                         if self.settings_cursor == 0 {
                             self.refresh_browser();
@@ -687,16 +873,27 @@ impl AppUI {
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(area);
 
+        let inner_browser_h = split[0].height.saturating_sub(2) as usize;
+        self.browser_page_height = inner_browser_h.max(1);
+
+        let inner_queue_h = split[1].height.saturating_sub(2) as usize;
+        self.queue_page_height = inner_queue_h.max(1);
+
         // Left Pane: File Browser
         let mode_tag = if self.settings_mgr.settings.metadata_view {
             "[TAGS]"
         } else {
             "[FILES]"
         };
-        let browser_title = if self.in_bookmarks_view {
-            format!(" BROWSER [★ Music Homes] {} ", mode_tag)
+        let count_tag = if self.browser_entries.is_empty() {
+            String::new()
         } else {
-            format!(" BROWSER [File System] {} ", mode_tag)
+            format!(" ({}/{})", self.browser_cursor + 1, self.browser_entries.len())
+        };
+        let browser_title = if self.in_bookmarks_view {
+            format!(" BROWSER [★ Music Homes]{} {} ", count_tag, mode_tag)
+        } else {
+            format!(" BROWSER [File System]{} {} ", count_tag, mode_tag)
         };
         let browser_block = Block::default()
             .borders(Borders::ALL)
@@ -728,9 +925,14 @@ impl AppUI {
         f.render_stateful_widget(browser_list, split[0], &mut self.browser_state);
 
         // Right Pane: Queue
+        let queue_title = if self.queue.is_empty() {
+            " QUEUE (0 tracks) ".to_string()
+        } else {
+            format!(" QUEUE ({}/{} tracks) ", self.queue_cursor + 1, self.queue.len())
+        };
         let queue_block = Block::default()
             .borders(Borders::ALL)
-            .title(format!(" QUEUE ({} tracks) ", self.queue.len()))
+            .title(queue_title.as_str())
             .border_style(if self.queue_focus {
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
             } else {
@@ -1099,6 +1301,8 @@ impl AppUI {
             Line::from("[Tab] / [1,2,3]  : Switch Active Tab"),
             Line::from("[h] / [l]        : Focus Browser vs Queue"),
             Line::from("[j] / [k]        : Move Selection Up / Down (wraps around)"),
+            Line::from("[PgDn] / [PgUp]  : Page Down / Up through list (also Ctrl+d/u, J/K)"),
+            Line::from("[Home] / [End]   : Jump to Start / End of list (also g / G)"),
             Line::from("[Enter]          : Open folder / Add file to queue / Play track"),
             Line::from("[/] or [f]       : Fuzzy Search current folder & subfolders"),
             Line::from("[a]              : Add all audio files in folder to queue"),

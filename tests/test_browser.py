@@ -113,6 +113,58 @@ class TestFileBrowser(unittest.TestCase):
         self.assertFalse(self.browser.metadata_view)
         self.assertIn("Filename", msg)
 
+    def test_browser_paging_and_jumping(self):
+        """Verify paging through entries via PageDown/PageUp, Ctrl+D/U, J/K, and Home/End."""
+        # Create a folder with 40 files
+        paged_dir = self.root / "Paged_Folder"
+        paged_dir.mkdir()
+        for i in range(40):
+            (paged_dir / f"track_{i:02d}.mp3").write_bytes(b"dummy")
+
+        self.browser.navigate_into(paged_dir)
+        total_entries = len(self.browser.entries)
+        self.assertGreaterEqual(total_entries, 40)
+        self.browser.last_list_height = 10
+
+        self.assertEqual(self.browser.cursor_idx, 0)
+
+        # 1. Page Down via KEY_NPAGE jumps by 10
+        self.browser.handle_key(curses.KEY_NPAGE)
+        self.assertEqual(self.browser.cursor_idx, 10)
+
+        # 2. Ctrl+D (code 4) jumps by 10
+        self.browser.handle_key(4)
+        self.assertEqual(self.browser.cursor_idx, 20)
+
+        # 3. Shift+J (ord('J')) jumps by 10
+        self.browser.handle_key(ord("J"))
+        self.assertEqual(self.browser.cursor_idx, 30)
+
+        # 4. End ('G') jumps to last entry
+        self.browser.handle_key(ord("G"))
+        self.assertEqual(self.browser.cursor_idx, total_entries - 1)
+
+        # 5. Page Down at last entry wraps to 0
+        self.browser.handle_key(curses.KEY_NPAGE)
+        self.assertEqual(self.browser.cursor_idx, 0)
+
+        # 6. Page Up at 0 wraps to last entry
+        self.browser.handle_key(curses.KEY_PPAGE)
+        self.assertEqual(self.browser.cursor_idx, total_entries - 1)
+
+        # 7. Ctrl+U (code 21) jumps up by 10
+        self.browser.handle_key(21)
+        self.assertEqual(self.browser.cursor_idx, total_entries - 1 - 10)
+
+        # 8. Shift+K (ord('K')) jumps up by 10
+        self.browser.handle_key(ord("K"))
+        self.assertEqual(self.browser.cursor_idx, total_entries - 1 - 20)
+
+        # 9. Home ('g') jumps to 0
+        self.browser.handle_key(ord("g"))
+        self.assertEqual(self.browser.cursor_idx, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

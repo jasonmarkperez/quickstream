@@ -314,6 +314,50 @@ impl SearchModalState {
         self.list_state.select(Some(self.selected_index));
     }
 
+    pub fn page_up(&mut self, step: usize) {
+        if self.filtered.is_empty() {
+            return;
+        }
+        let len = self.filtered.len();
+        if self.selected_index >= step {
+            self.selected_index -= step;
+        } else if self.selected_index > 0 {
+            self.selected_index = 0;
+        } else {
+            self.selected_index = len.saturating_sub(1);
+        }
+        self.list_state.select(Some(self.selected_index));
+    }
+
+    pub fn page_down(&mut self, step: usize) {
+        if self.filtered.is_empty() {
+            return;
+        }
+        let len = self.filtered.len();
+        if self.selected_index + step < len {
+            self.selected_index += step;
+        } else if self.selected_index < len.saturating_sub(1) {
+            self.selected_index = len.saturating_sub(1);
+        } else {
+            self.selected_index = 0;
+        }
+        self.list_state.select(Some(self.selected_index));
+    }
+
+    pub fn home(&mut self) {
+        if !self.filtered.is_empty() {
+            self.selected_index = 0;
+            self.list_state.select(Some(0));
+        }
+    }
+
+    pub fn end(&mut self) {
+        if !self.filtered.is_empty() {
+            self.selected_index = self.filtered.len().saturating_sub(1);
+            self.list_state.select(Some(self.selected_index));
+        }
+    }
+
     pub fn selected_track(&self) -> Option<&AudioMetadata> {
         self.filtered.get(self.selected_index).map(|(_, t)| t)
     }
