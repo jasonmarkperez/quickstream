@@ -570,3 +570,50 @@ fn test_browser_cancellation_on_navigation() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_browser_cache_instant_back_navigation() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_cache_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let parent_dir = temp_dir.join("Music");
+    let sub_dir = parent_dir.join("ArtistA");
+    fs::create_dir_all(&sub_dir).unwrap();
+
+    create_dummy_wav(&sub_dir.join("track1.wav"));
+
+    let config_path = temp_dir.join("config.json");
+    let settings_mgr = SettingsManager::with_path(config_path);
+    let mut app = AppUI::new(Some(parent_dir.clone()), settings_mgr);
+
+    // Initial load of parent_dir
+    assert_eq!(app.browser_dir, parent_dir);
+    assert!(!app.browser_loading);
+    assert!(app.browser_dir_cache.contains_key(&parent_dir));
+
+    // Navigate into sub_dir
+    app.navigate_browser(sub_dir.clone());
+    assert_eq!(app.browser_dir, sub_dir);
+
+    // Navigate back to parent_dir
+    let start = std::time::Instant::now();
+    app.navigate_browser(parent_dir.clone());
+    let elapsed = start.elapsed();
+
+    // Must be instantaneous (<50ms) from cache!
+    assert!(elapsed < std::time::Duration::from_millis(50));
+    assert_eq!(app.browser_dir, parent_dir);
+    assert!(!app.browser_loading);
+    // Cursor must be restored to ArtistA
+    let artist_pos = app.browser_entries.iter().position(|(_name, p, is_dir)| *is_dir && p == &sub_dir);
+    assert!(artist_pos.is_some());
+    assert_eq!(app.browser_cursor, artist_pos.unwrap());
+
+    // Test 'r' key refreshes and invalidates cache
+    app.handle_tab_key(crossterm::event::KeyCode::Char('r'));
+    assert!(app.status_message.contains("Refreshing directory"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+

@@ -24,14 +24,31 @@ use crate::player::AudioPlayer;
 use crate::queue::PlaybackQueue;
 use crate::settings::{SettingsManager, SETTING_DEFINITIONS};
 
-#[derive(Debug)]
-pub struct DirScanResult {
-    pub scan_id: u64,
-    pub dir: PathBuf,
+#[derive(Clone, Debug, Default)]
+pub struct CachedDir {
     pub dirs: Vec<(String, PathBuf, bool)>,
     pub files: Vec<(String, PathBuf, bool)>,
     pub unfetched_tracks: Vec<PathBuf>,
-    pub error: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum DirScanEvent {
+    Batch {
+        scan_id: u64,
+        dir: PathBuf,
+        dirs: Vec<(String, PathBuf, bool)>,
+        files: Vec<(String, PathBuf, bool)>,
+        unfetched_tracks: Vec<PathBuf>,
+    },
+    Complete {
+        scan_id: u64,
+        dir: PathBuf,
+    },
+    Error {
+        scan_id: u64,
+        dir: PathBuf,
+        message: String,
+    },
 }
 
 pub struct AppUI {
@@ -42,8 +59,9 @@ pub struct AppUI {
     pub browser_cursor: usize,
     pub browser_loading: bool,
     pub browser_load_start: Option<std::time::Instant>,
-    pub dir_scan_tx: std::sync::mpsc::Sender<DirScanResult>,
-    pub dir_scan_rx: std::sync::mpsc::Receiver<DirScanResult>,
+    pub browser_dir_cache: std::collections::HashMap<PathBuf, CachedDir>,
+    pub dir_scan_tx: std::sync::mpsc::Sender<DirScanEvent>,
+    pub dir_scan_rx: std::sync::mpsc::Receiver<DirScanEvent>,
     pub dir_scan_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub dir_scan_id: u64,
     pub pending_parent_restore: Option<PathBuf>,
@@ -110,6 +128,7 @@ impl AppUI {
             browser_cursor: 0,
             browser_loading: false,
             browser_load_start: None,
+            browser_dir_cache: std::collections::HashMap::new(),
             dir_scan_tx,
             dir_scan_rx,
             dir_scan_stop: None,
@@ -205,6 +224,36 @@ impl AppUI {
                 .push((".. [Parent Directory]".to_string(), parent.to_path_buf(), true));
         }
 
+        // Cache hit: instantaneous display with zero filesystem overhead!
+        if let Some(cached) = self.browser_dir_cache.get(&self.browser_dir).cloned() {
+            self.browser_loading = false;
+            self.browser_load_start = None;
+            self.browser_entries.extend(cached.dirs);
+            self.browser_entries.extend(cached.files);
+
+            if let Some(target_sub) = self.pending_parent_restore.take() {
+                if let Some(pos) = self.browser_entries.iter().position(|(name, p, is_dir)| {
+                    *is_dir && p == &target_sub && name.starts_with("📁 ")
+                }) {
+                    self.browser_cursor = pos;
+                    self.browser_state = ListState::default();
+                    self.browser_state.select(Some(pos));
+                    return;
+                }
+            }
+
+            self.browser_cursor = old_cursor.min(self.browser_entries.len().saturating_sub(1));
+            if self.browser_cursor == 0 {
+                self.browser_state = ListState::default();
+                self.browser_state.select(Some(0));
+            }
+
+            if !cached.unfetched_tracks.is_empty() && self.settings_mgr.settings.metadata_view {
+                self.start_background_metadata_fetch(cached.unfetched_tracks);
+            }
+            return;
+        }
+
         self.browser_cursor = old_cursor.min(self.browser_entries.len().saturating_sub(1));
         if self.browser_cursor == 0 {
             self.browser_state = ListState::default();
@@ -227,9 +276,9 @@ impl AppUI {
             let _t = crate::log_perf!("browser", "background dir scan for '{}'", scan_dir.display());
             match std::fs::read_dir(&scan_dir) {
                 Ok(entries) => {
-                    let mut dirs = Vec::new();
-                    let mut files = Vec::new();
-                    let mut unfetched = Vec::new();
+                    let mut batch_dirs = Vec::new();
+                    let mut batch_files = Vec::new();
+                    let mut batch_unfetched = Vec::new();
 
                     for entry in entries.flatten() {
                         if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -256,101 +305,180 @@ impl AppUI {
                         };
 
                         if is_dir {
-                            dirs.push((format!("📁 {}/", name), path, true));
+                            batch_dirs.push((format!("📁 {}/", name), path, true));
                         } else if is_supported_audio_file(&path) {
                             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase();
                             let label = if metadata_view {
                                 if let Some(m) = cached_map.get(&path) {
                                     m.format_display_label(true)
                                 } else {
-                                    unfetched.push(path.clone());
+                                    batch_unfetched.push(path.clone());
                                     format!("🎵 [{}] {}", ext, name)
                                 }
                             } else {
                                 format!("🎵 [{}] {}", ext, name)
                             };
-                            files.push((label, path, false));
+                            batch_files.push((label, path, false));
+                        }
+
+                        if batch_dirs.len() + batch_files.len() >= 50 {
+                            if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                return;
+                            }
+                            let _ = tx.send(DirScanEvent::Batch {
+                                scan_id,
+                                dir: scan_dir.clone(),
+                                dirs: std::mem::take(&mut batch_dirs),
+                                files: std::mem::take(&mut batch_files),
+                                unfetched_tracks: std::mem::take(&mut batch_unfetched),
+                            });
                         }
                     }
 
-                    dirs.sort_by_key(|a| a.0.to_lowercase());
-                    files.sort_by_key(|a| a.0.to_lowercase());
+                    if (!batch_dirs.is_empty() || !batch_files.is_empty())
+                        && !stop_flag.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        let _ = tx.send(DirScanEvent::Batch {
+                            scan_id,
+                            dir: scan_dir.clone(),
+                            dirs: batch_dirs,
+                            files: batch_files,
+                            unfetched_tracks: batch_unfetched,
+                        });
+                    }
 
                     if !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                        let _ = tx.send(DirScanResult {
+                        let _ = tx.send(DirScanEvent::Complete {
                             scan_id,
                             dir: scan_dir,
-                            dirs,
-                            files,
-                            unfetched_tracks: unfetched,
-                            error: None,
                         });
                     }
                 }
                 Err(err) => {
                     if !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                        let _ = tx.send(DirScanResult {
+                        let _ = tx.send(DirScanEvent::Error {
                             scan_id,
                             dir: scan_dir,
-                            dirs: Vec::new(),
-                            files: Vec::new(),
-                            unfetched_tracks: Vec::new(),
-                            error: Some(err.to_string()),
+                            message: err.to_string(),
                         });
                     }
                 }
             }
         });
 
-        // Fast path for fast local filesystem reads: receive result if ready within 50ms
-        if let Ok(res) = self.dir_scan_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            self.apply_dir_scan_result(res);
+        // Fast path for immediate local reads: process any events available within 50ms
+        while let Ok(event) = self.dir_scan_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            let is_complete = matches!(event, DirScanEvent::Complete { .. } | DirScanEvent::Error { .. });
+            self.handle_dir_scan_event(event);
+            if is_complete {
+                break;
+            }
         }
     }
 
-    fn apply_dir_scan_result(&mut self, res: DirScanResult) {
-        if res.scan_id != self.dir_scan_id || res.dir != self.browser_dir {
-            return;
-        }
-        self.browser_loading = false;
-        self.browser_load_start = None;
+    fn handle_dir_scan_event(&mut self, event: DirScanEvent) {
+        match event {
+            DirScanEvent::Batch {
+                scan_id,
+                dir,
+                dirs,
+                files,
+                unfetched_tracks,
+            } => {
+                if scan_id != self.dir_scan_id || dir != self.browser_dir {
+                    return;
+                }
 
-        if let Some(err) = res.error {
-            self.status_message = format!("Error reading directory '{}': {}", res.dir.display(), err);
-            return;
-        }
+                let cached = self.browser_dir_cache.entry(dir).or_default();
+                cached.dirs.extend(dirs.clone());
+                cached.files.extend(files.clone());
+                cached.unfetched_tracks.extend(unfetched_tracks.clone());
 
-        self.browser_entries.extend(res.dirs);
-        self.browser_entries.extend(res.files);
+                self.browser_entries.extend(dirs);
+                self.browser_entries.extend(files);
 
-        if let Some(target_sub) = self.pending_parent_restore.take() {
-            if let Some(pos) = self.browser_entries.iter().position(|(name, p, is_dir)| {
-                *is_dir && p == &target_sub && name.starts_with("📁 ")
-            }) {
-                self.browser_cursor = pos;
-                self.browser_state = ListState::default();
-                self.browser_state.select(Some(pos));
+                if let Some(ref target_sub) = self.pending_parent_restore {
+                    if let Some(pos) = self.browser_entries.iter().position(|(name, p, is_dir)| {
+                        *is_dir && p == target_sub && name.starts_with("📁 ")
+                    }) {
+                        self.browser_cursor = pos;
+                        self.browser_state = ListState::default();
+                        self.browser_state.select(Some(pos));
+                        self.pending_parent_restore = None;
+                    }
+                }
             }
-        }
+            DirScanEvent::Complete { scan_id, dir } => {
+                if scan_id != self.dir_scan_id || dir != self.browser_dir {
+                    return;
+                }
+                self.browser_loading = false;
+                self.browser_load_start = None;
 
-        if !res.unfetched_tracks.is_empty() && self.settings_mgr.settings.metadata_view {
-            self.start_background_metadata_fetch(res.unfetched_tracks);
-        } else if let Some(stop) = self.metadata_worker_stop.take() {
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                let header_count = if self.browser_dir.parent().is_some() { 2 } else { 1 };
+                if self.browser_entries.len() > header_count {
+                    let mut content_entries = self.browser_entries.split_off(header_count);
+                    content_entries.sort_by(|a, b| {
+                        match (a.2, b.2) {
+                            (true, false) => std::cmp::Ordering::Less,
+                            (false, true) => std::cmp::Ordering::Greater,
+                            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+                        }
+                    });
+                    self.browser_entries.extend(content_entries);
+                }
+
+                if let Some(cached) = self.browser_dir_cache.get_mut(&dir) {
+                    cached.dirs.sort_by_key(|a| a.0.to_lowercase());
+                    cached.files.sort_by_key(|a| a.0.to_lowercase());
+                }
+
+                if let Some(target_sub) = self.pending_parent_restore.take() {
+                    if let Some(pos) = self.browser_entries.iter().position(|(name, p, is_dir)| {
+                        *is_dir && p == &target_sub && name.starts_with("📁 ")
+                    }) {
+                        self.browser_cursor = pos;
+                        self.browser_state = ListState::default();
+                        self.browser_state.select(Some(pos));
+                    }
+                }
+
+                if self.settings_mgr.settings.metadata_view {
+                    if let Some(cached) = self.browser_dir_cache.get(&dir) {
+                        if !cached.unfetched_tracks.is_empty() {
+                            self.start_background_metadata_fetch(cached.unfetched_tracks.clone());
+                        }
+                    }
+                }
+            }
+            DirScanEvent::Error {
+                scan_id,
+                dir,
+                message,
+            } => {
+                if scan_id != self.dir_scan_id || dir != self.browser_dir {
+                    return;
+                }
+                self.browser_loading = false;
+                self.browser_load_start = None;
+                self.status_message = format!("Error reading directory '{}': {}", dir.display(), message);
+            }
         }
     }
 
     pub fn poll_background_dir_scan(&mut self) {
-        while let Ok(res) = self.dir_scan_rx.try_recv() {
-            self.apply_dir_scan_result(res);
+        while let Ok(event) = self.dir_scan_rx.try_recv() {
+            self.handle_dir_scan_event(event);
         }
 
         if self.browser_loading {
             if let Some(start) = self.browser_load_start {
                 if start.elapsed() > std::time::Duration::from_secs(3) {
+                    let count = self.browser_entries.len().saturating_sub(2);
                     self.status_message = format!(
-                        "Opening '{}' (filesystem may be slow or offline). Esc or '..' to go back",
-                        self.browser_dir.display()
+                        "Loaded {} items from '{}'... Esc or '..' to go back",
+                        count,
+                        self.browser_dir.file_name().unwrap_or_default().to_string_lossy()
                     );
                 }
             }
@@ -866,6 +994,7 @@ impl AppUI {
                         }
                         (KeyCode::Char('v'), KeyModifiers::NONE) => {
                             self.settings_mgr.cycle_setting(0, true);
+                            self.browser_dir_cache.clear();
                             self.refresh_browser();
                             self.status_message = format!(
                                 "Display mode: {}",
@@ -1111,6 +1240,11 @@ impl AppUI {
                     (KeyCode::Char('c'), KeyModifiers::NONE) if self.queue_focus => {
                         self.queue.clear();
                         self.status_message = "Cleared queue".to_string();
+                    }
+                    (KeyCode::Char('r'), KeyModifiers::NONE) if !self.queue_focus => {
+                        self.browser_dir_cache.remove(&self.browser_dir);
+                        self.refresh_browser();
+                        self.status_message = format!("Refreshing directory '{}'", self.browser_dir.display());
                     }
                     _ => {}
                 }
