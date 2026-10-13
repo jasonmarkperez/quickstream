@@ -203,6 +203,10 @@ impl AppUI {
                 self.play_next_track();
             }
 
+            if let Some(ref mut modal) = self.search_modal {
+                modal.poll_background_scan();
+            }
+
             terminal.draw(|f| self.render(f))?;
 
             if event::poll(Duration::from_millis(100))? {
@@ -217,16 +221,21 @@ impl AppUI {
                     if let Some(ref mut modal) = self.search_modal {
                         match (key.code, key.modifiers) {
                             (KeyCode::Esc, _) => {
-                                self.search_modal = None;
+                                if let Some(mut m) = self.search_modal.take() {
+                                    m.close();
+                                }
                             }
                             (KeyCode::Enter, KeyModifiers::NONE) => {
-                                if let Some(track) = modal.selected_track().cloned() {
+                                let track_opt = modal.selected_track().cloned();
+                                if let Some(mut m) = self.search_modal.take() {
+                                    m.close();
+                                }
+                                if let Some(track) = track_opt {
                                     self.queue.add_track(track.clone());
                                     self.queue.current_index = self.queue.len().saturating_sub(1);
                                     self.play_current_track();
                                     self.status_message = format!("Playing: {}", track.display_title());
                                 }
-                                self.search_modal = None;
                             }
                             (KeyCode::Char('a'), KeyModifiers::NONE) => {
                                 if let Some(track) = modal.selected_track().cloned() {
@@ -237,11 +246,13 @@ impl AppUI {
                             (KeyCode::Char('A'), _) => {
                                 let tracks = modal.all_filtered_tracks();
                                 let count = tracks.len();
+                                if let Some(mut m) = self.search_modal.take() {
+                                    m.close();
+                                }
                                 for t in tracks {
                                     self.queue.add_track(t);
                                 }
                                 self.status_message = format!("Added {} tracks to queue", count);
-                                self.search_modal = None;
                             }
                             (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                                 modal.move_selection_up();
@@ -361,17 +372,42 @@ impl AppUI {
             self.browser_dir.clone()
         };
 
-        let tracks = crate::library::LibraryManager::scan_directory_scoped(&target_dir);
-        for t in &tracks {
+        // 1. Immediately pull any cached tracks for target_dir
+        let cached_map = crate::library::LibraryManager::load_cache_map();
+        let initial_tracks: Vec<crate::metadata::AudioMetadata> = cached_map
+            .values()
+            .filter(|t| t.filepath.starts_with(&target_dir))
+            .cloned()
+            .collect();
+
+        for t in &initial_tracks {
             self.metadata_cache.insert(t.filepath.clone(), t.clone());
         }
 
-        self.status_message = format!(
-            "Fuzzy search: indexed {} tracks in {}",
-            tracks.len(),
-            target_dir.file_name().unwrap_or_default().to_string_lossy()
+        // 2. Set up background streaming scanner
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = stop_flag.clone();
+        let scan_dir = target_dir.clone();
+        let scan_cache = cached_map;
+
+        std::thread::spawn(move || {
+            crate::library::LibraryManager::scan_directory_streaming(
+                scan_dir,
+                scan_cache,
+                tx,
+                stop_clone,
+            );
+        });
+
+        let target_name = target_dir.file_name().unwrap_or_default().to_string_lossy();
+        self.status_message = format!("Fuzzy search in {}", target_name);
+        let modal = search::SearchModalState::new_with_scanner(
+            target_dir,
+            initial_tracks,
+            Some(rx),
+            Some(stop_flag),
         );
-        let modal = search::SearchModalState::new(target_dir, tracks);
         self.search_modal = Some(modal);
     }
 
@@ -837,7 +873,15 @@ impl AppUI {
         // 1. Search Query Input Bar
         let match_count = modal.filtered.len();
         let total_count = modal.all_tracks.len();
-        let query_title = format!(" Search Query ({} of {} tracks matched) ", match_count, total_count);
+        let scan_badge = if modal.is_scanning {
+            format!(" [Scanning... {}]", modal.spinner_char())
+        } else {
+            String::new()
+        };
+        let query_title = format!(
+            " Search Query ({} of {} tracks matched){} ",
+            match_count, total_count, scan_badge
+        );
         let input_block = Block::default()
             .borders(Borders::ALL)
             .title(query_title)

@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use skim::prelude::*;
@@ -86,6 +88,34 @@ impl LibraryManager {
         tracks
     }
 
+    /// Load library from cached music_index.jsonl into a HashMap for fast key lookup.
+    pub fn load_cache_map() -> HashMap<PathBuf, AudioMetadata> {
+        let path = paths::get_music_index_path();
+        if !path.exists() {
+            return HashMap::new();
+        }
+
+        let mut map = HashMap::new();
+        if let Ok(file) = File::open(&path) {
+            let reader = BufReader::new(file);
+            for line in reader.lines().map_while(Result::ok) {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(track) = serde_json::from_str::<AudioMetadata>(&line) {
+                    map.insert(track.filepath.clone(), track);
+                }
+            }
+        }
+        map
+    }
+
+    /// Load cached tracks that reside within the given directory.
+    pub fn load_cache_for_dir(dir: &Path) -> Vec<AudioMetadata> {
+        let cache = Self::load_cache();
+        cache.into_iter().filter(|t| t.filepath.starts_with(dir)).collect()
+    }
+
     /// Save library tracks to cached music_index.jsonl.
     pub fn save_cache(tracks: &[AudioMetadata]) -> bool {
         let path = paths::get_music_index_path();
@@ -109,9 +139,21 @@ impl LibraryManager {
         Self::scan_directory_scoped(dir)
     }
 
-    /// Scan a directory and all subdirectories, avoiding symlink loops and hidden directories.
+    /// Scan a directory and all subdirectories, avoiding symlink loops and hidden directories,
+    /// reusing metadata from cache when file size matches to avoid disk I/O.
     pub fn scan_directory_scoped(dir: &Path) -> Vec<AudioMetadata> {
+        let cache = Self::load_cache_map();
+        Self::scan_directory_scoped_with_cache(dir, &cache)
+    }
+
+    pub fn scan_directory_scoped_with_cache(
+        dir: &Path,
+        cache: &HashMap<PathBuf, AudioMetadata>,
+    ) -> Vec<AudioMetadata> {
         let mut tracks = Vec::new();
+        let mut new_discovered = false;
+        let mut full_cache = cache.clone();
+
         for entry in WalkDir::new(dir)
             .follow_links(false)
             .into_iter()
@@ -126,12 +168,86 @@ impl LibraryManager {
         {
             let path = entry.path();
             if path.is_file() && is_supported_audio_file(path) {
+                let file_len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                if let Some(cached) = cache.get(path) {
+                    if cached.file_size == file_len {
+                        tracks.push(cached.clone());
+                        continue;
+                    }
+                }
                 if let Ok(meta) = extract_metadata(path) {
-                    tracks.push(meta);
+                    tracks.push(meta.clone());
+                    full_cache.insert(meta.filepath.clone(), meta);
+                    new_discovered = true;
                 }
             }
         }
+
+        if new_discovered {
+            let all_tracks: Vec<AudioMetadata> = full_cache.into_values().collect();
+            Self::save_cache(&all_tracks);
+        }
+
         tracks
+    }
+
+    /// Background streaming scanner: discovers tracks and streams them in batches of 50 via channel.
+    pub fn scan_directory_streaming(
+        dir: PathBuf,
+        cache: HashMap<PathBuf, AudioMetadata>,
+        tx: Sender<Vec<AudioMetadata>>,
+        stop_flag: Arc<AtomicBool>,
+    ) {
+        let mut batch = Vec::new();
+        let mut new_discovered = Vec::new();
+        let mut full_cache = cache.clone();
+
+        for entry in WalkDir::new(&dir)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| {
+                let name = e.file_name().to_string_lossy();
+                !(name.starts_with('.') && name != "." && name != "..")
+            })
+            .filter_map(|e| e.ok())
+        {
+            if stop_flag.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let path = entry.path();
+            if path.is_file() && is_supported_audio_file(path) {
+                let file_len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let already_cached = if let Some(cached) = cache.get(path) {
+                    cached.file_size == file_len
+                } else {
+                    false
+                };
+
+                if already_cached {
+                    continue;
+                }
+
+                if let Ok(meta) = extract_metadata(path) {
+                    full_cache.insert(meta.filepath.clone(), meta.clone());
+                    new_discovered.push(meta.clone());
+                    batch.push(meta);
+
+                    if batch.len() >= 50 && tx.send(std::mem::take(&mut batch)).is_err() {
+                        return; // receiver dropped
+                    }
+                }
+            }
+        }
+
+        if !batch.is_empty() {
+            let _ = tx.send(batch);
+        }
+
+        if !new_discovered.is_empty() {
+            let all_tracks: Vec<AudioMetadata> = full_cache.into_values().collect();
+            Self::save_cache(&all_tracks);
+        }
     }
 
     /// Run Skim interactive fuzzy search over tracks and return selected items.

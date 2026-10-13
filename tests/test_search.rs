@@ -202,3 +202,127 @@ fn test_scoped_directory_scan() {
 
     let _ = fs::remove_dir_all(&temp_root);
 }
+
+#[test]
+fn test_multi_token_out_of_order_search() {
+    let (root, tracks) = sample_tracks();
+    let mut modal = SearchModalState::new(root, tracks);
+
+    // Out-of-order query: "android radiohead" (words reversed compared to "Radiohead - Paranoid Android")
+    modal.update_query("android radiohead".to_string());
+    assert!(!modal.filtered.is_empty(), "Should match regardless of word order");
+    assert_eq!(modal.selected_track().unwrap().artist, "Radiohead");
+    assert_eq!(modal.selected_track().unwrap().title, "Paranoid Android");
+
+    // Out-of-order query: "blue miles"
+    modal.update_query("blue miles".to_string());
+    assert!(!modal.filtered.is_empty());
+    assert_eq!(modal.selected_track().unwrap().artist, "Miles Davis");
+}
+
+#[test]
+fn test_background_streaming_scanner() {
+    let root = PathBuf::from("/music");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let mut modal = SearchModalState::new_with_scanner(
+        root.clone(),
+        Vec::new(),
+        Some(rx),
+        Some(stop_flag),
+    );
+
+    assert!(modal.is_scanning);
+    assert_eq!(modal.all_tracks.len(), 0);
+
+    // Stream first batch
+    let batch1 = vec![
+        AudioMetadata {
+            filepath: root.join("track1.flac"),
+            filename: "track1.flac".to_string(),
+            title: "Track 1".to_string(),
+            artist: "Artist A".to_string(),
+            album: "Album A".to_string(),
+            genre: "Rock".to_string(),
+            format_name: "FLAC".to_string(),
+            duration_seconds: 180.0,
+            file_size: 1000,
+            bitrate_kbps: 900,
+            sample_rate_hz: 44100,
+            channels: 2,
+        },
+    ];
+    tx.send(batch1).unwrap();
+
+    modal.poll_background_scan();
+    assert_eq!(modal.all_tracks.len(), 1);
+    assert!(modal.is_scanning);
+
+    // Stream second batch and close sender
+    let batch2 = vec![
+        AudioMetadata {
+            filepath: root.join("track2.flac"),
+            filename: "track2.flac".to_string(),
+            title: "Track 2".to_string(),
+            artist: "Artist B".to_string(),
+            album: "Album B".to_string(),
+            genre: "Jazz".to_string(),
+            format_name: "FLAC".to_string(),
+            duration_seconds: 240.0,
+            file_size: 1500,
+            bitrate_kbps: 900,
+            sample_rate_hz: 44100,
+            channels: 2,
+        },
+    ];
+    tx.send(batch2).unwrap();
+    drop(tx);
+
+    modal.poll_background_scan();
+    assert_eq!(modal.all_tracks.len(), 2);
+    assert!(!modal.is_scanning, "Scanner should be marked complete when channel disconnects");
+}
+
+#[test]
+fn test_large_library_search_performance() {
+    let root = PathBuf::from("/large_library");
+    let mut large_tracks = Vec::with_capacity(20_000);
+
+    // Generate 20,000 synthetic tracks
+    for i in 0..20_000 {
+        large_tracks.push(AudioMetadata {
+            filepath: root.join(format!("artist_{:04}/album_{:03}/track_{:05}.flac", i % 100, i % 500, i)),
+            filename: format!("track_{:05}.flac", i),
+            title: format!("Song Title {:05}", i),
+            artist: format!("Popular Artist {:03}", i % 200),
+            album: format!("Studio Album {:03}", i % 500),
+            genre: "Electronic".to_string(),
+            format_name: "FLAC".to_string(),
+            duration_seconds: 210.0,
+            file_size: 30_000_000,
+            bitrate_kbps: 1000,
+            sample_rate_hz: 44100,
+            channels: 2,
+        });
+    }
+
+    let start_build = std::time::Instant::now();
+    let mut modal = SearchModalState::new(root, large_tracks);
+    let build_elapsed = start_build.elapsed();
+    println!("Indexing 20,000 tracks took: {:?}", build_elapsed);
+
+    // Benchmark search filter execution across 20,000 tracks
+    let start_search = std::time::Instant::now();
+    modal.update_query("popular 042 song 150".to_string());
+    let search_elapsed = start_search.elapsed();
+    println!("Fuzzy query across 20,000 tracks took: {:?}", search_elapsed);
+
+    assert!(!modal.filtered.is_empty());
+    assert!(
+        search_elapsed.as_millis() < 100,
+        "Search across 20,000 tracks must be ultra-fast (<100ms in debug, ~5ms in release), took {:?}",
+        search_elapsed
+    );
+}
+
