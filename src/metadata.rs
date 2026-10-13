@@ -132,6 +132,106 @@ pub fn extract_metadata(path: &Path) -> anyhow::Result<AudioMetadata> {
     })
 }
 
+/// Extract cover artwork from an audio file.
+/// Looks first for embedded ID3/FLAC/Vorbis pictures, then scans the folder for image files.
+/// Returns (image_bytes, mime_type).
+pub fn extract_cover_art(path: &Path) -> Option<(Vec<u8>, String)> {
+    if !path.exists() {
+        return None;
+    }
+
+    // 1. Try embedded tags via lofty
+    if let Ok(probe) = Probe::open(path) {
+        if let Ok(guessed) = probe.guess_file_type() {
+            if let Ok(tagged_file) = guessed.read() {
+                let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag());
+                if let Some(tag) = tag {
+                    let pics = tag.pictures();
+                    let pic = pics
+                        .iter()
+                        .find(|p| p.pic_type() == lofty::picture::PictureType::CoverFront)
+                        .or_else(|| pics.first());
+                    if let Some(p) = pic {
+                        let mime = p
+                            .mime_type()
+                            .map(|m| m.as_str().to_string())
+                            .unwrap_or_else(|| "image/jpeg".to_string());
+                        return Some((p.data().to_vec(), mime));
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Fall back to image files in the same directory
+    if let Some(parent) = path.parent() {
+        let candidates = [
+            "cover.jpg", "cover.jpeg", "cover.png", "cover.webp",
+            "folder.jpg", "folder.jpeg", "folder.png",
+            "front.jpg", "front.jpeg", "front.png",
+            "album.jpg", "album.jpeg", "album.png",
+            "artwork.jpg", "artwork.png",
+        ];
+
+        for name in &candidates {
+            let candidate_path = parent.join(name);
+            if candidate_path.is_file() {
+                if let Ok(data) = std::fs::read(&candidate_path) {
+                    let mime = if candidate_path
+                        .extension()
+                        .map(|e| e.to_string_lossy().to_lowercase())
+                        .as_deref()
+                        == Some("png")
+                    {
+                        "image/png"
+                    } else if candidate_path
+                        .extension()
+                        .map(|e| e.to_string_lossy().to_lowercase())
+                        .as_deref()
+                        == Some("webp")
+                    {
+                        "image/webp"
+                    } else {
+                        "image/jpeg"
+                    };
+                    return Some((data, mime.to_string()));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Fallback SVG placeholder when no cover art is available.
+pub fn default_cover_svg() -> &'static str {
+    r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 500" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#141824"/>
+      <stop offset="50%" stop-color="#0f111a"/>
+      <stop offset="100%" stop-color="#090a0f"/>
+    </linearGradient>
+    <linearGradient id="vinyl" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2a2e3d"/>
+      <stop offset="100%" stop-color="#161822"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00d2ff"/>
+      <stop offset="100%" stop-color="#0072ff"/>
+    </linearGradient>
+  </defs>
+  <rect width="500" height="500" rx="24" fill="url(#bg)"/>
+  <circle cx="250" cy="250" r="180" fill="url(#vinyl)" stroke="#3a4055" stroke-width="4"/>
+  <circle cx="250" cy="250" r="145" fill="none" stroke="#252938" stroke-width="2"/>
+  <circle cx="250" cy="250" r="115" fill="none" stroke="#222634" stroke-width="2"/>
+  <circle cx="250" cy="250" r="85" fill="none" stroke="#1f222e" stroke-width="2"/>
+  <circle cx="250" cy="250" r="60" fill="url(#accent)"/>
+  <circle cx="250" cy="250" r="18" fill="#090a0f"/>
+  <path d="M242 220 L270 220 L270 265 A16 16 0 1 1 254 249 L254 232 L242 232 Z" fill="#ffffff" opacity="0.9"/>
+</svg>"##
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +270,38 @@ mod tests {
             "🎵 [FLAC] Test Artist - Test Song (02:05)"
         );
         assert_eq!(meta.format_display_label(false), "🎵 [FLAC] song.flac");
+    }
+
+    #[test]
+    fn test_default_cover_svg() {
+        let svg = default_cover_svg();
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.ends_with("</svg>"));
+        assert!(svg.contains("vinyl"));
+    }
+
+    #[test]
+    fn test_extract_cover_art_from_folder() {
+        let temp_dir = std::env::temp_dir().join(format!("quickstream_art_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let track_path = temp_dir.join("track01.wav");
+        std::fs::write(&track_path, b"RIFF dummy").unwrap();
+
+        // No cover yet
+        assert_eq!(extract_cover_art(&track_path), None);
+
+        // Put cover.jpg in the same directory
+        let cover_path = temp_dir.join("cover.jpg");
+        std::fs::write(&cover_path, b"fake-jpg-data").unwrap();
+
+        let art = extract_cover_art(&track_path);
+        assert!(art.is_some());
+        let (bytes, mime) = art.unwrap();
+        assert_eq!(bytes, b"fake-jpg-data");
+        assert_eq!(mime, "image/jpeg");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

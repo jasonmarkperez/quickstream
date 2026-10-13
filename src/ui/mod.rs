@@ -49,6 +49,9 @@ pub struct AppUI {
     pub search_modal: Option<SearchModalState>,
     pub browser_page_height: usize,
     pub queue_page_height: usize,
+    pub web_server: Option<crate::web::WebServerHandle>,
+    pub web_state: std::sync::Arc<std::sync::RwLock<crate::web::NowPlayingState>>,
+    pub web_cmd_rx: Option<std::sync::mpsc::Receiver<crate::web::WebCommand>>,
 }
 
 impl AppUI {
@@ -58,6 +61,21 @@ impl AppUI {
         let bookmarks = Self::load_bookmarks();
         let device_manager = DeviceManager::new();
         device_manager.start_background_scan();
+
+        let web_state = std::sync::Arc::new(std::sync::RwLock::new(crate::web::NowPlayingState::default()));
+        let (web_server, web_cmd_rx) = if settings_mgr.settings.web_server_enabled {
+            let (tx, rx) = std::sync::mpsc::channel();
+            match crate::web::WebServer::start(
+                settings_mgr.settings.web_server_port,
+                web_state.clone(),
+                tx,
+            ) {
+                Ok(handle) => (Some(handle), Some(rx)),
+                Err(_) => (None, None),
+            }
+        } else {
+            (None, None)
+        };
 
         let mut app = Self {
             active_tab: 0,
@@ -84,6 +102,9 @@ impl AppUI {
             search_modal: None,
             browser_page_height: 15,
             queue_page_height: 15,
+            web_server,
+            web_state,
+            web_cmd_rx,
         };
         app.refresh_browser();
         app
@@ -290,6 +311,12 @@ impl AppUI {
                 self.player.reset_finished();
                 self.play_next_track();
             }
+
+            // Process remote web commands
+            self.handle_web_commands();
+
+            // Synchronize web server live state
+            self.update_web_state();
 
             if let Some(ref mut modal) = self.search_modal {
                 modal.poll_background_scan();
@@ -780,6 +807,8 @@ impl AppUI {
                         } else if self.settings_cursor == 1 {
                             let backend = self.settings_mgr.settings.player_backend.clone();
                             self.player = LocalPlayer::new(&backend);
+                        } else if self.settings_cursor == 6 {
+                            self.sync_web_server();
                         }
                         self.status_message = format!(
                             "{}: {}",
@@ -821,6 +850,139 @@ impl AppUI {
             let title = track.display_title().to_string();
             if self.player.play(&path).is_ok() {
                 self.status_message = format!("Playing: {}", title);
+            }
+        }
+    }
+
+    pub fn sync_web_server(&mut self) {
+        if self.settings_mgr.settings.web_server_enabled {
+            if self.web_server.is_none() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                match crate::web::WebServer::start(
+                    self.settings_mgr.settings.web_server_port,
+                    self.web_state.clone(),
+                    tx,
+                ) {
+                    Ok(handle) => {
+                        self.status_message = format!("Started web server on port {}", handle.port);
+                        self.web_server = Some(handle);
+                        self.web_cmd_rx = Some(rx);
+                    }
+                    Err(e) => {
+                        self.status_message = format!("Failed to start web server: {}", e);
+                        self.settings_mgr.settings.web_server_enabled = false;
+                        self.settings_mgr.save();
+                    }
+                }
+            }
+        } else if let Some(handle) = self.web_server.take() {
+            handle.stop();
+            self.web_cmd_rx = None;
+            self.status_message = "Stopped web server".to_string();
+        }
+    }
+
+    pub fn handle_web_commands(&mut self) {
+        let commands: Vec<crate::web::WebCommand> = if let Some(ref rx) = self.web_cmd_rx {
+            let mut list = Vec::new();
+            while let Ok(cmd) = rx.try_recv() {
+                list.push(cmd);
+            }
+            list
+        } else {
+            Vec::new()
+        };
+
+        for cmd in commands {
+            match cmd {
+                crate::web::WebCommand::TogglePause => {
+                    if self.player.is_playing() {
+                        let _ = self.player.pause();
+                        self.status_message = "Paused playback (web)".to_string();
+                    } else if self.player.is_paused() {
+                        let _ = self.player.resume();
+                        self.status_message = "Resumed playback (web)".to_string();
+                    } else {
+                        self.play_current_track();
+                    }
+                }
+                crate::web::WebCommand::Play => {
+                    if self.player.is_paused() {
+                        let _ = self.player.resume();
+                    } else if !self.player.is_playing() {
+                        self.play_current_track();
+                    }
+                }
+                crate::web::WebCommand::Pause => {
+                    if self.player.is_playing() {
+                        let _ = self.player.pause();
+                    }
+                }
+                crate::web::WebCommand::Next => {
+                    self.play_next_track();
+                }
+                crate::web::WebCommand::Prev => {
+                    self.play_prev_track();
+                }
+                crate::web::WebCommand::SetVolume(vol) => {
+                    let _ = self.player.set_volume(vol);
+                    self.status_message = format!("Volume {}% (web)", vol);
+                }
+                crate::web::WebCommand::SeekRelative(delta) => {
+                    let _ = self.player.seek(delta);
+                }
+            }
+        }
+    }
+
+    pub fn update_web_state(&mut self) {
+        if self.web_server.is_none() {
+            return;
+        }
+        if let Ok(mut state) = self.web_state.write() {
+            state.is_playing = self.player.is_playing();
+            state.is_paused = self.player.is_paused();
+            state.position_seconds = self.player.position_seconds();
+            state.duration_seconds = self.player.duration_seconds();
+            state.volume = self.player.volume();
+            state.output_device = self
+                .device_manager
+                .get_active_device()
+                .map(|d| d.friendly_name)
+                .unwrap_or_else(|| "Local Audio".to_string());
+            state.queue_index = self.queue.current_index;
+            state.queue_total = self.queue.len();
+
+            if let Some(track) = self.queue.current_track() {
+                state.title = track.title.clone();
+                state.artist = track.artist.clone();
+                state.album = track.album.clone();
+                state.genre = track.genre.clone();
+                state.format = track.format_name.clone();
+                state.bitrate_kbps = track.bitrate_kbps;
+                state.sample_rate_hz = track.sample_rate_hz;
+                state.channels = track.channels;
+                state.filepath = Some(track.filepath.clone());
+                state.has_cover = true;
+            } else {
+                state.title = "No Track Loaded".to_string();
+                state.artist = String::new();
+                state.album = String::new();
+                state.genre = String::new();
+                state.format = String::new();
+                state.bitrate_kbps = 0;
+                state.sample_rate_hz = 0;
+                state.channels = 2;
+                state.filepath = None;
+                state.has_cover = false;
+            }
+
+            if self.queue.len() > 1 && self.queue.current_index + 1 < self.queue.len() {
+                state.next_track_title = self.queue.tracks.get(self.queue.current_index + 1).map(|t| t.display_title().to_string());
+            } else if !self.queue.is_empty() && self.settings_mgr.settings.queue_mode == "loop" {
+                state.next_track_title = self.queue.tracks.first().map(|t| t.display_title().to_string());
+            } else {
+                state.next_track_title = None;
             }
         }
     }
@@ -1267,9 +1429,14 @@ impl AppUI {
             .unwrap_or_else(|| "Local Audio".to_string());
 
         let vol = self.player.volume();
+        let web_badge = if let Some(ref s) = self.web_server {
+            format!(" │ 🌐 :{}", s.port)
+        } else {
+            String::new()
+        };
         let status_text = format!(
-            "{} │ {} │ Vol: {}% │ Out: {} │ {}",
-            state, title, vol, active_dev_name, self.status_message
+            "{} │ {} │ Vol: {}% │ Out: {}{} │ {}",
+            state, title, vol, active_dev_name, web_badge, self.status_message
         );
         f.render_widget(
             Paragraph::new(status_text).style(Style::default().fg(Color::Yellow)),

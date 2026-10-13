@@ -6,3 +6,4 @@ pub mod player;
 pub mod queue;
 pub mod settings;
 pub mod ui;
+pub mod web;

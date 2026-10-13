@@ -8,6 +8,7 @@ pub mod player;
 pub mod queue;
 pub mod settings;
 pub mod ui;
+pub mod web;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -38,6 +39,14 @@ struct Cli {
     /// Scan local network for DLNA / UPnP MediaRenderers
     #[arg(long)]
     scan: bool,
+
+    /// Launch local Now Playing web server (HTTP metadata, cover art & remote control)
+    #[arg(long)]
+    web: bool,
+
+    /// Port for Now Playing web server (default: 8080)
+    #[arg(long)]
+    web_port: Option<u16>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -110,7 +119,14 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Launch full interactive TUI
-    let settings_mgr = SettingsManager::new();
+    let mut settings_mgr = SettingsManager::new();
+    if cli.web {
+        settings_mgr.settings.web_server_enabled = true;
+    }
+    if let Some(port) = cli.web_port {
+        settings_mgr.settings.web_server_port = port;
+        settings_mgr.settings.web_server_enabled = true;
+    }
     let start_dir = cli.paths.first().filter(|p| p.is_dir()).cloned();
     let mut app = AppUI::new(start_dir, settings_mgr);
 

@@ -15,6 +15,14 @@ pub struct Settings {
     pub queue_mode: String,
     pub force_transcode: bool,
     pub player_backend: String,
+    #[serde(default)]
+    pub web_server_enabled: bool,
+    #[serde(default = "default_web_port")]
+    pub web_server_port: u16,
+}
+
+fn default_web_port() -> u16 {
+    8080
 }
 
 impl Default for Settings {
@@ -27,6 +35,8 @@ impl Default for Settings {
             queue_mode: "loop".to_string(),
             force_transcode: false,
             player_backend: "mpv".to_string(),
+            web_server_enabled: false,
+            web_server_port: 8080,
         }
     }
 }
@@ -67,6 +77,11 @@ pub const SETTING_DEFINITIONS: &[SettingDefinition] = &[
         key: "force_transcode",
         label: "Audio Transcoding",
         description: "Transcode audio into 16-bit PCM WAV via ffmpeg for legacy DLNA renderers.",
+    },
+    SettingDefinition {
+        key: "web_server_enabled",
+        label: "Now Playing Web Server",
+        description: "Run local HTTP server (metadata, cover art & remote control) on configured port.",
     },
 ];
 
@@ -171,6 +186,10 @@ impl SettingsManager {
                 // force_transcode
                 self.settings.force_transcode = !self.settings.force_transcode;
             }
+            6 => {
+                // web_server_enabled
+                self.settings.web_server_enabled = !self.settings.web_server_enabled;
+            }
             _ => {}
         }
         self.save();
@@ -189,6 +208,11 @@ impl SettingsManager {
                 other => other,
             }.to_string(),
             5 => if self.settings.force_transcode { "Force 16-bit PCM WAV" } else { "Direct Stream (Auto)" }.to_string(),
+            6 => if self.settings.web_server_enabled {
+                format!("Enabled (Port {})", self.settings.web_server_port)
+            } else {
+                "Disabled".to_string()
+            },
             _ => String::new(),
         }
     }
@@ -241,6 +265,10 @@ mod tests {
         assert_eq!(mgr.settings.player_backend, "mpv");
         mgr.cycle_setting(1, true);
         assert_eq!(mgr.settings.player_backend, "ffplay");
+
+        assert!(!mgr.settings.web_server_enabled);
+        mgr.cycle_setting(6, true);
+        assert!(mgr.settings.web_server_enabled);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
