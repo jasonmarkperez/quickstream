@@ -740,5 +740,64 @@ fn test_ui_seek_hotkeys() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_browser_add_track_to_queue_does_not_start_playback() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_add_track_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let song1 = temp_dir.join("01_ambient_intro.mp3");
+    let song2 = temp_dir.join("02_beat_drop.flac");
+    fs::write(&song1, b"ID3\x03\0\0\0\0\0#TIT2\0\0\0\x0f\0\0\0Ambient Intro").unwrap();
+    fs::write(&song2, b"fLaC\0\0\0").unwrap();
+
+    let config_path = temp_dir.join("config.json");
+    let settings_mgr = SettingsManager::with_path(config_path);
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    // Initial state: queue is empty, player is not playing
+    assert_eq!(app.queue.len(), 0);
+    assert!(!app.player.is_playing());
+
+    // Locate song 1 in browser entries and position cursor
+    let song1_idx = app.browser_entries.iter().position(|(_, p, is_dir)| !*is_dir && p == &song1).unwrap();
+    app.browser_cursor = song1_idx;
+    assert!(!app.queue_focus);
+
+    // Press Enter to add song1 to queue
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    // VERIFY:
+    // 1. Song was added to queue
+    assert_eq!(app.queue.len(), 1);
+    assert!(app.status_message.contains("Added to queue: "));
+    // 2. Playback did NOT start immediately!
+    assert!(!app.player.is_playing(), "Adding track to queue must NOT start playback immediately!");
+
+    // Locate song 2 in browser entries and position cursor
+    let song2_idx = app.browser_entries.iter().position(|(_, p, is_dir)| !*is_dir && p == &song2).unwrap();
+    app.browser_cursor = song2_idx;
+
+    // Press Enter to add song2 to queue
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    // VERIFY:
+    // 1. Both songs in queue
+    assert_eq!(app.queue.len(), 2);
+    // 2. Current index remained 0
+    assert_eq!(app.queue.current_index, 0);
+    // 3. Playback still NOT started
+    assert!(!app.player.is_playing());
+    assert!(app.status_message.contains("Added to queue: "));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
 
 

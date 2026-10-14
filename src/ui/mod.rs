@@ -849,10 +849,9 @@ impl AppUI {
                                     m.close();
                                 }
                                 if let Some(track) = track_opt {
-                                    self.queue.add_track(track.clone());
-                                    self.queue.current_index = self.queue.len().saturating_sub(1);
-                                    self.play_current_track();
-                                    self.status_message = format!("Playing: {}", track.display_title());
+                                    let title = track.display_title().to_string();
+                                    self.queue.add_track(track);
+                                    self.status_message = format!("Added to queue: {}", title);
                                 }
                             }
                             (KeyCode::Tab, KeyModifiers::NONE) => {
@@ -933,9 +932,9 @@ impl AppUI {
                                             })
                                             .or_else(|| Some(crate::metadata::fallback_metadata(&path)));
                                         if let Some(meta) = meta_opt {
+                                            let title = meta.display_title().to_string();
                                             self.queue.add_track(meta);
-                                            self.queue.current_index = self.queue.len().saturating_sub(1);
-                                            self.play_current_track();
+                                            self.status_message = format!("Added to queue: {}", title);
                                         }
                                     }
                                 }
@@ -1347,9 +1346,9 @@ impl AppUI {
                                     })
                                     .or_else(|| Some(crate::metadata::fallback_metadata(&path)));
                                 if let Some(meta) = meta_opt {
+                                    let title = meta.display_title().to_string();
                                     self.queue.add_track(meta);
-                                    self.queue.current_index = self.queue.len().saturating_sub(1);
-                                    self.play_current_track();
+                                    self.status_message = format!("Added to queue: {}", title);
                                 }
                             }
                         }
@@ -2324,7 +2323,7 @@ impl AppUI {
         // 3. Action legend bar
         let action_spans = vec![
             Span::styled(" [Enter] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("Play Now  │  "),
+            Span::raw("Add & Close  │  "),
             Span::styled(" [Tab] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             Span::raw("Add to Queue  │  "),
             Span::styled(" [Shift+Tab] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
