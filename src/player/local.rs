@@ -287,6 +287,8 @@ impl AudioPlayer for LocalPlayer {
         // Do not block UI thread on synchronous tag extraction!
         // Duration is streamed asynchronously via IPC ("observe_property", "duration").
         *self.shared_state.position.lock().unwrap() = 0.0;
+        self.accumulated_offset = 0.0;
+        self.start_time = None;
         self.shared_state.is_finished.store(false, Ordering::SeqCst);
         self.shared_state.is_playing.store(true, Ordering::SeqCst);
         self.shared_state.is_paused.store(false, Ordering::SeqCst);
@@ -321,8 +323,9 @@ impl AudioPlayer for LocalPlayer {
         }
         self.shared_state.is_paused.store(true, Ordering::SeqCst);
 
-        if self.ffplay_child.is_some() {
+        if self.ffplay_child.is_some() || self.backend != "mpv" {
             self.accumulated_offset = self.position_seconds();
+            self.start_time = None;
             if let Some(mut child) = self.ffplay_child.take() {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -375,6 +378,8 @@ impl AudioPlayer for LocalPlayer {
         self.shared_state.is_paused.store(false, Ordering::SeqCst);
         self.shared_state.is_finished.store(false, Ordering::SeqCst);
         *self.shared_state.position.lock().unwrap() = 0.0;
+        self.accumulated_offset = 0.0;
+        self.start_time = None;
 
         if let Some(mut child) = self.ffplay_child.take() {
             let _ = child.kill();
@@ -399,7 +404,15 @@ impl AudioPlayer for LocalPlayer {
             position_seconds.max(0.0)
         };
 
-        if self.ffplay_child.is_some() {
+        crate::log_info!("player", "LocalPlayer::seek_to target={:.2}s via {}", target, self.backend);
+
+        if self.current_file.is_none() {
+            self.accumulated_offset = target;
+            *self.shared_state.position.lock().unwrap() = target;
+            return Ok(());
+        }
+
+        if self.ffplay_child.is_some() || self.backend != "mpv" {
             self.accumulated_offset = target;
             if !self.is_paused() {
                 if let Some(file) = self.current_file.clone() {
@@ -421,6 +434,8 @@ impl AudioPlayer for LocalPlayer {
                     self.ffplay_child = Some(cmd.spawn()?);
                     self.start_time = Some(Instant::now());
                 }
+            } else {
+                self.start_time = None;
             }
             Ok(())
         } else if self.backend == "mpv" {
@@ -477,6 +492,8 @@ impl AudioPlayer for LocalPlayer {
             } else {
                 self.accumulated_offset
             }
+        } else if self.backend != "mpv" {
+            self.accumulated_offset
         } else if self.backend == "mpv" {
             *self.shared_state.position.lock().unwrap()
         } else {

@@ -5,7 +5,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::discovery::{extract_xml_tag, get_local_ip_for_target, DLNADevice};
 use crate::metadata::{extract_metadata, get_audio_mime_type};
@@ -509,6 +509,8 @@ pub struct UPnPPlayer {
     track_finished: Arc<AtomicBool>,
     poll_stop_flag: Arc<AtomicBool>,
     current_filepath: Arc<Mutex<Option<PathBuf>>>,
+    playback_stream_offset: Arc<Mutex<f64>>,
+    last_seek_time: Arc<Mutex<Instant>>,
 }
 
 impl UPnPPlayer {
@@ -527,6 +529,8 @@ impl UPnPPlayer {
             track_finished: Arc::new(AtomicBool::new(false)),
             poll_stop_flag: Arc::new(AtomicBool::new(false)),
             current_filepath: Arc::new(Mutex::new(None)),
+            playback_stream_offset: Arc::new(Mutex::new(0.0)),
+            last_seek_time: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(10))),
         }
     }
 
@@ -539,6 +543,8 @@ impl UPnPPlayer {
         let is_playing_ref = self.is_playing.clone();
         let is_paused_ref = self.is_paused.clone();
         let finished_ref = self.track_finished.clone();
+        let offset_ref = self.playback_stream_offset.clone();
+        let last_seek_ref = self.last_seek_time.clone();
 
         std::thread::spawn(move || {
             let mut consecutive_stopped = 0;
@@ -552,7 +558,21 @@ impl UPnPPlayer {
                 if dur_sec > 0.0 {
                     *dur_ref.lock().unwrap() = dur_sec;
                 }
-                *pos_ref.lock().unwrap() = rel_sec;
+
+                // If user just sought within 2.0s, ignore stale renderer reports to prevent progress bar jitter
+                let time_since_seek = last_seek_ref.lock().unwrap().elapsed();
+                if time_since_seek >= Duration::from_millis(2000) {
+                    let stream_offset = *offset_ref.lock().unwrap();
+                    let actual_pos = if stream_offset > 0.0 && rel_sec < stream_offset {
+                        stream_offset + rel_sec
+                    } else if stream_offset > 0.0 {
+                        // Renderer natively advanced past offset
+                        rel_sec
+                    } else {
+                        rel_sec
+                    };
+                    *pos_ref.lock().unwrap() = actual_pos;
+                }
 
                 let state = client.get_transport_info();
                 match state.as_str() {
@@ -580,6 +600,59 @@ impl UPnPPlayer {
                 }
             }
         });
+    }
+
+    fn seek_via_stream_offset(&mut self, target: f64) -> anyhow::Result<()> {
+        let filepath = match self.current_filepath.lock().unwrap().clone() {
+            Some(p) => p,
+            None => anyhow::bail!("No track currently loaded"),
+        };
+
+        // Stop current renderer playback
+        let _ = self.client.stop();
+
+        // Build stream URL with pos offset parameter
+        let host_ip = get_local_ip_for_target(&self.device.host, self.device.port);
+        let file_name = filepath
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| "track".to_string());
+        let encoded_name = url_encode(&file_name);
+        let stream_url = format!(
+            "http://{}:{}/stream/{}?pos={:.2}",
+            host_ip, self.web_port, encoded_name, target
+        );
+        crate::log_info!("player", "Reloading UPnP transport URI with seek offset: {}", stream_url);
+
+        let mime = get_audio_mime_type(&filepath);
+        let (title, artist, album, duration) = if let Ok(m) = extract_metadata(&filepath) {
+            (m.title, m.artist, m.album, m.duration_seconds)
+        } else {
+            (file_name.clone(), String::new(), String::new(), 0.0)
+        };
+
+        // Set transport URI with offset URL
+        if !self.client.set_transport_uri(&stream_url, &title, &artist, &album, duration, mime) {
+            let err = self.client.last_error.lock().unwrap().clone();
+            crate::log_warn!("player", "SetAVTransportURI with seek offset failed: {}", err);
+            anyhow::bail!("SetAVTransportURI offset failed: {}", err);
+        }
+
+        // Send Play command
+        if !self.client.play("1") {
+            let err = self.client.last_error.lock().unwrap().clone();
+            crate::log_warn!("player", "Play after seek offset failed: {}", err);
+            anyhow::bail!("Play after seek offset failed: {}", err);
+        }
+
+        *self.playback_stream_offset.lock().unwrap() = target;
+        *self.position_seconds.lock().unwrap() = target;
+        *self.last_seek_time.lock().unwrap() = Instant::now();
+        self.is_playing.store(true, Ordering::SeqCst);
+        self.is_paused.store(false, Ordering::SeqCst);
+
+        crate::log_info!("player", "UPnP stream offset seek to {:.2}s successfully started", target);
+        Ok(())
     }
 }
 
@@ -623,6 +696,8 @@ impl AudioPlayer for UPnPPlayer {
 
         *self.duration_seconds.lock().unwrap() = duration;
         *self.position_seconds.lock().unwrap() = 0.0;
+        *self.playback_stream_offset.lock().unwrap() = 0.0;
+        *self.last_seek_time.lock().unwrap() = Instant::now() - Duration::from_secs(10);
         *self.current_filepath.lock().unwrap() = Some(filepath.to_path_buf());
         self.track_finished.store(false, Ordering::SeqCst);
 
@@ -690,6 +765,7 @@ impl AudioPlayer for UPnPPlayer {
         self.is_playing.store(false, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);
         *self.position_seconds.lock().unwrap() = 0.0;
+        *self.playback_stream_offset.lock().unwrap() = 0.0;
         let _ = self.client.stop();
         Ok(())
     }
@@ -708,13 +784,34 @@ impl AudioPlayer for UPnPPlayer {
             position_seconds.max(0.0)
         };
 
+        crate::log_info!(
+            "player",
+            "UPnPPlayer::seek_to target={:.2}s (current={:.2}s) on '{}'",
+            target,
+            *self.position_seconds.lock().unwrap(),
+            self.device.friendly_name
+        );
+        *self.last_seek_time.lock().unwrap() = Instant::now();
+        *self.position_seconds.lock().unwrap() = target;
+
+        // 1. Try native UPnP REL_TIME Seek first
         if self.client.seek(target) {
-            *self.position_seconds.lock().unwrap() = target;
-            Ok(())
-        } else {
-            let err = self.client.last_error.lock().unwrap().clone();
-            anyhow::bail!("Seek failed: {}", err);
+            crate::log_info!("player", "UPnP native Seek succeeded to {:.2}s", target);
+            *self.playback_stream_offset.lock().unwrap() = 0.0;
+            return Ok(());
         }
+
+        // 2. If native seek failed (e.g. errorCode 710 Seek Mode Not Supported),
+        // fallback to stream offset reload (universal DLNA standard)
+        let last_err = self.client.last_error.lock().unwrap().clone();
+        crate::log_info!(
+            "player",
+            "UPnP native Seek failed ('{}'), falling back to stream offset reload at {:.2}s",
+            last_err,
+            target
+        );
+
+        self.seek_via_stream_offset(target)
     }
 
     fn set_volume(&mut self, volume: u8) -> anyhow::Result<()> {

@@ -261,3 +261,39 @@ fn test_web_server_audio_streaming_byte_ranges() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_web_server_audio_streaming_seek_pos_query() {
+    let temp_dir = std::env::temp_dir().join("test_web_seek_stream");
+    let _ = fs::create_dir_all(&temp_dir);
+    let test_file = temp_dir.join("test_seek.mp3");
+
+    // Create 1000 bytes of dummy audio data
+    let test_data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
+    fs::write(&test_file, &test_data).unwrap();
+
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    {
+        let mut s = state.write().unwrap();
+        s.filepath = Some(test_file.clone());
+        s.duration_seconds = 100.0;
+    }
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state.clone(), tx).expect("start web server");
+    let port = handle.port;
+
+    // Request stream with ?pos=50.0 (middle of the file)
+    let (status, headers, body) = http_get(port, "/stream/test_seek.mp3?pos=50.0");
+    assert_eq!(status, 200);
+    assert!(headers.contains("transferMode.dlna.org: Streaming"));
+    // Since pos=50.0 out of 100.0s, ratio is 0.50, so body length is ~500 bytes
+    assert!(
+        body.len() <= 550 && body.len() >= 450,
+        "Body length with pos=50.0 should be roughly half (got {} bytes)",
+        body.len()
+    );
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+

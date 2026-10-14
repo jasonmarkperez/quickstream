@@ -335,6 +335,166 @@ fn handle_client(
 
     Ok(())
 }
+fn find_mp3_frame_sync(file: &mut std::fs::File, start_offset: u64, max_scan: u64) -> u64 {
+    use std::io::{Read, Seek, SeekFrom};
+    if file.seek(SeekFrom::Start(start_offset)).is_err() {
+        return start_offset;
+    }
+    let mut buf = vec![0u8; max_scan as usize];
+    let n = match file.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return start_offset,
+    };
+    if n < 4 {
+        return start_offset;
+    }
+    for i in 0..(n - 3) {
+        // Frame sync: 11 set bits (0xFF, 0xEx)
+        if buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0 {
+            // Check MPEG version (01 reserved)
+            if (buf[i + 1] & 0x18) == 0x08 {
+                continue;
+            }
+            // Check bitrate index (1111 invalid)
+            if (buf[i + 2] & 0xF0) == 0xF0 {
+                continue;
+            }
+            // Check sampling frequency (11 reserved)
+            if (buf[i + 2] & 0x0C) == 0x0C {
+                continue;
+            }
+            return start_offset + i as u64;
+        }
+    }
+    start_offset
+}
+
+fn get_id3v2_size(file: &mut std::fs::File) -> u64 {
+    use std::io::{Read, Seek, SeekFrom};
+    let _ = file.seek(SeekFrom::Start(0));
+    let mut hdr = [0u8; 10];
+    if file.read_exact(&mut hdr).is_ok() && &hdr[0..3] == b"ID3" {
+        let size = ((hdr[6] as u64 & 0x7F) << 21)
+            | ((hdr[7] as u64 & 0x7F) << 14)
+            | ((hdr[8] as u64 & 0x7F) << 7)
+            | (hdr[9] as u64 & 0x7F);
+        return 10 + size;
+    }
+    0
+}
+
+fn find_mp3_stream_offset(file: &mut std::fs::File, offset_seconds: f64, duration: f64, total_size: u64) -> u64 {
+    let id3_size = get_id3v2_size(file);
+    let audio_size = total_size.saturating_sub(id3_size);
+    let dur = if duration > 0.0 { duration } else { 1.0 };
+    let ratio = (offset_seconds / dur).clamp(0.0, 0.995);
+    let est_offset = id3_size + (audio_size as f64 * ratio) as u64;
+    find_mp3_frame_sync(file, est_offset, 4096)
+}
+
+fn find_wav_pcm_offset(file: &mut std::fs::File, offset_seconds: f64) -> (u64, Option<Vec<u8>>) {
+    use std::io::{Read, Seek, SeekFrom};
+    let _ = file.seek(SeekFrom::Start(0));
+    let mut riff_hdr = [0u8; 12];
+    if file.read_exact(&mut riff_hdr).is_err() || &riff_hdr[0..4] != b"RIFF" || &riff_hdr[8..12] != b"WAVE" {
+        return (0, None);
+    }
+    let mut fmt_info = None;
+    let mut data_offset = 0u64;
+    let mut data_size = 0u32;
+
+    while let Ok(chunk_hdr) = (|| -> std::io::Result<[u8; 8]> {
+        let mut h = [0u8; 8];
+        file.read_exact(&mut h)?;
+        Ok(h)
+    })() {
+        let cid = &chunk_hdr[0..4];
+        let csize = u32::from_le_bytes(chunk_hdr[4..8].try_into().unwrap());
+        if cid == b"fmt " {
+            let mut fmt_bytes = vec![0u8; csize as usize];
+            if file.read_exact(&mut fmt_bytes).is_ok() && fmt_bytes.len() >= 16 {
+                let audio_fmt = u16::from_le_bytes(fmt_bytes[0..2].try_into().unwrap());
+                let channels = u16::from_le_bytes(fmt_bytes[2..4].try_into().unwrap());
+                let srate = u32::from_le_bytes(fmt_bytes[4..8].try_into().unwrap());
+                let brate = u32::from_le_bytes(fmt_bytes[8..12].try_into().unwrap());
+                let align = u16::from_le_bytes(fmt_bytes[12..14].try_into().unwrap());
+                let bps = u16::from_le_bytes(fmt_bytes[14..16].try_into().unwrap());
+                fmt_info = Some((audio_fmt, channels, srate, brate, align, bps));
+            }
+        } else if cid == b"data" {
+            data_offset = file.stream_position().unwrap_or(0);
+            data_size = csize;
+            break;
+        } else {
+            let pad = (csize % 2) as i64;
+            let _ = file.seek(SeekFrom::Current(csize as i64 + pad));
+        }
+    }
+
+    if let (Some((audio_fmt, channels, srate, brate, align, bps)), true) = (fmt_info, data_offset > 0 && data_size > 0) {
+        let pcm_offset = (offset_seconds * brate as f64) as u64;
+        let aligned_pcm = if align > 0 {
+            (pcm_offset / align as u64) * align as u64
+        } else {
+            pcm_offset
+        };
+        let clamped_pcm = aligned_pcm.min(data_size as u64);
+        let file_seek_pos = data_offset + clamped_pcm;
+        let remaining_pcm = (data_size as u64).saturating_sub(clamped_pcm) as u32;
+
+        let mut hdr = Vec::with_capacity(44);
+        hdr.extend_from_slice(b"RIFF");
+        hdr.extend_from_slice(&(36u32 + remaining_pcm).to_le_bytes());
+        hdr.extend_from_slice(b"WAVEfmt ");
+        hdr.extend_from_slice(&16u32.to_le_bytes());
+        hdr.extend_from_slice(&audio_fmt.to_le_bytes());
+        hdr.extend_from_slice(&channels.to_le_bytes());
+        hdr.extend_from_slice(&srate.to_le_bytes());
+        hdr.extend_from_slice(&brate.to_le_bytes());
+        hdr.extend_from_slice(&align.to_le_bytes());
+        hdr.extend_from_slice(&bps.to_le_bytes());
+        hdr.extend_from_slice(b"data");
+        hdr.extend_from_slice(&remaining_pcm.to_le_bytes());
+        return (file_seek_pos, Some(hdr));
+    }
+    (0, None)
+}
+
+pub fn calculate_stream_offset(
+    filepath: &std::path::Path,
+    file: &mut std::fs::File,
+    offset_seconds: f64,
+    total_size: u64,
+    duration_hint: f64,
+) -> (u64, Option<Vec<u8>>) {
+    if offset_seconds <= 0.0 || total_size == 0 {
+        return (0, None);
+    }
+    let ext = filepath
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let duration = if duration_hint > 0.0 {
+        duration_hint
+    } else {
+        crate::metadata::extract_metadata(filepath)
+            .map(|m| m.duration_seconds)
+            .unwrap_or(0.0)
+    };
+
+    if ext == "wav" || ext == "wave" {
+        find_wav_pcm_offset(file, offset_seconds)
+    } else if ext == "mp3" {
+        let off = find_mp3_stream_offset(file, offset_seconds, duration, total_size);
+        (off, None)
+    } else {
+        let dur = if duration > 0.0 { duration } else { 1.0 };
+        let ratio = (offset_seconds / dur).clamp(0.0, 0.995);
+        let seek_pos = (total_size as f64 * ratio) as u64;
+        (seek_pos, None)
+    }
+}
 
 fn serve_audio_stream(
     mut stream: TcpStream,
@@ -343,15 +503,29 @@ fn serve_audio_stream(
     head_only: bool,
     state: &Arc<RwLock<NowPlayingState>>,
 ) -> std::io::Result<()> {
-    // 1. Resolve target file
+    // 1. Resolve target file and optional seek offset query parameter
     let raw_encoded = path.strip_prefix("/stream/").unwrap_or("");
     let encoded_path = raw_encoded.split('?').next().unwrap_or(raw_encoded);
     let decoded_path = crate::player::upnp::url_decode(encoded_path);
     let candidate = PathBuf::from(&decoded_path);
 
-    let current_filepath = {
+    let query_str = path.split_once('?').map(|(_, q)| q);
+    let mut offset_seconds: f64 = 0.0;
+    if let Some(query) = query_str {
+        for param in query.split('&') {
+            if let Some((k, v)) = param.split_once('=') {
+                if k == "pos" || k == "offset" {
+                    if let Ok(sec) = v.parse::<f64>() {
+                        offset_seconds = sec.max(0.0);
+                    }
+                }
+            }
+        }
+    }
+
+    let (current_filepath, current_duration) = {
         let s = state.read().unwrap();
-        s.filepath.clone()
+        (s.filepath.clone(), s.duration_seconds)
     };
 
     let filepath = if candidate.exists() && candidate.is_file() {
@@ -385,13 +559,22 @@ fn serve_audio_stream(
     let total_size = file.metadata()?.len();
     let mime = crate::metadata::get_audio_mime_type(&filepath);
 
-    // 2. Parse Range header if present
+    // 2. Calculate base byte offset for seek queries (e.g. ?pos=12.5)
+    let (base_offset, synthesized_hdr) =
+        calculate_stream_offset(&filepath, &mut file, offset_seconds, total_size, current_duration);
+
+    let effective_total = if let Some(ref hdr) = synthesized_hdr {
+        hdr.len() as u64 + total_size.saturating_sub(base_offset)
+    } else {
+        total_size.saturating_sub(base_offset)
+    };
+
+    // 3. Parse Range header if present
     let mut req_start = 0u64;
-    let mut req_end = total_size.saturating_sub(1);
+    let mut req_end = effective_total.saturating_sub(1);
     let mut is_range = false;
 
     if let Some(range) = range_header {
-        // e.g. "bytes=0-", "bytes=1000-2000", "bytes=500-"
         if let Some(spec) = range.strip_prefix("bytes=") {
             let parts: Vec<&str> = spec.split('-').collect();
             if parts.len() == 2 {
@@ -399,17 +582,17 @@ fn serve_audio_stream(
                     req_start = s;
                     is_range = true;
                     if let Ok(e) = parts[1].parse::<u64>() {
-                        req_end = e.min(total_size.saturating_sub(1));
+                        req_end = e.min(effective_total.saturating_sub(1));
                     }
                 }
             }
         }
     }
 
-    if req_start >= total_size || req_start > req_end {
+    if req_start >= effective_total || req_start > req_end {
         let err_resp = format!(
             "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nConnection: close\r\n\r\n",
-            total_size
+            effective_total
         );
         stream.write_all(err_resp.as_bytes())?;
         stream.flush()?;
@@ -418,7 +601,7 @@ fn serve_audio_stream(
 
     let content_length = req_end - req_start + 1;
 
-    // 3. Write DLNA HTTP headers
+    // 4. Write DLNA HTTP headers
     let status_line = if is_range {
         "HTTP/1.1 206 Partial Content"
     } else {
@@ -437,7 +620,10 @@ fn serve_audio_stream(
     );
 
     if is_range {
-        headers.push_str(&format!("Content-Range: bytes {}-{}/{}\r\n", req_start, req_end, total_size));
+        headers.push_str(&format!(
+            "Content-Range: bytes {}-{}/{}\r\n",
+            req_start, req_end, effective_total
+        ));
     }
     headers.push_str("\r\n");
 
@@ -448,27 +634,66 @@ fn serve_audio_stream(
         return Ok(());
     }
 
-    // 4. Stream audio file chunk by chunk
+    // 5. Stream audio file
     use std::io::Seek;
-    file.seek(std::io::SeekFrom::Start(req_start))?;
-
-    // Allow longer write timeout for streaming
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
 
-    let mut buf = [0u8; 65536];
-    let mut remaining = content_length;
-    while remaining > 0 {
-        let to_read = remaining.min(buf.len() as u64) as usize;
-        let n = match file.read(&mut buf[..to_read]) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => break,
-        };
-        if stream.write_all(&buf[..n]).is_err() {
-            // Client closed socket (e.g. paused or jumped to next song)
-            break;
+    if let Some(hdr) = synthesized_hdr {
+        let hdr_len = hdr.len() as u64;
+        let mut bytes_sent = 0u64;
+
+        // If request starts inside the synthesized header
+        if req_start < hdr_len {
+            let hdr_slice_start = req_start as usize;
+            let hdr_slice_end = (req_end + 1).min(hdr_len) as usize;
+            let slice = &hdr[hdr_slice_start..hdr_slice_end];
+            if stream.write_all(slice).is_err() {
+                return Ok(());
+            }
+            bytes_sent += slice.len() as u64;
         }
-        remaining -= n as u64;
+
+        // Remaining bytes from file
+        if req_end >= hdr_len {
+            let file_start_offset = if req_start > hdr_len {
+                base_offset + (req_start - hdr_len)
+            } else {
+                base_offset
+            };
+            file.seek(std::io::SeekFrom::Start(file_start_offset))?;
+            let mut remaining = content_length.saturating_sub(bytes_sent);
+            let mut buf = [0u8; 65536];
+            while remaining > 0 {
+                let to_read = remaining.min(buf.len() as u64) as usize;
+                let n = match file.read(&mut buf[..to_read]) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                if stream.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+                remaining -= n as u64;
+            }
+        }
+    } else {
+        let file_start = base_offset + req_start;
+        file.seek(std::io::SeekFrom::Start(file_start))?;
+
+        let mut buf = [0u8; 65536];
+        let mut remaining = content_length;
+        while remaining > 0 {
+            let to_read = remaining.min(buf.len() as u64) as usize;
+            let n = match file.read(&mut buf[..to_read]) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if stream.write_all(&buf[..n]).is_err() {
+                break;
+            }
+            remaining -= n as u64;
+        }
     }
     let _ = stream.flush();
 

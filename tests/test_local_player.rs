@@ -34,8 +34,38 @@ fn test_local_playback_lifecycle() {
     assert!(!player.is_paused());
     assert!(player.is_playing());
 
-    // Test seek
-    assert!(player.seek(2.0).is_ok());
+    // Test seek forward
+    assert!(player.seek_to(4.0).is_ok());
+    thread::sleep(Duration::from_millis(250));
+    let pos_after_seek = player.position_seconds();
+    assert!(
+        pos_after_seek >= 3.8 && pos_after_seek <= 4.5,
+        "Position after seek_to(4.0) should be around 4.0s, got {:.3}s",
+        pos_after_seek
+    );
+
+    // Test relative seek backward
+    assert!(player.seek(-1.5).is_ok());
+    thread::sleep(Duration::from_millis(250));
+    let pos_after_rel = player.position_seconds();
+    assert!(
+        pos_after_rel >= 2.0 && pos_after_rel <= 3.3,
+        "Position after seek(-1.5) should be around 2.5s, got {:.3}s",
+        pos_after_rel
+    );
+
+    // Test seek while paused
+    assert!(player.pause().is_ok());
+    assert!(player.is_paused());
+    assert!(player.seek_to(6.0).is_ok());
+    assert!(
+        player.position_seconds() >= 5.8,
+        "Position when seeking while paused should be ~6.0s, got {:.3}s",
+        player.position_seconds()
+    );
+    assert!(player.is_paused(), "Player should remain paused after seeking while paused");
+    assert!(player.resume().is_ok());
+    assert!(player.is_playing());
 
     // Test volume
     assert!(player.set_volume(80).is_ok());
@@ -59,6 +89,35 @@ fn test_ffplay_backend_lifecycle() {
 
     thread::sleep(Duration::from_millis(200));
     assert!(player.position_seconds() > 0.0);
+
+    // Test seek while playing on ffplay
+    assert!(player.seek_to(3.5).is_ok());
+    thread::sleep(Duration::from_millis(200));
+    let ffplay_pos = player.position_seconds();
+    assert!(
+        ffplay_pos >= 3.4 && ffplay_pos <= 4.5,
+        "ffplay position after seek_to(3.5) should be >= 3.4, got {:.3}s",
+        ffplay_pos
+    );
+
+    // Test seek while paused on ffplay
+    assert!(player.pause().is_ok());
+    assert!(player.is_paused());
+    assert!(player.seek_to(5.0).is_ok());
+    assert_eq!(
+        player.position_seconds(),
+        5.0,
+        "ffplay position_seconds while paused should match seek target exactly"
+    );
+
+    // Test resume after seeking while paused
+    assert!(player.resume().is_ok());
+    assert!(player.is_playing());
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        player.position_seconds() >= 5.0,
+        "ffplay position after resume should advance from sought offset"
+    );
 
     assert!(player.stop().is_ok());
     assert!(!player.is_playing());

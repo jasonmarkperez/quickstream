@@ -954,114 +954,157 @@ impl AppUI {
                         continue;
                     }
 
-                    // Global hotkeys
-                    match (key.code, key.modifiers) {
-                        (KeyCode::Char('q'), KeyModifiers::NONE)
-                        | (KeyCode::Esc, KeyModifiers::NONE)
-                        | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                            if key.code == KeyCode::Esc && self.browser_loading {
-                                if let Some(stop) = self.dir_scan_stop.take() {
-                                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                                }
-                                self.browser_loading = false;
-                                self.browser_load_start = None;
-                                self.status_message = "Cancelled directory scan".to_string();
-                                continue;
-                            }
-                            crate::log_info!("ui", "Quit requested by user");
-                            self.player.stop()?;
-                            return Ok(());
-                        }
-                        (KeyCode::Char('?'), KeyModifiers::NONE) => {
-                            self.show_help_modal = true;
-                        }
-                        (KeyCode::Tab, KeyModifiers::NONE) => {
-                            self.active_tab = (self.active_tab + 1) % 3;
-                        }
-                        (KeyCode::Char('1'), KeyModifiers::NONE) => {
-                            self.active_tab = 0;
-                        }
-                        (KeyCode::Char('2'), KeyModifiers::NONE) => {
-                            self.active_tab = 1;
-                        }
-                        (KeyCode::Char('3'), KeyModifiers::NONE) => {
-                            self.active_tab = 2;
-                        }
-                        (KeyCode::Char(' '), KeyModifiers::NONE) => {
-                            if !self.player.is_playing() && !self.player.is_paused() {
-                                if !self.queue.is_empty() {
-                                    self.play_current_track();
-                                } else {
-                                    self.status_message = "No tracks in queue".to_string();
-                                }
-                            } else {
-                                let paused = self.player.toggle_pause()?;
-                                self.status_message = if paused { "Paused" } else { "Playing" }.to_string();
-                            }
-                        }
-                        (KeyCode::Char('s'), KeyModifiers::NONE) => {
-                            self.player.stop()?;
-                            self.status_message = "Stopped".to_string();
-                        }
-                        (KeyCode::Right, KeyModifiers::NONE) => {
-                            self.play_next_track();
-                        }
-                        (KeyCode::Left, KeyModifiers::NONE) => {
-                            self.play_prev_track();
-                        }
-                        (KeyCode::Right, KeyModifiers::SHIFT) => {
-                            let step = self.settings_mgr.settings.seek_step_seconds;
-                            let _ = self.player.seek(step);
-                            self.status_message = format!("Seek +{:.0}s", step);
-                        }
-                        (KeyCode::Left, KeyModifiers::SHIFT) => {
-                            let step = self.settings_mgr.settings.seek_step_seconds;
-                            let _ = self.player.seek(-step);
-                            self.status_message = format!("Seek -{:.0}s", step);
-                        }
-                        (KeyCode::Char('+') | KeyCode::Char('='), KeyModifiers::NONE) => {
-                            let step = self.settings_mgr.settings.volume_step;
-                            let new_vol = self.player.volume().saturating_add(step).min(100);
-                            let _ = self.player.set_volume(new_vol);
-                            self.status_message = format!("Volume {}%", new_vol);
-                        }
-                        (KeyCode::Char('-'), KeyModifiers::NONE) => {
-                            let step = self.settings_mgr.settings.volume_step;
-                            let new_vol = self.player.volume().saturating_sub(step);
-                            let _ = self.player.set_volume(new_vol);
-                            self.status_message = format!("Volume {}%", new_vol);
-                        }
-                        (KeyCode::Char('v'), KeyModifiers::NONE) => {
-                            self.settings_mgr.cycle_setting(0, true);
-                            self.browser_dir_cache.clear();
-                            self.refresh_browser();
-                            self.status_message = format!(
-                                "Display mode: {}",
-                                if self.settings_mgr.settings.metadata_view {
-                                    "Metadata Tags (Artist - Title) [TAGS]"
-                                } else {
-                                    "Filenames [FILES]"
-                                }
-                            );
-                        }
-                        (KeyCode::Char('/'), KeyModifiers::NONE) => {
-                            if self.active_tab == 0 && !self.queue_focus {
-                                self.open_spotlight();
-                            } else {
-                                self.open_fuzzy_search();
-                            }
-                        }
-                        (KeyCode::Char('f'), KeyModifiers::NONE) => {
-                            self.open_fuzzy_search();
-                        }
-                        _ => {
-                            // Tab specific key handling
-                            self.handle_tab_key_with_modifiers(key.code, key.modifiers);
-                        }
+                    if self.handle_input_key(key)? {
+                        return Ok(());
                     }
                 }
             }
         }
+    }
+
+    pub fn handle_input_key(&mut self, key: crossterm::event::KeyEvent) -> anyhow::Result<bool> {
+        // Global hotkeys
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), KeyModifiers::NONE)
+            | (KeyCode::Esc, KeyModifiers::NONE)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                if key.code == KeyCode::Esc && self.browser_loading {
+                    if let Some(stop) = self.dir_scan_stop.take() {
+                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    self.browser_loading = false;
+                    self.browser_load_start = None;
+                    self.status_message = "Cancelled directory scan".to_string();
+                    return Ok(false);
+                }
+                crate::log_info!("ui", "Quit requested by user");
+                self.player.stop()?;
+                return Ok(true);
+            }
+            (KeyCode::Char('?'), KeyModifiers::NONE) => {
+                self.show_help_modal = true;
+            }
+            (KeyCode::Tab, KeyModifiers::NONE) => {
+                self.active_tab = (self.active_tab + 1) % 3;
+            }
+            (KeyCode::Char('1'), KeyModifiers::NONE) => {
+                self.active_tab = 0;
+            }
+            (KeyCode::Char('2'), KeyModifiers::NONE) => {
+                self.active_tab = 1;
+            }
+            (KeyCode::Char('3'), KeyModifiers::NONE) => {
+                self.active_tab = 2;
+            }
+            (KeyCode::Char(' '), KeyModifiers::NONE) => {
+                if !self.player.is_playing() && !self.player.is_paused() {
+                    if !self.queue.is_empty() {
+                        self.play_current_track();
+                    } else {
+                        self.status_message = "No tracks in queue".to_string();
+                    }
+                } else {
+                    let paused = self.player.toggle_pause()?;
+                    self.status_message = if paused { "Paused" } else { "Playing" }.to_string();
+                }
+            }
+            (KeyCode::Char('s'), KeyModifiers::NONE) => {
+                self.player.stop()?;
+                self.status_message = "Stopped".to_string();
+            }
+            (KeyCode::Right, KeyModifiers::NONE) => {
+                self.play_next_track();
+            }
+            (KeyCode::Left, KeyModifiers::NONE) => {
+                self.play_prev_track();
+            }
+            (KeyCode::Right, KeyModifiers::SHIFT)
+            | (KeyCode::Right, KeyModifiers::CONTROL)
+            | (KeyCode::Right, KeyModifiers::ALT)
+            | (KeyCode::Char(']'), KeyModifiers::NONE)
+            | (KeyCode::Char('>'), _) => {
+                let step = self.settings_mgr.settings.seek_step_seconds;
+                match self.player.seek(step) {
+                    Ok(_) => {
+                        let new_pos = self.player.position_seconds();
+                        self.status_message = format!(
+                            "Seek +{:.0}s ({})",
+                            step,
+                            crate::player::upnp::format_seconds_to_upnp_time(new_pos)
+                        );
+                        crate::log_info!("ui", "Seek +{:.0}s -> {:.2}s", step, new_pos);
+                    }
+                    Err(e) => {
+                        self.status_message = format!("Seek error: {}", e);
+                        crate::log_warn!("ui", "Seek +{:.0}s failed: {:?}", step, e);
+                    }
+                }
+                self.update_web_state();
+            }
+            (KeyCode::Left, KeyModifiers::SHIFT)
+            | (KeyCode::Left, KeyModifiers::CONTROL)
+            | (KeyCode::Left, KeyModifiers::ALT)
+            | (KeyCode::Char('['), KeyModifiers::NONE)
+            | (KeyCode::Char('<'), _) => {
+                let step = self.settings_mgr.settings.seek_step_seconds;
+                match self.player.seek(-step) {
+                    Ok(_) => {
+                        let new_pos = self.player.position_seconds();
+                        self.status_message = format!(
+                            "Seek -{:.0}s ({})",
+                            step,
+                            crate::player::upnp::format_seconds_to_upnp_time(new_pos)
+                        );
+                        crate::log_info!("ui", "Seek -{:.0}s -> {:.2}s", step, new_pos);
+                    }
+                    Err(e) => {
+                        self.status_message = format!("Seek error: {}", e);
+                        crate::log_warn!("ui", "Seek -{:.0}s failed: {:?}", step, e);
+                    }
+                }
+                self.update_web_state();
+            }
+            (KeyCode::Char('+') | KeyCode::Char('='), KeyModifiers::NONE) => {
+                let step = self.settings_mgr.settings.volume_step;
+                let new_vol = self.player.volume().saturating_add(step).min(100);
+                let _ = self.player.set_volume(new_vol);
+                self.status_message = format!("Volume {}%", new_vol);
+            }
+            (KeyCode::Char('-'), KeyModifiers::NONE) => {
+                let step = self.settings_mgr.settings.volume_step;
+                let new_vol = self.player.volume().saturating_sub(step);
+                let _ = self.player.set_volume(new_vol);
+                self.status_message = format!("Volume {}%", new_vol);
+            }
+            (KeyCode::Char('v'), KeyModifiers::NONE) => {
+                self.settings_mgr.cycle_setting(0, true);
+                self.browser_dir_cache.clear();
+                self.refresh_browser();
+                self.status_message = format!(
+                    "Display mode: {}",
+                    if self.settings_mgr.settings.metadata_view {
+                        "Metadata Tags (Artist - Title) [TAGS]"
+                    } else {
+                        "Filenames [FILES]"
+                    }
+                );
+            }
+            (KeyCode::Char('/'), KeyModifiers::NONE) => {
+                if self.active_tab == 0 && !self.queue_focus {
+                    self.open_spotlight();
+                } else {
+                    self.open_fuzzy_search();
+                }
+            }
+            (KeyCode::Char('f'), KeyModifiers::NONE) => {
+                self.open_fuzzy_search();
+            }
+            _ => {
+                // Tab specific key handling
+                self.handle_tab_key_with_modifiers(key.code, key.modifiers);
+            }
+        }
+        Ok(false)
     }
 
     pub fn open_fuzzy_search(&mut self) {
@@ -1163,8 +1206,7 @@ impl AppUI {
                     | (KeyCode::Char('u'), KeyModifiers::CONTROL)
                     | (KeyCode::Char('b'), KeyModifiers::CONTROL)
                     | (KeyCode::Char('K'), _)
-                    | (KeyCode::Up, KeyModifiers::SHIFT)
-                    | (KeyCode::Char('['), KeyModifiers::NONE) => {
+                    | (KeyCode::Up, KeyModifiers::SHIFT) => {
                         if self.queue_focus {
                             self.page_up_queue();
                         } else {
@@ -1175,8 +1217,7 @@ impl AppUI {
                     | (KeyCode::Char('d'), KeyModifiers::CONTROL)
                     | (KeyCode::Char('f'), KeyModifiers::CONTROL)
                     | (KeyCode::Char('J'), _)
-                    | (KeyCode::Down, KeyModifiers::SHIFT)
-                    | (KeyCode::Char(']'), KeyModifiers::NONE) => {
+                    | (KeyCode::Down, KeyModifiers::SHIFT) => {
                         if self.queue_focus {
                             self.page_down_queue();
                         } else {
@@ -1310,8 +1351,7 @@ impl AppUI {
                     (KeyCode::PageUp, _)
                     | (KeyCode::Char('u'), KeyModifiers::CONTROL)
                     | (KeyCode::Char('K'), _)
-                    | (KeyCode::Up, KeyModifiers::SHIFT)
-                    | (KeyCode::Char('['), KeyModifiers::NONE) => {
+                    | (KeyCode::Up, KeyModifiers::SHIFT) => {
                         let step = 10;
                         if self.devices_cursor >= step {
                             self.devices_cursor -= step;
@@ -1324,8 +1364,7 @@ impl AppUI {
                     (KeyCode::PageDown, _)
                     | (KeyCode::Char('d'), KeyModifiers::CONTROL)
                     | (KeyCode::Char('J'), _)
-                    | (KeyCode::Down, KeyModifiers::SHIFT)
-                    | (KeyCode::Char(']'), KeyModifiers::NONE) => {
+                    | (KeyCode::Down, KeyModifiers::SHIFT) => {
                         let step = 10;
                         if self.devices_cursor + step < total_devices {
                             self.devices_cursor += step;
@@ -1376,16 +1415,14 @@ impl AppUI {
                     | (KeyCode::Home, _)
                     | (KeyCode::Char('g'), KeyModifiers::NONE)
                     | (KeyCode::Char('K'), _)
-                    | (KeyCode::Up, KeyModifiers::SHIFT)
-                    | (KeyCode::Char('['), KeyModifiers::NONE) => {
+                    | (KeyCode::Up, KeyModifiers::SHIFT) => {
                         self.settings_cursor = 0;
                     }
                     (KeyCode::PageDown, _)
                     | (KeyCode::End, _)
                     | (KeyCode::Char('G'), _)
                     | (KeyCode::Char('J'), _)
-                    | (KeyCode::Down, KeyModifiers::SHIFT)
-                    | (KeyCode::Char(']'), KeyModifiers::NONE) => {
+                    | (KeyCode::Down, KeyModifiers::SHIFT) => {
                         self.settings_cursor = SETTING_DEFINITIONS.len() - 1;
                     }
                     (KeyCode::Enter, KeyModifiers::NONE) | (KeyCode::Char(' '), KeyModifiers::NONE) => {
@@ -1649,9 +1686,11 @@ impl AppUI {
                 }
                 crate::web::WebCommand::SeekTo(target) => {
                     let _ = self.player.seek_to(target);
+                    self.update_web_state();
                 }
                 crate::web::WebCommand::SeekRelative(delta) => {
                     let _ = self.player.seek(delta);
+                    self.update_web_state();
                 }
             }
         }
@@ -2292,7 +2331,7 @@ impl AppUI {
             Line::from("[v]              : Toggle Metadata Tags vs Filenames"),
             Line::from("[Space]          : Play / Pause"),
             Line::from("[s]              : Stop Playback"),
-            Line::from("[Shift+Left/Right: Seek Backward / Forward 10s"),
+            Line::from("[ / ] or Shift+←/→: Seek Backward / Forward 10s"),
             Line::from("[+] / [-]        : Volume Up / Down"),
             Line::from("[?]              : Toggle this Help Modal"),
             Line::from("[q] / [Esc]      : Exit Quickstream"),

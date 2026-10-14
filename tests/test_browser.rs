@@ -294,12 +294,18 @@ fn test_browser_paging_and_jump_shortcuts() {
     );
     assert_eq!(app.browser_cursor, 10);
 
-    // 12. MacBook friendly: ']' bracket key jumps down by page height (10 -> 20)
-    app.handle_tab_key(crossterm::event::KeyCode::Char(']'));
+    // 12. MacBook friendly: Ctrl+D jumps down by page height (10 -> 20)
+    app.handle_tab_key_with_modifiers(
+        crossterm::event::KeyCode::Char('d'),
+        crossterm::event::KeyModifiers::CONTROL,
+    );
     assert_eq!(app.browser_cursor, 20);
 
-    // 13. MacBook friendly: '[' bracket key jumps up by page height (20 -> 10)
-    app.handle_tab_key(crossterm::event::KeyCode::Char('['));
+    // 13. MacBook friendly: Ctrl+U jumps up by page height (20 -> 10)
+    app.handle_tab_key_with_modifiers(
+        crossterm::event::KeyCode::Char('u'),
+        crossterm::event::KeyModifiers::CONTROL,
+    );
     assert_eq!(app.browser_cursor, 10);
 
     // 14. MacBook friendly: Shift + Up jumps up by page height (10 -> 0)
@@ -667,5 +673,72 @@ fn test_browser_small_folder_streaming_and_incremental_sorting() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_ui_seek_hotkeys() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_seek_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let config_path = temp_dir.join("config.json");
+    let settings_mgr = SettingsManager::with_path(config_path);
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    // Initial status
+    assert!(app.status_message.contains("Welcome") || app.status_message.contains("Found"));
+
+    // Press ']'
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char(']'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(
+        app.status_message.contains("Seek +10s"),
+        "Status should report Seek +10s, got: {}",
+        app.status_message
+    );
+
+    // Press '['
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('['),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(
+        app.status_message.contains("Seek -10s"),
+        "Status should report Seek -10s, got: {}",
+        app.status_message
+    );
+
+    // Press Shift + Right
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Right,
+        crossterm::event::KeyModifiers::SHIFT,
+    ));
+    assert!(app.status_message.contains("Seek +10s"));
+
+    // Press Shift + Left
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Left,
+        crossterm::event::KeyModifiers::SHIFT,
+    ));
+    assert!(app.status_message.contains("Seek -10s"));
+
+    // Press Ctrl + Right
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Right,
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
+    assert!(app.status_message.contains("Seek +10s"));
+
+    // Press Ctrl + Left
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Left,
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
+    assert!(app.status_message.contains("Seek -10s"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
 
 
