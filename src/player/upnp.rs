@@ -125,7 +125,7 @@ pub fn create_didl_lite_xml(
         album_xml,
         mime_type,
         duration_attr,
-        stream_url
+        quick_xml_escape(stream_url)
     )
 }
 
@@ -304,21 +304,30 @@ impl UPnPClient {
 
         crate::log_info!("upnp", "Calling SetAVTransportURI on {} with stream URL: {}", self.device.friendly_name, stream_url);
 
-        let res = self.send_soap_action_with_timeout(
-            &self.device.av_transport_control_url,
-            AV_TRANSPORT_SERVICE,
-            "SetAVTransportURI",
-            &[
-                ("InstanceID", "0"),
-                ("CurrentURI", stream_url),
-                ("CurrentURIMetaData", &didl),
-            ],
-            Duration::from_secs(20),
-        );
+        for attempt in 0..3 {
+            let res = self.send_soap_action_with_timeout(
+                &self.device.av_transport_control_url,
+                AV_TRANSPORT_SERVICE,
+                "SetAVTransportURI",
+                &[
+                    ("InstanceID", "0"),
+                    ("CurrentURI", stream_url),
+                    ("CurrentURIMetaData", &didl),
+                ],
+                Duration::from_secs(20),
+            );
 
-        if res.is_some() {
-            crate::log_info!("upnp", "SetAVTransportURI with DIDL succeeded on {}", self.device.friendly_name);
-            return true;
+            if res.is_some() {
+                crate::log_info!("upnp", "SetAVTransportURI with DIDL succeeded on {}", self.device.friendly_name);
+                return true;
+            }
+
+            let err = self.last_error.lock().unwrap().clone();
+            if (err.contains("701") || err.contains("Transition not available")) && attempt < 2 {
+                std::thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            break;
         }
 
         crate::log_info!(
@@ -403,7 +412,14 @@ impl UPnPClient {
             "Stop",
             &[("InstanceID", "0")],
         );
-        res.is_some()
+        if res.is_some() {
+            return true;
+        }
+        let err = self.last_error.lock().unwrap().clone();
+        if err.contains("701") || err.contains("Transition not available") {
+            return true;
+        }
+        false
     }
 
     /// Seek to specific position in track (REL_TIME).
@@ -563,15 +579,16 @@ impl UPnPPlayer {
                 let time_since_seek = last_seek_ref.lock().unwrap().elapsed();
                 if time_since_seek >= Duration::from_millis(2000) {
                     let stream_offset = *offset_ref.lock().unwrap();
-                    let actual_pos = if stream_offset > 0.0 && rel_sec < stream_offset {
+                    let actual_pos = if stream_offset > 0.0 {
                         stream_offset + rel_sec
-                    } else if stream_offset > 0.0 {
-                        // Renderer natively advanced past offset
-                        rel_sec
                     } else {
                         rel_sec
                     };
-                    *pos_ref.lock().unwrap() = actual_pos;
+                    *pos_ref.lock().unwrap() = if dur_sec > 0.0 {
+                        actual_pos.min(dur_sec)
+                    } else {
+                        actual_pos
+                    };
                 }
 
                 let state = client.get_transport_info();
@@ -794,23 +811,8 @@ impl AudioPlayer for UPnPPlayer {
         *self.last_seek_time.lock().unwrap() = Instant::now();
         *self.position_seconds.lock().unwrap() = target;
 
-        // 1. Try native UPnP REL_TIME Seek first
-        if self.client.seek(target) {
-            crate::log_info!("player", "UPnP native Seek succeeded to {:.2}s", target);
-            *self.playback_stream_offset.lock().unwrap() = 0.0;
-            return Ok(());
-        }
-
-        // 2. If native seek failed (e.g. errorCode 710 Seek Mode Not Supported),
-        // fallback to stream offset reload (universal DLNA standard)
-        let last_err = self.client.last_error.lock().unwrap().clone();
-        crate::log_info!(
-            "player",
-            "UPnP native Seek failed ('{}'), falling back to stream offset reload at {:.2}s",
-            last_err,
-            target
-        );
-
+        // DLNA/UPnP HTTP progressive streams must be sought via stream offset reloading (?pos=),
+        // because network stereos either reject SOAP REL_TIME Seek or silently ignore it (returning 200 OK without seeking).
         self.seek_via_stream_offset(target)
     }
 

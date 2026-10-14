@@ -92,6 +92,9 @@ pub struct AppUI {
     pub web_server: Option<crate::web::WebServerHandle>,
     pub web_state: std::sync::Arc<std::sync::RwLock<crate::web::NowPlayingState>>,
     pub web_cmd_rx: Option<std::sync::mpsc::Receiver<crate::web::WebCommand>>,
+    pub pending_seek_delta: f64,
+    pub pending_seek_target: Option<f64>,
+    pub last_seek_key_time: Option<std::time::Instant>,
 }
 
 impl AppUI {
@@ -161,6 +164,9 @@ impl AppUI {
             web_server,
             web_state,
             web_cmd_rx,
+            pending_seek_delta: 0.0,
+            pending_seek_target: None,
+            last_seek_key_time: None,
         };
         app.refresh_browser();
         app
@@ -805,6 +811,9 @@ impl AppUI {
                 modal.poll_background_scan();
             }
 
+            // Flush debounced seek if debounce timer expired
+            self.poll_pending_seek();
+
             terminal.draw(|f| self.render(f))?;
 
             if event::poll(Duration::from_millis(100))? {
@@ -962,7 +971,108 @@ impl AppUI {
         }
     }
 
+    pub fn accumulate_seek(&mut self, delta: f64) {
+        if !self.player.is_playing() && !self.player.is_paused() {
+            let sign = if delta > 0.0 { "+" } else { "" };
+            self.status_message = format!("Seek {}{:.0}s (00:00:00)", sign, delta);
+            return;
+        }
+
+        // If seek direction changed (+ to - or - to +), flush previous seek first
+        if (self.pending_seek_delta > 0.0 && delta < 0.0)
+            || (self.pending_seek_delta < 0.0 && delta > 0.0)
+        {
+            self.flush_pending_seek();
+        }
+
+        let dur = self.player.duration_seconds();
+        let current_base = self
+            .pending_seek_target
+            .unwrap_or_else(|| self.player.position_seconds());
+        let new_target = if dur > 0.0 {
+            (current_base + delta).clamp(0.0, dur)
+        } else {
+            (current_base + delta).max(0.0)
+        };
+        self.pending_seek_delta += delta;
+        self.pending_seek_target = Some(new_target);
+        self.last_seek_key_time = Some(std::time::Instant::now());
+
+        let sign = if self.pending_seek_delta > 0.0 { "+" } else { "" };
+        self.status_message = format!(
+            "Seek {}{:.0}s ({})",
+            sign,
+            self.pending_seek_delta,
+            crate::player::upnp::format_seconds_to_upnp_time(new_target)
+        );
+        crate::log_info!(
+            "ui",
+            "Accumulated seek: target={:.2}s (delta={:.1}s)",
+            new_target,
+            self.pending_seek_delta
+        );
+    }
+
+    pub fn flush_pending_seek(&mut self) {
+        if let Some(target) = self.pending_seek_target.take() {
+            let delta = self.pending_seek_delta;
+            self.pending_seek_delta = 0.0;
+            self.last_seek_key_time = None;
+
+            let sign = if delta > 0.0 { "+" } else { "" };
+            match self.player.seek_to(target) {
+                Ok(_) => {
+                    self.status_message = format!(
+                        "Seek {}{:.0}s ({})",
+                        sign,
+                        delta,
+                        crate::player::upnp::format_seconds_to_upnp_time(target)
+                    );
+                    crate::log_info!(
+                        "ui",
+                        "Flushed seek: target={:.2}s (delta={:.1}s)",
+                        target,
+                        delta
+                    );
+                }
+                Err(e) => {
+                    self.status_message = format!("Seek error: {}", e);
+                    crate::log_warn!("ui", "Flushed seek to {:.2}s failed: {:?}", target, e);
+                }
+            }
+            self.update_web_state();
+        }
+    }
+
+    pub fn poll_pending_seek(&mut self) {
+        if self.pending_seek_target.is_some() {
+            if let Some(t) = self.last_seek_key_time {
+                if t.elapsed() >= Duration::from_millis(350) {
+                    self.flush_pending_seek();
+                }
+            }
+        }
+    }
+
     pub fn handle_input_key(&mut self, key: crossterm::event::KeyEvent) -> anyhow::Result<bool> {
+        // If user presses any non-seek key, immediately flush any pending debounced seek
+        let is_seek_key = matches!(
+            (key.code, key.modifiers),
+            (KeyCode::Right, KeyModifiers::SHIFT)
+                | (KeyCode::Right, KeyModifiers::CONTROL)
+                | (KeyCode::Right, KeyModifiers::ALT)
+                | (KeyCode::Char(']'), KeyModifiers::NONE)
+                | (KeyCode::Char('>'), _)
+                | (KeyCode::Left, KeyModifiers::SHIFT)
+                | (KeyCode::Left, KeyModifiers::CONTROL)
+                | (KeyCode::Left, KeyModifiers::ALT)
+                | (KeyCode::Char('['), KeyModifiers::NONE)
+                | (KeyCode::Char('<'), _)
+        );
+        if !is_seek_key && self.pending_seek_target.is_some() {
+            self.flush_pending_seek();
+        }
+
         // Global hotkeys
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), KeyModifiers::NONE)
@@ -1024,21 +1134,7 @@ impl AppUI {
             | (KeyCode::Char(']'), KeyModifiers::NONE)
             | (KeyCode::Char('>'), _) => {
                 let step = self.settings_mgr.settings.seek_step_seconds;
-                match self.player.seek(step) {
-                    Ok(_) => {
-                        let new_pos = self.player.position_seconds();
-                        self.status_message = format!(
-                            "Seek +{:.0}s ({})",
-                            step,
-                            crate::player::upnp::format_seconds_to_upnp_time(new_pos)
-                        );
-                        crate::log_info!("ui", "Seek +{:.0}s -> {:.2}s", step, new_pos);
-                    }
-                    Err(e) => {
-                        self.status_message = format!("Seek error: {}", e);
-                        crate::log_warn!("ui", "Seek +{:.0}s failed: {:?}", step, e);
-                    }
-                }
+                self.accumulate_seek(step);
                 self.update_web_state();
             }
             (KeyCode::Left, KeyModifiers::SHIFT)
@@ -1047,21 +1143,7 @@ impl AppUI {
             | (KeyCode::Char('['), KeyModifiers::NONE)
             | (KeyCode::Char('<'), _) => {
                 let step = self.settings_mgr.settings.seek_step_seconds;
-                match self.player.seek(-step) {
-                    Ok(_) => {
-                        let new_pos = self.player.position_seconds();
-                        self.status_message = format!(
-                            "Seek -{:.0}s ({})",
-                            step,
-                            crate::player::upnp::format_seconds_to_upnp_time(new_pos)
-                        );
-                        crate::log_info!("ui", "Seek -{:.0}s -> {:.2}s", step, new_pos);
-                    }
-                    Err(e) => {
-                        self.status_message = format!("Seek error: {}", e);
-                        crate::log_warn!("ui", "Seek -{:.0}s failed: {:?}", step, e);
-                    }
-                }
+                self.accumulate_seek(-step);
                 self.update_web_state();
             }
             (KeyCode::Char('+') | KeyCode::Char('='), KeyModifiers::NONE) => {
@@ -2295,7 +2377,9 @@ impl AppUI {
         );
 
         // Progress bar with formatted MM:SS / MM:SS
-        let pos = self.player.position_seconds();
+        let pos = self
+            .pending_seek_target
+            .unwrap_or_else(|| self.player.position_seconds());
         let dur = self.player.duration_seconds();
         let pct = if dur > 0.0 { (pos / dur).min(1.0) } else { 0.0 };
 
