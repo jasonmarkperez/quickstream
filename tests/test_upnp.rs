@@ -573,3 +573,54 @@ fn test_upnp_player_pause_resume_after_seek() {
     let _ = handle.join();
 }
 
+#[test]
+fn test_upnp_player_with_stream_server_state_socket_closure_and_registration() {
+    let (port, stop_flag, handle) = spawn_mock_upnp_renderer();
+
+    let device = DLNADevice {
+        udn: "uuid:test-upnp-stream-state".to_string(),
+        friendly_name: "Mock Stereo".to_string(),
+        model_name: "I15".to_string(),
+        manufacturer: "Primare".to_string(),
+        host: "127.0.0.1".to_string(),
+        port,
+        location: format!("http://127.0.0.1:{}/desc.xml", port),
+        av_transport_control_url: format!("http://127.0.0.1:{}/ctrl/AVTransport", port),
+        rendering_control_url: format!("http://127.0.0.1:{}/ctrl/RenderingControl", port),
+    };
+
+    let stream_state = Arc::new(quickstream::web::StreamServerState::new());
+    let mut player = UPnPPlayer::new(device, 8080)
+        .with_stream_state(Some(stream_state.clone()));
+
+    // Create a dummy audio file
+    let temp_file = std::env::temp_dir().join("test_registered_upnp.mp3");
+    let _ = std::fs::write(&temp_file, b"DUMMY_MP3_DATA");
+
+    // Simulate an open streaming socket
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let lport = listener.local_addr().unwrap().port();
+    let client_sock = TcpStream::connect(format!("127.0.0.1:{}", lport)).unwrap();
+    let (server_sock, _) = listener.accept().unwrap();
+
+    let conn_id = stream_state.register_socket(&server_sock).unwrap();
+    assert_eq!(stream_state.active_sockets.lock().unwrap().len(), 1);
+
+    // Play track: should register file and abort/close active sockets
+    assert!(player.play(&temp_file).is_ok());
+
+    // File must now be in stream_state registry
+    assert!(stream_state.lookup_file("test_registered_upnp.mp3").is_some());
+    // Active sockets must have been drained/closed
+    assert_eq!(stream_state.active_sockets.lock().unwrap().len(), 0);
+
+    // Clean up
+    stream_state.unregister_socket(conn_id);
+    drop(client_sock);
+    let _ = player.stop();
+    let _ = std::fs::remove_file(temp_file);
+    stop_flag.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
+    let _ = handle.join();
+}
+

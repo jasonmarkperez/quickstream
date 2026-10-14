@@ -296,4 +296,86 @@ fn test_web_server_audio_streaming_seek_pos_query() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_web_server_stream_file_registry() {
+    let temp_dir = std::env::temp_dir().join("test_web_registry");
+    let _ = fs::create_dir_all(&temp_dir);
+    let test_file = temp_dir.join("registered_song.mp3");
 
+    let test_data: Vec<u8> = vec![0x42; 256];
+    fs::write(&test_file, &test_data).unwrap();
+
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    // state.filepath is explicitly None to prove registry resolves the file independently
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state, tx).expect("start web server");
+    let port = handle.port;
+
+    // Register file in the stream registry
+    handle.register_stream_file(&test_file);
+
+    // 1. Exact filename lookup
+    let (status, headers, body) = http_get(port, "/stream/registered_song.mp3");
+    assert_eq!(status, 200);
+    assert!(headers.contains("Content-Length: 256"));
+    assert_eq!(body, test_data);
+
+    // 2. Case-insensitive lookup
+    let (status_ci, headers_ci, body_ci) = http_get(port, "/stream/REGISTERED_SONG.MP3");
+    assert_eq!(status_ci, 200);
+    assert!(headers_ci.contains("Content-Length: 256"));
+    assert_eq!(body_ci, test_data);
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_web_server_close_active_streams_terminates_clients() {
+    let temp_dir = std::env::temp_dir().join("test_web_close_streams");
+    let _ = fs::create_dir_all(&temp_dir);
+    let test_file = temp_dir.join("large_stream.mp3");
+
+    // 2 MB dummy data
+    let test_data: Vec<u8> = vec![0xAA; 2 * 1024 * 1024];
+    fs::write(&test_file, &test_data).unwrap();
+
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state, tx).expect("start web server");
+    let port = handle.port;
+
+    handle.register_stream_file(&test_file);
+
+    // Connect client and start reading partial stream
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let req = format!(
+        "GET /stream/large_stream.mp3 HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        port
+    );
+    client.write_all(req.as_bytes()).unwrap();
+
+    // Read headers and some bytes
+    let mut initial_buf = [0u8; 1024];
+    let n = client.read(&mut initial_buf).unwrap();
+    assert!(n > 0);
+
+    // Now abruptly close all active streaming sockets from the server side
+    handle.close_active_streams();
+
+    // Attempting to read more should immediately return EOF or error
+    let mut read_after_close = Vec::new();
+    let _ = client.read_to_end(&mut read_after_close);
+    // Stream should have terminated well short of the full 2MB
+    assert!(
+        read_after_close.len() < test_data.len(),
+        "Active stream should be aborted, got {} bytes",
+        read_after_close.len()
+    );
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&temp_dir);
+}

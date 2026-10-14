@@ -850,12 +850,14 @@ impl AppUI {
                                 }
                                 if let Some(track) = track_opt {
                                     let title = track.display_title().to_string();
+                                    self.register_stream_file(&track.filepath);
                                     self.queue.add_track(track);
                                     self.status_message = format!("Added to queue: {}", title);
                                 }
                             }
                             (KeyCode::Tab, KeyModifiers::NONE) => {
                                 if let Some(track) = modal.selected_track().cloned() {
+                                    self.register_stream_file(&track.filepath);
                                     self.queue.add_track(track.clone());
                                     self.status_message = format!("Added to queue: {}", track.display_title());
                                 }
@@ -867,6 +869,7 @@ impl AppUI {
                                     m.close();
                                 }
                                 for t in tracks {
+                                    self.register_stream_file(&t.filepath);
                                     self.queue.add_track(t);
                                 }
                                 self.status_message = format!("Added {} tracks to queue", count);
@@ -933,6 +936,7 @@ impl AppUI {
                                             .or_else(|| Some(crate::metadata::fallback_metadata(&path)));
                                         if let Some(meta) = meta_opt {
                                             let title = meta.display_title().to_string();
+                                            self.register_stream_file(&meta.filepath);
                                             self.queue.add_track(meta);
                                             self.status_message = format!("Added to queue: {}", title);
                                         }
@@ -1347,6 +1351,7 @@ impl AppUI {
                                     .or_else(|| Some(crate::metadata::fallback_metadata(&path)));
                                 if let Some(meta) = meta_opt {
                                     let title = meta.display_title().to_string();
+                                    self.register_stream_file(&meta.filepath);
                                     self.queue.add_track(meta);
                                     self.status_message = format!("Added to queue: {}", title);
                                 }
@@ -1368,6 +1373,7 @@ impl AppUI {
                                     })
                                     .or_else(|| Some(crate::metadata::fallback_metadata(path)));
                                 if let Some(meta) = meta_opt {
+                                    self.register_stream_file(&meta.filepath);
                                     self.queue.add_track(meta);
                                     added += 1;
                                 }
@@ -1542,6 +1548,10 @@ impl AppUI {
         if let Some(track) = self.queue.current_track() {
             let path = track.filepath.clone();
             let title = track.display_title().to_string();
+            if let Some(ref ws) = self.web_server {
+                ws.close_active_streams();
+                ws.register_stream_file(&path);
+            }
             if let Ok(mut s) = self.web_state.write() {
                 s.filepath = Some(path.clone());
             }
@@ -1562,6 +1572,10 @@ impl AppUI {
         if let Some(track) = self.queue.next_track(&mode) {
             let path = track.filepath.clone();
             let title = track.display_title().to_string();
+            if let Some(ref ws) = self.web_server {
+                ws.close_active_streams();
+                ws.register_stream_file(&path);
+            }
             if let Ok(mut s) = self.web_state.write() {
                 s.filepath = Some(path.clone());
             }
@@ -1581,6 +1595,10 @@ impl AppUI {
         if let Some(track) = self.queue.prev_track() {
             let path = track.filepath.clone();
             let title = track.display_title().to_string();
+            if let Some(ref ws) = self.web_server {
+                ws.close_active_streams();
+                ws.register_stream_file(&path);
+            }
             if let Ok(mut s) = self.web_state.write() {
                 s.filepath = Some(path.clone());
             }
@@ -1605,6 +1623,9 @@ impl AppUI {
         match crate::web::WebServer::start(port, self.web_state.clone(), tx) {
             Ok(handle) => {
                 let actual_port = handle.port;
+                for track in &self.queue.tracks {
+                    handle.register_stream_file(&track.filepath);
+                }
                 self.web_server = Some(handle);
                 self.web_cmd_rx = Some(rx);
                 actual_port
@@ -1616,6 +1637,12 @@ impl AppUI {
         }
     }
 
+    pub fn register_stream_file(&self, path: &std::path::Path) {
+        if let Some(ref ws) = self.web_server {
+            ws.register_stream_file(path);
+        }
+    }
+
     pub fn switch_to_local_player(&mut self) {
         let was_playing = self.player.is_playing();
         let was_paused = self.player.is_paused();
@@ -1624,6 +1651,9 @@ impl AppUI {
         let current_track = self.queue.current_track().cloned();
 
         let _ = self.player.stop();
+        if let Some(ref ws) = self.web_server {
+            ws.close_active_streams();
+        }
         self.device_manager.set_active_device(None);
 
         let backend = self.settings_mgr.settings.player_backend.clone();
@@ -1660,15 +1690,26 @@ impl AppUI {
         let current_track = self.queue.current_track().cloned();
 
         let _ = self.player.stop();
+        if let Some(ref ws) = self.web_server {
+            ws.close_active_streams();
+            for track in &self.queue.tracks {
+                ws.register_stream_file(&track.filepath);
+            }
+        }
         self.device_manager.set_active_device(Some(dev.clone()));
 
-        let mut upnp_player = crate::player::upnp::UPnPPlayer::new(dev.clone(), port);
+        let stream_state = self.web_server.as_ref().map(|ws| ws.stream_state());
+        let mut upnp_player = crate::player::upnp::UPnPPlayer::new(dev.clone(), port)
+            .with_stream_state(stream_state);
         // Do NOT overwrite the remote hardware volume with local software volume!
         // The UPnP device preserves its own hardware volume setting.
 
         let mut status = format!("Active output: {}", dev.friendly_name);
         if let Some(track) = current_track {
             if was_playing || was_paused {
+                if let Some(ref ws) = self.web_server {
+                    ws.register_stream_file(&track.filepath);
+                }
                 if let Ok(mut s) = self.web_state.write() {
                     s.filepath = Some(track.filepath.clone());
                 }
@@ -1707,6 +1748,9 @@ impl AppUI {
                 ) {
                     Ok(handle) => {
                         self.status_message = format!("Started server on port {}", handle.port);
+                        for track in &self.queue.tracks {
+                            handle.register_stream_file(&track.filepath);
+                        }
                         self.web_server = Some(handle);
                         self.web_cmd_rx = Some(rx);
                     }

@@ -1,11 +1,12 @@
 //! Embedded local Now Playing web server with live metadata, cover art, and remote control.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -81,16 +82,116 @@ struct ActionPayload {
     value: Option<f64>,
 }
 
+/// Manages registered media files and active streaming TCP connections.
+pub struct StreamServerState {
+    pub active_sockets: Mutex<HashMap<u64, TcpStream>>,
+    pub file_registry: RwLock<HashMap<String, PathBuf>>,
+    next_conn_id: AtomicU64,
+}
+
+impl Default for StreamServerState {
+    fn default() -> Self {
+        Self {
+            active_sockets: Mutex::new(HashMap::new()),
+            file_registry: RwLock::new(HashMap::new()),
+            next_conn_id: AtomicU64::new(1),
+        }
+    }
+}
+
+impl StreamServerState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a file on disk so that /stream/<filename> resolves to its exact path.
+    pub fn register_file(&self, path: &Path) {
+        if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+            let mut reg = self.file_registry.write().unwrap();
+            reg.insert(filename.to_string(), path.to_path_buf());
+            reg.insert(filename.to_lowercase(), path.to_path_buf());
+        }
+    }
+
+    /// Look up a file by exact or case-insensitive filename.
+    pub fn lookup_file(&self, name: &str) -> Option<PathBuf> {
+        let reg = self.file_registry.read().unwrap();
+        if let Some(p) = reg.get(name) {
+            return Some(p.clone());
+        }
+        let lower = name.to_lowercase();
+        if let Some(p) = reg.get(&lower) {
+            return Some(p.clone());
+        }
+        None
+    }
+
+    /// Register an active streaming socket clone for clean abort/termination.
+    pub fn register_socket(&self, stream: &TcpStream) -> Option<u64> {
+        if let Ok(cloned) = stream.try_clone() {
+            let id = self.next_conn_id.fetch_add(1, Ordering::SeqCst);
+            self.active_sockets.lock().unwrap().insert(id, cloned);
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    /// Untrack an active streaming socket when the request finishes.
+    pub fn unregister_socket(&self, id: u64) {
+        self.active_sockets.lock().unwrap().remove(&id);
+    }
+
+    /// Immediately abort and close all active streaming TCP connections to stereos.
+    pub fn close_active_streams(&self) {
+        let mut sockets = self.active_sockets.lock().unwrap();
+        let count = sockets.len();
+        if count > 0 {
+            crate::log_info!("web", "Closing {} active streaming TCP socket(s)", count);
+            for (_, sock) in sockets.drain() {
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+}
+
+struct SocketGuard {
+    stream_state: Arc<StreamServerState>,
+    conn_id: Option<u64>,
+}
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.conn_id {
+            self.stream_state.unregister_socket(id);
+        }
+    }
+}
+
 /// Handle to the background web server process.
 pub struct WebServerHandle {
     pub port: u16,
     stop_flag: Arc<AtomicBool>,
+    stream_state: Arc<StreamServerState>,
     join_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl WebServerHandle {
+    pub fn stream_state(&self) -> Arc<StreamServerState> {
+        self.stream_state.clone()
+    }
+
+    pub fn close_active_streams(&self) {
+        self.stream_state.close_active_streams();
+    }
+
+    pub fn register_stream_file(&self, path: &Path) {
+        self.stream_state.register_file(path);
+    }
+
     pub fn stop(mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
+        self.stream_state.close_active_streams();
         let _ = TcpStream::connect(format!("127.0.0.1:{}", self.port));
         if let Some(h) = self.join_handle.take() {
             let _ = h.join();
@@ -101,6 +202,7 @@ impl WebServerHandle {
 impl Drop for WebServerHandle {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
+        self.stream_state.close_active_streams();
         // Ping socket to unblock accept()
         let _ = TcpStream::connect(format!("127.0.0.1:{}", self.port));
         if let Some(h) = self.join_handle.take() {
@@ -118,6 +220,16 @@ impl WebServer {
         state: Arc<RwLock<NowPlayingState>>,
         cmd_tx: mpsc::Sender<WebCommand>,
     ) -> anyhow::Result<WebServerHandle> {
+        Self::start_with_stream_state(port, state, cmd_tx, Arc::new(StreamServerState::new()))
+    }
+
+    /// Start the local web server sharing an existing StreamServerState.
+    pub fn start_with_stream_state(
+        port: u16,
+        state: Arc<RwLock<NowPlayingState>>,
+        cmd_tx: mpsc::Sender<WebCommand>,
+        stream_state: Arc<StreamServerState>,
+    ) -> anyhow::Result<WebServerHandle> {
         let candidate_ports = [port, 8080, 8090, 8091, 0];
         let mut listener_opt = None;
         for &p in &candidate_ports {
@@ -134,6 +246,7 @@ impl WebServer {
         let actual_port = listener.local_addr()?.port();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_thread = stop_flag.clone();
+        let stream_state_thread = stream_state.clone();
 
         let join_handle = std::thread::Builder::new()
             .name("QuickstreamWebServer".to_string())
@@ -146,8 +259,9 @@ impl WebServer {
                             }
                             let state_clone = state.clone();
                             let cmd_tx_clone = cmd_tx.clone();
+                            let stream_state_clone = stream_state_thread.clone();
                             std::thread::spawn(move || {
-                                let _ = handle_client(stream, &state_clone, &cmd_tx_clone);
+                                let _ = handle_client(stream, &state_clone, &cmd_tx_clone, &stream_state_clone);
                             });
                         }
                         Err(_) => {
@@ -160,6 +274,7 @@ impl WebServer {
         Ok(WebServerHandle {
             port: actual_port,
             stop_flag,
+            stream_state,
             join_handle: Some(join_handle),
         })
     }
@@ -169,6 +284,7 @@ fn handle_client(
     mut stream: TcpStream,
     state: &Arc<RwLock<NowPlayingState>>,
     cmd_tx: &mpsc::Sender<WebCommand>,
+    stream_state: &Arc<StreamServerState>,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(4)))?;
     stream.set_write_timeout(Some(Duration::from_secs(4)))?;
@@ -275,7 +391,7 @@ fn handle_client(
             }
         } else if path.starts_with("/stream") {
             // Serve DLNA audio streaming with HTTP byte ranges
-            serve_audio_stream(stream, path, range_header.as_deref(), is_head, state)?;
+            serve_audio_stream(stream, path, range_header.as_deref(), is_head, state, stream_state)?;
             return Ok(());
         } else {
             let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
@@ -502,7 +618,22 @@ fn serve_audio_stream(
     range_header: Option<&str>,
     head_only: bool,
     state: &Arc<RwLock<NowPlayingState>>,
+    stream_state: &Arc<StreamServerState>,
 ) -> std::io::Result<()> {
+    let client_ip = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    let conn_id = stream_state.register_socket(&stream);
+    let _socket_guard = SocketGuard {
+        stream_state: stream_state.clone(),
+        conn_id,
+    };
+
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+
     // 1. Resolve target file and optional seek offset query parameter
     let raw_encoded = path.strip_prefix("/stream/").unwrap_or("");
     let encoded_path = raw_encoded.split('?').next().unwrap_or(raw_encoded);
@@ -528,18 +659,60 @@ fn serve_audio_stream(
         (s.filepath.clone(), s.duration_seconds)
     };
 
-    let filepath = if candidate.exists() && candidate.is_file() {
+    let filepath = if candidate.is_absolute() && candidate.exists() && candidate.is_file() {
+        candidate
+    } else if let Some(reg_path) = stream_state.lookup_file(&decoded_path) {
+        if reg_path.exists() && reg_path.is_file() {
+            reg_path
+        } else if let Some(ref p) = current_filepath {
+            if p.exists() && p.is_file() {
+                p.clone()
+            } else {
+                crate::log_warn!(
+                    "web",
+                    "Stream 404: Registered file '{}' missing on disk ({})",
+                    decoded_path,
+                    reg_path.display()
+                );
+                let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
+                stream.write_all(not_found)?;
+                stream.flush()?;
+                return Ok(());
+            }
+        } else {
+            crate::log_warn!(
+                "web",
+                "Stream 404: Registered file '{}' missing on disk ({})",
+                decoded_path,
+                reg_path.display()
+            );
+            let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
+            stream.write_all(not_found)?;
+            stream.flush()?;
+            return Ok(());
+        }
+    } else if candidate.exists() && candidate.is_file() {
         candidate
     } else if let Some(ref p) = current_filepath {
         if p.exists() && p.is_file() {
             p.clone()
         } else {
+            crate::log_warn!(
+                "web",
+                "Stream 404: Candidate '{}' not found and current_filepath is invalid",
+                decoded_path
+            );
             let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
             stream.write_all(not_found)?;
             stream.flush()?;
             return Ok(());
         }
     } else {
+        crate::log_warn!(
+            "web",
+            "Stream 404: File '{}' not found in registry and no current_filepath",
+            decoded_path
+        );
         let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
         stream.write_all(not_found)?;
         stream.flush()?;
@@ -548,7 +721,8 @@ fn serve_audio_stream(
 
     let mut file = match std::fs::File::open(&filepath) {
         Ok(f) => f,
-        Err(_) => {
+        Err(e) => {
+            crate::log_warn!("web", "Stream 404: Failed to open '{}': {}", filepath.display(), e);
             let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
             stream.write_all(not_found)?;
             stream.flush()?;
@@ -590,6 +764,14 @@ fn serve_audio_stream(
     }
 
     if req_start >= effective_total || req_start > req_end {
+        crate::log_warn!(
+            "web",
+            "Stream 416 Range Not Satisfiable: bytes={}-{}/{} for client {}",
+            req_start,
+            req_end,
+            effective_total,
+            client_ip
+        );
         let err_resp = format!(
             "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nConnection: close\r\n\r\n",
             effective_total
@@ -607,6 +789,25 @@ fn serve_audio_stream(
     } else {
         "HTTP/1.1 200 OK"
     };
+
+    let display_name = filepath
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("track");
+
+    crate::log_info!(
+        "web",
+        "Serving '{}' to {} (method: {}, range: {:?}, offset: {:.2}s, bytes: {}-{}/{}, status: {})",
+        display_name,
+        client_ip,
+        if head_only { "HEAD" } else { "GET" },
+        range_header,
+        offset_seconds,
+        req_start,
+        req_end,
+        effective_total,
+        status_line
+    );
 
     let mut headers = format!(
         "{}\r\n\
@@ -636,11 +837,10 @@ fn serve_audio_stream(
 
     // 5. Stream audio file
     use std::io::Seek;
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    let mut streamed_count = 0u64;
 
     if let Some(hdr) = synthesized_hdr {
         let hdr_len = hdr.len() as u64;
-        let mut bytes_sent = 0u64;
 
         // If request starts inside the synthesized header
         if req_start < hdr_len {
@@ -648,9 +848,15 @@ fn serve_audio_stream(
             let hdr_slice_end = (req_end + 1).min(hdr_len) as usize;
             let slice = &hdr[hdr_slice_start..hdr_slice_end];
             if stream.write_all(slice).is_err() {
+                crate::log_info!(
+                    "web",
+                    "Client {} disconnected during synthesized header write after {} bytes",
+                    client_ip,
+                    streamed_count
+                );
                 return Ok(());
             }
-            bytes_sent += slice.len() as u64;
+            streamed_count += slice.len() as u64;
         }
 
         // Remaining bytes from file
@@ -661,7 +867,7 @@ fn serve_audio_stream(
                 base_offset
             };
             file.seek(std::io::SeekFrom::Start(file_start_offset))?;
-            let mut remaining = content_length.saturating_sub(bytes_sent);
+            let mut remaining = content_length.saturating_sub(streamed_count);
             let mut buf = [0u8; 65536];
             while remaining > 0 {
                 let to_read = remaining.min(buf.len() as u64) as usize;
@@ -671,9 +877,17 @@ fn serve_audio_stream(
                     Err(_) => break,
                 };
                 if stream.write_all(&buf[..n]).is_err() {
-                    break;
+                    crate::log_info!(
+                        "web",
+                        "Client {} disconnected or stream aborted after {} bytes for '{}'",
+                        client_ip,
+                        streamed_count,
+                        display_name
+                    );
+                    return Ok(());
                 }
                 remaining -= n as u64;
+                streamed_count += n as u64;
             }
         }
     } else {
@@ -690,12 +904,29 @@ fn serve_audio_stream(
                 Err(_) => break,
             };
             if stream.write_all(&buf[..n]).is_err() {
-                break;
+                crate::log_info!(
+                    "web",
+                    "Client {} disconnected or stream aborted after {} bytes for '{}'",
+                    client_ip,
+                    streamed_count,
+                    display_name
+                );
+                return Ok(());
             }
             remaining -= n as u64;
+            streamed_count += n as u64;
         }
     }
     let _ = stream.flush();
+
+    crate::log_info!(
+        "web",
+        "Streamed {} bytes to {} for '{}' (requested: {})",
+        streamed_count,
+        client_ip,
+        display_name,
+        content_length
+    );
 
     Ok(())
 }

@@ -518,6 +518,7 @@ pub struct UPnPPlayer {
     pub device: DLNADevice,
     client: Arc<UPnPClient>,
     web_port: u16,
+    stream_state: Option<Arc<crate::web::StreamServerState>>,
     is_playing: Arc<AtomicBool>,
     is_paused: Arc<AtomicBool>,
     position_seconds: Arc<Mutex<f64>>,
@@ -532,12 +533,21 @@ pub struct UPnPPlayer {
 
 impl UPnPPlayer {
     pub fn new(device: DLNADevice, web_port: u16) -> Self {
+        Self::new_with_stream_state(device, web_port, None)
+    }
+
+    pub fn new_with_stream_state(
+        device: DLNADevice,
+        web_port: u16,
+        stream_state: Option<Arc<crate::web::StreamServerState>>,
+    ) -> Self {
         let client = Arc::new(UPnPClient::new(device.clone()));
         let init_vol = client.get_volume().unwrap_or(20);
         Self {
             device,
             client,
             web_port,
+            stream_state,
             is_playing: Arc::new(AtomicBool::new(false)),
             is_paused: Arc::new(AtomicBool::new(false)),
             position_seconds: Arc::new(Mutex::new(0.0)),
@@ -549,6 +559,15 @@ impl UPnPPlayer {
             playback_stream_offset: Arc::new(Mutex::new(0.0)),
             last_seek_time: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(10))),
         }
+    }
+
+    pub fn with_stream_state(mut self, stream_state: Option<Arc<crate::web::StreamServerState>>) -> Self {
+        self.stream_state = stream_state;
+        self
+    }
+
+    pub fn set_stream_state(&mut self, stream_state: Option<Arc<crate::web::StreamServerState>>) {
+        self.stream_state = stream_state;
     }
 
     fn start_polling_loop(&mut self) {
@@ -651,8 +670,15 @@ impl UPnPPlayer {
             self.start_polling_loop();
         }
 
+        // Close prior active streaming TCP connection so renderer resets its HTTP buffer
+        if let Some(ref ss) = self.stream_state {
+            ss.close_active_streams();
+            ss.register_file(&filepath);
+        }
+
         // Stop current renderer playback
         let _ = self.client.stop();
+        std::thread::sleep(Duration::from_millis(50));
 
         // Build stream URL with pos offset parameter
         let host_ip = get_local_ip_for_target(&self.device.host, self.device.port);
@@ -702,6 +728,9 @@ impl UPnPPlayer {
 impl Drop for UPnPPlayer {
     fn drop(&mut self) {
         self.poll_stop_flag.store(true, Ordering::SeqCst);
+        if let Some(ref ss) = self.stream_state {
+            ss.close_active_streams();
+        }
         let _ = self.client.stop();
     }
 }
@@ -715,9 +744,14 @@ impl AudioPlayer for UPnPPlayer {
             self.device.friendly_name
         );
 
-        // 1. Terminate any previous polling thread & stop renderer
+        // 1. Terminate any previous polling thread, close streaming sockets, & stop renderer
         self.poll_stop_flag.store(true, Ordering::SeqCst);
+        if let Some(ref ss) = self.stream_state {
+            ss.close_active_streams();
+            ss.register_file(filepath);
+        }
         let _ = self.client.stop();
+        std::thread::sleep(Duration::from_millis(50));
 
         // 2. Resolve local IP routable to renderer and construct stream URL
         let host_ip = get_local_ip_for_target(&self.device.host, self.device.port);
@@ -839,10 +873,14 @@ impl AudioPlayer for UPnPPlayer {
 
     fn stop(&mut self) -> anyhow::Result<()> {
         self.poll_stop_flag.store(true, Ordering::SeqCst);
+        if let Some(ref ss) = self.stream_state {
+            ss.close_active_streams();
+        }
         self.is_playing.store(false, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);
         *self.position_seconds.lock().unwrap() = 0.0;
         *self.playback_stream_offset.lock().unwrap() = 0.0;
+        *self.current_filepath.lock().unwrap() = None;
         let _ = self.client.stop();
         Ok(())
     }
