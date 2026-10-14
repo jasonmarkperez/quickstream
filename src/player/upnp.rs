@@ -514,7 +514,7 @@ pub struct UPnPPlayer {
 impl UPnPPlayer {
     pub fn new(device: DLNADevice, web_port: u16) -> Self {
         let client = Arc::new(UPnPClient::new(device.clone()));
-        let init_vol = client.get_volume().unwrap_or(50);
+        let init_vol = client.get_volume().unwrap_or(20);
         Self {
             device,
             client,

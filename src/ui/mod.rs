@@ -1532,14 +1532,14 @@ impl AppUI {
         let was_playing = self.player.is_playing();
         let was_paused = self.player.is_paused();
         let pos = self.player.position_seconds();
-        let vol = self.player.volume();
         let current_track = self.queue.current_track().cloned();
 
         let _ = self.player.stop();
         self.device_manager.set_active_device(Some(dev.clone()));
 
         let mut upnp_player = crate::player::upnp::UPnPPlayer::new(dev.clone(), port);
-        let _ = upnp_player.set_volume(vol);
+        // Do NOT overwrite the remote hardware volume with local software volume!
+        // The UPnP device preserves its own hardware volume setting.
 
         let mut status = format!("Active output: {}", dev.friendly_name);
         if let Some(track) = current_track {
