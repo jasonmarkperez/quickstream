@@ -98,9 +98,13 @@ pub fn create_didl_lite_xml(
     duration_sec: f64,
     mime_type: &str,
 ) -> String {
-    let dur_str = format_seconds_to_upnp_time(duration_sec);
     let album_xml = if !album.is_empty() {
         format!("<upnp:album>{}</upnp:album>", quick_xml_escape(album))
+    } else {
+        String::new()
+    };
+    let duration_attr = if duration_sec > 0.0 {
+        format!(" duration=\"{}\"", format_seconds_to_upnp_time(duration_sec))
     } else {
         String::new()
     };
@@ -114,13 +118,13 @@ pub fn create_didl_lite_xml(
         <dc:creator>{}</dc:creator>\
         {}\
         <upnp:class>object.item.audioItem.musicTrack</upnp:class>\
-        <res protocolInfo=\"http-get:*:{}:*\" duration=\"{}\">{}</res>\
+        <res protocolInfo=\"http-get:*:{}:*\"{}>{}</res>\
         </item></DIDL-Lite>",
         quick_xml_escape(title),
         quick_xml_escape(artist),
         album_xml,
         mime_type,
-        dur_str,
+        duration_attr,
         stream_url
     )
 }
@@ -136,18 +140,30 @@ impl UPnPClient {
     pub fn new(device: DLNADevice) -> Self {
         Self {
             device,
-            timeout: Duration::from_millis(2500),
+            timeout: Duration::from_millis(4000),
             last_error: Arc::new(Mutex::new(String::new())),
         }
     }
 
-    /// Send a UPnP SOAP POST action and return response XML body.
+    /// Send a UPnP SOAP POST action using default timeout.
     pub fn send_soap_action(
         &self,
         control_url: &str,
         service_type: &str,
         action: &str,
         arguments: &[(&str, &str)],
+    ) -> Option<String> {
+        self.send_soap_action_with_timeout(control_url, service_type, action, arguments, self.timeout)
+    }
+
+    /// Send a UPnP SOAP POST action with custom timeout and return response XML body.
+    pub fn send_soap_action_with_timeout(
+        &self,
+        control_url: &str,
+        service_type: &str,
+        action: &str,
+        arguments: &[(&str, &str)],
+        timeout: Duration,
     ) -> Option<String> {
         if control_url.is_empty() {
             *self.last_error.lock().unwrap() = "Missing control URL".to_string();
@@ -172,7 +188,13 @@ impl UPnPClient {
         );
 
         let url_trimmed = control_url.trim();
-        let without_proto = url_trimmed.strip_prefix("http://")?;
+        let without_proto = match url_trimmed.strip_prefix("http://") {
+            Some(p) => p,
+            None => {
+                *self.last_error.lock().unwrap() = format!("Invalid control URL: {}", control_url);
+                return None;
+            }
+        };
         let (host_port, path) = if let Some(slash) = without_proto.find('/') {
             (&without_proto[..slash], &without_proto[slash..])
         } else {
@@ -181,23 +203,41 @@ impl UPnPClient {
 
         let (host, port) = if let Some(colon) = host_port.find(':') {
             let h = &host_port[..colon];
-            let p = host_port[colon + 1..].parse::<u16>().ok()?;
-            (h, p)
+            match host_port[colon + 1..].parse::<u16>() {
+                Ok(p) => (h, p),
+                Err(e) => {
+                    *self.last_error.lock().unwrap() = format!("Invalid port in {}: {}", control_url, e);
+                    return None;
+                }
+            }
         } else {
             (host_port, 80)
         };
 
-        let addrs = (host, port).to_socket_addrs().ok()?;
+        let addrs = match (host, port).to_socket_addrs() {
+            Ok(a) => a,
+            Err(e) => {
+                *self.last_error.lock().unwrap() = format!("Address resolution failed for {}:{}: {}", host, port, e);
+                return None;
+            }
+        };
+
         let mut stream = None;
         for addr in addrs {
-            if let Ok(s) = TcpStream::connect_timeout(&addr, self.timeout) {
-                let _ = s.set_read_timeout(Some(self.timeout));
-                let _ = s.set_write_timeout(Some(self.timeout));
+            if let Ok(s) = TcpStream::connect_timeout(&addr, timeout) {
+                let _ = s.set_read_timeout(Some(timeout));
+                let _ = s.set_write_timeout(Some(timeout));
                 stream = Some(s);
                 break;
             }
         }
-        let mut stream = stream?;
+        let mut stream = match stream {
+            Some(s) => s,
+            None => {
+                *self.last_error.lock().unwrap() = format!("Connection timed out to {}:{}", host, port);
+                return None;
+            }
+        };
 
         let request = format!(
             "POST {} HTTP/1.1\r\n\
@@ -211,11 +251,17 @@ impl UPnPClient {
             path, host_port, service_type, action, body.len(), body
         );
 
-        stream.write_all(request.as_bytes()).ok()?;
-        stream.flush().ok()?;
+        if let Err(e) = stream.write_all(request.as_bytes()) {
+            *self.last_error.lock().unwrap() = format!("Write failed: {}", e);
+            return None;
+        }
+        let _ = stream.flush();
 
         let mut response = Vec::new();
-        stream.read_to_end(&mut response).ok()?;
+        if let Err(e) = stream.read_to_end(&mut response) {
+            *self.last_error.lock().unwrap() = format!("SOAP read timeout/error: {}", e);
+            return None;
+        }
         let resp_str = String::from_utf8_lossy(&response).to_string();
 
         if let Some(pos) = resp_str.find("\r\n\r\n") {
@@ -237,7 +283,7 @@ impl UPnPClient {
         }
     }
 
-    /// Call SetAVTransportURI to point the renderer to our stream URL.
+    /// Call SetAVTransportURI to point the renderer to our stream URL (with 20s timeout for renderer media probe).
     pub fn set_transport_uri(
         &self,
         stream_url: &str,
@@ -256,7 +302,9 @@ impl UPnPClient {
             mime_type,
         );
 
-        let res = self.send_soap_action(
+        crate::log_info!("upnp", "Calling SetAVTransportURI on {} with stream URL: {}", self.device.friendly_name, stream_url);
+
+        let res = self.send_soap_action_with_timeout(
             &self.device.av_transport_control_url,
             AV_TRANSPORT_SERVICE,
             "SetAVTransportURI",
@@ -265,14 +313,23 @@ impl UPnPClient {
                 ("CurrentURI", stream_url),
                 ("CurrentURIMetaData", &didl),
             ],
+            Duration::from_secs(20),
         );
 
         if res.is_some() {
+            crate::log_info!("upnp", "SetAVTransportURI with DIDL succeeded on {}", self.device.friendly_name);
             return true;
         }
 
+        crate::log_info!(
+            "upnp",
+            "SetAVTransportURI with DIDL failed on {} ('{}'), retrying with empty metadata...",
+            self.device.friendly_name,
+            self.last_error.lock().unwrap()
+        );
+
         // Fallback: Retry with empty CurrentURIMetaData (many stereos reject custom DIDL)
-        let res_fallback = self.send_soap_action(
+        let res_fallback = self.send_soap_action_with_timeout(
             &self.device.av_transport_control_url,
             AV_TRANSPORT_SERVICE,
             "SetAVTransportURI",
@@ -281,9 +338,21 @@ impl UPnPClient {
                 ("CurrentURI", stream_url),
                 ("CurrentURIMetaData", ""),
             ],
+            Duration::from_secs(20),
         );
 
-        res_fallback.is_some()
+        if res_fallback.is_some() {
+            crate::log_info!("upnp", "SetAVTransportURI with empty metadata succeeded on {}", self.device.friendly_name);
+            true
+        } else {
+            crate::log_info!(
+                "upnp",
+                "SetAVTransportURI fallback also failed on {}: {}",
+                self.device.friendly_name,
+                self.last_error.lock().unwrap()
+            );
+            false
+        }
     }
 
     /// Send Play command with retries if renderer is transitioning.
@@ -540,8 +609,9 @@ impl AudioPlayer for UPnPPlayer {
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| "track".to_string());
-        let encoded_path = url_encode(&filepath.to_string_lossy());
-        let stream_url = format!("http://{}:{}/stream/{}", host_ip, self.web_port, encoded_path);
+        let encoded_name = url_encode(&file_name);
+        let stream_url = format!("http://{}:{}/stream/{}", host_ip, self.web_port, encoded_name);
+        crate::log_info!("player", "UPnP stream URL for '{}': {}", filepath.display(), stream_url);
 
         // 3. Extract audio metadata & MIME type
         let mime = get_audio_mime_type(filepath);
@@ -559,14 +629,18 @@ impl AudioPlayer for UPnPPlayer {
         // 4. Set URI on stereo
         if !self.client.set_transport_uri(&stream_url, &title, &artist, &album, duration, mime) {
             let err = self.client.last_error.lock().unwrap().clone();
+            crate::log_info!("player", "SetAVTransportURI failed on {}: {}", self.device.friendly_name, err);
             anyhow::bail!("SetAVTransportURI failed on {}: {}", self.device.friendly_name, err);
         }
 
         // 5. Send Play command
         if !self.client.play("1") {
             let err = self.client.last_error.lock().unwrap().clone();
+            crate::log_info!("player", "Play command failed on {}: {}", self.device.friendly_name, err);
             anyhow::bail!("Play command failed on {}: {}", self.device.friendly_name, err);
         }
+
+        crate::log_info!("player", "UPnP playback successfully started on {}", self.device.friendly_name);
 
         self.is_playing.store(true, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);
