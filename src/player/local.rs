@@ -487,4 +487,12 @@ impl AudioPlayer for LocalPlayer {
     fn duration_seconds(&self) -> f64 {
         *self.shared_state.duration.lock().unwrap()
     }
+
+    fn is_track_finished(&mut self) -> bool {
+        LocalPlayer::is_track_finished(self)
+    }
+
+    fn reset_finished(&mut self) {
+        LocalPlayer::reset_finished(self);
+    }
 }

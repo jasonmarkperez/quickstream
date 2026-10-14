@@ -74,7 +74,7 @@ pub struct AppUI {
     pub show_help_modal: bool,
     pub status_message: String,
     pub queue: PlaybackQueue,
-    pub player: LocalPlayer,
+    pub player: Box<dyn AudioPlayer>,
     pub device_manager: DeviceManager,
     pub settings_mgr: SettingsManager,
     pub metadata_cache: std::collections::HashMap<PathBuf, crate::metadata::AudioMetadata>,
@@ -143,7 +143,7 @@ impl AppUI {
             show_help_modal: false,
             status_message: "Welcome to Quickstream (Rust)".to_string(),
             queue: PlaybackQueue::new(),
-            player: LocalPlayer::new(&backend),
+            player: Box::new(LocalPlayer::new(&backend)),
             device_manager,
             settings_mgr,
             metadata_cache,
@@ -1343,11 +1343,9 @@ impl AppUI {
                     }
                     (KeyCode::Enter, KeyModifiers::NONE) => {
                         if self.devices_cursor == 0 {
-                            self.device_manager.set_active_device(None);
-                            self.status_message = "Active output: Local Audio".to_string();
+                            self.switch_to_local_player();
                         } else if let Some(dev) = devices.get(self.devices_cursor - 1) {
-                            self.device_manager.set_active_device(Some(dev.clone()));
-                            self.status_message = format!("Active output: {}", dev.friendly_name);
+                            self.switch_to_upnp_player(dev.clone());
                         }
                     }
                     (KeyCode::Char('r'), KeyModifiers::NONE) => {
@@ -1396,7 +1394,9 @@ impl AppUI {
                             self.refresh_browser();
                         } else if self.settings_cursor == 1 {
                             let backend = self.settings_mgr.settings.player_backend.clone();
-                            self.player = LocalPlayer::new(&backend);
+                            if self.device_manager.get_active_device().is_none() {
+                                self.player = Box::new(LocalPlayer::new(&backend));
+                            }
                         } else if self.settings_cursor == 6 {
                             self.sync_web_server();
                         }
@@ -1417,6 +1417,9 @@ impl AppUI {
         if let Some(track) = self.queue.current_track() {
             let path = track.filepath.clone();
             let title = track.display_title().to_string();
+            if let Ok(mut s) = self.web_state.write() {
+                s.filepath = Some(path.clone());
+            }
             match self.player.play(&path) {
                 Ok(_) => {
                     self.status_message = format!("Playing: {}", title);
@@ -1425,6 +1428,7 @@ impl AppUI {
                     self.status_message = format!("Playback error: {}", e);
                 }
             }
+            self.update_web_state();
         }
     }
 
@@ -1433,6 +1437,9 @@ impl AppUI {
         if let Some(track) = self.queue.next_track(&mode) {
             let path = track.filepath.clone();
             let title = track.display_title().to_string();
+            if let Ok(mut s) = self.web_state.write() {
+                s.filepath = Some(path.clone());
+            }
             match self.player.play(&path) {
                 Ok(_) => {
                     self.status_message = format!("Playing: {}", title);
@@ -1441,6 +1448,7 @@ impl AppUI {
                     self.status_message = format!("Playback error: {}", e);
                 }
             }
+            self.update_web_state();
         }
     }
 
@@ -1448,6 +1456,9 @@ impl AppUI {
         if let Some(track) = self.queue.prev_track() {
             let path = track.filepath.clone();
             let title = track.display_title().to_string();
+            if let Ok(mut s) = self.web_state.write() {
+                s.filepath = Some(path.clone());
+            }
             match self.player.play(&path) {
                 Ok(_) => {
                     self.status_message = format!("Playing: {}", title);
@@ -1456,11 +1467,112 @@ impl AppUI {
                     self.status_message = format!("Playback error: {}", e);
                 }
             }
+            self.update_web_state();
         }
     }
 
+    pub fn ensure_web_server_started(&mut self) -> u16 {
+        if let Some(ref handle) = self.web_server {
+            return handle.port;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let port = self.settings_mgr.settings.web_server_port;
+        match crate::web::WebServer::start(port, self.web_state.clone(), tx) {
+            Ok(handle) => {
+                let actual_port = handle.port;
+                self.web_server = Some(handle);
+                self.web_cmd_rx = Some(rx);
+                actual_port
+            }
+            Err(e) => {
+                crate::log_info!("ui", "Failed to start streaming server: {}", e);
+                port
+            }
+        }
+    }
+
+    pub fn switch_to_local_player(&mut self) {
+        let was_playing = self.player.is_playing();
+        let was_paused = self.player.is_paused();
+        let pos = self.player.position_seconds();
+        let vol = self.player.volume();
+        let current_track = self.queue.current_track().cloned();
+
+        let _ = self.player.stop();
+        self.device_manager.set_active_device(None);
+
+        let backend = self.settings_mgr.settings.player_backend.clone();
+        let mut new_player = LocalPlayer::new(&backend);
+        let _ = new_player.set_volume(vol);
+
+        if let Some(track) = current_track {
+            if was_playing || was_paused {
+                if let Ok(mut s) = self.web_state.write() {
+                    s.filepath = Some(track.filepath.clone());
+                }
+                if new_player.play(&track.filepath).is_ok() {
+                    if pos > 0.0 {
+                        let _ = new_player.seek_to(pos);
+                    }
+                    if was_paused {
+                        let _ = new_player.pause();
+                    }
+                }
+            }
+        }
+
+        self.player = Box::new(new_player);
+        self.status_message = "Active output: Local Audio".to_string();
+        self.sync_web_server();
+        self.update_web_state();
+    }
+
+    pub fn switch_to_upnp_player(&mut self, dev: crate::discovery::DLNADevice) {
+        let port = self.ensure_web_server_started();
+        let was_playing = self.player.is_playing();
+        let was_paused = self.player.is_paused();
+        let pos = self.player.position_seconds();
+        let vol = self.player.volume();
+        let current_track = self.queue.current_track().cloned();
+
+        let _ = self.player.stop();
+        self.device_manager.set_active_device(Some(dev.clone()));
+
+        let mut upnp_player = crate::player::upnp::UPnPPlayer::new(dev.clone(), port);
+        let _ = upnp_player.set_volume(vol);
+
+        let mut status = format!("Active output: {}", dev.friendly_name);
+        if let Some(track) = current_track {
+            if was_playing || was_paused {
+                if let Ok(mut s) = self.web_state.write() {
+                    s.filepath = Some(track.filepath.clone());
+                }
+                match upnp_player.play(&track.filepath) {
+                    Ok(_) => {
+                        if pos > 0.0 {
+                            let _ = upnp_player.seek_to(pos);
+                        }
+                        if was_paused {
+                            let _ = upnp_player.pause();
+                        }
+                    }
+                    Err(e) => {
+                        status = format!("Connected to {}, but play failed: {}", dev.friendly_name, e);
+                    }
+                }
+            }
+        }
+
+        self.player = Box::new(upnp_player);
+        self.status_message = status;
+        self.update_web_state();
+    }
+
     pub fn sync_web_server(&mut self) {
-        if self.settings_mgr.settings.web_server_enabled {
+        let needs_server = self.settings_mgr.settings.web_server_enabled
+            || self.device_manager.get_active_device().is_some();
+
+        if needs_server {
             if self.web_server.is_none() {
                 let (tx, rx) = std::sync::mpsc::channel();
                 match crate::web::WebServer::start(
@@ -1469,14 +1581,16 @@ impl AppUI {
                     tx,
                 ) {
                     Ok(handle) => {
-                        self.status_message = format!("Started web server on port {}", handle.port);
+                        self.status_message = format!("Started server on port {}", handle.port);
                         self.web_server = Some(handle);
                         self.web_cmd_rx = Some(rx);
                     }
                     Err(e) => {
-                        self.status_message = format!("Failed to start web server: {}", e);
-                        self.settings_mgr.settings.web_server_enabled = false;
-                        self.settings_mgr.save();
+                        self.status_message = format!("Failed to start server: {}", e);
+                        if self.settings_mgr.settings.web_server_enabled {
+                            self.settings_mgr.settings.web_server_enabled = false;
+                            self.settings_mgr.save();
+                        }
                     }
                 }
             }

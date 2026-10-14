@@ -193,3 +193,71 @@ fn test_web_server_action_commands() {
 
     handle.stop();
 }
+
+#[test]
+fn test_web_server_audio_streaming_byte_ranges() {
+    let temp_dir = std::env::temp_dir().join(format!("qs_stream_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let test_file = temp_dir.join("test_song.mp3");
+
+    // Create 100 bytes of dummy audio data
+    let test_data: Vec<u8> = (0..100).collect();
+    fs::write(&test_file, &test_data).unwrap();
+
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    {
+        let mut s = state.write().unwrap();
+        s.filepath = Some(test_file.clone());
+    }
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state.clone(), tx).expect("start web server");
+    let port = handle.port;
+
+    // 1. Full GET request
+    let (status, headers, body) = http_get(port, "/stream/test_song.mp3");
+    assert_eq!(status, 200);
+    assert!(headers.contains("transferMode.dlna.org: Streaming"));
+    assert!(headers.contains("Content-Length: 100"));
+    assert_eq!(body, test_data);
+
+    // 2. Partial GET with Range: bytes=10-24 (15 bytes)
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let req = format!(
+        "GET /stream/test_song.mp3 HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nRange: bytes=10-24\r\nConnection: close\r\n\r\n",
+        port
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut resp = Vec::new();
+    let _ = stream.read_to_end(&mut resp);
+    let (status, headers, body) = parse_http_response(&resp);
+    assert_eq!(status, 206);
+    assert!(headers.contains("Content-Range: bytes 10-24/100"));
+    assert!(headers.contains("Content-Length: 15"));
+    assert_eq!(body, &test_data[10..25]);
+
+    // 3. HEAD request
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let req = format!(
+        "HEAD /stream/test_song.mp3 HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        port
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut resp = Vec::new();
+    let _ = stream.read_to_end(&mut resp);
+    let (status, headers, body) = parse_http_response(&resp);
+    assert_eq!(status, 200);
+    assert!(headers.contains("Content-Length: 100"));
+    assert!(body.is_empty());
+
+    // 4. Non-existent stream when state.filepath is cleared
+    {
+        let mut s = state.write().unwrap();
+        s.filepath = None;
+    }
+    let (status, _, _) = http_get(port, "/stream/nonexistent_xyz.mp3");
+    assert_eq!(status, 404);
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+

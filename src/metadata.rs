@@ -69,6 +69,20 @@ pub fn is_supported_audio_file(path: &Path) -> bool {
     }
 }
 
+pub fn get_audio_mime_type(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+        "mp3" => "audio/mpeg",
+        "flac" => "audio/flac",
+        "wav" | "wave" => "audio/wav",
+        "aiff" | "aif" => "audio/aiff",
+        "ogg" => "audio/ogg",
+        "opus" => "audio/opus",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        _ => "application/octet-stream",
+    }
+}
+
 pub fn extract_metadata(path: &Path) -> anyhow::Result<AudioMetadata> {
     let filename = path
         .file_name()

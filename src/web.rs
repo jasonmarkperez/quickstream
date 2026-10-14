@@ -118,9 +118,19 @@ impl WebServer {
         state: Arc<RwLock<NowPlayingState>>,
         cmd_tx: mpsc::Sender<WebCommand>,
     ) -> anyhow::Result<WebServerHandle> {
-        let bind_addr = format!("0.0.0.0:{}", port);
-        let listener = TcpListener::bind(&bind_addr)
-            .or_else(|_| TcpListener::bind(format!("127.0.0.1:{}", port)))?;
+        let candidate_ports = [port, 8080, 8090, 8091, 0];
+        let mut listener_opt = None;
+        for &p in &candidate_ports {
+            if let Ok(l) = TcpListener::bind(format!("0.0.0.0:{}", p)) {
+                listener_opt = Some(l);
+                break;
+            }
+            if let Ok(l) = TcpListener::bind(format!("127.0.0.1:{}", p)) {
+                listener_opt = Some(l);
+                break;
+            }
+        }
+        let listener = listener_opt.ok_or_else(|| anyhow::anyhow!("Failed to bind web server to any port"))?;
         let actual_port = listener.local_addr()?.port();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_thread = stop_flag.clone();
@@ -179,6 +189,7 @@ fn handle_client(
 
     // Read remaining headers
     let mut content_length = 0usize;
+    let mut range_header = None;
     loop {
         let mut header_line = String::new();
         if reader.read_line(&mut header_line)? == 0 {
@@ -192,11 +203,16 @@ fn handle_client(
             if let Some(val_str) = trimmed.split(':').nth(1) {
                 content_length = val_str.trim().parse::<usize>().unwrap_or(0);
             }
+        } else if trimmed.to_lowercase().starts_with("range:") {
+            if let Some(val_str) = trimmed.split(':').nth(1) {
+                range_header = Some(val_str.trim().to_string());
+            }
         }
     }
 
     // Route dispatch
-    if method == "GET" {
+    if method == "GET" || method == "HEAD" {
+        let is_head = method == "HEAD";
         if path == "/" || path == "/index.html" {
             // Serve single-page dashboard
             let body = NOW_PLAYING_HTML.as_bytes();
@@ -205,7 +221,9 @@ fn handle_client(
                 body.len()
             );
             stream.write_all(header.as_bytes())?;
-            stream.write_all(body)?;
+            if !is_head {
+                stream.write_all(body)?;
+            }
             stream.flush()?;
         } else if path.starts_with("/api/status") {
             // Serve JSON playback status
@@ -220,7 +238,9 @@ fn handle_client(
                 body.len()
             );
             stream.write_all(header.as_bytes())?;
-            stream.write_all(body)?;
+            if !is_head {
+                stream.write_all(body)?;
+            }
             stream.flush()?;
         } else if path.starts_with("/api/cover") {
             // Serve cover art (JPEG/PNG) or SVG placeholder
@@ -237,7 +257,9 @@ fn handle_client(
                     bytes.len()
                 );
                 stream.write_all(header.as_bytes())?;
-                stream.write_all(&bytes)?;
+                if !is_head {
+                    stream.write_all(&bytes)?;
+                }
                 stream.flush()?;
             } else {
                 let svg = default_cover_svg().as_bytes();
@@ -246,9 +268,15 @@ fn handle_client(
                     svg.len()
                 );
                 stream.write_all(header.as_bytes())?;
-                stream.write_all(svg)?;
+                if !is_head {
+                    stream.write_all(svg)?;
+                }
                 stream.flush()?;
             }
+        } else if path.starts_with("/stream") {
+            // Serve DLNA audio streaming with HTTP byte ranges
+            serve_audio_stream(stream, path, range_header.as_deref(), is_head, state)?;
+            return Ok(());
         } else {
             let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
             stream.write_all(not_found)?;
@@ -304,6 +332,145 @@ fn handle_client(
         stream.write_all(not_found)?;
         stream.flush()?;
     }
+
+    Ok(())
+}
+
+fn serve_audio_stream(
+    mut stream: TcpStream,
+    path: &str,
+    range_header: Option<&str>,
+    head_only: bool,
+    state: &Arc<RwLock<NowPlayingState>>,
+) -> std::io::Result<()> {
+    // 1. Resolve target file
+    let raw_encoded = path.strip_prefix("/stream/").unwrap_or("");
+    let encoded_path = raw_encoded.split('?').next().unwrap_or(raw_encoded);
+    let decoded_path = crate::player::upnp::url_decode(encoded_path);
+    let candidate = PathBuf::from(&decoded_path);
+
+    let current_filepath = {
+        let s = state.read().unwrap();
+        s.filepath.clone()
+    };
+
+    let filepath = if candidate.exists() && candidate.is_file() {
+        candidate
+    } else if let Some(ref p) = current_filepath {
+        if p.exists() && p.is_file() {
+            p.clone()
+        } else {
+            let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
+            stream.write_all(not_found)?;
+            stream.flush()?;
+            return Ok(());
+        }
+    } else {
+        let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
+        stream.write_all(not_found)?;
+        stream.flush()?;
+        return Ok(());
+    };
+
+    let mut file = match std::fs::File::open(&filepath) {
+        Ok(f) => f,
+        Err(_) => {
+            let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
+            stream.write_all(not_found)?;
+            stream.flush()?;
+            return Ok(());
+        }
+    };
+
+    let total_size = file.metadata()?.len();
+    let mime = crate::metadata::get_audio_mime_type(&filepath);
+
+    // 2. Parse Range header if present
+    let mut req_start = 0u64;
+    let mut req_end = total_size.saturating_sub(1);
+    let mut is_range = false;
+
+    if let Some(range) = range_header {
+        // e.g. "bytes=0-", "bytes=1000-2000", "bytes=500-"
+        if let Some(spec) = range.strip_prefix("bytes=") {
+            let parts: Vec<&str> = spec.split('-').collect();
+            if parts.len() == 2 {
+                if let Ok(s) = parts[0].parse::<u64>() {
+                    req_start = s;
+                    is_range = true;
+                    if let Ok(e) = parts[1].parse::<u64>() {
+                        req_end = e.min(total_size.saturating_sub(1));
+                    }
+                }
+            }
+        }
+    }
+
+    if req_start >= total_size || req_start > req_end {
+        let err_resp = format!(
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nConnection: close\r\n\r\n",
+            total_size
+        );
+        stream.write_all(err_resp.as_bytes())?;
+        stream.flush()?;
+        return Ok(());
+    }
+
+    let content_length = req_end - req_start + 1;
+
+    // 3. Write DLNA HTTP headers
+    let status_line = if is_range {
+        "HTTP/1.1 206 Partial Content"
+    } else {
+        "HTTP/1.1 200 OK"
+    };
+
+    let mut headers = format!(
+        "{}\r\n\
+        Content-Type: {}\r\n\
+        Content-Length: {}\r\n\
+        Accept-Ranges: bytes\r\n\
+        transferMode.dlna.org: Streaming\r\n\
+        contentFeatures.dlna.org: DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000\r\n\
+        Connection: keep-alive\r\n",
+        status_line, mime, content_length
+    );
+
+    if is_range {
+        headers.push_str(&format!("Content-Range: bytes {}-{}/{}\r\n", req_start, req_end, total_size));
+    }
+    headers.push_str("\r\n");
+
+    stream.write_all(headers.as_bytes())?;
+    stream.flush()?;
+
+    if head_only {
+        return Ok(());
+    }
+
+    // 4. Stream audio file chunk by chunk
+    use std::io::Seek;
+    file.seek(std::io::SeekFrom::Start(req_start))?;
+
+    // Allow longer write timeout for streaming
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+
+    let mut buf = [0u8; 65536];
+    let mut remaining = content_length;
+    while remaining > 0 {
+        let to_read = remaining.min(buf.len() as u64) as usize;
+        let n = match file.read(&mut buf[..to_read]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if stream.write_all(&buf[..n]).is_err() {
+            // Client closed socket (e.g. paused or jumped to next song)
+            break;
+        }
+        remaining -= n as u64;
+    }
+    let _ = stream.flush();
 
     Ok(())
 }

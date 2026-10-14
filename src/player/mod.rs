@@ -1,6 +1,7 @@
-//! Player abstraction and local audio playback implementations.
+//! Player abstraction and local/DLNA audio playback implementations.
 
 pub mod local;
+pub mod upnp;
 
 use std::path::Path;
 
@@ -18,4 +19,8 @@ pub trait AudioPlayer: Send + Sync {
     fn is_paused(&self) -> bool;
     fn position_seconds(&self) -> f64;
     fn duration_seconds(&self) -> f64;
+    fn is_track_finished(&mut self) -> bool {
+        false
+    }
+    fn reset_finished(&mut self) {}
 }

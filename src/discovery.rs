@@ -40,8 +40,38 @@ impl DLNADevice {
     }
 }
 
+/// Determine the local IPv4 address routable to the target host.
+pub fn get_local_ip_for_target(target_host: &str, target_port: u16) -> String {
+    let port = if target_port > 0 { target_port } else { 80 };
+    let addr = format!("{}:{}", target_host, port);
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect(&addr).is_ok() {
+            if let Ok(local_addr) = socket.local_addr() {
+                let ip = local_addr.ip().to_string();
+                if !ip.starts_with("127.") {
+                    return ip;
+                }
+            }
+        }
+    }
+    // Fallback probes to common gateway destinations
+    for probe in ["192.168.1.1:80", "192.168.0.1:80", "10.0.0.1:80", "8.8.8.8:80", "1.1.1.1:80"] {
+        if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+            if socket.connect(probe).is_ok() {
+                if let Ok(local_addr) = socket.local_addr() {
+                    let ip = local_addr.ip().to_string();
+                    if !ip.starts_with("127.") {
+                        return ip;
+                    }
+                }
+            }
+        }
+    }
+    "127.0.0.1".to_string()
+}
+
 /// Extract content between XML tag delimiters `<tag>...</tag>`, ignoring namespaces.
-fn extract_xml_tag(xml: &str, tag_name: &str) -> Option<String> {
+pub fn extract_xml_tag(xml: &str, tag_name: &str) -> Option<String> {
     let open_pat_simple = format!("<{}>", tag_name);
     let close_pat_simple = format!("</{}>", tag_name);
 
