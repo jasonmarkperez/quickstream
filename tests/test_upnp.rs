@@ -401,3 +401,175 @@ fn test_upnp_player_seek_mode_not_supported_fallback() {
     let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
     let _ = handle.join();
 }
+
+#[test]
+fn test_upnp_player_pause_resume_after_seek() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock renderer");
+    let port = listener.local_addr().unwrap().port();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_flag_thread = stop_flag.clone();
+    let last_set_uri = Arc::new(std::sync::Mutex::new(String::new()));
+    let last_set_uri_thread = last_set_uri.clone();
+    let current_state = Arc::new(std::sync::Mutex::new("STOPPED".to_string()));
+    let current_state_thread = current_state.clone();
+    let fresh_uri_loaded = Arc::new(AtomicBool::new(false));
+    let fresh_uri_loaded_thread = fresh_uri_loaded.clone();
+
+    let handle = std::thread::spawn(move || {
+        while !stop_flag_thread.load(Ordering::SeqCst) {
+            listener.set_nonblocking(true).expect("set nonblocking");
+            let stream_opt = match listener.accept() {
+                Ok((s, _)) => Some(s),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(15));
+                    continue;
+                }
+                Err(_) => break,
+            };
+
+            if let Some(mut stream) = stream_opt {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
+                    continue;
+                }
+
+                let mut soap_action = String::new();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                        break;
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.to_lowercase().starts_with("soapaction:") {
+                        soap_action = trimmed.split(':').skip(1).collect::<Vec<_>>().join(":");
+                    } else if trimmed.to_lowercase().starts_with("content-length:") {
+                        if let Some(v) = trimmed.split(':').nth(1) {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+
+                let mut body = vec![0u8; content_length];
+                if content_length > 0 {
+                    let _ = reader.read_exact(&mut body);
+                }
+                let body_str = String::from_utf8_lossy(&body);
+
+                let (status_line, resp_body) = if soap_action.contains("SetAVTransportURI") {
+                    if let Some(start) = body_str.find("<CurrentURI>") {
+                        if let Some(end) = body_str[start..].find("</CurrentURI>") {
+                            let uri = &body_str[start + 12..start + end];
+                            *last_set_uri_thread.lock().unwrap() = uri.to_string();
+                        }
+                    }
+                    *current_state_thread.lock().unwrap() = "STOPPED".to_string();
+                    fresh_uri_loaded_thread.store(true, Ordering::SeqCst);
+                    ("HTTP/1.1 200 OK", r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:SetAVTransportURIResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1" /></s:Body></s:Envelope>"#.to_string())
+                } else if soap_action.contains("Play") {
+                    let state = current_state_thread.lock().unwrap().clone();
+                    if state == "STOPPED" && !fresh_uri_loaded_thread.load(Ordering::SeqCst) {
+                        // Simulate Error 701: Transition not available when attempting to Play from STOPPED after buffer ended
+                        (
+                            "HTTP/1.1 500 Internal Server Error",
+                            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>701</errorCode><errorDescription>Transition not available</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#.to_string()
+                        )
+                    } else {
+                        *current_state_thread.lock().unwrap() = "PLAYING".to_string();
+                        fresh_uri_loaded_thread.store(false, Ordering::SeqCst);
+                        ("HTTP/1.1 200 OK", r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1" /></s:Body></s:Envelope>"#.to_string())
+                    }
+                } else if soap_action.contains("Pause") {
+                    // Simulate Primare / DLNA renderer returning UPnP 401 Invalid Action on progressive HTTP streams
+                    (
+                        "HTTP/1.1 500 Internal Server Error",
+                        r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>401</errorCode><errorDescription>Invalid Action</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#.to_string()
+                    )
+                } else if soap_action.contains("Stop") {
+                    *current_state_thread.lock().unwrap() = "STOPPED".to_string();
+                    ("HTTP/1.1 200 OK", r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:StopResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1" /></s:Body></s:Envelope>"#.to_string())
+                } else if soap_action.contains("GetTransportInfo") {
+                    let st = current_state_thread.lock().unwrap().clone();
+                    let xml = format!(
+                        r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetTransportInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><CurrentTransportState>{}</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed></u:GetTransportInfoResponse></s:Body></s:Envelope>"#,
+                        st
+                    );
+                    ("HTTP/1.1 200 OK", xml)
+                } else if soap_action.contains("GetPositionInfo") {
+                    ("HTTP/1.1 200 OK", r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetPositionInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><TrackDuration>00:03:00</TrackDuration><RelTime>00:00:00</RelTime></u:GetPositionInfoResponse></s:Body></s:Envelope>"#.to_string())
+                } else {
+                    ("HTTP/1.1 200 OK", r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:SuccessResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1" /></s:Body></s:Envelope>"#.to_string())
+                };
+
+                let response = format!(
+                    "{}\r\nContent-Type: text/xml; charset=\"utf-8\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_line,
+                    resp_body.len(),
+                    resp_body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        }
+    });
+
+    let device = DLNADevice {
+        udn: "uuid:test-pause-resume-seek".to_string(),
+        friendly_name: "Primare Prisma Test".to_string(),
+        model_name: "I15".to_string(),
+        manufacturer: "Primare".to_string(),
+        host: "127.0.0.1".to_string(),
+        port,
+        location: format!("http://127.0.0.1:{}/desc.xml", port),
+        av_transport_control_url: format!("http://127.0.0.1:{}/ctrl/AVTransport", port),
+        rendering_control_url: format!("http://127.0.0.1:{}/ctrl/RenderingControl", port),
+    };
+
+    let mut player = UPnPPlayer::new(device, 8080);
+    let temp_file = std::env::temp_dir().join("test_upnp_pause_resume.mp3");
+    let _ = std::fs::write(&temp_file, b"DUMMY_AUDIO_DATA");
+
+    // 1. Initial play
+    assert!(player.play(&temp_file).is_ok());
+    assert!(player.is_playing());
+    assert!(!player.is_paused());
+
+    // 2. Seek to 50 seconds
+    assert!(player.seek_to(50.0).is_ok());
+    assert_eq!(player.position_seconds(), 50.0);
+    assert!(player.is_playing());
+    assert!(!player.is_paused());
+    assert!(last_set_uri.lock().unwrap().contains("?pos=50.00"));
+
+    // 3. Pause playback (renderer returns 401 Invalid Action -> falls back to Stop)
+    assert!(player.pause().is_ok());
+    assert!(!player.is_playing());
+    assert!(player.is_paused());
+    assert_eq!(*current_state.lock().unwrap(), "STOPPED");
+
+    // Wait past poller tick: renderer is STOPPED, but player is paused -> must NOT be finished!
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(!player.is_track_finished(), "Poller must not mark track finished while paused!");
+
+    // 4. Resume playback:
+    // Renderer is STOPPED (and would return 701 on direct Play);
+    // UPnPPlayer::resume() must detect this and seamlessly reload via seek_via_stream_offset(50.0)
+    assert!(player.resume().is_ok());
+    assert!(player.is_playing());
+    assert!(!player.is_paused());
+    assert_eq!(*current_state.lock().unwrap(), "PLAYING");
+    assert_eq!(player.position_seconds(), 50.0);
+    assert!(!player.is_track_finished());
+
+    // Verify URI was refreshed with ?pos=50.00
+    assert!(last_set_uri.lock().unwrap().contains("?pos=50.00"));
+
+    let _ = player.stop();
+    let _ = std::fs::remove_file(temp_file);
+    stop_flag.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
+    let _ = handle.join();
+}
+

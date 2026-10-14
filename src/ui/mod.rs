@@ -1114,8 +1114,15 @@ impl AppUI {
                         self.status_message = "No tracks in queue".to_string();
                     }
                 } else {
-                    let paused = self.player.toggle_pause()?;
-                    self.status_message = if paused { "Paused" } else { "Playing" }.to_string();
+                    match self.player.toggle_pause() {
+                        Ok(paused) => {
+                            self.status_message = if paused { "Paused" } else { "Playing" }.to_string();
+                        }
+                        Err(e) => {
+                            self.status_message = format!("Pause error: {}", e);
+                            crate::log_warn!("ui", "Toggle pause error: {:?}", e);
+                        }
+                    }
                 }
             }
             (KeyCode::Char('s'), KeyModifiers::NONE) => {

@@ -398,10 +398,11 @@ impl UPnPClient {
             return true;
         }
         let err = self.last_error.lock().unwrap().clone();
-        if err.contains("401") || err.contains("Invalid Action") {
+        if err.contains("401") || err.contains("Invalid Action") || err.contains("501") || err.contains("Not Implemented") {
             return self.stop();
         }
-        false
+        // Fallback: If Pause failed for any reason on a progressive stream, try Stop
+        self.stop()
     }
 
     /// Send Stop command.
@@ -550,8 +551,9 @@ impl UPnPPlayer {
         }
     }
 
-    fn start_polling_loop(&self) {
-        self.poll_stop_flag.store(false, Ordering::SeqCst);
+    fn start_polling_loop(&mut self) {
+        self.poll_stop_flag.store(true, Ordering::SeqCst);
+        self.poll_stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag = self.poll_stop_flag.clone();
         let client = self.client.clone();
         let pos_ref = self.position_seconds.clone();
@@ -575,9 +577,9 @@ impl UPnPPlayer {
                     *dur_ref.lock().unwrap() = dur_sec;
                 }
 
-                // If user just sought within 2.0s, ignore stale renderer reports to prevent progress bar jitter
+                // If user just sought within 2.5s, ignore stale renderer reports to prevent progress bar jitter
                 let time_since_seek = last_seek_ref.lock().unwrap().elapsed();
-                if time_since_seek >= Duration::from_millis(2000) {
+                if time_since_seek >= Duration::from_millis(2500) {
                     let stream_offset = *offset_ref.lock().unwrap();
                     let actual_pos = if stream_offset > 0.0 {
                         stream_offset + rel_sec
@@ -604,13 +606,33 @@ impl UPnPPlayer {
                         is_paused_ref.store(true, Ordering::SeqCst);
                     }
                     "STOPPED" | "NO_MEDIA_PRESENT" => {
+                        // If we are within 2.5s of a seek, ignore STOPPED states (renderer is transitioning)
+                        if time_since_seek < Duration::from_millis(2500) {
+                            consecutive_stopped = 0;
+                            continue;
+                        }
+
+                        // If user has explicitly paused playback, the renderer being STOPPED
+                        // (e.g. pause-via-stop fallback or socket close) is expected and does NOT mean track finished!
+                        if is_paused_ref.load(Ordering::SeqCst) {
+                            consecutive_stopped = 0;
+                            continue;
+                        }
+
                         consecutive_stopped += 1;
-                        if consecutive_stopped >= 2 && is_playing_ref.load(Ordering::SeqCst) {
-                            // Track has finished playing on the remote renderer
+                        let dur = *dur_ref.lock().unwrap();
+                        let pos = *pos_ref.lock().unwrap();
+                        let near_end = dur > 0.0 && pos >= (dur - 5.0).max(0.0);
+
+                        if consecutive_stopped >= 2
+                            && is_playing_ref.load(Ordering::SeqCst)
+                            && !is_paused_ref.load(Ordering::SeqCst)
+                            && near_end
+                        {
+                            // Track has genuinely finished playing on the remote renderer
                             is_playing_ref.store(false, Ordering::SeqCst);
                             is_paused_ref.store(false, Ordering::SeqCst);
                             finished_ref.store(true, Ordering::SeqCst);
-                            break;
                         }
                     }
                     _ => {}
@@ -624,6 +646,10 @@ impl UPnPPlayer {
             Some(p) => p,
             None => anyhow::bail!("No track currently loaded"),
         };
+
+        if self.poll_stop_flag.load(Ordering::Relaxed) {
+            self.start_polling_loop();
+        }
 
         // Stop current renderer playback
         let _ = self.client.stop();
@@ -744,9 +770,20 @@ impl AudioPlayer for UPnPPlayer {
     }
 
     fn pause(&mut self) -> anyhow::Result<()> {
-        if self.client.pause() {
-            self.is_playing.store(false, Ordering::SeqCst);
-            self.is_paused.store(true, Ordering::SeqCst);
+        let (rel_sec, _) = self.client.get_position_info();
+        if rel_sec > 0.0 {
+            let offset = *self.playback_stream_offset.lock().unwrap();
+            let current = if offset > 0.0 { offset + rel_sec } else { rel_sec };
+            let dur = *self.duration_seconds.lock().unwrap();
+            let clamped = if dur > 0.0 { current.min(dur) } else { current };
+            *self.position_seconds.lock().unwrap() = clamped;
+        }
+
+        let paused = self.client.pause();
+        self.is_playing.store(false, Ordering::SeqCst);
+        self.is_paused.store(true, Ordering::SeqCst);
+        if paused {
+            crate::log_info!("player", "UPnPPlayer paused at {:.2}s", *self.position_seconds.lock().unwrap());
             Ok(())
         } else {
             let err = self.client.last_error.lock().unwrap().clone();
@@ -755,14 +792,37 @@ impl AudioPlayer for UPnPPlayer {
     }
 
     fn resume(&mut self) -> anyhow::Result<()> {
-        if self.client.play("1") {
-            self.is_playing.store(true, Ordering::SeqCst);
-            self.is_paused.store(false, Ordering::SeqCst);
-            Ok(())
+        let current_pos = *self.position_seconds.lock().unwrap();
+        crate::log_info!("player", "UPnPPlayer::resume at {:.2}s", current_pos);
+
+        // Check current transport state of the renderer
+        let state = self.client.get_transport_info();
+        if state == "PAUSED_PLAYBACK" && self.client.play("1") {
+            // Verify that the renderer actually entered PLAYING
+            std::thread::sleep(Duration::from_millis(150));
+            let new_state = self.client.get_transport_info();
+            if new_state == "PLAYING" {
+                self.is_playing.store(true, Ordering::SeqCst);
+                self.is_paused.store(false, Ordering::SeqCst);
+                crate::log_info!("player", "Native Play succeeded; renderer in PLAYING state");
+                return Ok(());
+            }
+            crate::log_info!(
+                "player",
+                "Renderer did not enter PLAYING after native Play (state: '{}'); reloading via stream offset",
+                new_state
+            );
         } else {
-            let err = self.client.last_error.lock().unwrap().clone();
-            anyhow::bail!("Resume failed: {}", err);
+            crate::log_info!(
+                "player",
+                "Renderer state is '{}' (not PAUSED_PLAYBACK or play rejected); resuming via stream offset at {:.2}s",
+                state,
+                current_pos
+            );
         }
+
+        // Seamless resume: reload stream with ?pos=current_pos
+        self.seek_via_stream_offset(current_pos)
     }
 
     fn toggle_pause(&mut self) -> anyhow::Result<bool> {
