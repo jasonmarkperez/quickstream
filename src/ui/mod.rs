@@ -1076,6 +1076,19 @@ impl AppUI {
             self.flush_pending_seek();
         }
 
+        // If help modal is open, let Esc, q, or ? dismiss it
+        if self.show_help_modal {
+            if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+                self.player.stop()?;
+                return Ok(true);
+            }
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')) {
+                self.show_help_modal = false;
+                return Ok(false);
+            }
+            return Ok(false);
+        }
+
         // Global hotkeys
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), KeyModifiers::NONE)
@@ -1095,7 +1108,7 @@ impl AppUI {
                 return Ok(true);
             }
             (KeyCode::Char('?'), KeyModifiers::NONE) => {
-                self.show_help_modal = true;
+                self.show_help_modal = !self.show_help_modal;
             }
             (KeyCode::Tab, KeyModifiers::NONE) => {
                 self.active_tab = (self.active_tab + 1) % 3;
@@ -1356,6 +1369,15 @@ impl AppUI {
                                     self.status_message = format!("Added to queue: {}", title);
                                 }
                             }
+                        }
+                    }
+                    (KeyCode::Backspace, _) if !self.queue_focus => {
+                        if self.in_bookmarks_view {
+                            self.in_bookmarks_view = false;
+                            self.refresh_browser();
+                        } else if let Some(parent) = self.browser_dir.parent() {
+                            let parent_path = parent.to_path_buf();
+                            self.navigate_browser(parent_path);
                         }
                     }
                     (KeyCode::Char('a'), KeyModifiers::NONE) if !self.in_bookmarks_view => {
@@ -2532,39 +2554,111 @@ impl AppUI {
     }
 
     fn render_help_modal(&self, f: &mut Frame) {
-        let area = centered_rect(60, 60, f.area());
+        let area = help_modal_rect(f.area());
         f.render_widget(Clear, area);
-
-        let text = vec![
-            Line::from(vec![Span::styled(" QUICKSTREAM KEYBOARD CHEAT-SHEET ", Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))]),
-            Line::from(""),
-            Line::from("[Tab] / [1,2,3]  : Switch Active Tab"),
-            Line::from("[h] / [l]        : Focus Browser vs Queue"),
-            Line::from("[j] / [k]        : Move Selection Up / Down (wraps around)"),
-            Line::from("[Shift+Up/Dn] / []: Page Up / Down (MacBook friendly, also PgUp/Dn, Ctrl+u/d)"),
-            Line::from("[Home] / [End]   : Jump to Start / End of list (also g / G)"),
-            Line::from("[Enter]          : Open folder / Add file to queue / Play track"),
-            Line::from("[/]              : Spotlight jump to subfolders as you type"),
-            Line::from("[f]              : Full Library fuzzy search"),
-            Line::from("[a]              : Add all audio files in folder to queue"),
-            Line::from("[b]              : Bookmark / Unbookmark folder in Music Homes"),
-            Line::from("[d] / [x]        : Remove item from queue or bookmarks"),
-            Line::from("[c]              : Clear Queue"),
-            Line::from("[v]              : Toggle Metadata Tags vs Filenames"),
-            Line::from("[Space]          : Play / Pause"),
-            Line::from("[s]              : Stop Playback"),
-            Line::from("[ / ] or Shift+←/→: Seek Backward / Forward 10s"),
-            Line::from("[+] / [-]        : Volume Up / Down"),
-            Line::from("[?]              : Toggle this Help Modal"),
-            Line::from("[q] / [Esc]      : Exit Quickstream"),
-        ];
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" [?] Help ")
+            .title(Span::styled(
+                " QUICKSTREAM KEYBOARD CHEAT-SHEET ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ))
+            .border_style(Style::default().fg(Color::Cyan))
             .style(Style::default().bg(Color::Black));
-        let paragraph = Paragraph::new(text).block(block);
-        f.render_widget(paragraph, area);
+        f.render_widget(block, area);
+
+        let inner = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(14),   // 2-column key list
+                Constraint::Length(1), // Footer instruction
+            ])
+            .margin(1)
+            .split(area);
+
+        if inner.len() < 2 {
+            return;
+        }
+
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(50),
+                Constraint::Percentage(50),
+            ])
+            .split(inner[0]);
+
+        if cols.len() < 2 {
+            return;
+        }
+
+        // Left Column: Playback & Navigation
+        let left_lines = vec![
+            Self::help_section_header("PLAYBACK & AUDIO"),
+            Self::help_key_line("Space", "Play / Pause"),
+            Self::help_key_line("s", "Stop playback"),
+            Self::help_key_line("← / →", "Previous / Next track"),
+            Self::help_key_line("[ / ]", "Seek -10s / +10s (Shift+←/→)"),
+            Self::help_key_line("+ / -", "Volume Up / Down"),
+            Line::from(""),
+            Self::help_section_header("NAVIGATION & PANES"),
+            Self::help_key_line("h / l", "Focus Browser ↔ Queue"),
+            Self::help_key_line("j / k", "Move cursor Up / Down (wraps)"),
+            Self::help_key_line("J / K", "Page Down / Up (Shift+↑/↓)"),
+            Self::help_key_line("g / G", "Jump to Start / End of list"),
+            Self::help_key_line("Backspace", "Go up to parent directory"),
+            Self::help_key_line("1 / 2 / 3", "Switch Tabs (or Tab key)"),
+        ];
+        f.render_widget(Paragraph::new(left_lines), cols[0]);
+
+        // Right Column: Library & Search
+        let right_lines = vec![
+            Self::help_section_header("LIBRARY & QUEUE"),
+            Self::help_key_line("Enter", "Open folder / Queue / Play"),
+            Self::help_key_line("a", "Add all songs in folder to queue"),
+            Self::help_key_line("d / x", "Remove track or bookmark (Del)"),
+            Self::help_key_line("c", "Clear entire queue (queue pane)"),
+            Self::help_key_line("b", "Bookmark folder in Music Homes"),
+            Self::help_key_line("v", "Toggle metadata tags vs filenames"),
+            Self::help_key_line("r", "Refresh directory contents"),
+            Line::from(""),
+            Self::help_section_header("SEARCH & DISCOVERY"),
+            Self::help_key_line("/", "Spotlight jump to subfolder"),
+            Self::help_key_line("f", "Full library fuzzy search (Skim)"),
+            Self::help_key_line("r", "Rescan DLNA renderers (Devices)"),
+        ];
+        f.render_widget(Paragraph::new(right_lines), cols[1]);
+
+        // Footer: dismiss instruction
+        let footer_line = Line::from(vec![
+            Span::styled("Press ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[?]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(", ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[Esc]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(", or ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[q]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" to close this cheat-sheet", Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(footer_line).alignment(Alignment::Center), inner[1]);
+    }
+
+    fn help_section_header(title: &str) -> Line<'static> {
+        Line::from(vec![
+            Span::styled(
+                format!("  {}  ", title),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+        ])
+    }
+
+    fn help_key_line(key: &str, desc: &str) -> Line<'static> {
+        Line::from(vec![
+            Span::styled(
+                format!("  {:11}", key),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(desc.to_string(), Style::default().fg(Color::White)),
+        ])
     }
 }
 
@@ -2586,6 +2680,15 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+fn help_modal_rect(r: Rect) -> Rect {
+    let target_width = 88.min(r.width.saturating_sub(4)).max(40).min(r.width);
+    let target_height = 20.min(r.height.saturating_sub(2)).max(10).min(r.height);
+
+    let x = r.x + (r.width.saturating_sub(target_width)) / 2;
+    let y = r.y + (r.height.saturating_sub(target_height)) / 2;
+    Rect::new(x, y, target_width, target_height)
 }
 
 fn format_time(seconds: f64) -> String {

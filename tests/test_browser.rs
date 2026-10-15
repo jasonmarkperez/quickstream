@@ -799,5 +799,107 @@ fn test_browser_add_track_to_queue_does_not_start_playback() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_browser_backspace_parent_navigation() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_backspace_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let sub_dir = temp_dir.join("subfolder");
+    fs::create_dir_all(&sub_dir).unwrap();
+
+    let song = sub_dir.join("song.wav");
+    create_dummy_wav(&song);
+
+    let config_path = temp_dir.join("config.json");
+    let settings_mgr = SettingsManager::with_path(config_path);
+
+    let mut app = AppUI::new(Some(sub_dir.clone()), settings_mgr);
+    assert_eq!(app.browser_dir, sub_dir);
+
+    // Press Backspace while browser pane has focus
+    assert!(!app.queue_focus);
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Backspace,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    // VERIFY: Navigated to parent directory
+    assert_eq!(app.browser_dir, temp_dir);
+
+    // Switch focus to queue
+    app.queue_focus = true;
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Backspace,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    // VERIFY: Did NOT navigate when queue has focus
+    assert_eq!(app.browser_dir, temp_dir);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_help_modal_lifecycle_and_render() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_help_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let config_path = temp_dir.join("config.json");
+    let settings_mgr = SettingsManager::with_path(config_path);
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    assert!(!app.show_help_modal);
+
+    // Press '?' -> opens modal
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('?'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(app.show_help_modal);
+
+    // Render with TestBackend (verify no panic)
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| app.render(f)).unwrap();
+
+    // Also test small terminal rendering (e.g. 70x20)
+    let backend_small = ratatui::backend::TestBackend::new(70, 20);
+    let mut terminal_small = ratatui::Terminal::new(backend_small).unwrap();
+    terminal_small.draw(|f| app.render(f)).unwrap();
+
+    // Press 'Esc' -> dismisses modal
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(!app.show_help_modal);
+
+    // Press '?' then 'q' -> dismisses modal
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('?'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(app.show_help_modal);
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('q'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(!app.show_help_modal);
+
+    // Press '?' then '?' -> toggles closed
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('?'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(app.show_help_modal);
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('?'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(!app.show_help_modal);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
 
 
