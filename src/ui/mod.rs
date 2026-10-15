@@ -99,7 +99,16 @@ pub struct AppUI {
 
 impl AppUI {
     pub fn new(start_dir: Option<PathBuf>, settings_mgr: SettingsManager) -> Self {
-        let cwd = start_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let cwd = start_dir
+            .or_else(|| {
+                settings_mgr
+                    .settings
+                    .home_dir
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_dir())
+            })
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         let backend = settings_mgr.settings.player_backend.clone();
         let bookmarks = Self::load_bookmarks();
         let device_manager = DeviceManager::new();
@@ -1442,6 +1451,38 @@ impl AppUI {
                         self.refresh_browser();
                         self.status_message = format!("Refreshing directory '{}'", self.browser_dir.display());
                     }
+                    (KeyCode::Char('H'), _) => {
+                        let target = if self.in_bookmarks_view && self.browser_cursor > 0 && self.browser_cursor <= self.bookmarks.len() {
+                            self.bookmarks[self.browser_cursor - 1].clone()
+                        } else {
+                            self.browser_dir.to_string_lossy().to_string()
+                        };
+                        if self.settings_mgr.settings.home_dir.as_deref() == Some(&target) {
+                            self.settings_mgr.settings.home_dir = None;
+                            self.settings_mgr.save();
+                            self.status_message = "Cleared startup home (defaulting to launch folder)".to_string();
+                        } else {
+                            self.settings_mgr.settings.home_dir = Some(target.clone());
+                            self.settings_mgr.save();
+                            self.status_message = format!("Set startup home directory: {}", target);
+                        }
+                        self.update_web_state();
+                    }
+                    (KeyCode::Char('~'), _) => {
+                        let home = if let Some(ref h) = self.settings_mgr.settings.home_dir {
+                            PathBuf::from(h)
+                        } else if let Some(base) = directories::BaseDirs::new() {
+                            base.home_dir().to_path_buf()
+                        } else {
+                            std::env::current_dir().unwrap_or_default()
+                        };
+                        if home.is_dir() {
+                            self.status_message = format!("Jumped to home: {}", home.display());
+                            self.navigate_browser(home);
+                        } else {
+                            self.status_message = format!("Home directory not found: {}", home.display());
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1552,6 +1593,8 @@ impl AppUI {
                             }
                         } else if self.settings_cursor == 6 {
                             self.sync_web_server();
+                        } else if self.settings_cursor == 7 {
+                            self.update_web_state();
                         }
                         self.status_message = format!(
                             "{}: {}",
@@ -1949,6 +1992,16 @@ impl AppUI {
                     let _ = self.settings_mgr.save();
                     self.update_web_state();
                 }
+                crate::web::WebCommand::SetHome(path_opt) => {
+                    self.settings_mgr.settings.home_dir = path_opt.clone();
+                    let _ = self.settings_mgr.save();
+                    if let Some(ref p) = path_opt {
+                        self.status_message = format!("Set startup home directory (web): {}", p);
+                    } else {
+                        self.status_message = "Cleared startup home directory (web)".to_string();
+                    }
+                    self.update_web_state();
+                }
             }
         }
     }
@@ -1972,6 +2025,7 @@ impl AppUI {
             state.queue_total = self.queue.len();
             state.queue_mode = self.settings_mgr.settings.queue_mode.clone();
             state.is_scanning = self.device_manager.is_scanning();
+            state.home_dir = self.settings_mgr.settings.home_dir.clone();
 
             state.queue = self
                 .queue
@@ -2714,7 +2768,7 @@ impl AppUI {
             Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Min(14),   // 2-column key list
+                    Constraint::Min(15),   // 2-column key list
                     Constraint::Length(1), // Footer instruction
                 ])
                 .margin(1)
@@ -2760,6 +2814,7 @@ impl AppUI {
             Self::help_key_line("J / K", "Page Down / Up"),
             Self::help_key_line("g / G", "Jump to Start / End"),
             Self::help_key_line("Bksp", "Go up to parent dir"),
+            Self::help_key_line("~", "Jump to startup home dir"),
             Self::help_key_line("1 / 2 / 3", "Switch active tab"),
         ];
         f.render_widget(Paragraph::new(left_lines), cols[0]);
@@ -2772,6 +2827,7 @@ impl AppUI {
             Self::help_key_line("d / x", "Remove track / bookmark"),
             Self::help_key_line("c", "Clear queue (queue pane)"),
             Self::help_key_line("b", "Bookmark folder in Homes"),
+            Self::help_key_line("H", "Set folder as startup home"),
             Self::help_key_line("v", "Toggle tags vs filenames"),
             Self::help_key_line("r", "Refresh folder contents"),
             Line::from(""),
@@ -2844,7 +2900,7 @@ fn help_modal_rect(r: Rect) -> Rect {
         r.width.saturating_sub(2)
     };
     let target_width = max_w.min(r.width);
-    let target_height = 19.min(r.height.saturating_sub(2)).min(r.height);
+    let target_height = 20.min(r.height.saturating_sub(2)).min(r.height);
 
     let x = r.x + (r.width.saturating_sub(target_width)) / 2;
     let y = r.y + (r.height.saturating_sub(target_height)) / 2;

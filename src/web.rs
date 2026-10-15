@@ -49,6 +49,8 @@ pub struct WebBrowserResponse {
     pub parent_path: Option<String>,
     pub bookmarks: Vec<String>,
     pub entries: Vec<WebBrowserEntry>,
+    #[serde(default)]
+    pub home_dir: Option<String>,
 }
 
 /// Live playback state shared between Quickstream and the web server.
@@ -81,6 +83,8 @@ pub struct NowPlayingState {
     pub queue_mode: String,
     #[serde(default)]
     pub is_scanning: bool,
+    #[serde(default)]
+    pub home_dir: Option<String>,
 }
 
 impl Default for NowPlayingState {
@@ -109,6 +113,7 @@ impl Default for NowPlayingState {
             devices: Vec::new(),
             queue_mode: "loop".to_string(),
             is_scanning: false,
+            home_dir: None,
         }
     }
 }
@@ -132,6 +137,7 @@ pub enum WebCommand {
     SelectDevice(usize),
     RescanDevices,
     SetQueueMode(String),
+    SetHome(Option<String>),
 }
 
 #[derive(Deserialize)]
@@ -474,15 +480,28 @@ fn handle_client(
                 None
             };
 
+            let current_home_dir = {
+                let s = state.read().unwrap();
+                s.home_dir.clone()
+            };
+
             let target_dir = if let Some(ref p) = requested_path {
                 let pb = PathBuf::from(p);
                 if pb.is_dir() {
                     pb
                 } else {
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                    current_home_dir
+                        .as_ref()
+                        .map(PathBuf::from)
+                        .filter(|p| p.is_dir())
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
                 }
             } else {
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                current_home_dir
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_dir())
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
             };
 
             let parent_path = target_dir.parent().map(|p| p.to_string_lossy().to_string());
@@ -534,6 +553,7 @@ fn handle_client(
                 parent_path,
                 bookmarks,
                 entries: all_entries,
+                home_dir: current_home_dir,
             };
 
             let json = serde_json::to_string(&resp_data).unwrap_or_else(|_| "{}".to_string());
@@ -629,6 +649,9 @@ fn handle_client(
                     if let Some(mode) = payload.mode {
                         let _ = cmd_tx.send(WebCommand::SetQueueMode(mode));
                     }
+                }
+                "set_home" => {
+                    let _ = cmd_tx.send(WebCommand::SetHome(payload.path));
                 }
                 _ => {}
             }
@@ -2133,13 +2156,21 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       <div class="bookmarks-row" id="bookmarksRow" style="display:none;"></div>
 
       <div class="browser-nav-bar">
+        <button class="btn-sm" id="btnBrowserHome" title="Jump to Startup Home Directory">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
+          Home
+        </button>
         <button class="btn-sm" id="btnBrowserUp" title="Parent Directory">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"></polyline></svg>
-          Parent
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"></polyline></svg>
+          Up
         </button>
         <div class="browser-current-path" id="browserCurrentPath">/</div>
+        <button class="btn-sm" id="btnBrowserSetHome" title="Set current directory as startup home">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
+          Set Home
+        </button>
         <button class="btn-sm accent" id="btnBrowserAddAll" title="Add all audio files in this folder">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
           Add All
         </button>
       </div>
@@ -2536,6 +2567,15 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       document.getElementById('browserCurrentPath').textContent = data.current_path || "/";
       document.getElementById('btnBrowserUp').disabled = !data.parent_path;
 
+      const setHomeBtn = document.getElementById('btnBrowserSetHome');
+      if (data.home_dir && data.home_dir === data.current_path) {
+        setHomeBtn.classList.add('accent');
+        setHomeBtn.title = "Current directory is startup home (click to clear)";
+      } else {
+        setHomeBtn.classList.remove('accent');
+        setHomeBtn.title = "Set current directory as startup home";
+      }
+
       // Bookmarks chips
       const bmRow = document.getElementById('bookmarksRow');
       if (data.bookmarks && data.bookmarks.length > 0) {
@@ -2590,9 +2630,31 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       loadBrowser(path);
     }
 
+    document.getElementById('btnBrowserHome').addEventListener('click', () => {
+      if (currentBrowserData && currentBrowserData.home_dir) {
+        browseTo(currentBrowserData.home_dir);
+      } else {
+        browseTo("");
+      }
+    });
+
     document.getElementById('btnBrowserUp').addEventListener('click', () => {
       if (currentBrowserData && currentBrowserData.parent_path) {
         browseTo(currentBrowserData.parent_path);
+      }
+    });
+
+    document.getElementById('btnBrowserSetHome').addEventListener('click', async () => {
+      if (currentBrowserPath) {
+        const isCurrentHome = currentBrowserData && currentBrowserData.home_dir === currentBrowserPath;
+        if (isCurrentHome) {
+          await sendAction('set_home', null, { path: null });
+          showToast('Startup home directory cleared');
+        } else {
+          await sendAction('set_home', null, { path: currentBrowserPath });
+          showToast(`Startup home set to ${currentBrowserPath}`);
+        }
+        await loadBrowser(currentBrowserPath);
       }
     });
 

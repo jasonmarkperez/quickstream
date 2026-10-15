@@ -48,6 +48,10 @@ struct Cli {
     /// Port for Now Playing web server (default: 8080)
     #[arg(long)]
     web_port: Option<u16>,
+
+    /// Set persistent startup home directory and exit (use "default" or "none" to clear)
+    #[arg(long)]
+    set_home: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -63,6 +67,53 @@ fn main() -> anyhow::Result<()> {
     });
 
     let cli = Cli::parse();
+
+    // Set startup home flag
+    if let Some(home_path) = cli.set_home {
+        let trimmed = home_path.to_string_lossy().trim().to_string();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("none")
+            || trimmed.eq_ignore_ascii_case("default")
+            || trimmed.eq_ignore_ascii_case("clear")
+        {
+            let mut settings_mgr = SettingsManager::new();
+            settings_mgr.settings.home_dir = None;
+            if settings_mgr.save() {
+                println!("Startup home directory cleared (defaulting to launch directory).");
+                return Ok(());
+            } else {
+                eprintln!("Error: Failed to save settings to '{}'", settings_mgr.path.display());
+                std::process::exit(1);
+            }
+        }
+
+        let abs_path = if home_path.is_absolute() {
+            home_path
+        } else {
+            std::env::current_dir()?.join(home_path)
+        };
+        let canonical = match abs_path.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Error: Cannot resolve path '{}': {}", abs_path.display(), e);
+                std::process::exit(1);
+            }
+        };
+        if !canonical.is_dir() {
+            eprintln!("Error: '{}' is not a directory", canonical.display());
+            std::process::exit(1);
+        }
+        let mut settings_mgr = SettingsManager::new();
+        let path_str = canonical.to_string_lossy().to_string();
+        settings_mgr.settings.home_dir = Some(path_str.clone());
+        if settings_mgr.save() {
+            println!("Startup home directory set to: {}", path_str);
+            return Ok(());
+        } else {
+            eprintln!("Error: Failed to save settings to '{}'", settings_mgr.path.display());
+            std::process::exit(1);
+        }
+    }
 
     // Inspect metadata flag
     if let Some(info_path) = cli.info {
@@ -139,7 +190,15 @@ fn main() -> anyhow::Result<()> {
         settings_mgr.settings.web_server_port = port;
         settings_mgr.settings.web_server_enabled = true;
     }
-    let start_dir = cli.paths.first().filter(|p| !is_supported_audio_file(p)).cloned();
+    let explicit_dir = cli.paths.first().filter(|p| !is_supported_audio_file(p)).cloned();
+    let start_dir = explicit_dir.or_else(|| {
+        settings_mgr
+            .settings
+            .home_dir
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+    });
     let mut app = AppUI::new(start_dir, settings_mgr);
 
     // Pre-queue any explicit files passed on CLI

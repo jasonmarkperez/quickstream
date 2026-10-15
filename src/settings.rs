@@ -19,6 +19,8 @@ pub struct Settings {
     pub web_server_enabled: bool,
     #[serde(default = "default_web_port")]
     pub web_server_port: u16,
+    #[serde(default)]
+    pub home_dir: Option<String>,
 }
 
 fn default_web_port() -> u16 {
@@ -37,6 +39,7 @@ impl Default for Settings {
             player_backend: "mpv".to_string(),
             web_server_enabled: false,
             web_server_port: 8080,
+            home_dir: None,
         }
     }
 }
@@ -82,6 +85,11 @@ pub const SETTING_DEFINITIONS: &[SettingDefinition] = &[
         key: "web_server_enabled",
         label: "Now Playing Web Server",
         description: "Run local HTTP server (metadata, cover art & remote control) on configured port.",
+    },
+    SettingDefinition {
+        key: "home_dir",
+        label: "Startup Home Directory",
+        description: "Default directory loaded on startup instead of current working directory.",
     },
 ];
 
@@ -190,6 +198,53 @@ impl SettingsManager {
                 // web_server_enabled
                 self.settings.web_server_enabled = !self.settings.web_server_enabled;
             }
+            7 => {
+                // home_dir cycling:
+                // None (Default launch folder), Music folder (if exists), Home folder, Bookmarks, and current custom path
+                let mut options: Vec<Option<String>> = vec![None];
+                if let Some(user_dirs) = directories::UserDirs::new() {
+                    if let Some(audio) = user_dirs.audio_dir() {
+                        let p = audio.to_string_lossy().to_string();
+                        if !options.iter().any(|o| o.as_deref() == Some(&p)) {
+                            options.push(Some(p));
+                        }
+                    }
+                }
+                if let Some(base) = directories::BaseDirs::new() {
+                    let home = base.home_dir().to_string_lossy().to_string();
+                    if !options.iter().any(|o| o.as_deref() == Some(&home)) {
+                        options.push(Some(home));
+                    }
+                }
+                let bookmarks_file = paths::get_bookmarks_path();
+                if bookmarks_file.exists() {
+                    if let Ok(content) = fs::read_to_string(&bookmarks_file) {
+                        if let Ok(bm_list) = serde_json::from_str::<Vec<String>>(&content) {
+                            for bm in bm_list {
+                                if !options.iter().any(|o| o.as_deref() == Some(&bm)) {
+                                    options.push(Some(bm));
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(ref current) = self.settings.home_dir {
+                    if !options.iter().any(|o| o.as_deref() == Some(current)) {
+                        options.push(Some(current.clone()));
+                    }
+                }
+
+                let current_idx = options
+                    .iter()
+                    .position(|o| o == &self.settings.home_dir)
+                    .unwrap_or(0);
+                let next_idx = if forward {
+                    (current_idx + 1) % options.len()
+                } else {
+                    (current_idx + options.len() - 1) % options.len()
+                };
+                self.settings.home_dir = options[next_idx].clone();
+            }
             _ => {}
         }
         self.save();
@@ -213,6 +268,22 @@ impl SettingsManager {
             } else {
                 "Disabled".to_string()
             },
+            7 => {
+                if let Some(ref h) = self.settings.home_dir {
+                    if let Some(base) = directories::BaseDirs::new() {
+                        let home_str = base.home_dir().to_string_lossy();
+                        if h.starts_with(home_str.as_ref()) {
+                            format!("~{}", &h[home_str.len()..])
+                        } else {
+                            h.clone()
+                        }
+                    } else {
+                        h.clone()
+                    }
+                } else {
+                    "Default (Launch Directory)".to_string()
+                }
+            }
             _ => String::new(),
         }
     }
@@ -231,6 +302,7 @@ mod tests {
         assert_eq!(s.seek_step_seconds, 10.0);
         assert_eq!(s.volume_step, 5);
         assert_eq!(s.queue_mode, "loop");
+        assert_eq!(s.home_dir, None);
     }
 
     #[test]
@@ -242,11 +314,13 @@ mod tests {
         let mut mgr = SettingsManager::with_path(path.clone());
         mgr.settings.metadata_view = false;
         mgr.settings.volume_step = 10;
+        mgr.settings.home_dir = Some("/custom/home".to_string());
         assert!(mgr.save());
 
         let loaded = SettingsManager::load_from(&path).expect("should load");
         assert!(!loaded.metadata_view);
         assert_eq!(loaded.volume_step, 10);
+        assert_eq!(loaded.home_dir, Some("/custom/home".to_string()));
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
@@ -269,6 +343,14 @@ mod tests {
         assert!(!mgr.settings.web_server_enabled);
         mgr.cycle_setting(6, true);
         assert!(mgr.settings.web_server_enabled);
+
+        assert_eq!(mgr.settings.home_dir, None);
+        assert_eq!(mgr.get_display_value(7), "Default (Launch Directory)");
+        mgr.cycle_setting(7, true);
+        // home_dir may be set to audio_dir or home or remain None if none exist in test env
+        // Regardless, cycling backwards returns to None
+        mgr.cycle_setting(7, false);
+        assert_eq!(mgr.settings.home_dir, None);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

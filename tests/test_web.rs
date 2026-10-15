@@ -400,7 +400,7 @@ fn test_web_server_browser_api() {
 
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
     let (tx, _rx) = mpsc::channel();
-    let handle = WebServer::start(0, state, tx).expect("start web server");
+    let handle = WebServer::start(0, state.clone(), tx).expect("start web server");
     let port = handle.port;
 
     let encoded_path = quickstream::player::upnp::url_encode(&temp_dir.to_string_lossy());
@@ -413,6 +413,7 @@ fn test_web_server_browser_api() {
     let resp: WebBrowserResponse = serde_json::from_slice(&body).expect("parse browser response");
     assert_eq!(resp.current_path, temp_dir.to_string_lossy());
     assert!(resp.parent_path.is_some());
+    assert_eq!(resp.home_dir, None);
 
     let entry_names: Vec<String> = resp.entries.iter().map(|e| e.name.clone()).collect();
     // Folders first (alphabetical)
@@ -426,6 +427,17 @@ fn test_web_server_browser_api() {
     assert!(entry_names.contains(&"track2.flac".to_string()));
     // Non-audio file filtered out
     assert!(!entry_names.contains(&"notes.txt".to_string()));
+
+    // Verify that setting state.home_dir makes /api/browser open home_dir by default
+    {
+        let mut s = state.write().unwrap();
+        s.home_dir = Some(temp_dir.join("Rock").to_string_lossy().to_string());
+    }
+    let (status_home, _, body_home) = http_get(port, "/api/browser");
+    assert_eq!(status_home, 200);
+    let resp_home: WebBrowserResponse = serde_json::from_slice(&body_home).expect("parse browser home response");
+    assert_eq!(resp_home.current_path, temp_dir.join("Rock").to_string_lossy());
+    assert_eq!(resp_home.home_dir, Some(temp_dir.join("Rock").to_string_lossy().to_string()));
 
     handle.stop();
     let _ = fs::remove_dir_all(&temp_dir);
@@ -477,6 +489,16 @@ fn test_web_server_extended_action_commands() {
     let (status, _, _) = http_post(port, "/api/action", r#"{"action":"set_queue_mode","mode":"repeat_one"}"#);
     assert_eq!(status, 200);
     assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::SetQueueMode("repeat_one".to_string()));
+
+    // 9. Set home with directory path
+    let (status, _, _) = http_post(port, "/api/action", r#"{"action":"set_home","path":"/test/home"}"#);
+    assert_eq!(status, 200);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::SetHome(Some("/test/home".to_string())));
+
+    // 10. Clear home (path: null)
+    let (status, _, _) = http_post(port, "/api/action", r#"{"action":"set_home"}"#);
+    assert_eq!(status, 200);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::SetHome(None));
 
     handle.stop();
 }
