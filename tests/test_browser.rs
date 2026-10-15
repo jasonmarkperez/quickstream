@@ -83,7 +83,7 @@ fn test_browser_metadata_view_toggle() {
     let (label_filename, _, _) = entry_file.unwrap();
 
     // With metadata_view = false, label displays clean filename
-    assert_eq!(label_filename, "🎵 [WAV] test_track.wav");
+    assert_eq!(label_filename, "[WAV] test_track.wav");
     assert_ne!(label_meta.as_str(), label_filename.as_str());
 
     let _ = fs::remove_dir_all(&temp_dir);

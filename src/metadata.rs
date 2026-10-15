@@ -51,9 +51,9 @@ impl AudioMetadata {
             } else {
                 String::new()
             };
-            format!("🎵 [{}] {}{}{}", ext, artist_part, self.display_title(), time_part)
+            format!("[{}] {}{}{}", ext, artist_part, self.display_title(), time_part)
         } else {
-            format!("🎵 [{}] {}", ext, self.filename)
+            format!("[{}] {}", ext, self.filename)
         }
     }
 }
@@ -332,9 +332,9 @@ mod tests {
         assert_eq!(meta.formatted_duration(), "02:05");
         assert_eq!(
             meta.format_display_label(true),
-            "🎵 [FLAC] Test Artist - Test Song (02:05)"
+            "[FLAC] Test Artist - Test Song (02:05)"
         );
-        assert_eq!(meta.format_display_label(false), "🎵 [FLAC] song.flac");
+        assert_eq!(meta.format_display_label(false), "[FLAC] song.flac");
     }
 
     #[test]

@@ -70,8 +70,8 @@ class FileBrowser:
             artist_part = f"{meta.artist} - " if meta.artist else ""
             time_part = f" ({meta.duration_formatted})" if meta.duration_seconds > 0 else ""
             title = meta.display_title
-            return f"🎵 [{ext}] {artist_part}{title}{time_part}"
-        return f"🎵 [{ext}] {path.name}"
+            return f"[{ext}] {artist_part}{title}{time_part}"
+        return f"[{ext}] {path.name}"
 
     def _update_entry_labels(self) -> None:
         """Update display strings for all entries in the current listing."""

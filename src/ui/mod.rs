@@ -317,10 +317,10 @@ impl AppUI {
                                     m.format_display_label(true)
                                 } else {
                                     batch_unfetched.push(path.clone());
-                                    format!("🎵 [{}] {}", ext, name)
+                                    format!("[{}] {}", ext, name)
                                 }
                             } else {
-                                format!("🎵 [{}] {}", ext, name)
+                                format!("[{}] {}", ext, name)
                             };
                             batch_files.push((label, path, false));
                         } else {
@@ -1118,8 +1118,8 @@ impl AppUI {
                     }
                 } else {
                     match self.player.toggle_pause() {
-                        Ok(paused) => {
-                            self.status_message = if paused { "Paused" } else { "Playing" }.to_string();
+                        Ok(_) => {
+                            self.status_message.clear();
                         }
                         Err(e) => {
                             self.status_message = format!("Pause error: {}", e);
@@ -1130,7 +1130,7 @@ impl AppUI {
             }
             (KeyCode::Char('s'), KeyModifiers::NONE) => {
                 self.player.stop()?;
-                self.status_message = "Stopped".to_string();
+                self.status_message.clear();
             }
             (KeyCode::Right, KeyModifiers::NONE) => {
                 self.play_next_track();
@@ -1547,7 +1547,6 @@ impl AppUI {
     fn play_current_track(&mut self) {
         if let Some(track) = self.queue.current_track() {
             let path = track.filepath.clone();
-            let title = track.display_title().to_string();
             if let Some(ref ws) = self.web_server {
                 ws.close_active_streams();
                 ws.register_stream_file(&path);
@@ -1557,7 +1556,7 @@ impl AppUI {
             }
             match self.player.play(&path) {
                 Ok(_) => {
-                    self.status_message = format!("Playing: {}", title);
+                    self.status_message.clear();
                 }
                 Err(e) => {
                     self.status_message = format!("Playback error: {}", e);
@@ -1571,7 +1570,6 @@ impl AppUI {
         let mode = self.settings_mgr.settings.queue_mode.clone();
         if let Some(track) = self.queue.next_track(&mode) {
             let path = track.filepath.clone();
-            let title = track.display_title().to_string();
             if let Some(ref ws) = self.web_server {
                 ws.close_active_streams();
                 ws.register_stream_file(&path);
@@ -1581,7 +1579,7 @@ impl AppUI {
             }
             match self.player.play(&path) {
                 Ok(_) => {
-                    self.status_message = format!("Playing: {}", title);
+                    self.status_message.clear();
                 }
                 Err(e) => {
                     self.status_message = format!("Playback error: {}", e);
@@ -1594,7 +1592,6 @@ impl AppUI {
     fn play_prev_track(&mut self) {
         if let Some(track) = self.queue.prev_track() {
             let path = track.filepath.clone();
-            let title = track.display_title().to_string();
             if let Some(ref ws) = self.web_server {
                 ws.close_active_streams();
                 ws.register_stream_file(&path);
@@ -1604,7 +1601,7 @@ impl AppUI {
             }
             match self.player.play(&path) {
                 Ok(_) => {
-                    self.status_message = format!("Playing: {}", title);
+                    self.status_message.clear();
                 }
                 Err(e) => {
                     self.status_message = format!("Playback error: {}", e);
@@ -1886,7 +1883,7 @@ impl AppUI {
             .constraints([
                 Constraint::Length(3), // Tab header
                 Constraint::Min(5),    // Main workspace
-                Constraint::Length(4), // Bottom playback bar
+                Constraint::Length(5), // Bottom playback bar
             ])
             .split(f.area());
 
@@ -2381,52 +2378,143 @@ impl AppUI {
     }
 
     fn render_bottom_bar(&self, f: &mut Frame, area: Rect) {
-        let block = Block::default().borders(Borders::ALL);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                " NOW PLAYING ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
         f.render_widget(block, area);
 
         let inner = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(1), // Row 1: Music metadata
+                Constraint::Length(1), // Row 2: Status & Controls
+                Constraint::Length(1), // Row 3: Progress gauge
+            ])
             .margin(1)
             .split(area);
 
-        // Status line
-        let state = if self.player.is_playing() {
-            "▶ PLAYING"
-        } else if self.player.is_paused() {
-            "⏸ PAUSED"
+        if inner.len() < 3 {
+            return;
+        }
+
+        // --- Row 1: Dedicated solely to music metadata (Title, Artist, Album, Format/Bitrate) ---
+        let row1_line = if let Some(track) = self.queue.current_track() {
+            let mut spans = Vec::new();
+
+            // Title (Bold Yellow)
+            spans.push(Span::styled(
+                track.display_title(),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+
+            // Artist (Cyan)
+            if !track.artist.is_empty() {
+                spans.push(Span::styled("  —  ", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    &track.artist,
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ));
+            }
+
+            // Album (White)
+            if !track.album.is_empty() {
+                spans.push(Span::styled("  —  ", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    &track.album,
+                    Style::default().fg(Color::White),
+                ));
+            }
+
+            // Format / Bitrate (Gray)
+            let mut fmt_parts = Vec::new();
+            if !track.format_name.is_empty() {
+                fmt_parts.push(track.format_name.to_uppercase());
+            }
+            if track.bitrate_kbps > 0 {
+                fmt_parts.push(format!("{}kbps", track.bitrate_kbps));
+            }
+            if !fmt_parts.is_empty() {
+                spans.push(Span::styled(
+                    format!("  ({})", fmt_parts.join(" ")),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+
+            Line::from(spans)
         } else {
-            "⏹ STOPPED"
+            Line::from(vec![Span::styled(
+                "No Track Loaded",
+                Style::default().fg(Color::DarkGray),
+            )])
         };
+        f.render_widget(Paragraph::new(row1_line), inner[0]);
 
-        let title = self
-            .queue
-            .current_track()
-            .map(|t| t.display_title())
-            .unwrap_or("No Track Loaded");
+        // --- Row 2: State badge, Active Device, Volume, Web Server URL/Port, Notices ---
+        let mut row2_spans = Vec::new();
 
+        // State badge
+        if self.player.is_playing() {
+            row2_spans.push(Span::styled(
+                "▶ PLAYING",
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ));
+        } else if self.player.is_paused() {
+            row2_spans.push(Span::styled(
+                "⏸ PAUSED",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            row2_spans.push(Span::styled(
+                "⏹ STOPPED",
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        // Output Device (without "Out:" prefix)
         let active_dev_name = self
             .device_manager
             .get_active_device()
             .map(|d| d.friendly_name)
             .unwrap_or_else(|| "Local Audio".to_string());
+        row2_spans.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
+        row2_spans.push(Span::styled(active_dev_name, Style::default().fg(Color::White)));
 
+        // Volume
         let vol = self.player.volume();
-        let web_badge = if let Some(ref s) = self.web_server {
-            format!(" │ 🌐 :{}", s.port)
-        } else {
-            String::new()
-        };
-        let status_text = format!(
-            "{} │ {} │ Vol: {}% │ Out: {}{} │ {}",
-            state, title, vol, active_dev_name, web_badge, self.status_message
-        );
-        f.render_widget(
-            Paragraph::new(status_text).style(Style::default().fg(Color::Yellow)),
-            inner[0],
-        );
+        row2_spans.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
+        row2_spans.push(Span::styled(format!("Vol: {}%", vol), Style::default().fg(Color::White)));
 
-        // Progress bar with formatted MM:SS / MM:SS
+        // Web server badge
+        if let Some(ref s) = self.web_server {
+            row2_spans.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
+            row2_spans.push(Span::styled(format!("🌐 :{}", s.port), Style::default().fg(Color::Cyan)));
+        }
+
+        // Transient non-redundant notices
+        let is_redundant = self.status_message.is_empty()
+            || self.status_message.starts_with("Playing:")
+            || self.status_message == "Playing"
+            || self.status_message == "Paused"
+            || self.status_message == "Stopped"
+            || self.status_message.starts_with("Welcome to Quickstream");
+
+        if !is_redundant {
+            row2_spans.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
+            let msg_lower = self.status_message.to_lowercase();
+            let msg_style = if msg_lower.contains("error") || msg_lower.contains("failed") {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Magenta)
+            };
+            row2_spans.push(Span::styled(&self.status_message, msg_style));
+        }
+
+        f.render_widget(Paragraph::new(Line::from(row2_spans)), inner[1]);
+
+        // --- Row 3: Progress bar gauge with MM:SS / MM:SS ---
         let pos = self
             .pending_seek_target
             .unwrap_or_else(|| self.player.position_seconds());
@@ -2440,7 +2528,7 @@ impl AppUI {
             .gauge_style(Style::default().fg(Color::Cyan))
             .ratio(pct)
             .label(format!("{} / {}", pos_str, dur_str));
-        f.render_widget(gauge, inner[1]);
+        f.render_widget(gauge, inner[2]);
     }
 
     fn render_help_modal(&self, f: &mut Frame) {
