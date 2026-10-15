@@ -5,7 +5,11 @@ use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use quickstream::web::{NowPlayingState, WebCommand, WebServer};
+use std::path::PathBuf;
+
+use quickstream::web::{
+    NowPlayingState, WebBrowserResponse, WebCommand, WebDeviceItem, WebQueueItem, WebServer,
+};
 
 fn parse_http_response(raw: &[u8]) -> (u16, String, Vec<u8>) {
     let header_end = raw
@@ -378,4 +382,165 @@ fn test_web_server_close_active_streams_terminates_clients() {
 
     handle.stop();
     let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_web_server_browser_api() {
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+
+    // Create subfolders
+    fs::create_dir_all(temp_dir.join("Rock")).unwrap();
+    fs::create_dir_all(temp_dir.join("Ambient")).unwrap();
+    // Create audio files
+    fs::write(temp_dir.join("track1.mp3"), b"fake_mp3_data").unwrap();
+    fs::write(temp_dir.join("track2.flac"), b"fake_flac_data").unwrap();
+    // Non-audio file should be excluded
+    fs::write(temp_dir.join("notes.txt"), b"some text").unwrap();
+
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state, tx).expect("start web server");
+    let port = handle.port;
+
+    let encoded_path = quickstream::player::upnp::url_encode(&temp_dir.to_string_lossy());
+    let req_url = format!("/api/browser?path={}", encoded_path);
+
+    let (status, headers, body) = http_get(port, &req_url);
+    assert_eq!(status, 200);
+    assert!(headers.contains("application/json"));
+
+    let resp: WebBrowserResponse = serde_json::from_slice(&body).expect("parse browser response");
+    assert_eq!(resp.current_path, temp_dir.to_string_lossy());
+    assert!(resp.parent_path.is_some());
+
+    let entry_names: Vec<String> = resp.entries.iter().map(|e| e.name.clone()).collect();
+    // Folders first (alphabetical)
+    assert_eq!(entry_names[0], "Ambient");
+    assert!(resp.entries[0].is_dir);
+    assert_eq!(entry_names[1], "Rock");
+    assert!(resp.entries[1].is_dir);
+
+    // Audio files next (alphabetical)
+    assert!(entry_names.contains(&"track1.mp3".to_string()));
+    assert!(entry_names.contains(&"track2.flac".to_string()));
+    // Non-audio file filtered out
+    assert!(!entry_names.contains(&"notes.txt".to_string()));
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_web_server_extended_action_commands() {
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (tx, rx) = mpsc::channel();
+    let handle = WebServer::start(0, state, tx).expect("start web server");
+    let port = handle.port;
+
+    // 1. Play index
+    let (status, _, _) = http_post(port, "/api/action", r#"{"action":"play_index","index":4}"#);
+    assert_eq!(status, 200);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::PlayIndex(4));
+
+    // 2. Remove index
+    let (status, _, _) = http_post(port, "/api/action", r#"{"action":"remove_index","index":2}"#);
+    assert_eq!(status, 200);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::RemoveIndex(2));
+
+    // 3. Clear queue
+    let (status, _, _) = http_post(port, "/api/action", r#"{"action":"clear_queue"}"#);
+    assert_eq!(status, 200);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::ClearQueue);
+
+    // 4. Add file
+    let (status, _, _) = http_post(port, "/api/action", r#"{"action":"add_file","path":"/music/song.flac"}"#);
+    assert_eq!(status, 200);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::AddFile(PathBuf::from("/music/song.flac")));
+
+    // 5. Add folder
+    let (status, _, _) = http_post(port, "/api/action", r#"{"action":"add_folder","path":"/music/album"}"#);
+    assert_eq!(status, 200);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::AddFolder(PathBuf::from("/music/album")));
+
+    // 6. Select device
+    let (status, _, _) = http_post(port, "/api/action", r#"{"action":"select_device","id":1}"#);
+    assert_eq!(status, 200);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::SelectDevice(1));
+
+    // 7. Rescan devices
+    let (status, _, _) = http_post(port, "/api/action", r#"{"action":"rescan_devices"}"#);
+    assert_eq!(status, 200);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::RescanDevices);
+
+    // 8. Set queue mode
+    let (status, _, _) = http_post(port, "/api/action", r#"{"action":"set_queue_mode","mode":"repeat_one"}"#);
+    assert_eq!(status, 200);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::SetQueueMode("repeat_one".to_string()));
+
+    handle.stop();
+}
+
+#[test]
+fn test_web_server_status_api_with_queue_and_devices() {
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state.clone(), tx).expect("start web server");
+    let port = handle.port;
+
+    {
+        let mut s = state.write().unwrap();
+        s.queue_mode = "repeat_one".to_string();
+        s.is_scanning = true;
+        s.queue = vec![
+            WebQueueItem {
+                index: 0,
+                title: "Track 1".to_string(),
+                artist: "Artist 1".to_string(),
+                album: "Album 1".to_string(),
+                duration_seconds: 180.0,
+                filepath: "/music/t1.mp3".to_string(),
+                is_current: true,
+            },
+            WebQueueItem {
+                index: 1,
+                title: "Track 2".to_string(),
+                artist: "Artist 2".to_string(),
+                album: "Album 2".to_string(),
+                duration_seconds: 240.0,
+                filepath: "/music/t2.mp3".to_string(),
+                is_current: false,
+            },
+        ];
+        s.devices = vec![
+            WebDeviceItem {
+                id: 0,
+                name: "Local Audio".to_string(),
+                host_port: "Local Device".to_string(),
+                is_active: false,
+            },
+            WebDeviceItem {
+                id: 1,
+                name: "Living Room (Sonos)".to_string(),
+                host_port: "192.168.1.100:1400".to_string(),
+                is_active: true,
+            },
+        ];
+    }
+
+    let (status, headers, body) = http_get(port, "/api/status");
+    assert_eq!(status, 200);
+    assert!(headers.contains("application/json"));
+
+    let returned_state: NowPlayingState = serde_json::from_slice(&body).expect("parse status json");
+    assert_eq!(returned_state.queue_mode, "repeat_one");
+    assert!(returned_state.is_scanning);
+    assert_eq!(returned_state.queue.len(), 2);
+    assert_eq!(returned_state.queue[0].title, "Track 1");
+    assert!(returned_state.queue[0].is_current);
+    assert_eq!(returned_state.devices.len(), 2);
+    assert_eq!(returned_state.devices[1].name, "Living Room (Sonos)");
+    assert!(returned_state.devices[1].is_active);
+
+    handle.stop();
 }

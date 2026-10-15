@@ -1843,6 +1843,112 @@ impl AppUI {
                     let _ = self.player.seek(delta);
                     self.update_web_state();
                 }
+                crate::web::WebCommand::PlayIndex(idx) => {
+                    if idx < self.queue.len() {
+                        self.queue.current_index = idx;
+                        self.queue_cursor = idx;
+                        self.play_current_track();
+                        self.update_web_state();
+                    }
+                }
+                crate::web::WebCommand::RemoveIndex(idx) => {
+                    if idx < self.queue.len() {
+                        let was_current = idx == self.queue.current_index;
+                        self.queue.remove_track(idx);
+                        if self.queue_cursor >= self.queue.len() && !self.queue.is_empty() {
+                            self.queue_cursor = self.queue.len() - 1;
+                        }
+                        if was_current {
+                            if !self.queue.is_empty() {
+                                self.play_current_track();
+                            } else {
+                                let _ = self.player.stop();
+                            }
+                        }
+                        self.update_web_state();
+                    }
+                }
+                crate::web::WebCommand::ClearQueue => {
+                    let _ = self.player.stop();
+                    self.queue.clear();
+                    self.queue_cursor = 0;
+                    self.update_web_state();
+                }
+                crate::web::WebCommand::AddFile(path) => {
+                    if path.exists() && crate::metadata::is_supported_audio_file(&path) {
+                        let meta_opt = self.metadata_cache.get(&path).cloned()
+                            .or_else(|| {
+                                if let Ok(m) = crate::metadata::extract_metadata(&path) {
+                                    self.metadata_cache.insert(path.clone(), m.clone());
+                                    Some(m)
+                                } else {
+                                    None
+                                }
+                            })
+                            .or_else(|| Some(crate::metadata::fallback_metadata(&path)));
+                        if let Some(meta) = meta_opt {
+                            let title = meta.display_title().to_string();
+                            self.register_stream_file(&meta.filepath);
+                            self.queue.add_track(meta);
+                            self.status_message = format!("Added to queue (web): {}", title);
+                            self.update_web_state();
+                        }
+                    }
+                }
+                crate::web::WebCommand::AddFolder(path) => {
+                    if path.is_dir() {
+                        if let Ok(entries) = std::fs::read_dir(&path) {
+                            let mut files: Vec<std::path::PathBuf> = entries
+                                .filter_map(|e| e.ok())
+                                .map(|e| e.path())
+                                .filter(|p| crate::metadata::is_supported_audio_file(p))
+                                .collect();
+                            files.sort();
+                            let mut added = 0;
+                            for file_path in files {
+                                let meta_opt = self.metadata_cache.get(&file_path).cloned()
+                                    .or_else(|| {
+                                        if let Ok(m) = crate::metadata::extract_metadata(&file_path) {
+                                            self.metadata_cache.insert(file_path.clone(), m.clone());
+                                            Some(m)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .or_else(|| Some(crate::metadata::fallback_metadata(&file_path)));
+                                if let Some(meta) = meta_opt {
+                                    self.register_stream_file(&meta.filepath);
+                                    self.queue.add_track(meta);
+                                    added += 1;
+                                }
+                            }
+                            self.status_message = format!("Added {} tracks (web)", added);
+                            self.update_web_state();
+                        }
+                    }
+                }
+                crate::web::WebCommand::SelectDevice(id) => {
+                    let devices = self.device_manager.get_devices();
+                    if id == 0 {
+                        self.switch_to_local_player();
+                        self.status_message = "Switched to Local Audio (web)".to_string();
+                    } else if let Some(dev) = devices.get(id.saturating_sub(1)) {
+                        let name = dev.friendly_name.clone();
+                        self.switch_to_upnp_player(dev.clone());
+                        self.status_message = format!("Switched to {} (web)", name);
+                    }
+                    self.update_web_state();
+                }
+                crate::web::WebCommand::RescanDevices => {
+                    self.device_manager.start_background_scan();
+                    self.status_message = "Scanning for DLNA MediaRenderers (web)...".to_string();
+                    self.update_web_state();
+                }
+                crate::web::WebCommand::SetQueueMode(mode) => {
+                    self.settings_mgr.settings.queue_mode = mode;
+                    let _ = self.settings_mgr.save();
+                    self.update_web_state();
+                }
             }
         }
     }
@@ -1864,6 +1970,43 @@ impl AppUI {
                 .unwrap_or_else(|| "Local Audio".to_string());
             state.queue_index = self.queue.current_index;
             state.queue_total = self.queue.len();
+            state.queue_mode = self.settings_mgr.settings.queue_mode.clone();
+            state.is_scanning = self.device_manager.is_scanning();
+
+            state.queue = self
+                .queue
+                .tracks
+                .iter()
+                .enumerate()
+                .map(|(idx, track)| crate::web::WebQueueItem {
+                    index: idx,
+                    title: track.display_title().to_string(),
+                    artist: track.artist.clone(),
+                    album: track.album.clone(),
+                    duration_seconds: track.duration_seconds,
+                    filepath: track.filepath.to_string_lossy().to_string(),
+                    is_current: idx == self.queue.current_index,
+                })
+                .collect();
+
+            let active_dev = self.device_manager.get_active_device();
+            let mut devices = Vec::new();
+            devices.push(crate::web::WebDeviceItem {
+                id: 0,
+                name: "Local Audio (mpv/ffplay)".to_string(),
+                host_port: "Local Device".to_string(),
+                is_active: active_dev.is_none(),
+            });
+            for (idx, dev) in self.device_manager.get_devices().iter().enumerate() {
+                let is_active = active_dev.as_ref().map(|d| d.udn == dev.udn).unwrap_or(false);
+                devices.push(crate::web::WebDeviceItem {
+                    id: idx + 1,
+                    name: dev.display_label(),
+                    host_port: format!("{}:{}", dev.host, dev.port),
+                    is_active,
+                });
+            }
+            state.devices = devices;
 
             if let Some(track) = self.queue.current_track() {
                 state.title = track.title.clone();
