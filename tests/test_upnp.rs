@@ -624,3 +624,276 @@ fn test_upnp_player_with_stream_server_state_socket_closure_and_registration() {
     let _ = handle.join();
 }
 
+#[test]
+fn test_upnp_player_auto_advance_when_renderer_resets_rel_time_on_stop() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock renderer");
+    let port = listener.local_addr().unwrap().port();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_flag_thread = stop_flag.clone();
+    let current_state = Arc::new(std::sync::Mutex::new("PLAYING".to_string()));
+    let current_state_thread = current_state.clone();
+    let current_rel_time = Arc::new(std::sync::Mutex::new("00:02:55".to_string())); // 175s of 180s track
+    let current_rel_time_thread = current_rel_time.clone();
+
+    let handle = std::thread::spawn(move || {
+        while !stop_flag_thread.load(Ordering::SeqCst) {
+            listener.set_nonblocking(true).expect("set nonblocking");
+            let stream_opt = match listener.accept() {
+                Ok((s, _)) => Some(s),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(15));
+                    continue;
+                }
+                Err(_) => break,
+            };
+
+            if let Some(mut stream) = stream_opt {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
+                    continue;
+                }
+
+                let mut soap_action = String::new();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                        break;
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.to_lowercase().starts_with("soapaction:") {
+                        soap_action = trimmed.split(':').skip(1).collect::<Vec<_>>().join(":");
+                    } else if trimmed.to_lowercase().starts_with("content-length:") {
+                        if let Some(v) = trimmed.split(':').nth(1) {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+
+                let mut body = vec![0u8; content_length];
+                if content_length > 0 {
+                    let _ = reader.read_exact(&mut body);
+                }
+
+                let (status_line, resp_body) = if soap_action.contains("GetTransportInfo") {
+                    let st = current_state_thread.lock().unwrap().clone();
+                    (
+                        "HTTP/1.1 200 OK",
+                        format!(
+                            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetTransportInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><CurrentTransportState>{}</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed></u:GetTransportInfoResponse></s:Body></s:Envelope>"#,
+                            st
+                        )
+                    )
+                } else if soap_action.contains("GetPositionInfo") {
+                    let rel = current_rel_time_thread.lock().unwrap().clone();
+                    (
+                        "HTTP/1.1 200 OK",
+                        format!(
+                            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetPositionInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><TrackDuration>00:03:00</TrackDuration><RelTime>{}</RelTime></u:GetPositionInfoResponse></s:Body></s:Envelope>"#,
+                            rel
+                        )
+                    )
+                } else {
+                    ("HTTP/1.1 200 OK", r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:SuccessResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1" /></s:Body></s:Envelope>"#.to_string())
+                };
+
+                let response = format!(
+                    "{}\r\nContent-Type: text/xml; charset=\"utf-8\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_line,
+                    resp_body.len(),
+                    resp_body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        }
+    });
+
+    let device = DLNADevice {
+        udn: "uuid:test-auto-advance".to_string(),
+        friendly_name: "Mock DLNA Stereo".to_string(),
+        model_name: "Living Room".to_string(),
+        manufacturer: "Primare".to_string(),
+        host: "127.0.0.1".to_string(),
+        port,
+        location: format!("http://127.0.0.1:{}/desc.xml", port),
+        av_transport_control_url: format!("http://127.0.0.1:{}/ctrl/AVTransport", port),
+        rendering_control_url: format!("http://127.0.0.1:{}/ctrl/RenderingControl", port),
+    };
+
+    let mut player = UPnPPlayer::new(device, 8080);
+    let temp_file = std::env::temp_dir().join("test_upnp_auto_advance.mp3");
+    let _ = std::fs::write(&temp_file, b"DUMMY_MP3_DATA");
+
+    assert!(player.play(&temp_file).is_ok());
+    assert!(player.is_playing());
+    assert!(!player.is_track_finished());
+
+    // Wait past one poller tick (900ms) for player to query position at 175s
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(player.position_seconds(), 175.0);
+    assert!(player.is_playing());
+    assert!(!player.is_track_finished());
+
+    // Simulate renderer finishing playback: state becomes STOPPED, RelTime resets to 00:00:00
+    *current_state.lock().unwrap() = "STOPPED".to_string();
+    *current_rel_time.lock().unwrap() = "00:00:00".to_string();
+
+    // Wait for the next poller tick to detect completion
+    std::thread::sleep(Duration::from_millis(1100));
+
+    // Player must detect that track finished playing!
+    assert!(
+        player.is_track_finished(),
+        "Track finish must be detected even when RelTime is reset to 00:00:00!"
+    );
+    assert!(!player.is_playing(), "Player must not be marked as playing once track finished");
+    // Position must be clamped to duration (180s), NOT 0.0s
+    assert_eq!(
+        player.position_seconds(),
+        180.0,
+        "Position should be clamped at track duration"
+    );
+
+    // Resetting finished flag clears it
+    player.reset_finished();
+    assert!(!player.is_track_finished());
+
+    let _ = player.stop();
+    let _ = std::fs::remove_file(temp_file);
+    stop_flag.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
+    let _ = handle.join();
+}
+
+#[test]
+fn test_upnp_player_stopped_early_does_not_auto_advance() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock renderer");
+    let port = listener.local_addr().unwrap().port();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_flag_thread = stop_flag.clone();
+    let current_state = Arc::new(std::sync::Mutex::new("PLAYING".to_string()));
+    let current_state_thread = current_state.clone();
+    let current_rel_time = Arc::new(std::sync::Mutex::new("00:00:30".to_string())); // 30s of 180s track
+    let current_rel_time_thread = current_rel_time.clone();
+
+    let handle = std::thread::spawn(move || {
+        while !stop_flag_thread.load(Ordering::SeqCst) {
+            listener.set_nonblocking(true).expect("set nonblocking");
+            let stream_opt = match listener.accept() {
+                Ok((s, _)) => Some(s),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(15));
+                    continue;
+                }
+                Err(_) => break,
+            };
+
+            if let Some(mut stream) = stream_opt {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
+                    continue;
+                }
+
+                let mut soap_action = String::new();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                        break;
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.to_lowercase().starts_with("soapaction:") {
+                        soap_action = trimmed.split(':').skip(1).collect::<Vec<_>>().join(":");
+                    } else if trimmed.to_lowercase().starts_with("content-length:") {
+                        if let Some(v) = trimmed.split(':').nth(1) {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+
+                let mut body = vec![0u8; content_length];
+                if content_length > 0 {
+                    let _ = reader.read_exact(&mut body);
+                }
+
+                let (status_line, resp_body) = if soap_action.contains("GetTransportInfo") {
+                    let st = current_state_thread.lock().unwrap().clone();
+                    (
+                        "HTTP/1.1 200 OK",
+                        format!(
+                            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetTransportInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><CurrentTransportState>{}</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed></u:GetTransportInfoResponse></s:Body></s:Envelope>"#,
+                            st
+                        )
+                    )
+                } else if soap_action.contains("GetPositionInfo") {
+                    let rel = current_rel_time_thread.lock().unwrap().clone();
+                    (
+                        "HTTP/1.1 200 OK",
+                        format!(
+                            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetPositionInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><TrackDuration>00:03:00</TrackDuration><RelTime>{}</RelTime></u:GetPositionInfoResponse></s:Body></s:Envelope>"#,
+                            rel
+                        )
+                    )
+                } else {
+                    ("HTTP/1.1 200 OK", r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:SuccessResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1" /></s:Body></s:Envelope>"#.to_string())
+                };
+
+                let response = format!(
+                    "{}\r\nContent-Type: text/xml; charset=\"utf-8\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_line,
+                    resp_body.len(),
+                    resp_body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        }
+    });
+
+    let device = DLNADevice {
+        udn: "uuid:test-stop-early".to_string(),
+        friendly_name: "Mock DLNA Stereo".to_string(),
+        model_name: "Living Room".to_string(),
+        manufacturer: "Primare".to_string(),
+        host: "127.0.0.1".to_string(),
+        port,
+        location: format!("http://127.0.0.1:{}/desc.xml", port),
+        av_transport_control_url: format!("http://127.0.0.1:{}/ctrl/AVTransport", port),
+        rendering_control_url: format!("http://127.0.0.1:{}/ctrl/RenderingControl", port),
+    };
+
+    let mut player = UPnPPlayer::new(device, 8080);
+    let temp_file = std::env::temp_dir().join("test_upnp_stop_early.mp3");
+    let _ = std::fs::write(&temp_file, b"DUMMY_MP3_DATA");
+
+    assert!(player.play(&temp_file).is_ok());
+
+    // Wait past one poller tick (900ms) for player to query position at 30s
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(player.position_seconds(), 30.0);
+
+    // Renderer stops early (at 30s)
+    *current_state.lock().unwrap() = "STOPPED".to_string();
+    *current_rel_time.lock().unwrap() = "00:00:00".to_string();
+
+    // Wait for the next poller tick
+    std::thread::sleep(Duration::from_millis(1100));
+
+    // Must NOT mark track as finished since it was stopped early
+    assert!(
+        !player.is_track_finished(),
+        "Stopping early must not trigger track finished"
+    );
+
+    let _ = player.stop();
+    let _ = std::fs::remove_file(temp_file);
+    stop_flag.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
+    let _ = handle.join();
+}
+

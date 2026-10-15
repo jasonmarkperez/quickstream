@@ -583,33 +583,34 @@ impl UPnPPlayer {
         let offset_ref = self.playback_stream_offset.clone();
         let last_seek_ref = self.last_seek_time.clone();
 
+        let dev_name = self.device.friendly_name.clone();
+
         std::thread::spawn(move || {
             let mut consecutive_stopped = 0;
+            let mut max_observed_pos: f64 = 0.0;
+            let mut total_playing_seconds: f64 = 0.0;
+            let mut last_seek_instant = *last_seek_ref.lock().unwrap();
+
             while !stop_flag.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(900));
                 if stop_flag.load(Ordering::Relaxed) {
                     break;
                 }
 
+                // If user sought, sync last_seek_instant and reset max_observed_pos / total_playing_seconds
+                let current_seek_instant = *last_seek_ref.lock().unwrap();
+                if current_seek_instant != last_seek_instant {
+                    last_seek_instant = current_seek_instant;
+                    let target_pos = *pos_ref.lock().unwrap();
+                    max_observed_pos = target_pos;
+                    total_playing_seconds = target_pos;
+                }
+
+                let time_since_seek = current_seek_instant.elapsed();
+
                 let (rel_sec, dur_sec) = client.get_position_info();
                 if dur_sec > 0.0 {
                     *dur_ref.lock().unwrap() = dur_sec;
-                }
-
-                // If user just sought within 2.5s, ignore stale renderer reports to prevent progress bar jitter
-                let time_since_seek = last_seek_ref.lock().unwrap().elapsed();
-                if time_since_seek >= Duration::from_millis(2500) {
-                    let stream_offset = *offset_ref.lock().unwrap();
-                    let actual_pos = if stream_offset > 0.0 {
-                        stream_offset + rel_sec
-                    } else {
-                        rel_sec
-                    };
-                    *pos_ref.lock().unwrap() = if dur_sec > 0.0 {
-                        actual_pos.min(dur_sec)
-                    } else {
-                        actual_pos
-                    };
                 }
 
                 let state = client.get_transport_info();
@@ -618,11 +619,51 @@ impl UPnPPlayer {
                         consecutive_stopped = 0;
                         is_playing_ref.store(true, Ordering::SeqCst);
                         is_paused_ref.store(false, Ordering::SeqCst);
+
+                        // If user just sought within 2.5s, ignore stale renderer reports to prevent progress bar jitter
+                        if time_since_seek >= Duration::from_millis(2500) {
+                            total_playing_seconds += 0.9;
+                            let stream_offset = *offset_ref.lock().unwrap();
+                            let actual_pos = if stream_offset > 0.0 {
+                                stream_offset + rel_sec
+                            } else {
+                                rel_sec
+                            };
+                            let dur = *dur_ref.lock().unwrap();
+                            let clamped_pos = if dur > 0.0 {
+                                actual_pos.min(dur)
+                            } else {
+                                actual_pos
+                            };
+
+                            // Guard against transient zero-readings near end of playback
+                            if clamped_pos > 0.0 || max_observed_pos < 5.0 {
+                                *pos_ref.lock().unwrap() = clamped_pos;
+                                max_observed_pos = max_observed_pos.max(clamped_pos);
+                            }
+                        }
                     }
                     "PAUSED_PLAYBACK" => {
                         consecutive_stopped = 0;
                         is_playing_ref.store(false, Ordering::SeqCst);
                         is_paused_ref.store(true, Ordering::SeqCst);
+
+                        if time_since_seek >= Duration::from_millis(2500) && rel_sec > 0.0 {
+                            let stream_offset = *offset_ref.lock().unwrap();
+                            let actual_pos = if stream_offset > 0.0 {
+                                stream_offset + rel_sec
+                            } else {
+                                rel_sec
+                            };
+                            let dur = *dur_ref.lock().unwrap();
+                            let clamped_pos = if dur > 0.0 {
+                                actual_pos.min(dur)
+                            } else {
+                                actual_pos
+                            };
+                            *pos_ref.lock().unwrap() = clamped_pos;
+                            max_observed_pos = max_observed_pos.max(clamped_pos);
+                        }
                     }
                     "STOPPED" | "NO_MEDIA_PRESENT" => {
                         // If we are within 2.5s of a seek, ignore STOPPED states (renderer is transitioning)
@@ -638,20 +679,49 @@ impl UPnPPlayer {
                             continue;
                         }
 
+                        // If playback was already stopped, ignore
+                        if !is_playing_ref.load(Ordering::SeqCst) {
+                            consecutive_stopped = 0;
+                            continue;
+                        }
+
                         consecutive_stopped += 1;
                         let dur = *dur_ref.lock().unwrap();
-                        let pos = *pos_ref.lock().unwrap();
-                        let near_end = dur > 0.0 && pos >= (dur - 5.0).max(0.0);
+                        let current_pos = *pos_ref.lock().unwrap();
 
-                        if consecutive_stopped >= 2
-                            && is_playing_ref.load(Ordering::SeqCst)
-                            && !is_paused_ref.load(Ordering::SeqCst)
-                            && near_end
-                        {
+                        let near_end = if dur > 0.0 {
+                            let threshold = if dur > 30.0 {
+                                (dur - 15.0).max(dur * 0.85)
+                            } else if dur > 10.0 {
+                                (dur - 4.0).max(dur * 0.75)
+                            } else {
+                                (dur - 2.0).max(dur * 0.60)
+                            };
+                            max_observed_pos >= threshold
+                                || current_pos >= threshold
+                                || total_playing_seconds >= threshold
+                        } else {
+                            (max_observed_pos >= 15.0 || total_playing_seconds >= 15.0)
+                                && consecutive_stopped >= 3
+                        };
+
+                        if consecutive_stopped >= 1 && near_end {
                             // Track has genuinely finished playing on the remote renderer
+                            crate::log_info!(
+                                "player",
+                                "Track finished playing on '{}' (max_pos={:.1}s, current_pos={:.1}s, dur={:.1}s). Triggering auto-advance.",
+                                dev_name,
+                                max_observed_pos,
+                                current_pos,
+                                dur
+                            );
+                            if dur > 0.0 {
+                                *pos_ref.lock().unwrap() = dur;
+                            }
                             is_playing_ref.store(false, Ordering::SeqCst);
                             is_paused_ref.store(false, Ordering::SeqCst);
                             finished_ref.store(true, Ordering::SeqCst);
+                            break;
                         }
                     }
                     _ => {}
