@@ -1,6 +1,7 @@
 use std::fs::{self, File};
 use std::io::Write;
 
+use quickstream::metadata::AudioMetadata;
 use quickstream::settings::SettingsManager;
 use quickstream::ui::AppUI;
 
@@ -1116,5 +1117,58 @@ fn test_browser_perf_and_scan_lifecycle_tracking() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_queue_rendering_without_file_type_and_file_list_display_swap() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_q_render_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
 
+    let song_path = temp_dir.join("01_test_song.wav");
+    create_dummy_wav(&song_path);
 
+    let config_path = temp_dir.join("config.json");
+    let mut settings_mgr = SettingsManager::with_path(config_path);
+    settings_mgr.settings.metadata_view = true;
+
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    let meta = AudioMetadata {
+        filepath: song_path.clone(),
+        filename: "01_test_song.wav".to_string(),
+        title: "Test Track".to_string(),
+        artist: "Test Artist".to_string(),
+        duration_seconds: 60.0,
+        format_name: "WAV".to_string(),
+        ..Default::default()
+    };
+    app.queue.add_track(meta);
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+    // 1. In metadata_view = true, Queue displays "Test Artist - Test Track (01:00)" without [WAV]
+    app.active_tab = 1;
+    terminal.draw(|f| app.render(f)).unwrap();
+    let view1 = terminal.backend().to_string();
+    assert!(view1.contains("Test Artist - Test Track"));
+    assert!(!view1.contains("[WAV] Test Artist"));
+
+    // 2. Toggle via 'v' hotkey -> metadata_view = false (Filename mode)
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('v'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(!app.settings_mgr.settings.metadata_view);
+
+    // In Filename mode, Queue displays "01_test_song.wav (01:00)" without [WAV]
+    terminal.draw(|f| app.render(f)).unwrap();
+    let view2 = terminal.backend().to_string();
+    assert!(view2.contains("01_test_song.wav"));
+    assert!(!view2.contains("[WAV] 01_test_song.wav (01:00)"));
+
+    // Browser entries also show clean filename
+    let browser_entry = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song_path).unwrap();
+    assert_eq!(browser_entry.0, "[WAV] 01_test_song.wav");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

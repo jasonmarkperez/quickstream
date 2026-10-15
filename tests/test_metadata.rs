@@ -56,5 +56,13 @@ fn test_extract_metadata_real_audio() {
     assert_eq!(label_files, "[WAV] test_audio.wav");
     assert_ne!(label_tags, label_files);
 
+    // Queue labels should NOT contain file type / format badge
+    let q_tags = meta.format_queue_label(true);
+    let q_files = meta.format_queue_label(false);
+    assert!(!q_tags.contains("[WAV]"));
+    assert!(!q_files.contains("[WAV]"));
+    assert!(q_tags.contains("(00:02)"));
+    assert_eq!(q_files, "test_audio.wav (00:02)");
+
     let _ = fs::remove_dir_all(&temp_dir);
 }

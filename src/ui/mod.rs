@@ -236,6 +236,19 @@ impl AppUI {
                     }
                 }
             }
+
+            let header_count = if self.browser_dir.parent().is_some() { 2 } else { 1 };
+            if self.browser_entries.len() > header_count {
+                let mut content_entries = self.browser_entries.split_off(header_count);
+                content_entries.sort_by(|a, b| {
+                    match (a.2, b.2) {
+                        (true, false) => std::cmp::Ordering::Less,
+                        (false, true) => std::cmp::Ordering::Greater,
+                        _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+                    }
+                });
+                self.browser_entries.extend(content_entries);
+            }
         }
 
         // 2. Update cached entries across all cached directories
@@ -245,6 +258,7 @@ impl AppUI {
                     *label = Self::format_file_label(path, metadata_view, &self.metadata_cache);
                 }
             }
+            cached.files.sort_by_key(|a| a.0.to_lowercase());
         }
 
         // 3. If toggled to metadata view and there are unfetched tracks in the current dir, start background fetch
@@ -326,6 +340,19 @@ impl AppUI {
                         label = Self::format_file_label(&path, metadata_view, &self.metadata_cache);
                     }
                     self.browser_entries.push((label, path, is_dir));
+                }
+
+                let header_count = if self.browser_dir.parent().is_some() { 2 } else { 1 };
+                if self.browser_entries.len() > header_count {
+                    let mut content_entries = self.browser_entries.split_off(header_count);
+                    content_entries.sort_by(|a, b| {
+                        match (a.2, b.2) {
+                            (true, false) => std::cmp::Ordering::Less,
+                            (false, true) => std::cmp::Ordering::Greater,
+                            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+                        }
+                    });
+                    self.browser_entries.extend(content_entries);
                 }
 
                 if let Some(target_sub) = self.pending_parent_restore.take() {
@@ -540,11 +567,18 @@ impl AppUI {
                 scan_id,
                 dir,
                 dirs,
-                files,
+                mut files,
                 unfetched_tracks,
             } => {
                 if scan_id != self.dir_scan_id || dir != self.browser_dir {
                     return;
+                }
+
+                let metadata_view = self.settings_mgr.settings.metadata_view;
+                for (label, path, is_dir) in &mut files {
+                    if !*is_dir {
+                        *label = Self::format_file_label(path, metadata_view, &self.metadata_cache);
+                    }
                 }
 
                 let cached = self.browser_dir_cache.entry(dir).or_default();
@@ -2751,17 +2785,11 @@ impl AppUI {
                 } else {
                     for (i, t) in upcoming {
                         let dur_label = format_time(t.duration_seconds);
-                        let fmt_badge = if !t.format_name.is_empty() {
-                            format!(" [{}]", t.format_name.to_uppercase())
-                        } else {
-                            String::new()
-                        };
                         up_lines.push(Line::from(vec![
                             Span::styled(format!("#{:02}  ", i + 1), Style::default().fg(Color::Cyan)),
                             Span::styled(t.display_title(), Style::default().fg(Color::White)),
                             Span::styled(format!("  —  {}", if !t.artist.is_empty() { &t.artist } else { "Unknown Artist" }), Style::default().fg(Color::DarkGray)),
                             Span::styled(format!("  ({})", dur_label), Style::default().fg(Color::DarkGray)),
-                            Span::styled(fmt_badge, Style::default().fg(Color::Cyan)),
                         ]));
                     }
                 }
@@ -2933,6 +2961,7 @@ impl AppUI {
                 Style::default().fg(Color::DarkGray)
             });
 
+        let metadata_view = self.settings_mgr.settings.metadata_view;
         let queue_items: Vec<ListItem> = self
             .queue
             .tracks
@@ -2944,7 +2973,7 @@ impl AppUI {
                 } else {
                     "  "
                 };
-                let text = format!("{}{}. {}", prefix, idx + 1, track.format_display_label(true));
+                let text = format!("{}{}. {}", prefix, idx + 1, track.format_queue_label(metadata_view));
                 let style = if idx == self.queue_cursor && self.queue_focus {
                     Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
                 } else {

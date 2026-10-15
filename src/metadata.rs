@@ -56,6 +56,25 @@ impl AudioMetadata {
             format!("[{}] {}", ext, self.filename)
         }
     }
+
+    /// Format label for playback queue display without format/filetype badge.
+    pub fn format_queue_label(&self, metadata_mode: bool) -> String {
+        let time_part = if self.duration_seconds > 0.0 {
+            format!(" ({})", self.formatted_duration())
+        } else {
+            String::new()
+        };
+        if metadata_mode {
+            let artist_part = if !self.artist.is_empty() {
+                format!("{} - ", self.artist)
+            } else {
+                String::new()
+            };
+            format!("{}{}{}", artist_part, self.display_title(), time_part)
+        } else {
+            format!("{}{}", self.filename, time_part)
+        }
+    }
 }
 
 pub fn is_supported_audio_file(path: &Path) -> bool {
@@ -335,6 +354,12 @@ mod tests {
             "[FLAC] Test Artist - Test Song (02:05)"
         );
         assert_eq!(meta.format_display_label(false), "[FLAC] song.flac");
+
+        assert_eq!(
+            meta.format_queue_label(true),
+            "Test Artist - Test Song (02:05)"
+        );
+        assert_eq!(meta.format_queue_label(false), "song.flac (02:05)");
     }
 
     #[test]
