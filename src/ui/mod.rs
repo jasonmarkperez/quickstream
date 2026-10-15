@@ -14,13 +14,8 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 pub mod search;
-pub mod visualizer;
 
 use self::search::SearchModalState;
-use self::visualizer::{
-    render_oscilloscope_wave, render_spectrum_bars, BeatSync, FlameSim, MatrixRainSim, ParticleSim,
-    VisualizerMode,
-};
 use crate::discovery::DeviceManager;
 use crate::metadata::is_supported_audio_file;
 use crate::paths;
@@ -100,11 +95,6 @@ pub struct AppUI {
     pub pending_seek_delta: f64,
     pub pending_seek_target: Option<f64>,
     pub last_seek_key_time: Option<std::time::Instant>,
-    pub visualizer_mode: VisualizerMode,
-    pub beat_sync: BeatSync,
-    pub particle_sim: ParticleSim,
-    pub flame_sim: FlameSim,
-    pub matrix_rain_sim: MatrixRainSim,
 }
 
 impl AppUI {
@@ -142,11 +132,6 @@ impl AppUI {
         let (metadata_tx, metadata_rx) = std::sync::mpsc::channel();
         let metadata_cache = crate::library::LibraryManager::load_cache_map();
         let (dir_scan_tx, dir_scan_rx) = std::sync::mpsc::channel();
-        let visualizer_mode = VisualizerMode::from_str(&settings_mgr.settings.visualizer_mode);
-        let beat_sync = BeatSync::new();
-        let particle_sim = ParticleSim::new();
-        let flame_sim = FlameSim::new();
-        let matrix_rain_sim = MatrixRainSim::new();
 
         let mut app = Self {
             active_tab: 1,
@@ -191,11 +176,6 @@ impl AppUI {
             pending_seek_delta: 0.0,
             pending_seek_target: None,
             last_seek_key_time: None,
-            visualizer_mode,
-            beat_sync,
-            particle_sim,
-            flame_sim,
-            matrix_rain_sim,
         };
         app.refresh_browser();
         app
@@ -845,11 +825,7 @@ impl AppUI {
 
             terminal.draw(|f| self.render(f))?;
 
-            let poll_dur = if self.active_tab == 0 {
-                Duration::from_millis(33)
-            } else {
-                Duration::from_millis(100)
-            };
+            let poll_dur = Duration::from_millis(100);
 
             if event::poll(poll_dur)? {
                 if let Event::Key(key) = event::read()? {
@@ -1170,9 +1146,6 @@ impl AppUI {
                     self.active_tab = 0;
                 }
             }
-            (KeyCode::Char('m') | KeyCode::Char('M'), KeyModifiers::NONE) => {
-                self.cycle_visualizer_mode();
-            }
             (KeyCode::Char(' '), KeyModifiers::NONE) => {
                 if !self.player.is_playing() && !self.player.is_paused() {
                     if !self.queue.is_empty() {
@@ -1263,13 +1236,6 @@ impl AppUI {
         Ok(false)
     }
 
-    pub fn cycle_visualizer_mode(&mut self) {
-        self.visualizer_mode = self.visualizer_mode.next();
-        self.settings_mgr.settings.visualizer_mode = self.visualizer_mode.as_str().to_string();
-        self.settings_mgr.save();
-        self.status_message = format!("Visualizer: {}", self.visualizer_mode.display_name());
-    }
-
     pub fn open_fuzzy_search(&mut self) {
         let target_dir = if self.in_bookmarks_view {
             if self.browser_cursor > 0 && self.browser_cursor <= self.bookmarks.len() {
@@ -1331,9 +1297,6 @@ impl AppUI {
                 match (code, modifiers) {
                     (KeyCode::Esc, _) | (KeyCode::Char('q'), KeyModifiers::NONE) => {
                         self.active_tab = 1;
-                    }
-                    (KeyCode::Char('m') | KeyCode::Char('M'), _) => {
-                        self.cycle_visualizer_mode();
                     }
                     _ => {}
                 }
@@ -1656,8 +1619,6 @@ impl AppUI {
                             self.sync_web_server();
                         } else if self.settings_cursor == 7 {
                             self.update_web_state();
-                        } else if self.settings_cursor == 8 {
-                            self.visualizer_mode = VisualizerMode::from_str(&self.settings_mgr.settings.visualizer_mode);
                         }
                         self.status_message = format!(
                             "{}: {}",
@@ -1675,7 +1636,6 @@ impl AppUI {
     fn play_current_track(&mut self) {
         if let Some(track) = self.queue.current_track() {
             let path = track.filepath.clone();
-            self.beat_sync.load_track(&path);
             if let Some(ref ws) = self.web_server {
                 ws.close_active_streams();
                 ws.register_stream_file(&path);
@@ -1699,7 +1659,6 @@ impl AppUI {
         let mode = self.settings_mgr.settings.queue_mode.clone();
         if let Some(track) = self.queue.next_track(&mode) {
             let path = track.filepath.clone();
-            self.beat_sync.load_track(&path);
             if let Some(ref ws) = self.web_server {
                 ws.close_active_streams();
                 ws.register_stream_file(&path);
@@ -1722,7 +1681,6 @@ impl AppUI {
     fn play_prev_track(&mut self) {
         if let Some(track) = self.queue.prev_track() {
             let path = track.filepath.clone();
-            self.beat_sync.load_track(&path);
             if let Some(ref ws) = self.web_server {
                 ws.close_active_streams();
                 ws.register_stream_file(&path);
@@ -2215,31 +2173,38 @@ impl AppUI {
             return;
         }
 
-        let header_height = if area.height >= 18 {
-            6
-        } else if area.height >= 12 {
-            5
+        let outer_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(Span::styled(
+                " [1] NOW PLAYING ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Span::styled(
+                " [Space] Play/Pause   [←/→] Prev/Next Track   [[/]] Seek 10s   [+/-] Vol   [n / Esc] Queue & Library ",
+                Style::default().fg(Color::DarkGray),
+            ));
+
+        let inner = outer_block.inner(area);
+        f.render_widget(outer_block, area);
+
+        // If terminal has plenty of vertical space, split into Hero Track and Up Next Queue
+        let show_up_next = inner.height >= 14;
+        let (hero_area, up_next_area) = if show_up_next {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(8),
+                    Constraint::Min(4),
+                ])
+                .split(inner);
+            (chunks[0], Some(chunks[1]))
         } else {
-            3
+            (inner, None)
         };
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(header_height),
-                Constraint::Min(4),
-            ])
-            .split(area);
-
-        let header_area = chunks[0];
-        let visualizer_area = chunks[1];
-
-        if let Some(track) = self.queue.current_track() {
-            self.beat_sync.load_track(&track.filepath);
-        }
-
-        // --- Render Hero Header ---
-        let mut header_lines = Vec::new();
+        // --- 1. Hero Track Presentation ---
+        let mut hero_lines = Vec::new();
 
         // Row 1: State Pill, Active Output, Volume, Mode Pill
         let mut row1 = Vec::new();
@@ -2269,7 +2234,7 @@ impl AppUI {
             });
         row1.push(Span::raw("  "));
         row1.push(Span::styled(
-            format!(" [Output: {}] ", active_dev_name),
+            format!("[Output: {}]", active_dev_name),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
         row1.push(Span::raw("  "));
@@ -2289,10 +2254,18 @@ impl AppUI {
             Style::default().fg(Color::DarkGray),
         ));
 
-        header_lines.push(Line::from(row1));
+        if !self.queue.is_empty() {
+            row1.push(Span::raw("  "));
+            row1.push(Span::styled(
+                format!("Track {} of {}", self.queue.current_index + 1, self.queue.len()),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
 
-        // Row 2: Track Title (Prominent Hero typography)
+        hero_lines.push(Line::from(row1));
+
         if let Some(track) = self.queue.current_track() {
+            // Row 2: Prominent Hero Title
             let title_line = Line::from(vec![
                 Span::styled("♫  ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
                 Span::styled(
@@ -2300,7 +2273,7 @@ impl AppUI {
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 ),
             ]);
-            header_lines.push(title_line);
+            hero_lines.push(title_line);
 
             // Row 3: Artist & Album
             let mut artist_album_spans = Vec::new();
@@ -2319,85 +2292,111 @@ impl AppUI {
                     Style::default().fg(Color::White),
                 ));
             }
-            header_lines.push(Line::from(artist_album_spans));
+            hero_lines.push(Line::from(artist_album_spans));
 
-            // Row 4: Format Badges (Pills)
-            if header_height >= 5 {
-                let mut badge_spans = Vec::new();
-                if !track.format_name.is_empty() {
-                    badge_spans.push(Span::styled(
-                        format!("[{}]", track.format_name.to_uppercase()),
-                        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    ));
-                    badge_spans.push(Span::raw(" "));
-                }
-                if track.sample_rate_hz > 0 {
-                    let khz = track.sample_rate_hz as f64 / 1000.0;
-                    badge_spans.push(Span::styled(
-                        format!("[{:.1} kHz]", khz),
-                        Style::default().fg(Color::White).bg(Color::DarkGray),
-                    ));
-                    badge_spans.push(Span::raw(" "));
-                }
-                if track.bitrate_kbps > 0 {
-                    badge_spans.push(Span::styled(
-                        format!("[{} kbps]", track.bitrate_kbps),
-                        Style::default().fg(Color::White).bg(Color::DarkGray),
-                    ));
-                    badge_spans.push(Span::raw(" "));
-                }
-                if track.channels > 0 {
-                    let chan_label = if track.channels == 1 {
-                        "Mono"
-                    } else if track.channels == 2 {
-                        "Stereo"
-                    } else {
-                        "Multi"
-                    };
-                    badge_spans.push(Span::styled(
-                        format!("[{}]", chan_label),
-                        Style::default().fg(Color::White).bg(Color::DarkGray),
-                    ));
-                    badge_spans.push(Span::raw(" "));
-                }
-                if !track.genre.is_empty() {
-                    badge_spans.push(Span::styled(
-                        format!("[{}]", track.genre),
-                        Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-                    ));
-                }
-                header_lines.push(Line::from(badge_spans));
+            // Row 4: Format Quality Badges
+            let mut badge_spans = Vec::new();
+            if !track.format_name.is_empty() {
+                badge_spans.push(Span::styled(
+                    format!("[{}]", track.format_name.to_uppercase()),
+                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ));
+                badge_spans.push(Span::raw(" "));
             }
-
-            // Row 5: Sleek Progress Bar with Timestamps
-            if header_height >= 6 {
-                let pos = self
-                    .pending_seek_target
-                    .unwrap_or_else(|| self.player.position_seconds());
-                let dur = if track.duration_seconds > 0.0 {
-                    track.duration_seconds
+            if track.sample_rate_hz > 0 {
+                let khz = track.sample_rate_hz as f64 / 1000.0;
+                badge_spans.push(Span::styled(
+                    format!("[{:.1} kHz]", khz),
+                    Style::default().fg(Color::White).bg(Color::DarkGray),
+                ));
+                badge_spans.push(Span::raw(" "));
+            }
+            if track.bitrate_kbps > 0 {
+                badge_spans.push(Span::styled(
+                    format!("[{} kbps]", track.bitrate_kbps),
+                    Style::default().fg(Color::White).bg(Color::DarkGray),
+                ));
+                badge_spans.push(Span::raw(" "));
+            }
+            if track.channels > 0 {
+                let chan_label = if track.channels == 1 {
+                    "Mono"
+                } else if track.channels == 2 {
+                    "Stereo"
                 } else {
-                    self.player.duration_seconds().max(1.0)
+                    "Multi"
                 };
-                let pos_str = format_time(pos);
-                let dur_str = format_time(dur);
-                let ratio = (pos / dur).clamp(0.0, 1.0);
-
-                let available_w = (header_area.width as usize).saturating_sub(pos_str.len() + dur_str.len() + 6);
-                let filled = (ratio * available_w as f64).round() as usize;
-                let empty = available_w.saturating_sub(filled);
-
-                let bar_str = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
-
-                let prog_line = Line::from(vec![
-                    Span::styled(pos_str, Style::default().fg(Color::White)),
-                    Span::raw("  "),
-                    Span::styled(bar_str, Style::default().fg(Color::Cyan)),
-                    Span::raw("  "),
-                    Span::styled(dur_str, Style::default().fg(Color::DarkGray)),
-                ]);
-                header_lines.push(prog_line);
+                badge_spans.push(Span::styled(
+                    format!("[{}]", chan_label),
+                    Style::default().fg(Color::White).bg(Color::DarkGray),
+                ));
+                badge_spans.push(Span::raw(" "));
             }
+            if !track.genre.is_empty() {
+                badge_spans.push(Span::styled(
+                    format!("[{}]", track.genre),
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                ));
+                badge_spans.push(Span::raw(" "));
+            }
+            if track.file_size > 0 {
+                let mb = track.file_size as f64 / 1_048_576.0;
+                badge_spans.push(Span::styled(
+                    format!("[{:.1} MB]", mb),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            hero_lines.push(Line::from(badge_spans));
+
+            // Row 5: Full-Width Scrubbable Timeline Progress Bar
+            let pos = self
+                .pending_seek_target
+                .unwrap_or_else(|| self.player.position_seconds());
+            let dur = if track.duration_seconds > 0.0 {
+                track.duration_seconds
+            } else {
+                self.player.duration_seconds().max(1.0)
+            };
+            let pos_str = format_time(pos);
+            let dur_str = format_time(dur);
+            let ratio = (pos / dur).clamp(0.0, 1.0);
+
+            let available_w = (hero_area.width as usize).saturating_sub(pos_str.len() + dur_str.len() + 6);
+            let filled = (ratio * available_w as f64).round() as usize;
+            let empty = available_w.saturating_sub(filled);
+
+            let bar_str = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
+
+            let prog_line = Line::from(vec![
+                Span::styled(pos_str, Style::default().fg(Color::White)),
+                Span::raw("  "),
+                Span::styled(bar_str, Style::default().fg(Color::Cyan)),
+                Span::raw("  "),
+                Span::styled(dur_str, Style::default().fg(Color::DarkGray)),
+            ]);
+            hero_lines.push(prog_line);
+
+            // Row 6: Percentage & Time Remaining
+            let percent = (ratio * 100.0).round() as usize;
+            let remaining = (dur - pos).max(0.0);
+            let rem_str = format_time(remaining);
+            let info_line = Line::from(vec![
+                Span::styled(
+                    format!("{}% complete", percent),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("   •   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("-{} remaining", rem_str),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled("   •   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    track.filepath.display().to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            hero_lines.push(info_line);
         } else {
             let empty_title = Line::from(vec![
                 Span::styled("♫  ", Style::default().fg(Color::DarkGray)),
@@ -2406,59 +2405,84 @@ impl AppUI {
                     Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
                 ),
             ]);
-            header_lines.push(empty_title);
-            header_lines.push(Line::from(vec![
+            hero_lines.push(empty_title);
+            hero_lines.push(Line::from(vec![
                 Span::styled(
-                    "Press Space to play queue, or navigate to [2] Queue & Library to select music.",
+                    "Press Space to play active queue, or navigate to [2] Queue & Library to browse your collection.",
                     Style::default().fg(Color::DarkGray),
                 ),
             ]));
         }
 
-        f.render_widget(Paragraph::new(header_lines), header_area);
+        f.render_widget(Paragraph::new(hero_lines), hero_area);
 
-        // --- Render Visualizer Stage ---
-        let viz_title = format!(
-            " Visualizer: {} ▾ (press 'm' to cycle) ",
-            self.visualizer_mode.display_name()
-        );
-        let footer_hints = " [Space] Play/Pause   [←/→] Prev/Next   [[/]] Seek 10s   [+/-] Vol   [m] Next Style   [n/Esc] Queue & Library ";
+        // --- 2. Up Next in Queue Section ---
+        if let Some(up_area) = up_next_area {
+            let up_block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled(
+                    " UP NEXT IN QUEUE ",
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ));
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(Span::styled(
-                viz_title,
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ))
-            .title_bottom(Span::styled(
-                footer_hints,
-                Style::default().fg(Color::DarkGray),
-            ));
+            let up_inner = up_block.inner(up_area);
+            f.render_widget(up_block, up_area);
 
-        let inner = block.inner(visualizer_area);
-        f.render_widget(block, visualizer_area);
+            let mut up_lines = Vec::new();
+            if self.queue.is_empty() {
+                up_lines.push(Line::from(vec![Span::styled(
+                    "Queue is empty. Select files or press 'a' in the library to enqueue tracks.",
+                    Style::default().fg(Color::DarkGray),
+                )]));
+            } else {
+                let current_idx = self.queue.current_index;
+                let next_idx = current_idx + 1;
+                let max_items = (up_inner.height as usize).saturating_sub(1).max(1);
+                let upcoming: Vec<_> = self
+                    .queue
+                    .tracks
+                    .iter()
+                    .enumerate()
+                    .skip(next_idx)
+                    .take(max_items)
+                    .collect();
 
-        let pos = self.player.position_seconds();
-        let is_playing = self.player.is_playing();
-        let beat_state = self.beat_sync.update(pos, is_playing);
+                if upcoming.is_empty() {
+                    let loop_mode = self.settings_mgr.settings.queue_mode == "loop";
+                    if loop_mode && self.queue.len() > 1 {
+                        let first = &self.queue.tracks[0];
+                        up_lines.push(Line::from(vec![
+                            Span::styled("↺ End of queue reached. Loops to #1: ", Style::default().fg(Color::Cyan)),
+                            Span::styled(first.display_title(), Style::default().fg(Color::Yellow)),
+                            Span::styled(format!("  —  {}", first.artist), Style::default().fg(Color::White)),
+                        ]));
+                    } else {
+                        up_lines.push(Line::from(vec![Span::styled(
+                            "End of playback queue. (Playback will stop after this track)",
+                            Style::default().fg(Color::DarkGray),
+                        )]));
+                    }
+                } else {
+                    for (i, t) in upcoming {
+                        let dur_label = format_time(t.duration_seconds);
+                        let fmt_badge = if !t.format_name.is_empty() {
+                            format!(" [{}]", t.format_name.to_uppercase())
+                        } else {
+                            String::new()
+                        };
+                        up_lines.push(Line::from(vec![
+                            Span::styled(format!("#{:02}  ", i + 1), Style::default().fg(Color::Cyan)),
+                            Span::styled(t.display_title(), Style::default().fg(Color::White)),
+                            Span::styled(format!("  —  {}", if !t.artist.is_empty() { &t.artist } else { "Unknown Artist" }), Style::default().fg(Color::DarkGray)),
+                            Span::styled(format!("  ({})", dur_label), Style::default().fg(Color::DarkGray)),
+                            Span::styled(fmt_badge, Style::default().fg(Color::Cyan)),
+                        ]));
+                    }
+                }
+            }
 
-        match self.visualizer_mode {
-            VisualizerMode::Bars => {
-                render_spectrum_bars(inner, f.buffer_mut(), &beat_state, &self.beat_sync.peak_bars);
-            }
-            VisualizerMode::Wave => {
-                render_oscilloscope_wave(inner, f.buffer_mut(), &beat_state, pos);
-            }
-            VisualizerMode::Particles => {
-                self.particle_sim.update_and_render(inner, f.buffer_mut(), &beat_state);
-            }
-            VisualizerMode::Flame => {
-                self.flame_sim.update_and_render(inner, f.buffer_mut(), &beat_state);
-            }
-            VisualizerMode::MatrixRain => {
-                self.matrix_rain_sim.update_and_render(inner, f.buffer_mut(), &beat_state);
-            }
+            f.render_widget(Paragraph::new(up_lines), up_inner);
         }
     }
 
@@ -3131,7 +3155,6 @@ impl AppUI {
             Self::help_key_line("← / →", "Previous / Next track"),
             Self::help_key_line("[ / ]", "Seek -10s / +10s"),
             Self::help_key_line("+ / -", "Volume Up / Down"),
-            Self::help_key_line("m", "Cycle visualizer style"),
             Line::from(""),
             Self::help_section_header("NAVIGATION & TABS"),
             Self::help_key_line("n", "Toggle Now Playing ↔ Queue"),

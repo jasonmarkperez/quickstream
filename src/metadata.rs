@@ -6,7 +6,7 @@ use lofty::probe::Probe;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AudioMetadata {
     pub filepath: PathBuf,
     pub filename: String,

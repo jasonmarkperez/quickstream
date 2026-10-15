@@ -21,16 +21,10 @@ pub struct Settings {
     pub web_server_port: u16,
     #[serde(default)]
     pub home_dir: Option<String>,
-    #[serde(default = "default_visualizer_mode")]
-    pub visualizer_mode: String,
 }
 
 fn default_web_port() -> u16 {
     8080
-}
-
-fn default_visualizer_mode() -> String {
-    "bars".to_string()
 }
 
 impl Default for Settings {
@@ -46,7 +40,6 @@ impl Default for Settings {
             web_server_enabled: false,
             web_server_port: 8080,
             home_dir: None,
-            visualizer_mode: "bars".to_string(),
         }
     }
 }
@@ -97,11 +90,6 @@ pub const SETTING_DEFINITIONS: &[SettingDefinition] = &[
         key: "home_dir",
         label: "Startup Home Directory",
         description: "Default directory loaded on startup instead of current working directory.",
-    },
-    SettingDefinition {
-        key: "visualizer_mode",
-        label: "Visualizer Style",
-        description: "Audio visualizer display mode on the Now Playing screen (press 'm' to cycle).",
     },
 ];
 
@@ -257,20 +245,6 @@ impl SettingsManager {
                 };
                 self.settings.home_dir = options[next_idx].clone();
             }
-            8 => {
-                // visualizer_mode: "bars", "wave", "particles", "flame", "matrix_rain"
-                let options = ["bars", "wave", "particles", "flame", "matrix_rain"];
-                let current_idx = options
-                    .iter()
-                    .position(|&v| v == self.settings.visualizer_mode)
-                    .unwrap_or(0);
-                let next_idx = if forward {
-                    (current_idx + 1) % options.len()
-                } else {
-                    (current_idx + options.len() - 1) % options.len()
-                };
-                self.settings.visualizer_mode = options[next_idx].to_string();
-            }
             _ => {}
         }
         self.save();
@@ -315,14 +289,6 @@ impl SettingsManager {
                     "Default (Launch Directory)".to_string()
                 }
             }
-            8 => match self.settings.visualizer_mode.as_str() {
-                "bars" => "Spectrum Bars",
-                "wave" => "Oscilloscope Wave",
-                "particles" => "Particle Burst",
-                "flame" => "Dancing Flame",
-                "matrix_rain" => "Matrix Rain",
-                other => other,
-            }.to_string(),
             _ => String::new(),
         }
     }
@@ -342,7 +308,6 @@ mod tests {
         assert_eq!(s.volume_step, 5);
         assert_eq!(s.queue_mode, "loop");
         assert_eq!(s.home_dir, None);
-        assert_eq!(s.visualizer_mode, "bars");
     }
 
     #[test]
@@ -355,14 +320,12 @@ mod tests {
         mgr.settings.metadata_view = false;
         mgr.settings.volume_step = 10;
         mgr.settings.home_dir = Some("/custom/home".to_string());
-        mgr.settings.visualizer_mode = "flame".to_string();
         assert!(mgr.save());
 
         let loaded = SettingsManager::load_from(&path).expect("should load");
         assert!(!loaded.metadata_view);
         assert_eq!(loaded.volume_step, 10);
         assert_eq!(loaded.home_dir, Some("/custom/home".to_string()));
-        assert_eq!(loaded.visualizer_mode, "flame");
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
@@ -391,14 +354,6 @@ mod tests {
         mgr.cycle_setting(7, true);
         mgr.cycle_setting(7, false);
         assert_eq!(mgr.settings.home_dir, None);
-
-        assert_eq!(mgr.settings.visualizer_mode, "bars");
-        assert_eq!(mgr.get_display_value(8), "Spectrum Bars");
-        mgr.cycle_setting(8, true);
-        assert_eq!(mgr.settings.visualizer_mode, "wave");
-        assert_eq!(mgr.get_display_value(8), "Oscilloscope Wave");
-        mgr.cycle_setting(8, false);
-        assert_eq!(mgr.settings.visualizer_mode, "bars");
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
