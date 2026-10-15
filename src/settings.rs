@@ -290,7 +290,12 @@ impl SettingsManager {
             }.to_string(),
             5 => if self.settings.force_transcode { "Force 16-bit PCM WAV" } else { "Direct Stream (Auto)" }.to_string(),
             6 => if self.settings.web_server_enabled {
-                format!("Enabled (Port {})", self.settings.web_server_port)
+                let ip = crate::discovery::get_local_ip_for_target("8.8.8.8", 80);
+                if ip != "127.0.0.1" {
+                    format!("Enabled (http://{}:{})", ip, self.settings.web_server_port)
+                } else {
+                    format!("Enabled (Port {})", self.settings.web_server_port)
+                }
             } else {
                 "Disabled".to_string()
             },
