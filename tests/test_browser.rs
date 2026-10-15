@@ -901,5 +901,179 @@ fn test_help_modal_lifecycle_and_render() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_queue_track_skip_debouncing_and_flushing() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_debounce_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut track_paths = Vec::new();
+    for i in 1..=5 {
+        let p = temp_dir.join(format!("song_{:02}.wav", i));
+        create_dummy_wav(&p);
+        track_paths.push(p);
+    }
+
+    let config_path = temp_dir.join("config.json");
+    let settings_mgr = SettingsManager::with_path(config_path);
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    for p in &track_paths {
+        let meta = quickstream::metadata::fallback_metadata(p);
+        app.queue.add_track(meta);
+    }
+
+    assert_eq!(app.queue.len(), 5);
+    assert_eq!(app.queue.current_index, 0);
+
+    // Initial state: no pending skip
+    assert!(!app.pending_track_skip);
+    assert!(app.last_track_skip_time.is_none());
+
+    // Rapidly press Right arrow 3 times
+    for _ in 0..3 {
+        let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Right,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+
+    // Cursor should have advanced 3 times: 0 -> 1 -> 2 -> 3
+    assert_eq!(app.queue.current_index, 3);
+    assert_eq!(app.queue_cursor, 3);
+    assert!(app.pending_track_skip);
+    assert!(app.last_track_skip_time.is_some());
+    assert!(app.status_message.contains("Skipped to:"));
+
+    // Intermediate tracks were not played yet because debounce timer has not expired
+    // Before 300ms, poll should NOT flush
+    app.poll_pending_track_skip();
+    assert!(app.pending_track_skip);
+
+    // Wait until 350ms elapsed
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    app.poll_pending_track_skip();
+
+    // Now it should have flushed!
+    assert!(!app.pending_track_skip);
+    assert!(app.last_track_skip_time.is_none());
+    assert_eq!(app.queue.current_index, 3);
+
+    // Test Prev skip debounce
+    for _ in 0..2 {
+        let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Left,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+    assert_eq!(app.queue.current_index, 1);
+    assert!(app.pending_track_skip);
+
+    // Test that pressing Space immediately flushes pending skip without waiting
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char(' '),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(!app.pending_track_skip);
+    assert_eq!(app.queue.current_index, 1);
+
+    // Test that pressing 's' cancels pending skip
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Right,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(app.pending_track_skip);
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('s'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(!app.pending_track_skip);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_browser_metadata_view_toggle_in_place_and_settings_tab() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_toggle_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let song = temp_dir.join("01_test_song.wav");
+    create_dummy_wav(&song);
+
+    let config_path = temp_dir.join("config.json");
+    let mut settings_mgr = SettingsManager::with_path(config_path);
+    settings_mgr.settings.metadata_view = false;
+
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    // Filenames mode initially
+    let initial_entry = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song);
+    assert!(initial_entry.is_some());
+    assert_eq!(initial_entry.unwrap().0, "[WAV] 01_test_song.wav");
+
+    // Press 'v' to toggle to metadata mode
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('v'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(app.settings_mgr.settings.metadata_view);
+
+    // Wait a brief moment for metadata worker to parse tag and poll
+    for _ in 0..50 {
+        app.poll_background_metadata();
+        let e = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song).unwrap();
+        if e.0.contains("01:00") || e.0.contains("00:01") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    app.poll_background_metadata();
+
+    let tag_entry = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song).unwrap();
+    assert!(tag_entry.0.contains("[WAV]"));
+    assert!(tag_entry.0.contains("01:00") || tag_entry.0.contains("00:01"));
+
+    // Press 'v' again to toggle back to filenames mode
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('v'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(!app.settings_mgr.settings.metadata_view);
+
+    let filename_entry = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song).unwrap();
+    assert_eq!(filename_entry.0, "[WAV] 01_test_song.wav");
+
+    // Also verify cached directory has the filename updated
+    if let Some(cached) = app.browser_dir_cache.get(&temp_dir) {
+        let cached_file = cached.files.iter().find(|(_, p, is_dir)| !*is_dir && p == &song).unwrap();
+        assert_eq!(cached_file.0, "[WAV] 01_test_song.wav");
+    }
+
+    // Now test Tab 3 (Settings) cycling:
+    app.active_tab = 3;
+    app.settings_cursor = 0; // File List Display
+
+    // Press 'Enter' to cycle forward -> metadata mode
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(app.settings_mgr.settings.metadata_view);
+    let entry_after_tab3 = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song).unwrap();
+    assert!(entry_after_tab3.0.contains("01:00") || entry_after_tab3.0.contains("00:01"));
+
+    // Press 'Left' on Tab 3 to cycle backward -> filenames mode
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Left,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(!app.settings_mgr.settings.metadata_view);
+    let entry_after_left = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song).unwrap();
+    assert_eq!(entry_after_left.0, "[WAV] 01_test_song.wav");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
 
 

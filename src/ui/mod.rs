@@ -2,8 +2,8 @@
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
@@ -95,6 +95,8 @@ pub struct AppUI {
     pub pending_seek_delta: f64,
     pub pending_seek_target: Option<f64>,
     pub last_seek_key_time: Option<std::time::Instant>,
+    pub pending_track_skip: bool,
+    pub last_track_skip_time: Option<std::time::Instant>,
 }
 
 impl AppUI {
@@ -176,6 +178,8 @@ impl AppUI {
             pending_seek_delta: 0.0,
             pending_seek_target: None,
             last_seek_key_time: None,
+            pending_track_skip: false,
+            last_track_skip_time: None,
         };
         app.refresh_browser();
         app
@@ -200,6 +204,52 @@ impl AppUI {
         }
         if let Ok(json) = serde_json::to_string_pretty(&self.bookmarks) {
             let _ = fs::write(path, json);
+        }
+    }
+
+    pub fn format_file_label(
+        path: &Path,
+        metadata_view: bool,
+        cache: &std::collections::HashMap<PathBuf, crate::metadata::AudioMetadata>,
+    ) -> String {
+        if metadata_view {
+            if let Some(m) = cache.get(path) {
+                return m.format_display_label(true);
+            }
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase();
+        let file_name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+        format!("[{}] {}", ext, file_name)
+    }
+
+    pub fn update_browser_entry_labels(&mut self) {
+        let metadata_view = self.settings_mgr.settings.metadata_view;
+        let mut unfetched = Vec::new();
+
+        // 1. Update current visible entries
+        if !self.in_bookmarks_view {
+            for (label, path, is_dir) in &mut self.browser_entries {
+                if !*is_dir {
+                    *label = Self::format_file_label(path, metadata_view, &self.metadata_cache);
+                    if metadata_view && !self.metadata_cache.contains_key(path) {
+                        unfetched.push(path.clone());
+                    }
+                }
+            }
+        }
+
+        // 2. Update cached entries across all cached directories
+        for cached in self.browser_dir_cache.values_mut() {
+            for (label, path, is_dir) in &mut cached.files {
+                if !*is_dir {
+                    *label = Self::format_file_label(path, metadata_view, &self.metadata_cache);
+                }
+            }
+        }
+
+        // 3. If toggled to metadata view and there are unfetched tracks in the current dir, start background fetch
+        if metadata_view && !unfetched.is_empty() {
+            self.start_background_metadata_fetch(unfetched);
         }
     }
 
@@ -246,7 +296,13 @@ impl AppUI {
                 self.browser_loading = false;
                 self.browser_load_start = None;
                 self.browser_entries.extend(cached.dirs);
-                self.browser_entries.extend(cached.files);
+                let metadata_view = self.settings_mgr.settings.metadata_view;
+                for (mut label, path, is_dir) in cached.files {
+                    if !is_dir {
+                        label = Self::format_file_label(&path, metadata_view, &self.metadata_cache);
+                    }
+                    self.browser_entries.push((label, path, is_dir));
+                }
 
                 if let Some(target_sub) = self.pending_parent_restore.take() {
                     if let Some(pos) = self.browser_entries.iter().position(|(name, p, is_dir)| {
@@ -320,17 +376,10 @@ impl AppUI {
 
                         // Optimization: Check supported audio file by extension first to avoid expensive stat calls
                         if is_supported_audio_file(&path) {
-                            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase();
-                            let label = if metadata_view {
-                                if let Some(m) = cached_map.get(&path) {
-                                    m.format_display_label(true)
-                                } else {
-                                    batch_unfetched.push(path.clone());
-                                    format!("[{}] {}", ext, name)
-                                }
-                            } else {
-                                format!("[{}] {}", ext, name)
-                            };
+                            let label = Self::format_file_label(&path, metadata_view, &cached_map);
+                            if metadata_view && !cached_map.contains_key(&path) {
+                                batch_unfetched.push(path.clone());
+                            }
                             batch_files.push((label, path, false));
                         } else {
                             let ft_res = entry.file_type();
@@ -575,11 +624,24 @@ impl AppUI {
             let path = meta.filepath.clone();
             self.metadata_cache.insert(path.clone(), meta.clone());
 
-            if self.settings_mgr.settings.metadata_view && !self.in_bookmarks_view {
-                for (label, p, is_dir) in &mut self.browser_entries {
-                    if !*is_dir && p == &path {
-                        *label = meta.format_display_label(true);
-                        break;
+            if self.settings_mgr.settings.metadata_view {
+                if !self.in_bookmarks_view {
+                    for (label, p, is_dir) in &mut self.browser_entries {
+                        if !*is_dir && p == &path {
+                            *label = meta.format_display_label(true);
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(parent) = path.parent() {
+                    if let Some(cached) = self.browser_dir_cache.get_mut(parent) {
+                        for (label, p, is_dir) in &mut cached.files {
+                            if !*is_dir && p == &path {
+                                *label = meta.format_display_label(true);
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -822,6 +884,9 @@ impl AppUI {
 
             // Flush debounced seek if debounce timer expired
             self.poll_pending_seek();
+
+            // Flush debounced track skip if debounce timer expired
+            self.poll_pending_track_skip();
 
             terminal.draw(|f| self.render(f))?;
 
@@ -1068,6 +1133,68 @@ impl AppUI {
         }
     }
 
+    pub fn skip_next_track_debounced(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+
+        let raw_mode = self.settings_mgr.settings.queue_mode.clone();
+        let mode = if raw_mode == "repeat_one" { "loop" } else { &raw_mode };
+        if let Some(track) = self.queue.next_track(mode) {
+            let track_title = track.display_title().to_string();
+            self.queue_cursor = self.queue.current_index;
+
+            if !self.pending_track_skip && self.player.is_playing() {
+                let _ = self.player.stop();
+            }
+
+            self.pending_track_skip = true;
+            self.last_track_skip_time = Some(Instant::now());
+            self.status_message = format!("Skipped to: {}", track_title);
+            self.update_web_state();
+        } else {
+            self.status_message = "End of queue".to_string();
+        }
+    }
+
+    pub fn skip_prev_track_debounced(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+
+        if let Some(track) = self.queue.prev_track() {
+            let track_title = track.display_title().to_string();
+            self.queue_cursor = self.queue.current_index;
+
+            if !self.pending_track_skip && self.player.is_playing() {
+                let _ = self.player.stop();
+            }
+
+            self.pending_track_skip = true;
+            self.last_track_skip_time = Some(Instant::now());
+            self.status_message = format!("Skipped to: {}", track_title);
+            self.update_web_state();
+        }
+    }
+
+    pub fn flush_pending_track_skip(&mut self) {
+        if self.pending_track_skip {
+            self.pending_track_skip = false;
+            self.last_track_skip_time = None;
+            self.play_current_track();
+        }
+    }
+
+    pub fn poll_pending_track_skip(&mut self) {
+        if self.pending_track_skip {
+            if let Some(t) = self.last_track_skip_time {
+                if t.elapsed() >= Duration::from_millis(300) {
+                    self.flush_pending_track_skip();
+                }
+            }
+        }
+    }
+
     pub fn handle_input_key(&mut self, key: crossterm::event::KeyEvent) -> anyhow::Result<bool> {
         // If user presses any non-seek key, immediately flush any pending debounced seek
         let is_seek_key = matches!(
@@ -1085,6 +1212,18 @@ impl AppUI {
         );
         if !is_seek_key && self.pending_seek_target.is_some() {
             self.flush_pending_seek();
+        }
+
+        // If user presses any non-skip key, flush any pending debounced track skip
+        let is_skip_key = matches!(
+            (key.code, key.modifiers),
+            (KeyCode::Right, KeyModifiers::NONE) | (KeyCode::Left, KeyModifiers::NONE)
+        );
+        if !is_skip_key
+            && self.pending_track_skip
+            && !matches!(key.code, KeyCode::Char('s') | KeyCode::Char('c'))
+        {
+            self.flush_pending_track_skip();
         }
 
         // If help modal is open, let Esc, q, or ? dismiss it
@@ -1147,7 +1286,11 @@ impl AppUI {
                 }
             }
             (KeyCode::Char(' '), KeyModifiers::NONE) => {
-                if !self.player.is_playing() && !self.player.is_paused() {
+                if self.active_tab == 3 {
+                    self.cycle_and_apply_setting(true);
+                } else if self.pending_track_skip {
+                    self.flush_pending_track_skip();
+                } else if !self.player.is_playing() && !self.player.is_paused() {
                     if !self.queue.is_empty() {
                         self.play_current_track();
                     } else {
@@ -1166,14 +1309,24 @@ impl AppUI {
                 }
             }
             (KeyCode::Char('s'), KeyModifiers::NONE) => {
+                self.pending_track_skip = false;
+                self.last_track_skip_time = None;
                 self.player.stop()?;
                 self.status_message.clear();
             }
             (KeyCode::Right, KeyModifiers::NONE) => {
-                self.play_next_track();
+                if self.active_tab == 3 {
+                    self.cycle_and_apply_setting(true);
+                } else {
+                    self.skip_next_track_debounced();
+                }
             }
             (KeyCode::Left, KeyModifiers::NONE) => {
-                self.play_prev_track();
+                if self.active_tab == 3 {
+                    self.cycle_and_apply_setting(false);
+                } else {
+                    self.skip_prev_track_debounced();
+                }
             }
             (KeyCode::Right, KeyModifiers::SHIFT)
             | (KeyCode::Right, KeyModifiers::CONTROL)
@@ -1207,8 +1360,7 @@ impl AppUI {
             }
             (KeyCode::Char('v'), KeyModifiers::NONE) => {
                 self.settings_mgr.cycle_setting(0, true);
-                self.browser_dir_cache.clear();
-                self.refresh_browser();
+                self.update_browser_entry_labels();
                 self.status_message = format!(
                     "Display mode: {}",
                     if self.settings_mgr.settings.metadata_view {
@@ -1606,25 +1758,15 @@ impl AppUI {
                     | (KeyCode::Down, KeyModifiers::SHIFT) => {
                         self.settings_cursor = SETTING_DEFINITIONS.len() - 1;
                     }
-                    (KeyCode::Enter, KeyModifiers::NONE) | (KeyCode::Char(' '), KeyModifiers::NONE) => {
-                        self.settings_mgr.cycle_setting(self.settings_cursor, true);
-                        if self.settings_cursor == 0 {
-                            self.refresh_browser();
-                        } else if self.settings_cursor == 1 {
-                            let backend = self.settings_mgr.settings.player_backend.clone();
-                            if self.device_manager.get_active_device().is_none() {
-                                self.player = Box::new(LocalPlayer::new(&backend));
-                            }
-                        } else if self.settings_cursor == 6 {
-                            self.sync_web_server();
-                        } else if self.settings_cursor == 7 {
-                            self.update_web_state();
-                        }
-                        self.status_message = format!(
-                            "{}: {}",
-                            SETTING_DEFINITIONS[self.settings_cursor].label,
-                            self.settings_mgr.get_display_value(self.settings_cursor)
-                        );
+                    (KeyCode::Left, KeyModifiers::NONE)
+                    | (KeyCode::Char('h'), KeyModifiers::NONE) => {
+                        self.cycle_and_apply_setting(false);
+                    }
+                    (KeyCode::Right, KeyModifiers::NONE)
+                    | (KeyCode::Char('l'), KeyModifiers::NONE)
+                    | (KeyCode::Enter, KeyModifiers::NONE)
+                    | (KeyCode::Char(' '), KeyModifiers::NONE) => {
+                        self.cycle_and_apply_setting(true);
                     }
                     _ => {}
                 }
@@ -1633,7 +1775,30 @@ impl AppUI {
         }
     }
 
-    fn play_current_track(&mut self) {
+    pub fn cycle_and_apply_setting(&mut self, forward: bool) {
+        self.settings_mgr.cycle_setting(self.settings_cursor, forward);
+        if self.settings_cursor == 0 {
+            self.update_browser_entry_labels();
+        } else if self.settings_cursor == 1 {
+            let backend = self.settings_mgr.settings.player_backend.clone();
+            if self.device_manager.get_active_device().is_none() {
+                self.player = Box::new(LocalPlayer::new(&backend));
+            }
+        } else if self.settings_cursor == 6 {
+            self.sync_web_server();
+        } else if self.settings_cursor == 7 {
+            self.update_web_state();
+        }
+        self.status_message = format!(
+            "{}: {}",
+            SETTING_DEFINITIONS[self.settings_cursor].label,
+            self.settings_mgr.get_display_value(self.settings_cursor)
+        );
+    }
+
+    pub fn play_current_track(&mut self) {
+        self.pending_track_skip = false;
+        self.last_track_skip_time = None;
         if let Some(track) = self.queue.current_track() {
             let path = track.filepath.clone();
             if let Some(ref ws) = self.web_server {
@@ -1655,7 +1820,9 @@ impl AppUI {
         }
     }
 
-    fn play_next_track(&mut self) {
+    pub fn play_next_track(&mut self) {
+        self.pending_track_skip = false;
+        self.last_track_skip_time = None;
         let mode = self.settings_mgr.settings.queue_mode.clone();
         if let Some(track) = self.queue.next_track(&mode) {
             let path = track.filepath.clone();
@@ -1678,7 +1845,9 @@ impl AppUI {
         }
     }
 
-    fn play_prev_track(&mut self) {
+    pub fn play_prev_track(&mut self) {
+        self.pending_track_skip = false;
+        self.last_track_skip_time = None;
         if let Some(track) = self.queue.prev_track() {
             let path = track.filepath.clone();
             if let Some(ref ws) = self.web_server {
@@ -1885,10 +2054,10 @@ impl AppUI {
                     }
                 }
                 crate::web::WebCommand::Next => {
-                    self.play_next_track();
+                    self.skip_next_track_debounced();
                 }
                 crate::web::WebCommand::Prev => {
-                    self.play_prev_track();
+                    self.skip_prev_track_debounced();
                 }
                 crate::web::WebCommand::SetVolume(vol) => {
                     let _ = self.player.set_volume(vol);
@@ -3015,7 +3184,12 @@ impl AppUI {
         let mut row2_spans = Vec::new();
 
         // State badge
-        if self.player.is_playing() {
+        if self.pending_track_skip {
+            row2_spans.push(Span::styled(
+                "⏳ QUEUED",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ));
+        } else if self.player.is_playing() {
             row2_spans.push(Span::styled(
                 "▶ PLAYING",
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
@@ -3074,10 +3248,15 @@ impl AppUI {
         f.render_widget(Paragraph::new(Line::from(row2_spans)), inner[1]);
 
         // --- Row 3: Progress bar gauge with MM:SS / MM:SS ---
-        let pos = self
-            .pending_seek_target
-            .unwrap_or_else(|| self.player.position_seconds());
-        let dur = self.player.duration_seconds();
+        let (pos, dur) = if self.pending_track_skip {
+            let dur = self.queue.current_track().map(|t| t.duration_seconds).unwrap_or(0.0);
+            (0.0, dur)
+        } else {
+            let p = self
+                .pending_seek_target
+                .unwrap_or_else(|| self.player.position_seconds());
+            (p, self.player.duration_seconds())
+        };
         let pct = if dur > 0.0 { (pos / dur).min(1.0) } else { 0.0 };
 
         let pos_str = format_time(pos);
