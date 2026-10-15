@@ -1172,3 +1172,100 @@ fn test_queue_rendering_without_file_type_and_file_list_display_swap() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_settings_view_file_actions_disabled_and_home_dir_editing() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_set_edit_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let config_path = temp_dir.join("config.json");
+    let settings_mgr = SettingsManager::with_path(config_path);
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    // Switch to Tab 3 (Settings)
+    app.active_tab = 3;
+    app.settings_cursor = 0; // File List Display
+
+    // 1. Fuzzy search keys '/' and 'f' must NOT open fuzzy search on Settings view
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('/'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(app.search_modal.is_none(), "Fuzzy search must not open on settings view with '/'");
+
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('f'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(app.search_modal.is_none(), "Fuzzy search must not open on settings view with 'f'");
+
+    // 'v' must NOT toggle metadata view from settings view
+    let initial_meta = app.settings_mgr.settings.metadata_view;
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('v'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(app.settings_mgr.settings.metadata_view, initial_meta);
+
+    // 2. Navigate to Startup Home Directory (row 7)
+    app.settings_cursor = 7;
+    assert_eq!(app.settings_mgr.settings.home_dir, None);
+
+    // Press 'Enter' to enter edit mode
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(app.editing_home_dir.is_some());
+
+    // Type "/music/flac"
+    for ch in "/music/flac".chars() {
+        let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(ch),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+    assert_eq!(app.editing_home_dir.as_deref(), Some("/music/flac"));
+
+    // Press 'Backspace'
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Backspace,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(app.editing_home_dir.as_deref(), Some("/music/fla"));
+
+    // Press 'Enter' to save
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(app.editing_home_dir.is_none());
+    assert_eq!(app.settings_mgr.settings.home_dir.as_deref(), Some("/music/fla"));
+
+    // 3. Clear setting with 'c'
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('c'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(app.settings_mgr.settings.home_dir, None);
+
+    // 4. Pressing '/' directly on row 7 starts editing with '/'
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('/'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(app.editing_home_dir.is_some());
+    assert_eq!(app.editing_home_dir.as_deref(), Some("/"));
+
+    // Press 'Esc' to cancel
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(app.editing_home_dir.is_none());
+    assert_eq!(app.settings_mgr.settings.home_dir, None);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+

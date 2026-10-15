@@ -439,6 +439,17 @@ fn test_web_server_browser_api() {
     assert_eq!(resp_home.current_path, temp_dir.join("Rock").to_string_lossy());
     assert_eq!(resp_home.home_dir, Some(temp_dir.join("Rock").to_string_lossy().to_string()));
 
+    // Verify that setting state.current_browser_dir makes /api/browser open the terminal browsed dir by default
+    {
+        let mut s = state.write().unwrap();
+        s.current_browser_dir = temp_dir.join("Ambient").to_string_lossy().to_string();
+    }
+    let (status_term, _, body_term) = http_get(port, "/api/browser");
+    assert_eq!(status_term, 200);
+    let resp_term: WebBrowserResponse = serde_json::from_slice(&body_term).expect("parse browser terminal response");
+    assert_eq!(resp_term.current_path, temp_dir.join("Ambient").to_string_lossy());
+    assert_eq!(resp_term.terminal_dir, Some(temp_dir.join("Ambient").to_string_lossy().to_string()));
+
     handle.stop();
     let _ = fs::remove_dir_all(&temp_dir);
 }

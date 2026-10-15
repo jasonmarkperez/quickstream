@@ -89,6 +89,7 @@ fn test_render_now_playing_tab_empty_and_populated() {
 
     let meta2 = AudioMetadata {
         filepath: temp_dir.join("song2.flac"),
+        filename: "song2.flac".to_string(),
         title: "Supermassive Black Hole".to_string(),
         artist: "Muse".to_string(),
         duration_seconds: 210.0,
@@ -103,7 +104,19 @@ fn test_render_now_playing_tab_empty_and_populated() {
     assert!(view2.contains("Starlight"), "Hero title should appear in render");
     assert!(view2.contains("Muse"), "Hero artist should appear in render");
     assert!(view2.contains("UP NEXT IN QUEUE"), "Up Next section should appear in render");
+    assert!(view2.contains("TITLE"), "Table header TITLE should appear in render");
+    assert!(view2.contains("ARTIST"), "Table header ARTIST should appear in render");
+    assert!(view2.contains("TIME"), "Table header TIME should appear in render");
+    assert!(view2.contains("#02"), "Track index #02 should appear in table");
     assert!(view2.contains("Supermassive Black Hole"), "Next track title should appear in render");
+
+    // 3. Toggle to Filenames mode -> Up Next table shows #, FILE, TIME
+    app.settings_mgr.settings.metadata_view = false;
+    terminal.draw(|f| app.render(f)).unwrap();
+    let view3 = terminal.backend().to_string();
+    assert!(view3.contains("FILE"), "Table header FILE should appear in filename mode");
+    assert!(view3.contains("TIME"), "Table header TIME should appear in filename mode");
+    assert!(view3.contains("song2.flac"), "Filename should appear in table");
 
     let _ = fs::remove_dir_all(&temp_dir);
 }

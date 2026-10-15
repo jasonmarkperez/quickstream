@@ -51,6 +51,8 @@ pub struct WebBrowserResponse {
     pub entries: Vec<WebBrowserEntry>,
     #[serde(default)]
     pub home_dir: Option<String>,
+    #[serde(default)]
+    pub terminal_dir: Option<String>,
 }
 
 /// Live playback state shared between Quickstream and the web server.
@@ -85,6 +87,8 @@ pub struct NowPlayingState {
     pub is_scanning: bool,
     #[serde(default)]
     pub home_dir: Option<String>,
+    #[serde(default)]
+    pub current_browser_dir: String,
 }
 
 impl Default for NowPlayingState {
@@ -114,6 +118,7 @@ impl Default for NowPlayingState {
             queue_mode: "loop".to_string(),
             is_scanning: false,
             home_dir: None,
+            current_browser_dir: String::new(),
         }
     }
 }
@@ -480,15 +485,17 @@ fn handle_client(
                 None
             };
 
-            let current_home_dir = {
+            let (current_home_dir, current_terminal_dir) = {
                 let s = state.read().unwrap();
-                s.home_dir.clone()
+                (s.home_dir.clone(), s.current_browser_dir.clone())
             };
 
             let target_dir = if let Some(ref p) = requested_path {
                 let pb = PathBuf::from(p);
                 if pb.is_dir() {
                     pb
+                } else if !current_terminal_dir.is_empty() && PathBuf::from(&current_terminal_dir).is_dir() {
+                    PathBuf::from(&current_terminal_dir)
                 } else {
                     current_home_dir
                         .as_ref()
@@ -496,6 +503,8 @@ fn handle_client(
                         .filter(|p| p.is_dir())
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
                 }
+            } else if !current_terminal_dir.is_empty() && PathBuf::from(&current_terminal_dir).is_dir() {
+                PathBuf::from(&current_terminal_dir)
             } else {
                 current_home_dir
                     .as_ref()
@@ -554,6 +563,11 @@ fn handle_client(
                 bookmarks,
                 entries: all_entries,
                 home_dir: current_home_dir,
+                terminal_dir: if current_terminal_dir.is_empty() {
+                    None
+                } else {
+                    Some(current_terminal_dir)
+                },
             };
 
             let json = serde_json::to_string(&resp_data).unwrap_or_else(|_| "{}".to_string());
@@ -850,6 +864,7 @@ fn serve_audio_stream(
 
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_nodelay(true);
 
     // 1. Resolve target file and optional seek offset query parameter
     let raw_encoded = path.strip_prefix("/stream/").unwrap_or("");
@@ -1182,7 +1197,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      padding: 1.5rem;
+      padding: 1rem;
       overflow-x: hidden;
       position: relative;
     }
@@ -1207,15 +1222,15 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       z-index: 1;
       width: 480px;
       max-width: 100%;
-      height: 680px;
-      max-height: calc(100dvh - 3rem);
-      min-height: 520px;
+      height: min(680px, calc(100dvh - 1.5rem));
+      max-height: calc(100dvh - 1.5rem);
+      min-height: 0;
       background: var(--card-bg);
       backdrop-filter: blur(24px);
       -webkit-backdrop-filter: blur(24px);
       border: 1px solid var(--card-border);
       border-radius: 28px;
-      padding: 1.5rem;
+      padding: 1.25rem;
       box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6), 0 4px 16px rgba(0, 0, 0, 0.4);
       display: flex;
       flex-direction: column;
@@ -1230,7 +1245,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       padding: 4px;
       background: rgba(0, 0, 0, 0.35);
       border-radius: 14px;
-      margin-bottom: 1.25rem;
+      margin-bottom: 0.85rem;
       width: 100%;
       flex-shrink: 0;
       border: 1px solid rgba(255, 255, 255, 0.05);
@@ -1297,11 +1312,12 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 1.5rem;
+      margin-bottom: 0.75rem;
       font-size: 0.8rem;
       text-transform: uppercase;
       letter-spacing: 0.08em;
       color: var(--text-dim);
+      flex-shrink: 0;
     }
 
     .logo {
@@ -1350,15 +1366,17 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     /* Cover Artwork */
     .artwork-container {
       position: relative;
-      width: 100%;
+      width: min(230px, 30vh, 52vw);
+      height: min(230px, 30vh, 52vw);
       aspect-ratio: 1 / 1;
-      max-width: 270px;
       border-radius: 20px;
       overflow: hidden;
       box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
-      margin-bottom: 1.15rem;
+      margin-bottom: 0.75rem;
       background: #141720;
-      flex-shrink: 0;
+      flex-shrink: 1;
+      min-width: 110px;
+      min-height: 110px;
     }
 
     .artwork {
@@ -1375,32 +1393,33 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     /* Track Metadata */
     .track-info {
       width: 100%;
-      margin-bottom: 1.25rem;
+      margin-bottom: 0.55rem;
+      flex-shrink: 0;
     }
 
     .title {
-      font-size: 1.35rem;
+      font-size: 1.25rem;
       font-weight: 700;
       color: var(--text);
       line-height: 1.25;
-      margin-bottom: 0.4rem;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .artist {
-      font-size: 1.05rem;
-      font-weight: 500;
-      color: var(--accent);
       margin-bottom: 0.25rem;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
     }
 
+    .artist {
+      font-size: 0.98rem;
+      font-weight: 500;
+      color: var(--accent);
+      margin-bottom: 0.2rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
     .album {
-      font-size: 0.85rem;
+      font-size: 0.82rem;
       color: var(--text-muted);
       white-space: nowrap;
       overflow: hidden;
@@ -1412,8 +1431,9 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       display: flex;
       flex-wrap: wrap;
       justify-content: center;
-      gap: 0.4rem;
-      margin-bottom: 1.25rem;
+      gap: 0.35rem;
+      margin-bottom: 0.6rem;
+      flex-shrink: 0;
     }
 
     .badge {
@@ -1435,12 +1455,13 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     /* Progress Bar */
     .progress-container {
       width: 100%;
-      margin-bottom: 1.25rem;
+      margin-bottom: 0.6rem;
       cursor: pointer;
-      padding: 10px 0;
+      padding: 6px 0;
       user-select: none;
       -webkit-user-select: none;
       touch-action: none;
+      flex-shrink: 0;
     }
 
     .progress-bar-bg {
@@ -1484,7 +1505,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     .time-labels {
       display: flex;
       justify-content: space-between;
-      margin-top: 0.5rem;
+      margin-top: 0.4rem;
       font-size: 0.78rem;
       color: var(--text-dim);
       font-variant-numeric: tabular-nums;
@@ -1496,9 +1517,10 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 1.25rem;
-      margin-bottom: 1.25rem;
+      gap: 1.15rem;
+      margin-bottom: 0.6rem;
       width: 100%;
+      flex-shrink: 0;
     }
 
     .btn {
@@ -1547,7 +1569,8 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       gap: 0.6rem;
       width: 80%;
       color: var(--text-dim);
-      margin-bottom: 0.5rem;
+      margin-bottom: 0.35rem;
+      flex-shrink: 0;
     }
     .volume-row svg {
       width: 16px;
@@ -1563,15 +1586,16 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
 
     /* Up Next Drawer */
     .up-next {
-      margin-top: 1rem;
-      padding-top: 1rem;
+      margin-top: 0.5rem;
+      padding-top: 0.5rem;
       border-top: 1px solid rgba(255, 255, 255, 0.06);
       width: 100%;
-      font-size: 0.78rem;
+      font-size: 0.75rem;
       color: var(--text-dim);
       display: flex;
       justify-content: space-between;
       align-items: center;
+      flex-shrink: 0;
     }
     .up-next-title {
       color: var(--text-muted);
@@ -1822,27 +1846,46 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       background: rgba(255, 214, 0, 0.18);
     }
 
-    .browser-nav-bar {
+    .browser-path-bar {
       display: flex;
       align-items: center;
       gap: 0.5rem;
-      margin-bottom: 0.75rem;
+      margin-bottom: 0.45rem;
       width: 100%;
       flex-shrink: 0;
+      background: rgba(0, 0, 0, 0.25);
+      padding: 0.45rem 0.65rem;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      box-sizing: border-box;
     }
     .browser-current-path {
       flex: 1;
-      font-family: monospace;
-      font-size: 0.75rem;
-      color: var(--text-muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.78rem;
+      color: var(--text);
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      background: rgba(0, 0, 0, 0.2);
-      padding: 0.35rem 0.6rem;
-      border-radius: 8px;
-      border: 1px solid rgba(255, 255, 255, 0.05);
       text-align: left;
+    }
+
+    .browser-actions-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      margin-bottom: 0.65rem;
+      width: 100%;
+      flex-shrink: 0;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .browser-actions-bar::-webkit-scrollbar {
+      display: none;
+    }
+    .browser-actions-bar .btn-sm {
+      white-space: nowrap;
+      flex-shrink: 0;
     }
 
     .search-input {
@@ -2016,6 +2059,78 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       transform: translateX(-50%) translateY(0);
       opacity: 1;
     }
+
+    @media (max-width: 520px) {
+      body {
+        padding: 0.4rem;
+      }
+      .container {
+        padding: 0.85rem;
+        border-radius: 20px;
+        height: calc(100dvh - 0.8rem);
+        max-height: calc(100dvh - 0.8rem);
+      }
+      .artwork-container {
+        width: min(180px, 24vh, 48vw);
+        height: min(180px, 24vh, 48vw);
+        margin-bottom: 0.5rem;
+      }
+      .title {
+        font-size: 1.15rem;
+      }
+      .artist {
+        font-size: 0.92rem;
+      }
+      .album {
+        font-size: 0.78rem;
+      }
+      .controls {
+        gap: 0.85rem;
+        margin-bottom: 0.5rem;
+      }
+      .btn-primary {
+        width: 52px;
+        height: 52px;
+      }
+      .btn-secondary {
+        width: 38px;
+        height: 38px;
+      }
+      .volume-row {
+        width: 90%;
+      }
+    }
+
+    @media (max-height: 720px) {
+      .artwork-container {
+        width: min(160px, 22vh, 44vw);
+        height: min(160px, 22vh, 44vw);
+        margin-bottom: 0.4rem;
+      }
+      .header {
+        margin-bottom: 0.4rem;
+      }
+      .tabs {
+        margin-bottom: 0.5rem;
+      }
+      .track-info {
+        margin-bottom: 0.35rem;
+      }
+      .badges {
+        margin-bottom: 0.45rem;
+      }
+      .progress-container {
+        margin-bottom: 0.45rem;
+        padding: 4px 0;
+      }
+      .controls {
+        margin-bottom: 0.45rem;
+      }
+      .up-next {
+        margin-top: 0.35rem;
+        padding-top: 0.35rem;
+      }
+    }
   </style>
 </head>
 <body>
@@ -2155,16 +2270,24 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     <div class="tab-panel" id="tab-browser">
       <div class="bookmarks-row" id="bookmarksRow" style="display:none;"></div>
 
-      <div class="browser-nav-bar">
-        <button class="btn-sm" id="btnBrowserHome" title="Jump to Startup Home Directory">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
-          Home
-        </button>
+      <div class="browser-path-bar">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;opacity:0.6;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+        <div class="browser-current-path" id="browserCurrentPath" title="Current Directory">/</div>
+      </div>
+
+      <div class="browser-actions-bar">
         <button class="btn-sm" id="btnBrowserUp" title="Parent Directory">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"></polyline></svg>
           Up
         </button>
-        <div class="browser-current-path" id="browserCurrentPath">/</div>
+        <button class="btn-sm" id="btnBrowserTerminal" title="Jump to Terminal Browsed Directory">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
+          Terminal
+        </button>
+        <button class="btn-sm" id="btnBrowserHome" title="Jump to Startup Home Directory">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
+          Home
+        </button>
         <button class="btn-sm" id="btnBrowserSetHome" title="Set current directory as startup home">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
           Set Home
@@ -2210,6 +2333,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
 
     let currentBrowserPath = "";
     let currentBrowserData = null;
+    let latestTerminalDir = "";
     let toastTimer = null;
 
     function formatTime(seconds) {
@@ -2357,6 +2481,10 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
 
       // 3. Devices view sync
       renderDevices(data);
+
+      if (data.current_browser_dir) {
+        latestTerminalDir = data.current_browser_dir;
+      }
     }
 
     function updateProgressUI() {
@@ -2567,6 +2695,10 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       document.getElementById('browserCurrentPath').textContent = data.current_path || "/";
       document.getElementById('btnBrowserUp').disabled = !data.parent_path;
 
+      if (data.terminal_dir) {
+        latestTerminalDir = data.terminal_dir;
+      }
+
       const setHomeBtn = document.getElementById('btnBrowserSetHome');
       if (data.home_dir && data.home_dir === data.current_path) {
         setHomeBtn.classList.add('accent');
@@ -2629,6 +2761,14 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       document.getElementById('browserSearchInput').value = "";
       loadBrowser(path);
     }
+
+    document.getElementById('btnBrowserTerminal').addEventListener('click', () => {
+      if (latestTerminalDir) {
+        browseTo(latestTerminalDir);
+      } else {
+        browseTo("");
+      }
+    });
 
     document.getElementById('btnBrowserHome').addEventListener('click', () => {
       if (currentBrowserData && currentBrowserData.home_dir) {

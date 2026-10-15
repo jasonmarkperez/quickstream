@@ -97,6 +97,7 @@ pub struct AppUI {
     pub last_seek_key_time: Option<std::time::Instant>,
     pub pending_track_skip: bool,
     pub last_track_skip_time: Option<std::time::Instant>,
+    pub editing_home_dir: Option<String>,
 }
 
 impl AppUI {
@@ -180,8 +181,10 @@ impl AppUI {
             last_seek_key_time: None,
             pending_track_skip: false,
             last_track_skip_time: None,
+            editing_home_dir: None,
         };
         app.refresh_browser();
+        app.update_web_state();
         app
     }
 
@@ -803,6 +806,7 @@ impl AppUI {
             self.browser_state = ListState::default();
             self.browser_state.select(Some(0));
             self.refresh_browser();
+            self.update_web_state();
             return;
         }
 
@@ -813,6 +817,7 @@ impl AppUI {
             self.browser_state = ListState::default();
             self.browser_state.select(Some(0));
             self.refresh_browser();
+            self.update_web_state();
             return;
         }
 
@@ -830,6 +835,7 @@ impl AppUI {
         self.browser_state = ListState::default();
         self.browser_state.select(Some(0));
         self.refresh_browser();
+        self.update_web_state();
     }
 
     pub fn open_spotlight(&mut self) {
@@ -1385,6 +1391,58 @@ impl AppUI {
             return Ok(false);
         }
 
+        // If editing startup home directory on settings view, intercept text input
+        if let Some(ref mut input) = self.editing_home_dir {
+            if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+                self.player.stop()?;
+                return Ok(true);
+            }
+            match key.code {
+                KeyCode::Esc => {
+                    self.editing_home_dir = None;
+                    self.status_message = "Cancelled editing startup home directory".to_string();
+                }
+                KeyCode::Enter => {
+                    let raw = input.trim();
+                    if raw.is_empty() || raw.eq_ignore_ascii_case("default") || raw.eq_ignore_ascii_case("none") {
+                        self.settings_mgr.settings.home_dir = None;
+                        self.settings_mgr.save();
+                        self.status_message = "Cleared startup home (defaulting to launch directory)".to_string();
+                    } else {
+                        let resolved = if raw.starts_with('~') {
+                            if let Some(base) = directories::BaseDirs::new() {
+                                let home = base.home_dir();
+                                if raw == "~" {
+                                    home.to_string_lossy().to_string()
+                                } else if raw.starts_with("~/") {
+                                    home.join(&raw[2..]).to_string_lossy().to_string()
+                                } else {
+                                    raw.to_string()
+                                }
+                            } else {
+                                raw.to_string()
+                            }
+                        } else {
+                            raw.to_string()
+                        };
+                        self.settings_mgr.settings.home_dir = Some(resolved.clone());
+                        self.settings_mgr.save();
+                        self.status_message = format!("Set startup home directory: {}", resolved);
+                    }
+                    self.editing_home_dir = None;
+                    self.update_web_state();
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+                    input.push(c);
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         // Global hotkeys
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), KeyModifiers::NONE)
@@ -1515,26 +1573,34 @@ impl AppUI {
                 self.status_message = format!("Volume {}%", new_vol);
             }
             (KeyCode::Char('v'), KeyModifiers::NONE) => {
-                self.settings_mgr.cycle_setting(0, true);
-                self.update_browser_entry_labels();
-                self.status_message = format!(
-                    "Display mode: {}",
-                    if self.settings_mgr.settings.metadata_view {
-                        "Metadata Tags (Artist - Title) [TAGS]"
-                    } else {
-                        "Filenames [FILES]"
-                    }
-                );
+                if self.active_tab == 0 || self.active_tab == 1 {
+                    self.settings_mgr.cycle_setting(0, true);
+                    self.update_browser_entry_labels();
+                    self.status_message = format!(
+                        "Display mode: {}",
+                        if self.settings_mgr.settings.metadata_view {
+                            "Metadata Tags (Artist - Title) [TAGS]"
+                        } else {
+                            "Filenames [FILES]"
+                        }
+                    );
+                }
             }
             (KeyCode::Char('/'), KeyModifiers::NONE) => {
                 if self.active_tab == 1 && !self.queue_focus {
                     self.open_spotlight();
-                } else {
+                } else if self.active_tab == 0 || (self.active_tab == 1 && self.queue_focus) {
                     self.open_fuzzy_search();
+                } else if self.active_tab == 3 && self.settings_cursor == 7 {
+                    let curr = self.settings_mgr.settings.home_dir.clone().unwrap_or_else(|| "/".to_string());
+                    self.editing_home_dir = Some(curr);
+                    self.status_message = "Editing Startup Home Directory (Enter: Save, Esc: Cancel)".to_string();
                 }
             }
             (KeyCode::Char('f'), KeyModifiers::NONE) => {
-                self.open_fuzzy_search();
+                if self.active_tab == 0 || self.active_tab == 1 {
+                    self.open_fuzzy_search();
+                }
             }
             _ => {
                 // Tab specific key handling
@@ -1914,14 +1980,39 @@ impl AppUI {
                     | (KeyCode::Down, KeyModifiers::SHIFT) => {
                         self.settings_cursor = SETTING_DEFINITIONS.len() - 1;
                     }
+                    (KeyCode::Char('e'), KeyModifiers::NONE) => {
+                        if self.settings_cursor == 7 {
+                            let curr = self.settings_mgr.settings.home_dir.clone().unwrap_or_default();
+                            self.editing_home_dir = Some(curr);
+                            self.status_message = "Editing Startup Home Directory (Enter: Save, Esc: Cancel)".to_string();
+                        }
+                    }
+                    (KeyCode::Char('c'), KeyModifiers::NONE) | (KeyCode::Delete, _) => {
+                        if self.settings_cursor == 7 {
+                            self.settings_mgr.settings.home_dir = None;
+                            self.settings_mgr.save();
+                            self.status_message = "Cleared startup home (defaulting to launch directory)".to_string();
+                            self.update_web_state();
+                        }
+                    }
                     (KeyCode::Left, KeyModifiers::NONE)
                     | (KeyCode::Char('h'), KeyModifiers::NONE) => {
                         self.cycle_and_apply_setting(false);
                     }
                     (KeyCode::Right, KeyModifiers::NONE)
-                    | (KeyCode::Char('l'), KeyModifiers::NONE)
-                    | (KeyCode::Enter, KeyModifiers::NONE)
-                    | (KeyCode::Char(' '), KeyModifiers::NONE) => {
+                    | (KeyCode::Char('l'), KeyModifiers::NONE) => {
+                        self.cycle_and_apply_setting(true);
+                    }
+                    (KeyCode::Enter, KeyModifiers::NONE) => {
+                        if self.settings_cursor == 7 {
+                            let curr = self.settings_mgr.settings.home_dir.clone().unwrap_or_default();
+                            self.editing_home_dir = Some(curr);
+                            self.status_message = "Editing Startup Home Directory (Enter: Save, Esc: Cancel)".to_string();
+                        } else {
+                            self.cycle_and_apply_setting(true);
+                        }
+                    }
+                    (KeyCode::Char(' '), KeyModifiers::NONE) => {
                         self.cycle_and_apply_setting(true);
                     }
                     _ => {}
@@ -2367,6 +2458,7 @@ impl AppUI {
             state.queue_mode = self.settings_mgr.settings.queue_mode.clone();
             state.is_scanning = self.device_manager.is_scanning();
             state.home_dir = self.settings_mgr.settings.home_dir.clone();
+            state.current_browser_dir = self.browser_dir.to_string_lossy().to_string();
 
             state.queue = self
                 .queue
@@ -2746,12 +2838,12 @@ impl AppUI {
             let up_inner = up_block.inner(up_area);
             f.render_widget(up_block, up_area);
 
-            let mut up_lines = Vec::new();
             if self.queue.is_empty() {
-                up_lines.push(Line::from(vec![Span::styled(
+                let up_lines = vec![Line::from(vec![Span::styled(
                     "Queue is empty. Select files or press 'a' in the library to enqueue tracks.",
                     Style::default().fg(Color::DarkGray),
-                )]));
+                )])];
+                f.render_widget(Paragraph::new(up_lines), up_inner);
             } else {
                 let current_idx = self.queue.current_index;
                 let next_idx = current_idx + 1;
@@ -2769,31 +2861,97 @@ impl AppUI {
                     let loop_mode = self.settings_mgr.settings.queue_mode == "loop";
                     if loop_mode && self.queue.len() > 1 {
                         let first = &self.queue.tracks[0];
-                        up_lines.push(Line::from(vec![
+                        let up_lines = vec![Line::from(vec![
                             Span::styled("↺ End of queue reached. Loops to #1: ", Style::default().fg(Color::Cyan)),
                             Span::styled(first.display_title(), Style::default().fg(Color::Yellow)),
                             Span::styled(format!("  —  {}", first.artist), Style::default().fg(Color::White)),
-                        ]));
+                        ])];
+                        f.render_widget(Paragraph::new(up_lines), up_inner);
                     } else {
-                        up_lines.push(Line::from(vec![Span::styled(
+                        let up_lines = vec![Line::from(vec![Span::styled(
                             "End of playback queue. (Playback will stop after this track)",
                             Style::default().fg(Color::DarkGray),
-                        )]));
+                        )])];
+                        f.render_widget(Paragraph::new(up_lines), up_inner);
                     }
                 } else {
-                    for (i, t) in upcoming {
-                        let dur_label = format_time(t.duration_seconds);
-                        up_lines.push(Line::from(vec![
-                            Span::styled(format!("#{:02}  ", i + 1), Style::default().fg(Color::Cyan)),
-                            Span::styled(t.display_title(), Style::default().fg(Color::White)),
-                            Span::styled(format!("  —  {}", if !t.artist.is_empty() { &t.artist } else { "Unknown Artist" }), Style::default().fg(Color::DarkGray)),
-                            Span::styled(format!("  ({})", dur_label), Style::default().fg(Color::DarkGray)),
-                        ]));
-                    }
+                    let metadata_view = self.settings_mgr.settings.metadata_view;
+                    let (header, widths, rows) = if metadata_view {
+                        let header = Row::new(vec![
+                            Cell::from("#"),
+                            Cell::from("TITLE"),
+                            Cell::from("ARTIST"),
+                            Cell::from("TIME"),
+                        ])
+                        .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+                        let widths = vec![
+                            Constraint::Length(5),
+                            Constraint::Fill(3),
+                            Constraint::Fill(2),
+                            Constraint::Length(7),
+                        ];
+
+                        let rows: Vec<Row> = upcoming
+                            .into_iter()
+                            .map(|(i, t)| {
+                                let dur_label = format_time(t.duration_seconds);
+                                let artist_text = if !t.artist.is_empty() {
+                                    t.artist.as_str()
+                                } else {
+                                    "Unknown Artist"
+                                };
+                                Row::new(vec![
+                                    Cell::from(Span::styled(format!("#{:02}", i + 1), Style::default().fg(Color::Cyan))),
+                                    Cell::from(Span::styled(t.display_title(), Style::default().fg(Color::White))),
+                                    Cell::from(Span::styled(artist_text, Style::default().fg(Color::DarkGray))),
+                                    Cell::from(Span::styled(dur_label, Style::default().fg(Color::DarkGray))),
+                                ])
+                            })
+                            .collect();
+
+                        (header, widths, rows)
+                    } else {
+                        let header = Row::new(vec![
+                            Cell::from("#"),
+                            Cell::from("FILE"),
+                            Cell::from("TIME"),
+                        ])
+                        .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+                        let widths = vec![
+                            Constraint::Length(5),
+                            Constraint::Fill(1),
+                            Constraint::Length(7),
+                        ];
+
+                        let rows: Vec<Row> = upcoming
+                            .into_iter()
+                            .map(|(i, t)| {
+                                let dur_label = format_time(t.duration_seconds);
+                                let fname = if !t.filename.is_empty() {
+                                    t.filename.as_str()
+                                } else {
+                                    t.filepath.file_name().and_then(|f| f.to_str()).unwrap_or("")
+                                };
+                                Row::new(vec![
+                                    Cell::from(Span::styled(format!("#{:02}", i + 1), Style::default().fg(Color::Cyan))),
+                                    Cell::from(Span::styled(fname, Style::default().fg(Color::White))),
+                                    Cell::from(Span::styled(dur_label, Style::default().fg(Color::DarkGray))),
+                                ])
+                            })
+                            .collect();
+
+                        (header, widths, rows)
+                    };
+
+                    let table = Table::new(rows, widths)
+                        .header(header)
+                        .column_spacing(2);
+
+                    f.render_widget(table, up_inner);
                 }
             }
-
-            f.render_widget(Paragraph::new(up_lines), up_inner);
         }
     }
 
@@ -3041,20 +3199,48 @@ impl AppUI {
     }
 
     fn render_settings_tab(&mut self, f: &mut Frame, area: Rect) {
-        let block = Block::default().borders(Borders::ALL).title(" APPLICATION SETTINGS ");
+        let mut block = Block::default().borders(Borders::ALL).title(" APPLICATION SETTINGS ");
+
+        if self.editing_home_dir.is_some() {
+            block = block.title_bottom(Span::styled(
+                " [Enter] Save Path   [Esc] Cancel Editing   [Backspace] Delete ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        } else if self.settings_cursor == 7 {
+            block = block.title_bottom(Span::styled(
+                " [Enter / e] Edit Path   [c] Clear   [←/→] Cycle Presets   [↑/↓] Navigate ",
+                Style::default().fg(Color::DarkGray),
+            ));
+        } else {
+            block = block.title_bottom(Span::styled(
+                " [Enter / Space / ←/→] Change   [↑/↓] Navigate ",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
 
         let items: Vec<ListItem> = SETTING_DEFINITIONS
             .iter()
             .enumerate()
             .map(|(idx, defn)| {
-                let val_str = self.settings_mgr.get_display_value(idx);
-                let text = format!("{:<28} : {}", defn.label, val_str);
-                let style = if idx == self.settings_cursor {
-                    Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+                if idx == 7 && self.editing_home_dir.is_some() {
+                    let edit_val = self.editing_home_dir.as_deref().unwrap_or("");
+                    let text = format!("{:<28} : [ {}█ ]", defn.label, edit_val);
+                    ListItem::new(text).style(
+                        Style::default()
+                            .bg(Color::Cyan)
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD),
+                    )
                 } else {
-                    Style::default().fg(Color::White)
-                };
-                ListItem::new(text).style(style)
+                    let val_str = self.settings_mgr.get_display_value(idx);
+                    let text = format!("{:<28} : {}", defn.label, val_str);
+                    let style = if idx == self.settings_cursor {
+                        Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    ListItem::new(text).style(style)
+                }
             })
             .collect();
 
