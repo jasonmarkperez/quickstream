@@ -53,7 +53,7 @@ fn test_extract_metadata_real_audio() {
 
     assert!(label_tags.contains("[WAV]"));
     assert!(label_tags.contains("(00:02)"));
-    assert_eq!(label_files, "[WAV] test_audio.wav");
+    assert_eq!(label_files, "test_audio.wav");
     assert_ne!(label_tags, label_files);
 
     // Queue labels should NOT contain file type / format badge

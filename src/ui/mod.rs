@@ -217,9 +217,7 @@ impl AppUI {
                 return m.format_display_label(true);
             }
         }
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase();
-        let file_name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-        format!("[{}] {}", ext, file_name)
+        path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()
     }
 
     pub fn update_browser_entry_labels(&mut self) {

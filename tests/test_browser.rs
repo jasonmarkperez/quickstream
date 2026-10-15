@@ -84,7 +84,7 @@ fn test_browser_metadata_view_toggle() {
     let (label_filename, _, _) = entry_file.unwrap();
 
     // With metadata_view = false, label displays clean filename
-    assert_eq!(label_filename, "[WAV] test_track.wav");
+    assert_eq!(label_filename, "test_track.wav");
     assert_ne!(label_meta.as_str(), label_filename.as_str());
 
     let _ = fs::remove_dir_all(&temp_dir);
@@ -1011,7 +1011,7 @@ fn test_browser_metadata_view_toggle_in_place_and_settings_tab() {
     // Filenames mode initially
     let initial_entry = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song);
     assert!(initial_entry.is_some());
-    assert_eq!(initial_entry.unwrap().0, "[WAV] 01_test_song.wav");
+    assert_eq!(initial_entry.unwrap().0, "01_test_song.wav");
 
     // Press 'v' to toggle to metadata mode
     let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
@@ -1043,12 +1043,12 @@ fn test_browser_metadata_view_toggle_in_place_and_settings_tab() {
     assert!(!app.settings_mgr.settings.metadata_view);
 
     let filename_entry = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song).unwrap();
-    assert_eq!(filename_entry.0, "[WAV] 01_test_song.wav");
+    assert_eq!(filename_entry.0, "01_test_song.wav");
 
     // Also verify cached directory has the filename updated
     if let Some(cached) = app.browser_dir_cache.get(&temp_dir) {
         let cached_file = cached.files.iter().find(|(_, p, is_dir)| !*is_dir && p == &song).unwrap();
-        assert_eq!(cached_file.0, "[WAV] 01_test_song.wav");
+        assert_eq!(cached_file.0, "01_test_song.wav");
     }
 
     // Now test Tab 3 (Settings) cycling:
@@ -1071,7 +1071,7 @@ fn test_browser_metadata_view_toggle_in_place_and_settings_tab() {
     ));
     assert!(!app.settings_mgr.settings.metadata_view);
     let entry_after_left = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song).unwrap();
-    assert_eq!(entry_after_left.0, "[WAV] 01_test_song.wav");
+    assert_eq!(entry_after_left.0, "01_test_song.wav");
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
@@ -1168,7 +1168,7 @@ fn test_queue_rendering_without_file_type_and_file_list_display_swap() {
 
     // Browser entries also show clean filename
     let browser_entry = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song_path).unwrap();
-    assert_eq!(browser_entry.0, "[WAV] 01_test_song.wav");
+    assert_eq!(browser_entry.0, "01_test_song.wav");
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
