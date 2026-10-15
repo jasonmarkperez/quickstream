@@ -1182,18 +1182,22 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     .container {
       position: relative;
       z-index: 1;
-      width: 100%;
-      max-width: 480px;
+      width: 480px;
+      max-width: 100%;
+      height: 680px;
+      max-height: calc(100dvh - 3rem);
+      min-height: 520px;
       background: var(--card-bg);
       backdrop-filter: blur(24px);
       -webkit-backdrop-filter: blur(24px);
       border: 1px solid var(--card-border);
       border-radius: 28px;
-      padding: 1.75rem;
+      padding: 1.5rem;
       box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6), 0 4px 16px rgba(0, 0, 0, 0.4);
       display: flex;
       flex-direction: column;
       align-items: center;
+      overflow: hidden;
     }
 
     /* Tab Bar Navigation */
@@ -1203,8 +1207,9 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       padding: 4px;
       background: rgba(0, 0, 0, 0.35);
       border-radius: 14px;
-      margin-bottom: 1.5rem;
+      margin-bottom: 1.25rem;
       width: 100%;
+      flex-shrink: 0;
       border: 1px solid rgba(255, 255, 255, 0.05);
     }
 
@@ -1246,12 +1251,21 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     /* Tab Panels */
     .tab-panel {
       width: 100%;
-      display: flex;
+      flex: 1;
+      min-height: 0;
+      display: none;
       flex-direction: column;
+    }
+    .tab-panel.active {
+      display: flex;
     }
     .tab-panel.centered {
       align-items: center;
       text-align: center;
+      overflow-y: auto;
+      overflow-x: hidden;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
     }
 
     /* Header Bar */
@@ -1315,12 +1329,13 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       position: relative;
       width: 100%;
       aspect-ratio: 1 / 1;
-      max-width: 320px;
+      max-width: 270px;
       border-radius: 20px;
       overflow: hidden;
       box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
-      margin-bottom: 1.5rem;
+      margin-bottom: 1.15rem;
       background: #141720;
+      flex-shrink: 0;
     }
 
     .artwork {
@@ -1551,6 +1566,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       justify-content: space-between;
       align-items: center;
       margin-bottom: 1rem;
+      flex-shrink: 0;
     }
     .panel-title {
       font-size: 1.05rem;
@@ -1617,6 +1633,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       gap: 0.4rem;
       margin-bottom: 0.85rem;
       width: 100%;
+      flex-shrink: 0;
     }
     .mode-label {
       font-size: 0.75rem;
@@ -1649,7 +1666,8 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       display: flex;
       flex-direction: column;
       gap: 0.4rem;
-      max-height: 380px;
+      flex: 1;
+      min-height: 0;
       overflow-y: auto;
       width: 100%;
       padding-right: 4px;
@@ -1753,7 +1771,6 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       color: var(--danger);
     }
 
-    /* Library / Browser Tab */
     .bookmarks-row {
       display: flex;
       gap: 0.4rem;
@@ -1761,6 +1778,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       padding-bottom: 0.5rem;
       margin-bottom: 0.75rem;
       width: 100%;
+      flex-shrink: 0;
     }
     .bookmarks-row::-webkit-scrollbar {
       height: 3px;
@@ -1787,6 +1805,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       gap: 0.5rem;
       margin-bottom: 0.75rem;
       width: 100%;
+      flex-shrink: 0;
     }
     .browser-current-path {
       flex: 1;
@@ -1813,6 +1832,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       font-size: 0.82rem;
       margin-bottom: 0.75rem;
       outline: none;
+      flex-shrink: 0;
       transition: border-color 0.15s;
     }
     .search-input:focus {
@@ -1823,7 +1843,8 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       display: flex;
       flex-direction: column;
       gap: 0.35rem;
-      max-height: 360px;
+      flex: 1;
+      min-height: 0;
       overflow-y: auto;
       width: 100%;
       padding-right: 4px;
@@ -1873,7 +1894,11 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       display: flex;
       flex-direction: column;
       gap: 0.5rem;
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
       width: 100%;
+      padding-right: 4px;
     }
     .device-item {
       display: flex;
@@ -1932,7 +1957,9 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      padding: 2.5rem 1rem;
+      flex: 1;
+      min-height: 180px;
+      padding: 2rem 1rem;
       color: var(--text-muted);
       text-align: center;
     }
@@ -2082,7 +2109,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     </div>
 
     <!-- TAB 2: Queue Management -->
-    <div class="tab-panel" id="tab-queue" style="display:none;">
+    <div class="tab-panel" id="tab-queue">
       <div class="panel-header">
         <div>
           <span class="panel-title">Queue</span>
@@ -2102,7 +2129,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     </div>
 
     <!-- TAB 3: Library / File Browser -->
-    <div class="tab-panel" id="tab-browser" style="display:none;">
+    <div class="tab-panel" id="tab-browser">
       <div class="bookmarks-row" id="bookmarksRow" style="display:none;"></div>
 
       <div class="browser-nav-bar">
@@ -2123,7 +2150,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     </div>
 
     <!-- TAB 4: Output Devices -->
-    <div class="tab-panel" id="tab-devices" style="display:none;">
+    <div class="tab-panel" id="tab-devices">
       <div class="panel-header">
         <div>
           <span class="panel-title">Output Devices</span>
@@ -2394,13 +2421,13 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     document.querySelectorAll('.tab-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-        document.querySelectorAll('.tab-panel').forEach(p => p.style.display = 'none');
+        document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
 
         btn.classList.add('active');
         const targetId = btn.getAttribute('data-tab');
         const targetPanel = document.getElementById(targetId);
         if (targetPanel) {
-          targetPanel.style.display = targetPanel.classList.contains('centered') ? 'flex' : 'block';
+          targetPanel.classList.add('active');
         }
 
         if (targetId === 'tab-browser' && !currentBrowserData) {
