@@ -408,7 +408,9 @@ impl DeviceManager {
                 *scanning = true;
             }
 
+            let scan_start = std::time::Instant::now();
             let found = discover_devices(Duration::from_millis(2500));
+            let found_count = found.len();
 
             {
                 let mut dev_list = devices_clone.lock().unwrap();
@@ -423,6 +425,16 @@ impl DeviceManager {
                 let mut scanning = scanning_clone.lock().unwrap();
                 *scanning = false;
             }
+
+            crate::logger::log_raw(
+                "PERF",
+                "discovery",
+                &format!(
+                    "DLNA device discovery complete ({} devices found) -> elapsed: {:.2?}",
+                    found_count,
+                    scan_start.elapsed()
+                ),
+            );
         });
     }
 

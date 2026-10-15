@@ -1075,5 +1075,46 @@ fn test_browser_metadata_view_toggle_in_place_and_settings_tab() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_browser_perf_and_scan_lifecycle_tracking() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_perf_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let folder = temp_dir.join("MusicFolder");
+    fs::create_dir_all(&folder).unwrap();
+    for i in 0..5 {
+        create_dummy_wav(&folder.join(format!("song_{}.wav", i)));
+    }
+
+    let config_path = temp_dir.join("config.json");
+    let settings_mgr = SettingsManager::with_path(config_path);
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    // Initial load: AppUI::new navigates to temp_dir
+    assert!(!app.browser_loading);
+    assert!(app.browser_load_start.is_none());
+
+    // Navigate to folder
+    app.navigate_browser(folder.clone());
+    // Since folder is small, fast path reads it immediately and fires DirScanEvent::Complete
+    assert!(!app.browser_loading);
+    assert!(app.browser_load_start.is_none());
+    assert!(app.browser_entries.iter().any(|(_, p, is_dir)| !*is_dir && p.ends_with("song_0.wav")));
+
+    // When cached, refresh_browser is instant and browser_load_start remains None
+    app.refresh_browser();
+    assert!(!app.browser_loading);
+    assert!(app.browser_load_start.is_none());
+
+    // When cache is cleared, refresh_browser triggers a fresh scan
+    app.browser_dir_cache.remove(&folder);
+    app.refresh_browser();
+    assert!(!app.browser_loading);
+    assert!(app.browser_load_start.is_none());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
 
 

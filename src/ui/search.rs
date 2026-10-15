@@ -41,6 +41,7 @@ pub struct SearchModalState {
     pub is_scanning: bool,
     pub scan_receiver: Option<Receiver<Vec<AudioMetadata>>>,
     pub stop_flag: Option<Arc<AtomicBool>>,
+    pub scan_start: Option<std::time::Instant>,
     pub spinner_frame: usize,
 }
 
@@ -56,6 +57,11 @@ impl SearchModalState {
         stop_flag: Option<Arc<AtomicBool>>,
     ) -> Self {
         let is_scanning = scan_receiver.is_some();
+        let scan_start = if is_scanning {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let mut state = Self {
             root_dir,
             query: String::new(),
@@ -67,6 +73,7 @@ impl SearchModalState {
             is_scanning,
             scan_receiver,
             stop_flag,
+            scan_start,
             spinner_frame: 0,
         };
 
@@ -163,6 +170,18 @@ impl SearchModalState {
             if disconnected {
                 self.is_scanning = false;
                 self.scan_receiver = None;
+                if let Some(start) = self.scan_start.take() {
+                    crate::logger::log_raw(
+                        "PERF",
+                        "search",
+                        &format!(
+                            "library search scan complete ({} total tracks indexed) for '{}' -> elapsed: {:.2?}",
+                            self.all_tracks.len(),
+                            self.root_dir.display(),
+                            start.elapsed()
+                        ),
+                    );
+                }
             }
         }
         self.spinner_frame = (self.spinner_frame + 1) % 10;
@@ -176,6 +195,20 @@ impl SearchModalState {
     pub fn close(&mut self) {
         if let Some(ref flag) = self.stop_flag {
             flag.store(true, Ordering::Relaxed);
+        }
+        if self.is_scanning {
+            if let Some(start) = self.scan_start.take() {
+                crate::logger::log_raw(
+                    "PERF",
+                    "search",
+                    &format!(
+                        "library search scan cancelled after {:.2?} (indexed {} tracks so far) for '{}'",
+                        start.elapsed(),
+                        self.all_tracks.len(),
+                        self.root_dir.display()
+                    ),
+                );
+            }
         }
         self.is_scanning = false;
         self.scan_receiver = None;

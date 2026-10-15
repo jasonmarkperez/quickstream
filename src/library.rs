@@ -209,6 +209,7 @@ impl LibraryManager {
         tx: Sender<Vec<AudioMetadata>>,
         stop_flag: Arc<AtomicBool>,
     ) {
+        let scan_start = std::time::Instant::now();
         let mut batch = Vec::new();
         let mut new_discovered = Vec::new();
         let mut full_cache = cache.clone();
@@ -258,6 +259,19 @@ impl LibraryManager {
         if !new_discovered.is_empty() {
             let all_tracks: Vec<AudioMetadata> = full_cache.into_values().collect();
             Self::save_cache(&all_tracks);
+        }
+
+        if !stop_flag.load(Ordering::Relaxed) {
+            crate::logger::log_raw(
+                "PERF",
+                "library",
+                &format!(
+                    "directory streaming scan complete ({} newly indexed) for '{}' -> elapsed: {:.2?}",
+                    new_discovered.len(),
+                    dir.display(),
+                    scan_start.elapsed()
+                ),
+            );
         }
     }
 

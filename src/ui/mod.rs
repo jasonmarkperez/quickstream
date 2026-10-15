@@ -254,11 +254,24 @@ impl AppUI {
     }
 
     pub fn refresh_browser(&mut self) {
-        let _timer = crate::log_perf!("browser", "refresh_browser for '{}'", self.browser_dir.display());
+        let refresh_start = std::time::Instant::now();
         let old_cursor = self.browser_cursor;
 
         if let Some(stop) = self.dir_scan_stop.take() {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if self.browser_loading {
+            if let Some(prev_start) = self.browser_load_start.take() {
+                crate::logger::log_raw(
+                    "PERF",
+                    "browser",
+                    &format!(
+                        "previous directory scan cancelled for '{}' after {:.2?}",
+                        self.browser_dir.display(),
+                        prev_start.elapsed()
+                    ),
+                );
+            }
         }
 
         self.browser_entries.clear();
@@ -279,6 +292,15 @@ impl AppUI {
                 self.browser_state = ListState::default();
                 self.browser_state.select(Some(0));
             }
+            crate::logger::log_raw(
+                "PERF",
+                "browser",
+                &format!(
+                    "bookmarks view loaded ({} bookmarks) -> elapsed: {:.2?}",
+                    self.bookmarks.len(),
+                    refresh_start.elapsed()
+                ),
+            );
             return;
         }
 
@@ -289,6 +311,8 @@ impl AppUI {
             self.browser_entries
                 .push((".. [Parent Directory]".to_string(), parent.to_path_buf(), true));
         }
+
+        let header_count = if self.browser_dir.parent().is_some() { 2 } else { 1 };
 
         // Cache hit: instantaneous display with zero filesystem overhead!
         if let Some(cached) = self.browser_dir_cache.get(&self.browser_dir).cloned() {
@@ -311,6 +335,17 @@ impl AppUI {
                         self.browser_cursor = pos;
                         self.browser_state = ListState::default();
                         self.browser_state.select(Some(pos));
+                        let item_count = self.browser_entries.len().saturating_sub(header_count);
+                        crate::logger::log_raw(
+                            "PERF",
+                            "browser",
+                            &format!(
+                                "directory loaded from cache ({} items) for '{}' -> elapsed: {:.2?}",
+                                item_count,
+                                self.browser_dir.display(),
+                                refresh_start.elapsed()
+                            ),
+                        );
                         return;
                     }
                 }
@@ -324,6 +359,17 @@ impl AppUI {
                 if !cached.unfetched_tracks.is_empty() && self.settings_mgr.settings.metadata_view {
                     self.start_background_metadata_fetch(cached.unfetched_tracks);
                 }
+                let item_count = self.browser_entries.len().saturating_sub(header_count);
+                crate::logger::log_raw(
+                    "PERF",
+                    "browser",
+                    &format!(
+                        "directory loaded from cache ({} items) for '{}' -> elapsed: {:.2?}",
+                        item_count,
+                        self.browser_dir.display(),
+                        refresh_start.elapsed()
+                    ),
+                );
                 return;
             }
         }
@@ -338,7 +384,7 @@ impl AppUI {
         }
 
         self.browser_loading = true;
-        self.browser_load_start = Some(std::time::Instant::now());
+        self.browser_load_start = Some(refresh_start);
 
         self.dir_scan_id += 1;
         let scan_id = self.dir_scan_id;
@@ -350,7 +396,7 @@ impl AppUI {
         let cached_map = self.metadata_cache.clone();
 
         std::thread::spawn(move || {
-            let _t = crate::log_perf!("browser", "background dir scan for '{}'", scan_dir.display());
+            let thread_start = std::time::Instant::now();
             match std::fs::read_dir(&scan_dir) {
                 Ok(entries) => {
                     let mut batch_dirs = Vec::new();
@@ -435,6 +481,16 @@ impl AppUI {
                     }
 
                     if !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        let thread_elapsed = thread_start.elapsed();
+                        crate::logger::log_raw(
+                            "PERF",
+                            "browser",
+                            &format!(
+                                "background read_dir complete for '{}' -> elapsed: {:.2?}",
+                                scan_dir.display(),
+                                thread_elapsed
+                            ),
+                        );
                         let _ = tx.send(DirScanEvent::Complete {
                             scan_id,
                             dir: scan_dir,
@@ -461,6 +517,20 @@ impl AppUI {
             if is_complete || fast_path_start.elapsed() >= std::time::Duration::from_millis(150) {
                 break;
             }
+        }
+
+        if self.browser_loading {
+            let partial_count = self.browser_entries.len().saturating_sub(header_count);
+            crate::logger::log_raw(
+                "DEBUG",
+                "browser",
+                &format!(
+                    "refresh_browser fast-path yielded after {:.2?} ({} items streamed so far), scan continuing in background for '{}'",
+                    refresh_start.elapsed(),
+                    partial_count,
+                    self.browser_dir.display()
+                ),
+            );
         }
     }
 
@@ -515,7 +585,7 @@ impl AppUI {
                     return;
                 }
                 self.browser_loading = false;
-                self.browser_load_start = None;
+                let load_duration = self.browser_load_start.take().map(|s| s.elapsed());
 
                 let header_count = if self.browser_dir.parent().is_some() { 2 } else { 1 };
                 if self.browser_entries.len() > header_count {
@@ -534,6 +604,20 @@ impl AppUI {
                     cached.dirs.sort_by_key(|a| a.0.to_lowercase());
                     cached.files.sort_by_key(|a| a.0.to_lowercase());
                     cached.is_complete = true;
+                }
+
+                let item_count = self.browser_entries.len().saturating_sub(header_count);
+                if let Some(dur) = load_duration {
+                    crate::logger::log_raw(
+                        "PERF",
+                        "browser",
+                        &format!(
+                            "directory scan complete ({} items) for '{}' -> total elapsed: {:.2?}",
+                            item_count,
+                            dir.display(),
+                            dur
+                        ),
+                    );
                 }
 
                 if let Some(target_sub) = self.pending_parent_restore.take() {
@@ -563,7 +647,19 @@ impl AppUI {
                     return;
                 }
                 self.browser_loading = false;
-                self.browser_load_start = None;
+                let dur = self.browser_load_start.take().map(|s| s.elapsed());
+                if let Some(d) = dur {
+                    crate::logger::log_raw(
+                        "PERF",
+                        "browser",
+                        &format!(
+                            "directory scan failed for '{}' after {:.2?}: {}",
+                            dir.display(),
+                            d,
+                            message
+                        ),
+                    );
+                }
                 self.status_message = format!("Error reading directory '{}': {}", dir.display(), message);
             }
         }
@@ -589,11 +685,13 @@ impl AppUI {
     }
 
     pub fn start_background_metadata_fetch(&mut self, paths: Vec<PathBuf>) {
+        let total_tracks = paths.len();
+        let scan_dir_display = self.browser_dir.display().to_string();
         crate::log_info!(
             "browser",
             "Queuing {} tracks for background metadata extraction in '{}'",
-            paths.len(),
-            self.browser_dir.display()
+            total_tracks,
+            scan_dir_display
         );
         if let Some(stop) = self.metadata_worker_stop.take() {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -604,6 +702,8 @@ impl AppUI {
         let tx = self.metadata_tx.clone();
 
         std::thread::spawn(move || {
+            let fetch_start = std::time::Instant::now();
+            let mut extracted = 0;
             for path in paths {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
@@ -614,7 +714,21 @@ impl AppUI {
                     }
                     crate::library::LibraryManager::append_to_cache(&meta);
                     let _ = tx.send(meta);
+                    extracted += 1;
                 }
+            }
+            if !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::logger::log_raw(
+                    "PERF",
+                    "browser",
+                    &format!(
+                        "background metadata extraction complete ({}/{} tracks extracted) for '{}' -> elapsed: {:.2?}",
+                        extracted,
+                        total_tracks,
+                        scan_dir_display,
+                        fetch_start.elapsed()
+                    ),
+                );
             }
         });
     }
@@ -1249,7 +1363,17 @@ impl AppUI {
                         stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     self.browser_loading = false;
-                    self.browser_load_start = None;
+                    if let Some(start) = self.browser_load_start.take() {
+                        crate::logger::log_raw(
+                            "PERF",
+                            "browser",
+                            &format!(
+                                "directory scan cancelled by user for '{}' after {:.2?}",
+                                self.browser_dir.display(),
+                                start.elapsed()
+                            ),
+                        );
+                    }
                     self.status_message = "Cancelled directory scan".to_string();
                     return Ok(false);
                 }
