@@ -19,6 +19,7 @@ It features a native **Ratatui** interactive terminal UI, an in-app recursive **
   - [Local Playback Engine (mpv IPC)](#local-playback-engine-mpv-ipc)
   - [DLNA / UPnP Network Streaming](#dlna--upnp-network-streaming)
   - [HTTP Byte-Range Audio Server](#http-byte-range-audio-server)
+  - [Audio Visualizers & Beat Synchronization](#audio-visualizers--beat-synchronization)
 - [Library Indexing & Search Engine](#library-indexing--search-engine)
 - [Web Interface & Remote Control Dashboard](#web-interface--remote-control-dashboard)
 - [Prerequisites & System Dependencies](#prerequisites--system-dependencies)
@@ -41,12 +42,23 @@ It features a native **Ratatui** interactive terminal UI, an in-app recursive **
   - **Local Audio**: Non-blocking local playback engine via `mpv` JSON-RPC IPC socket with dedicated reader thread, with seamless fallback to headless `ffplay`.
   - **Network Streaming**: Native SSDP multicast discovery (`239.255.255.250:1900`) for UPnP / DLNA MediaRenderers (Sonos, Primare, Denon, Marantz, KEF, etc.) with SOAP remote transport controls.
 
-- **Interactive 3-Tab Terminal Interface**:
-  - **Tab 1 (`[1] Queue & Library`)**: Dual-pane split view featuring an in-place **File Browser** on the left (with persistent directory bookmarks / "Music Homes" and metadata tag toggle `[v]`) and the active **Playback Queue** on the right.
-  - **Tab 2 (`[2] Devices`)**: Lists all discovered network DLNA MediaRenderers alongside **Local Audio** with live active indicator (`●`) and one-key output switching.
-  - **Tab 3 (`[3] Settings`)**: User preferences editor for metadata display, audio backend, seek jump interval, volume step size, queue mode, PCM transcoding, web server toggle, and startup home directory.
+- **Interactive 4-Tab Terminal Interface**:
+  - **Tab 1 (`[1] Now Playing`)**: Dedicated large-format hero display featuring prominent track typography (large title, artist, album), technical format badges (`[FLAC]`, `[24-bit / 96kHz]`, `[Stereo]`), full-width scrubbable timeline, "Up Next" preview, and real-time beat-synced audio visualizers.
+  - **Tab 2 (`[2] Queue & Library`)**: Dual-pane split view featuring an in-place **File Browser** on the left (with persistent directory bookmarks / "Music Homes" and metadata tag toggle `[v]`) and the active **Playback Queue** on the right. Focus toggled with `h` and `l`.
+  - **Tab 3 (`[3] Devices`)**: Lists all discovered network DLNA MediaRenderers alongside **Local Audio** with live active indicator (`●`) and one-key output switching.
+  - **Tab 4 (`[4] Settings`)**: User preferences editor for metadata display, audio backend, seek jump interval, volume step size, queue mode, PCM transcoding, visualizer style, web server toggle, and startup home directory.
   - **Persistent Bottom Playback Bar**: Always visible across all tabs with status badge (`▶`, `⏸`, `⏹`), track title, artist, album, format badge (codec, bitrate, sample rate, channels), volume level, elapsed/total time, and interactive progress bar.
   - **Overlay Help Modal (`?`)**: Full keyboard shortcut cheat-sheet that can be toggled on demand without disrupting playback or navigation.
+
+- **Audio Visualizers & Beat Synchronization**:
+  - Incorporates 5 visualizer modes adapted from [cli-viz](https://github.com/sam1am/cli-viz):
+    - **Spectrum Bars**: Frequency equalizer with adaptive bar widths, bouncing peak-hold indicator dots (`▪`), and Cyan-Magenta-Yellow-Red color gradient.
+    - **Oscilloscope Wave**: Multi-harmonic sinusoidal audio waveform rendered with high-resolution Braille characters (`⠂`, `⠄`, `⡀`, `⣀`, `⣤`) and phase ripples.
+    - **Particle Burst**: Physics-based 2D particle fountain with gravitational drag, ambient trickle, and explosive upward bursts triggered on beat transients.
+    - **Dancing Flame**: 2D cellular automaton fire simulation with thermal diffusion that flares up dynamically to audio energy.
+    - **Matrix Rain**: Cyberpunk cascading green digital code drops with glowing white heads and speed surges on beat drops.
+  - **Lightweight Beat Sync**: Background `ffmpeg` 100Hz envelope extraction (`aeval=abs(val(0)),aresample=100`) with dynamic onset detection and adaptive harmonic tempo fallback (capped complexity, zero microphone permissions or external C audio driver dependencies).
+  - **On-the-Fly Mode Cycling**: Press `m` / `M` to cycle visualizer modes instantly, with choice automatically saved to `config.json`.
 
 - **High-Performance Search**:
   - **In-App Fuzzy Search (`f`)**: Recursive directory search across your entire collection using `fuzzy-matcher` (`SkimMatcherV2`) with streaming background scanner, live preview details card, and non-blocking multi-field matching.
@@ -81,6 +93,7 @@ quickstream/
 │   ├── lib.rs            # Library entrypoint and module exports
 │   ├── ui/
 │   │   ├── mod.rs        # Ratatui event loop, render passes, tab switching, hotkeys, web sync
+│   │   ├── visualizer.rs # 5 visualizer modes (cli-viz), physics simulation, beat sync engine
 │   │   └── search.rs     # SearchModalState, live SkimMatcherV2 fuzzy filtering, preview card
 │   ├── player/
 │   │   ├── mod.rs        # AudioPlayer trait definition (play, pause, resume, stop, seek, volume)
@@ -102,6 +115,7 @@ quickstream/
     ├── test_metadata.rs  # Audio metadata tag extraction and format verification tests
     ├── test_search.rs    # Streaming scanner, fuzzy matching, and multi-field ranking tests
     ├── test_upnp.rs      # SOAP XML envelope generation, time formatting, and player tests
+    ├── test_visualizer.rs # Visualizer modes, beat detection, particle/flame physics, and buffer tests
     └── test_web.rs       # Web server REST endpoints, byte-range streaming, actions, and browser tests
 ```
 
@@ -141,12 +155,13 @@ graph TD
 
 Quickstream is architected for zero UI latency. Heavy operations never run on the terminal event loop:
 
-1. **Terminal UI Thread**: Drives Ratatui drawing and Crossterm input events with a 100ms poll timeout.
+1. **Terminal UI Thread**: Drives Ratatui drawing and Crossterm input events with dynamic frame polling: **33ms (~30 FPS)** when Tab 1 (Now Playing) is active for butter-smooth visualizer animation, and **100ms** on other tabs to minimize CPU consumption.
 2. **Local Audio IPC Thread**: A dedicated reader thread maintains a continuous Unix domain socket connection to `mpv`. It observes `time-pos`, `duration`, `pause`, and `eof-reached` events, updating thread-safe atomic state. The UI thread reads playback state via lock-free memory accesses with 0ms socket latency.
 3. **SSDP Multicast Discovery Thread**: Runs asynchronous UDP scans on `239.255.255.250:1900`, fetching device XML descriptions with timeout guards without blocking tab navigation.
 4. **Background Library Scanner**: Streams discovered audio tracks from disk via an `mpsc::channel` in batches of 50, allowing the fuzzy search modal to open instantly while scanning proceeds in the background.
 5. **Background Metadata Worker**: Extracts ID3/FLAC metadata tags in a separate worker thread for directories being browsed.
 6. **Embedded Web Server Thread**: Runs a lightweight, multi-client HTTP server handling concurrent status polling, cover art delivery, and audio byte-range streaming.
+7. **Background Beat Envelope Worker**: When a track starts playing, extracts a 100Hz audio envelope in a separate thread via `ffmpeg` without blocking playback or UI responsiveness.
 
 ---
 
@@ -174,6 +189,19 @@ Network stereos require HTTP Byte-Range support (`206 Partial Content`) to buffe
 - The streaming server resolves requests against an internal file registry and supports standard `Range: bytes=start-end` headers.
 - **DLNA Profiles**: Streams are served with mandatory DLNA headers (`transferMode.dlna.org: Streaming`, `contentFeatures.dlna.org`).
 - **Clean Socket Teardown**: When a track changes or playback stops, active streaming TCP sockets are forcefully closed (`shutdown(Both)`), cleanly terminating connections and preventing stereos from playing leftover buffer data.
+
+### Audio Visualizers & Beat Synchronization
+
+Quickstream features a dedicated, large-format **Now Playing** tab with 5 animated visualizer modes adapted from [sam1am/cli-viz](https://github.com/sam1am/cli-viz):
+- **Dynamic Beat Synchronization**: When playback begins, Quickstream executes a background `ffmpeg` process to extract a 100Hz rectified audio envelope (`-af aeval=abs(val(0)),aresample=100 -f f32le`). A sliding-window onset detection algorithm tracks dynamic peaks and transient energy deltas.
+- **Harmonic Tempo Fallback**: When streaming network audio or if envelope extraction is unavailable, an adaptive tempo oscillator (125 BPM) generates rhythmic pulses so animations stay lively and musical.
+- **5 Animated Modes**:
+  - `Bars`: Frequency equalizer bars with adaptive widths, peak-hold indicator dots (`▪`), and Cyan-Magenta-Yellow-Red gradient.
+  - `Wave`: Multi-harmonic Braille oscilloscope with sinusoidal ripples (`⠂`, `⠄`, `⡀`, `⣀`, `⣤`).
+  - `Particles`: 2D physics simulation with gravity, velocity drag, and explosive upward fountain bursts on beat hits.
+  - `Flame`: 2D cellular automaton fire simulation that surges in intensity with audio energy.
+  - `Matrix Rain`: Cyberpunk cascading code drops with glowing white heads and speed surges on beat transients.
+- **Hotkeys**: Press `m` / `M` to cycle visualizer styles in real time. Press `n` / `N` to toggle between Now Playing and Queue views.
 
 ---
 
@@ -368,7 +396,9 @@ Press **`?`** anywhere inside Quickstream to open the interactive help modal.
 | `←` / `→` | Skip to Previous / Next track in queue |
 | `[` / `]` | Seek backward 10s / forward 10s |
 | `+` / `-` | Increase / Decrease volume |
-| `1` / `2` / `3` | Jump directly to Tab 1 (Queue), Tab 2 (Devices), or Tab 3 (Settings) |
+| `1` / `2` / `3` / `4` | Jump directly to Tab 1 (Now Playing), Tab 2 (Queue & Library), Tab 3 (Devices), or Tab 4 (Settings) |
+| `n` / `N` | Toggle between **Now Playing** (`[1]`) and **Queue & Library** (`[2]`) |
+| `m` / `M` | Cycle visualizer style (`Bars` → `Wave` → `Particles` → `Flame` → `Matrix Rain`) |
 | `Tab` | Switch between tabs sequentially |
 | `?` | Toggle Help modal cheat-sheet |
 | `q` / `Esc` / `Ctrl+C` | Quit Quickstream safely |
@@ -438,7 +468,8 @@ Quickstream adheres to the [XDG Base Directory Specification](https://specificat
   "player_backend": "mpv",
   "web_server_enabled": false,
   "web_server_port": 8080,
-  "home_dir": "/Users/username/Music"
+  "home_dir": "/Users/username/Music",
+  "visualizer_mode": "bars"
 }
 ```
 

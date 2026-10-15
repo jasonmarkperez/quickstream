@@ -39,7 +39,7 @@ fn test_local_playback_lifecycle() {
     thread::sleep(Duration::from_millis(250));
     let pos_after_seek = player.position_seconds();
     assert!(
-        pos_after_seek >= 3.8 && pos_after_seek <= 4.5,
+        (3.8..=4.5).contains(&pos_after_seek),
         "Position after seek_to(4.0) should be around 4.0s, got {:.3}s",
         pos_after_seek
     );
@@ -49,7 +49,7 @@ fn test_local_playback_lifecycle() {
     thread::sleep(Duration::from_millis(250));
     let pos_after_rel = player.position_seconds();
     assert!(
-        pos_after_rel >= 2.0 && pos_after_rel <= 3.3,
+        (2.0..=3.3).contains(&pos_after_rel),
         "Position after seek(-1.5) should be around 2.5s, got {:.3}s",
         pos_after_rel
     );
@@ -95,7 +95,7 @@ fn test_ffplay_backend_lifecycle() {
     thread::sleep(Duration::from_millis(200));
     let ffplay_pos = player.position_seconds();
     assert!(
-        ffplay_pos >= 3.4 && ffplay_pos <= 4.5,
+        (3.4..=4.5).contains(&ffplay_pos),
         "ffplay position after seek_to(3.5) should be >= 3.4, got {:.3}s",
         ffplay_pos
     );
