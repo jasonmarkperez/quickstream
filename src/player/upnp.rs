@@ -364,9 +364,9 @@ impl UPnPClient {
         }
     }
 
-    /// Send Play command with retries if renderer is transitioning.
+    /// Send Play command with retries if renderer is transitioning or busy.
     pub fn play(&self, speed: &str) -> bool {
-        for _ in 0..3 {
+        for attempt in 0..5 {
             let res = self.send_soap_action(
                 &self.device.av_transport_control_url,
                 AV_TRANSPORT_SERVICE,
@@ -377,7 +377,19 @@ impl UPnPClient {
                 return true;
             }
             let err = self.last_error.lock().unwrap().clone();
-            if err.contains("701") || err.contains("Transition not available") {
+            if err.contains("701")
+                || err.contains("Transition not available")
+                || err.contains("501")
+                || err.contains("Action Failed")
+                || err.contains("705")
+                || err.contains("Transport locked")
+            {
+                crate::log_info!(
+                    "upnp",
+                    "Renderer returned '{}' on Play (attempt {}/5); retrying in 300ms...",
+                    err,
+                    attempt + 1
+                );
                 std::thread::sleep(Duration::from_millis(300));
                 continue;
             }
@@ -748,7 +760,7 @@ impl UPnPPlayer {
 
         // Stop current renderer playback
         let _ = self.client.stop();
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(100));
 
         // Build stream URL with pos offset parameter
         let host_ip = get_local_ip_for_target(&self.device.host, self.device.port);
@@ -807,10 +819,15 @@ impl Drop for UPnPPlayer {
 
 impl AudioPlayer for UPnPPlayer {
     fn play(&mut self, filepath: &Path) -> anyhow::Result<()> {
+        self.play_at(filepath, 0.0)
+    }
+
+    fn play_at(&mut self, filepath: &Path, position_seconds: f64) -> anyhow::Result<()> {
         let _timer = crate::log_perf!(
             "player",
-            "UPnPPlayer::play '{}' on '{}'",
+            "UPnPPlayer::play_at '{}' at {:.2}s on '{}'",
             filepath.display(),
+            position_seconds,
             self.device.friendly_name
         );
 
@@ -821,7 +838,7 @@ impl AudioPlayer for UPnPPlayer {
             ss.register_file(filepath);
         }
         let _ = self.client.stop();
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(100));
 
         // 2. Resolve local IP routable to renderer and construct stream URL
         let host_ip = get_local_ip_for_target(&self.device.host, self.device.port);
@@ -830,7 +847,14 @@ impl AudioPlayer for UPnPPlayer {
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| "track".to_string());
         let encoded_name = url_encode(&file_name);
-        let stream_url = format!("http://{}:{}/stream/{}", host_ip, self.web_port, encoded_name);
+        let stream_url = if position_seconds > 0.0 {
+            format!(
+                "http://{}:{}/stream/{}?pos={:.2}",
+                host_ip, self.web_port, encoded_name, position_seconds
+            )
+        } else {
+            format!("http://{}:{}/stream/{}", host_ip, self.web_port, encoded_name)
+        };
         crate::log_info!("player", "UPnP stream URL for '{}': {}", filepath.display(), stream_url);
 
         // 3. Extract audio metadata & MIME type
@@ -842,8 +866,8 @@ impl AudioPlayer for UPnPPlayer {
         };
 
         *self.duration_seconds.lock().unwrap() = duration;
-        *self.position_seconds.lock().unwrap() = 0.0;
-        *self.playback_stream_offset.lock().unwrap() = 0.0;
+        *self.position_seconds.lock().unwrap() = position_seconds;
+        *self.playback_stream_offset.lock().unwrap() = position_seconds;
         *self.last_seek_time.lock().unwrap() = Instant::now() - Duration::from_secs(10);
         *self.current_filepath.lock().unwrap() = Some(filepath.to_path_buf());
         self.track_finished.store(false, Ordering::SeqCst);
@@ -855,7 +879,7 @@ impl AudioPlayer for UPnPPlayer {
             anyhow::bail!("SetAVTransportURI failed on {}: {}", self.device.friendly_name, err);
         }
 
-        // 5. Send Play command
+        // 5. Send Play command (UPnPClient::play automatically retries on 501 Action Failed / 701 Transition not available)
         if !self.client.play("1") {
             let err = self.client.last_error.lock().unwrap().clone();
             crate::log_info!("player", "Play command failed on {}: {}", self.device.friendly_name, err);

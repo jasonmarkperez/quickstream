@@ -1751,13 +1751,8 @@ impl AppUI {
                 if let Ok(mut s) = self.web_state.write() {
                     s.filepath = Some(track.filepath.clone());
                 }
-                if new_player.play(&track.filepath).is_ok() {
-                    if pos > 0.0 {
-                        let _ = new_player.seek_to(pos);
-                    }
-                    if was_paused {
-                        let _ = new_player.pause();
-                    }
+                if new_player.play_at(&track.filepath, pos).is_ok() && was_paused {
+                    let _ = new_player.pause();
                 }
             }
         }
@@ -1799,11 +1794,8 @@ impl AppUI {
                 if let Ok(mut s) = self.web_state.write() {
                     s.filepath = Some(track.filepath.clone());
                 }
-                match upnp_player.play(&track.filepath) {
+                match upnp_player.play_at(&track.filepath, pos) {
                     Ok(_) => {
-                        if pos > 0.0 {
-                            let _ = upnp_player.seek_to(pos);
-                        }
                         if was_paused {
                             let _ = upnp_player.pause();
                         }

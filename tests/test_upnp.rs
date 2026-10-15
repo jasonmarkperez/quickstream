@@ -897,3 +897,204 @@ fn test_upnp_player_stopped_early_does_not_auto_advance() {
     let _ = handle.join();
 }
 
+#[test]
+fn test_upnp_client_play_retries_on_action_failed() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock renderer");
+    let port = listener.local_addr().unwrap().port();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_flag_thread = stop_flag.clone();
+    let play_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let play_attempts_thread = play_attempts.clone();
+
+    let handle = std::thread::spawn(move || {
+        while !stop_flag_thread.load(Ordering::SeqCst) {
+            listener.set_nonblocking(true).expect("set nonblocking");
+            let stream_opt = match listener.accept() {
+                Ok((s, _)) => Some(s),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(15));
+                    continue;
+                }
+                Err(_) => break,
+            };
+
+            if let Some(mut stream) = stream_opt {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
+                    continue;
+                }
+
+                let mut soap_action = String::new();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                        break;
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.to_lowercase().starts_with("soapaction:") {
+                        soap_action = trimmed.split(':').skip(1).collect::<Vec<_>>().join(":");
+                    } else if trimmed.to_lowercase().starts_with("content-length:") {
+                        if let Some(v) = trimmed.split(':').nth(1) {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+
+                let mut body = vec![0u8; content_length];
+                if content_length > 0 {
+                    let _ = reader.read_exact(&mut body);
+                }
+
+                let (status_line, resp_body) = if soap_action.contains("Play") {
+                    let count = play_attempts_thread.fetch_add(1, Ordering::SeqCst);
+                    if count < 2 {
+                        // Return 501 Action Failed on first 2 attempts
+                        (
+                            "HTTP/1.1 500 Internal Server Error",
+                            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>501</errorCode><errorDescription>Action Failed</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#.to_string()
+                        )
+                    } else {
+                        // Succeed on 3rd attempt
+                        (
+                            "HTTP/1.1 200 OK",
+                            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1" /></s:Body></s:Envelope>"#.to_string()
+                        )
+                    }
+                } else {
+                    ("HTTP/1.1 200 OK", r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:SuccessResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1" /></s:Body></s:Envelope>"#.to_string())
+                };
+
+                let response = format!(
+                    "{}\r\nContent-Type: text/xml; charset=\"utf-8\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_line,
+                    resp_body.len(),
+                    resp_body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        }
+    });
+
+    let device = DLNADevice {
+        udn: "uuid:test-play-retry-action-failed".to_string(),
+        friendly_name: "Mock DLNA Stereo".to_string(),
+        model_name: "Living Room".to_string(),
+        manufacturer: "Primare".to_string(),
+        host: "127.0.0.1".to_string(),
+        port,
+        location: format!("http://127.0.0.1:{}/desc.xml", port),
+        av_transport_control_url: format!("http://127.0.0.1:{}/ctrl/AVTransport", port),
+        rendering_control_url: format!("http://127.0.0.1:{}/ctrl/RenderingControl", port),
+    };
+
+    let client = UPnPClient::new(device);
+    assert!(client.play("1"), "Play must succeed after retrying on 501 Action Failed");
+    assert_eq!(play_attempts.load(Ordering::SeqCst), 3, "Play should have retried and succeeded on attempt 3");
+
+    stop_flag.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
+    let _ = handle.join();
+}
+
+#[test]
+fn test_upnp_player_play_at_starts_directly_with_pos_offset() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock renderer");
+    let port = listener.local_addr().unwrap().port();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_flag_thread = stop_flag.clone();
+    let last_set_uri = Arc::new(std::sync::Mutex::new(String::new()));
+    let last_set_uri_thread = last_set_uri.clone();
+
+    let handle = std::thread::spawn(move || {
+        while !stop_flag_thread.load(Ordering::SeqCst) {
+            listener.set_nonblocking(true).expect("set nonblocking");
+            let stream_opt = match listener.accept() {
+                Ok((s, _)) => Some(s),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(15));
+                    continue;
+                }
+                Err(_) => break,
+            };
+
+            if let Some(mut stream) = stream_opt {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
+                    continue;
+                }
+
+                let mut soap_action = String::new();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                        break;
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.to_lowercase().starts_with("soapaction:") {
+                        soap_action = trimmed.split(':').skip(1).collect::<Vec<_>>().join(":");
+                    } else if trimmed.to_lowercase().starts_with("content-length:") {
+                        if let Some(v) = trimmed.split(':').nth(1) {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+
+                let mut body = vec![0u8; content_length];
+                if content_length > 0 {
+                    let _ = reader.read_exact(&mut body);
+                }
+                let body_str = String::from_utf8_lossy(&body);
+
+                if soap_action.contains("SetAVTransportURI") {
+                    if let Some(start) = body_str.find("<CurrentURI>") {
+                        if let Some(end) = body_str[start..].find("</CurrentURI>") {
+                            let uri = &body_str[start + 12..start + end];
+                            *last_set_uri_thread.lock().unwrap() = uri.to_string();
+                        }
+                    }
+                }
+
+                let response = "HTTP/1.1 200 OK\r\nContent-Type: text/xml; charset=\"utf-8\"\r\nContent-Length: 298\r\nConnection: close\r\n\r\n<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:SuccessResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\" /></s:Body></s:Envelope>";
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        }
+    });
+
+    let device = DLNADevice {
+        udn: "uuid:test-play-at".to_string(),
+        friendly_name: "Mock DLNA Stereo".to_string(),
+        model_name: "Living Room".to_string(),
+        manufacturer: "Primare".to_string(),
+        host: "127.0.0.1".to_string(),
+        port,
+        location: format!("http://127.0.0.1:{}/desc.xml", port),
+        av_transport_control_url: format!("http://127.0.0.1:{}/ctrl/AVTransport", port),
+        rendering_control_url: format!("http://127.0.0.1:{}/ctrl/RenderingControl", port),
+    };
+
+    let mut player = UPnPPlayer::new(device, 8080);
+    let temp_file = std::env::temp_dir().join("test_upnp_play_at.mp3");
+    let _ = std::fs::write(&temp_file, b"DUMMY_MP3_DATA");
+
+    assert!(player.play_at(&temp_file, 4.67).is_ok());
+    assert_eq!(player.position_seconds(), 4.67);
+    assert!(player.is_playing());
+
+    let uri = last_set_uri.lock().unwrap().clone();
+    assert!(uri.contains("?pos=4.67"), "URI must directly include ?pos=4.67 on initial handoff, got: {}", uri);
+
+    let _ = player.stop();
+    let _ = std::fs::remove_file(temp_file);
+    stop_flag.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
+    let _ = handle.join();
+}
+

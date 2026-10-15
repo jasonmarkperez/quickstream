@@ -7,6 +7,13 @@ use std::path::Path;
 
 pub trait AudioPlayer: Send + Sync {
     fn play(&mut self, filepath: &Path) -> anyhow::Result<()>;
+    fn play_at(&mut self, filepath: &Path, position_seconds: f64) -> anyhow::Result<()> {
+        self.play(filepath)?;
+        if position_seconds > 0.0 {
+            self.seek_to(position_seconds)?;
+        }
+        Ok(())
+    }
     fn pause(&mut self) -> anyhow::Result<()>;
     fn resume(&mut self) -> anyhow::Result<()>;
     fn toggle_pause(&mut self) -> anyhow::Result<bool>;
