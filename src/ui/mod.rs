@@ -2567,16 +2567,26 @@ impl AppUI {
             .style(Style::default().bg(Color::Black));
         f.render_widget(block, area);
 
-        let inner = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(14),   // 2-column key list
-                Constraint::Length(1), // Footer instruction
-            ])
-            .margin(1)
-            .split(area);
+        let inner = if area.height >= 17 {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(14),   // 2-column key list
+                    Constraint::Length(1), // Footer instruction
+                ])
+                .margin(1)
+                .split(area)
+        } else {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(1),
+                ])
+                .margin(1)
+                .split(area)
+        };
 
-        if inner.len() < 2 {
+        if inner.is_empty() {
             return;
         }
 
@@ -2592,60 +2602,62 @@ impl AppUI {
             return;
         }
 
-        // Left Column: Playback & Navigation
+        // Left Column: Playback & Navigation (concise to guarantee <= 34 chars)
         let left_lines = vec![
             Self::help_section_header("PLAYBACK & AUDIO"),
             Self::help_key_line("Space", "Play / Pause"),
             Self::help_key_line("s", "Stop playback"),
             Self::help_key_line("← / →", "Previous / Next track"),
-            Self::help_key_line("[ / ]", "Seek -10s / +10s (Shift+←/→)"),
+            Self::help_key_line("[ / ]", "Seek -10s / +10s"),
             Self::help_key_line("+ / -", "Volume Up / Down"),
             Line::from(""),
             Self::help_section_header("NAVIGATION & PANES"),
             Self::help_key_line("h / l", "Focus Browser ↔ Queue"),
-            Self::help_key_line("j / k", "Move cursor Up / Down (wraps)"),
-            Self::help_key_line("J / K", "Page Down / Up (Shift+↑/↓)"),
-            Self::help_key_line("g / G", "Jump to Start / End of list"),
-            Self::help_key_line("Backspace", "Go up to parent directory"),
-            Self::help_key_line("1 / 2 / 3", "Switch Tabs (or Tab key)"),
+            Self::help_key_line("j / k", "Move Up / Down (wraps)"),
+            Self::help_key_line("J / K", "Page Down / Up"),
+            Self::help_key_line("g / G", "Jump to Start / End"),
+            Self::help_key_line("Bksp", "Go up to parent dir"),
+            Self::help_key_line("1 / 2 / 3", "Switch active tab"),
         ];
         f.render_widget(Paragraph::new(left_lines), cols[0]);
 
-        // Right Column: Library & Search
+        // Right Column: Library & Search (concise to guarantee <= 34 chars)
         let right_lines = vec![
             Self::help_section_header("LIBRARY & QUEUE"),
-            Self::help_key_line("Enter", "Open folder / Queue / Play"),
-            Self::help_key_line("a", "Add all songs in folder to queue"),
-            Self::help_key_line("d / x", "Remove track or bookmark (Del)"),
-            Self::help_key_line("c", "Clear entire queue (queue pane)"),
-            Self::help_key_line("b", "Bookmark folder in Music Homes"),
-            Self::help_key_line("v", "Toggle metadata tags vs filenames"),
-            Self::help_key_line("r", "Refresh directory contents"),
+            Self::help_key_line("Enter", "Open / Queue / Play"),
+            Self::help_key_line("a", "Add all songs in folder"),
+            Self::help_key_line("d / x", "Remove track / bookmark"),
+            Self::help_key_line("c", "Clear queue (queue pane)"),
+            Self::help_key_line("b", "Bookmark folder in Homes"),
+            Self::help_key_line("v", "Toggle tags vs filenames"),
+            Self::help_key_line("r", "Refresh folder contents"),
             Line::from(""),
             Self::help_section_header("SEARCH & DISCOVERY"),
-            Self::help_key_line("/", "Spotlight jump to subfolder"),
-            Self::help_key_line("f", "Full library fuzzy search (Skim)"),
-            Self::help_key_line("r", "Rescan DLNA renderers (Devices)"),
+            Self::help_key_line("/", "Spotlight jump in folder"),
+            Self::help_key_line("f", "Full library fuzzy search"),
+            Self::help_key_line("r", "Rescan DLNA renderers"),
         ];
         f.render_widget(Paragraph::new(right_lines), cols[1]);
 
-        // Footer: dismiss instruction
-        let footer_line = Line::from(vec![
-            Span::styled("Press ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[?]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(", ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[Esc]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(", or ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[q]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(" to close this cheat-sheet", Style::default().fg(Color::DarkGray)),
-        ]);
-        f.render_widget(Paragraph::new(footer_line).alignment(Alignment::Center), inner[1]);
+        // Footer: dismiss instruction (if vertical room allows)
+        if inner.len() >= 2 {
+            let footer_line = Line::from(vec![
+                Span::styled("Press ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[?]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(", ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[Esc]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(", or ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[q]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(" to close", Style::default().fg(Color::DarkGray)),
+            ]);
+            f.render_widget(Paragraph::new(footer_line).alignment(Alignment::Center), inner[1]);
+        }
     }
 
     fn help_section_header(title: &str) -> Line<'static> {
         Line::from(vec![
             Span::styled(
-                format!("  {}  ", title),
+                format!("── {} ──", title),
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ),
         ])
@@ -2654,7 +2666,7 @@ impl AppUI {
     fn help_key_line(key: &str, desc: &str) -> Line<'static> {
         Line::from(vec![
             Span::styled(
-                format!("  {:11}", key),
+                format!(" {:<7} ", key),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
             Span::styled(desc.to_string(), Style::default().fg(Color::White)),
@@ -2683,8 +2695,13 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 fn help_modal_rect(r: Rect) -> Rect {
-    let target_width = 88.min(r.width.saturating_sub(4)).max(40).min(r.width);
-    let target_height = 20.min(r.height.saturating_sub(2)).max(10).min(r.height);
+    let max_w = if r.width >= 96 {
+        90
+    } else {
+        r.width.saturating_sub(2)
+    };
+    let target_width = max_w.min(r.width);
+    let target_height = 19.min(r.height.saturating_sub(2)).min(r.height);
 
     let x = r.x + (r.width.saturating_sub(target_width)) / 2;
     let y = r.y + (r.height.saturating_sub(target_height)) / 2;
