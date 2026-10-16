@@ -36,53 +36,91 @@ impl MoodType {
     }
 
     pub fn matches_features(&self, feat: &TrackFeatures) -> bool {
-        let (min_bpm, max_bpm) = self.bpm_range();
-        let bpm_ok = feat.bpm.map(|b| b >= min_bpm && b <= max_bpm).unwrap_or(true);
+        let meta = AudioMetadata {
+            filepath: feat.filepath.clone(),
+            title: feat.title.clone(),
+            artist: feat.artist.clone(),
+            album: feat.album.clone(),
+            genre: feat.genre.clone(),
+            ..Default::default()
+        };
+        self.matches_track(&meta, Some(feat))
+    }
 
-        let tags_lower = feat.tags_json.to_lowercase();
-        let genre_lower = feat.genre.to_lowercase();
-        let combined = format!("{} {}", tags_lower, genre_lower);
+    pub fn matches_track(&self, meta: &AudioMetadata, feat: Option<&TrackFeatures>) -> bool {
+        let (min_bpm, max_bpm) = self.bpm_range();
+        let feat_bpm = feat.and_then(|f| f.bpm);
+        let bpm_ok = if let Some(b) = feat_bpm {
+            (b >= min_bpm && b <= max_bpm)
+                || (b >= min_bpm * 0.5 && b <= max_bpm * 0.5)
+                || (b >= min_bpm * 2.0 && b <= max_bpm * 2.0)
+        } else {
+            true
+        };
+
+        let tags_lower = feat.map(|f| f.tags_json.to_lowercase()).unwrap_or_default();
+        let feat_genre = feat.map(|f| f.genre.to_lowercase()).unwrap_or_default();
+        let meta_genre = meta.genre.to_lowercase();
+        let path_lower = meta.filepath.to_string_lossy().to_lowercase();
+        let album_lower = meta.album.to_lowercase();
+        let title_lower = meta.title.to_lowercase();
+        let artist_lower = meta.artist.to_lowercase();
+
+        let energy = feat.and_then(|f| f.energy);
+
+        let has_term = |terms: &[&str]| -> bool {
+            for &term in terms {
+                if meta_genre.contains(term)
+                    || feat_genre.contains(term)
+                    || tags_lower.contains(term)
+                    || path_lower.contains(term)
+                    || album_lower.contains(term)
+                    || title_lower.contains(term)
+                    || artist_lower.contains(term)
+                {
+                    return true;
+                }
+            }
+            false
+        };
 
         match self {
             MoodType::Chill => {
-                bpm_ok && (
-                    combined.contains("chill")
-                    || combined.contains("ambient")
-                    || combined.contains("acoustic")
-                    || combined.contains("classical")
-                    || combined.contains("downtempo")
-                    || combined.contains("lofi")
-                    || feat.energy.map(|e| e <= 0.50).unwrap_or(false)
-                )
+                let chill_terms = [
+                    "chill", "ambient", "downtempo", "lofi", "lo-fi", "acoustic",
+                    "classical", "meditation", "sleep", "drone", "trip hop", "trip-hop",
+                    "idm", "easy listening", "new age", "relax", "mellow", "piano",
+                    "peaceful", "soft", "calm", "zen",
+                ];
+                let energy_ok = energy.map(|e| e <= 0.50).unwrap_or(false);
+                bpm_ok && (has_term(&chill_terms) || energy_ok)
             }
             MoodType::Workout => {
-                bpm_ok && (
-                    combined.contains("dance")
-                    || combined.contains("electronic")
-                    || combined.contains("rock")
-                    || combined.contains("house")
-                    || combined.contains("techno")
-                    || combined.contains("upbeat")
-                    || feat.energy.map(|e| e >= 0.65).unwrap_or(false)
-                )
+                let workout_terms = [
+                    "dance", "electronic", "rock", "house", "techno", "upbeat",
+                    "workout", "fitness", "metal", "drum and bass", "dnb", "trance",
+                    "edm", "hip hop", "hip-hop", "rap", "punk", "hardcore", "club",
+                    "gym", "fast", "party",
+                ];
+                let energy_ok = energy.map(|e| e >= 0.65).unwrap_or(false);
+                bpm_ok && (has_term(&workout_terms) || energy_ok)
             }
             MoodType::Focus => {
-                combined.contains("instrumental")
-                || combined.contains("piano")
-                || combined.contains("soundtrack")
-                || combined.contains("synthwave")
-                || combined.contains("minimal")
-                || combined.contains("ambient")
+                let focus_terms = [
+                    "instrumental", "piano", "soundtrack", "synthwave", "minimal",
+                    "minimalist", "ambient", "classical", "study", "post-rock",
+                    "score", "film score", "neo-classical", "electronic", "meditation",
+                ];
+                let energy_ok = energy.map(|e| e <= 0.60).unwrap_or(false);
+                has_term(&focus_terms) || energy_ok
             }
             MoodType::Groove => {
-                bpm_ok && (
-                    combined.contains("funk")
-                    || combined.contains("soul")
-                    || combined.contains("disco")
-                    || combined.contains("groove")
-                    || combined.contains("r&b")
-                    || combined.contains("house")
-                )
+                let groove_terms = [
+                    "funk", "soul", "disco", "groove", "r&b", "rhythm and blues",
+                    "house", "boogie", "nu-disco", "motown", "afrobeat", "jazz-funk",
+                    "acid jazz", "dance", "funky",
+                ];
+                bpm_ok && has_term(&groove_terms)
             }
         }
     }
@@ -164,12 +202,19 @@ impl DjMixer {
             for (idx, (meta, feat)) in track_items.iter().enumerate() {
                 let mut score: i64 = 100;
 
-                // Penalize repeating recent artists
+                // Strongly penalize back-to-back identical artist
+                if let Some(last) = sequenced.last() {
+                    if !meta.artist.is_empty() && meta.artist == last.artist {
+                        score -= 50_000;
+                    }
+                }
+
+                // Penalize repeating recent artists heavily to enforce diversity
                 if !meta.artist.is_empty() {
                     if let Some(pos) = recent_artists.iter().rposition(|a| a == &meta.artist) {
                         let distance = recent_artists.len() - pos;
                         if distance < 8 {
-                            score -= (8 - distance as i64) * 40;
+                            score -= (8 - distance as i64) * 2000;
                         }
                     }
                 }
@@ -179,7 +224,7 @@ impl DjMixer {
                     if let Some(pos) = recent_albums.iter().rposition(|a| a == &meta.album) {
                         let distance = recent_albums.len() - pos;
                         if distance < 12 {
-                            score -= (12 - distance as i64) * 25;
+                            score -= (12 - distance as i64) * 500;
                         }
                     }
                 }
@@ -209,6 +254,12 @@ impl DjMixer {
                     best_score = score;
                     best_idx = idx;
                 }
+            }
+
+            // In multi-artist mixes, strictly prevent consecutive back-to-back identical artist tracks
+            let unique_artists_count = recent_artists.iter().collect::<std::collections::HashSet<_>>().len();
+            if unique_artists_count > 1 && best_score <= -40_000 {
+                break;
             }
 
             let (chosen_meta, _) = track_items.remove(best_idx);

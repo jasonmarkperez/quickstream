@@ -393,8 +393,35 @@ impl LibraryManager {
             let file_len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             if let Some(cached) = cache.get(path) {
                 if cached.file_size == file_len && !cached.title.is_empty() {
-                    return cached.clone();
+                    let mut meta = cached.clone();
+                    if meta.genre.is_empty() {
+                        if let Some(feat) = db.get_track(path) {
+                            if !feat.genre.is_empty() {
+                                meta.genre = feat.genre;
+                            }
+                        }
+                    }
+                    return meta;
                 }
+            }
+            if let Some(feat) = db.get_track(path) {
+                let (title, artist, album) = Self::parse_path_heuristics(path);
+                return AudioMetadata {
+                    filepath: path.to_path_buf(),
+                    filename: path.file_name().and_then(|f| f.to_str()).unwrap_or("track").to_string(),
+                    title: if !feat.title.is_empty() { feat.title } else { title },
+                    artist: if !feat.artist.is_empty() { feat.artist } else { artist },
+                    album: if !feat.album.is_empty() { feat.album } else { album },
+                    genre: feat.genre,
+                    format_name: path.extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase(),
+                    file_size: file_len,
+                    sample_rate_hz: 44100,
+                    channels: 2,
+                    ..Default::default()
+                };
+            }
+            if let Ok(meta) = crate::metadata::extract_metadata(path) {
+                return meta;
             }
             let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("track");
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase();
@@ -413,113 +440,12 @@ impl LibraryManager {
             }
         };
 
-        // If a specialized mix profile is active (BPM Flow, Mood Vibe, or Seed Radio),
-        // we gather candidate tracks, evaluate acoustic features, and run DjMixer sequence!
-        if profile != crate::analysis::MixProfile::DiverseShuffle {
-            let mut candidates: Vec<AudioMetadata> = Vec::new();
-            for entry in WalkDir::new(&dir)
-                .max_depth(4)
-                .follow_links(false)
-                .into_iter()
-                .filter_entry(|e| {
-                    let name = e.file_name().to_string_lossy();
-                    !name.starts_with('.') && name != "#recycle" && name != "$RECYCLE.BIN"
-                })
-            {
-                if stop_flag.load(Ordering::Relaxed) || candidates.len() >= 150 {
-                    break;
-                }
-                if let Ok(e) = entry {
-                    if e.file_type().is_file() && is_supported_audio_file(e.path()) {
-                        let meta = make_metadata(e.path());
-                        candidates.push(meta);
-                    }
-                }
-            }
-
-            let filtered: Vec<AudioMetadata> = match &profile {
-                crate::analysis::MixProfile::BpmFlow { target_bpm, tolerance } => {
-                    let min_bpm = target_bpm * (1.0 - tolerance);
-                    let max_bpm = target_bpm * (1.0 + tolerance);
-                    let matched: Vec<AudioMetadata> = candidates
-                        .iter()
-                        .filter(|m| {
-                            let feat = db.get_track(&m.filepath);
-                            if let Some(b) = feat.and_then(|f| f.bpm) {
-                                (b >= min_bpm && b <= max_bpm) || (b >= min_bpm / 2.0 && b <= max_bpm / 2.0)
-                            } else {
-                                false
-                            }
-                        })
-                        .cloned()
-                        .collect();
-                    if matched.is_empty() {
-                        candidates
-                    } else {
-                        matched
-                    }
-                }
-                crate::analysis::MixProfile::MoodVibe(mood) => {
-                    let matched: Vec<AudioMetadata> = candidates
-                        .iter()
-                        .filter(|m| {
-                            let feat = db.get_track(&m.filepath).unwrap_or_default();
-                            mood.matches_features(&feat)
-                        })
-                        .cloned()
-                        .collect();
-                    if matched.is_empty() {
-                        candidates
-                    } else {
-                        matched
-                    }
-                }
-                crate::analysis::MixProfile::SeedRadio(seed_path) => {
-                    let seed_feat = db.get_track(seed_path).unwrap_or_default();
-                    candidates
-                        .into_iter()
-                        .filter(|m| {
-                            if &m.filepath == seed_path {
-                                return false;
-                            }
-                            if !seed_feat.genre.is_empty() && m.genre.eq_ignore_ascii_case(&seed_feat.genre) {
-                                return true;
-                            }
-                            if !seed_feat.artist.is_empty() && m.artist.eq_ignore_ascii_case(&seed_feat.artist) {
-                                return true;
-                            }
-                            true
-                        })
-                        .collect()
-                }
-                _ => candidates,
-            };
-
-            let sequenced = crate::analysis::mixer::DjMixer::sequence_mix(filtered, &db, target_limit);
-
-            for track in sequenced {
-                if stop_flag.load(Ordering::Relaxed) {
-                    return;
-                }
-                if tx.send(AutopilotEvent::Track(track)).is_ok() {
-                    total_sent += 1;
-                }
-            }
-
-            if !stop_flag.load(Ordering::Relaxed) {
-                let _ = tx.send(AutopilotEvent::Finished(total_sent));
-            }
-            return;
-        }
-
-        // 1. Determine subdirectories:
-        // If known_subdirs already contains plenty of subdirectories (e.g. from the active browser),
-        // we reuse them immediately to avoid an expensive fs::read_dir call over the network!
-        let mut subdirs = if known_subdirs.len() >= target_limit {
-            known_subdirs
+        // 1. Determine subdirectories and immediate files in dir
+        let (mut subdirs, mut immediate_files) = if known_subdirs.len() >= target_limit {
+            (known_subdirs, Vec::new())
         } else {
             let mut found_subdirs = Vec::new();
-            let mut immediate_files = Vec::new();
+            let mut found_files = Vec::new();
 
             if let Ok(entries) = fs::read_dir(&dir) {
                 for entry in entries.flatten() {
@@ -549,40 +475,271 @@ impl LibraryManager {
                     if is_dir {
                         found_subdirs.push(path);
                     } else if is_supported_audio_file(&path) {
-                        immediate_files.push(path);
+                        found_files.push(path);
                     }
                 }
             }
+            (found_subdirs, found_files)
+        };
 
-            // If we found immediate files, stream a few right away
+        // Shuffle subdirectories for fair and diverse library sampling
+        rng.shuffle(&mut subdirs);
+
+        // 2. If specialized mix profile is active (BPM Flow, Mood Vibe, or Seed Radio),
+        // gather a fair candidate pool across shuffled subdirectories, evaluate acoustic features, and run DjMixer!
+        if profile != crate::analysis::MixProfile::DiverseShuffle {
+            let mut candidates: Vec<AudioMetadata> = Vec::new();
+
+            if !subdirs.is_empty() {
+                // Determine fair candidate quota per artist subdirectory
+                let per_subdir = if subdirs.len() >= 60 {
+                    2
+                } else if subdirs.len() >= 20 {
+                    3
+                } else if subdirs.len() >= 5 {
+                    4
+                } else {
+                    15
+                };
+
+                // Include immediate files if any
+                if !immediate_files.is_empty() {
+                    rng.shuffle(&mut immediate_files);
+                    for f in immediate_files.iter().take(per_subdir) {
+                        candidates.push(make_metadata(f));
+                    }
+                }
+
+                let mut extra_candidates: Vec<PathBuf> = Vec::new();
+
+                for subdir in &subdirs {
+                    if stop_flag.load(Ordering::Relaxed) || candidates.len() >= 150 {
+                        break;
+                    }
+                    let mut folder_tracks = Vec::new();
+                    for entry in WalkDir::new(subdir)
+                        .max_depth(3)
+                        .follow_links(false)
+                        .into_iter()
+                        .filter_entry(|e| {
+                            let name = e.file_name().to_string_lossy();
+                            !name.starts_with('.') && name != "#recycle" && name != "$RECYCLE.BIN"
+                        })
+                        .filter_map(|e| e.ok())
+                    {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let path = entry.path();
+                        if path.is_file() && is_supported_audio_file(path) {
+                            folder_tracks.push(path.to_path_buf());
+                            if folder_tracks.len() >= 30 {
+                                break;
+                            }
+                        }
+                    }
+
+                    if !folder_tracks.is_empty() {
+                        rng.shuffle(&mut folder_tracks);
+                        for (i, p) in folder_tracks.into_iter().enumerate() {
+                            if i < per_subdir && candidates.len() < 150 {
+                                candidates.push(make_metadata(&p));
+                            } else {
+                                extra_candidates.push(p);
+                            }
+                        }
+                    }
+                }
+
+                // If candidate pool is still small, draw extra tracks while strictly capping any single artist
+                if candidates.len() < 60 && !extra_candidates.is_empty() {
+                    let max_per_artist = (per_subdir * 2).max(4);
+                    let mut artist_counts: HashMap<String, usize> = HashMap::new();
+                    for c in &candidates {
+                        if !c.artist.is_empty() {
+                            *artist_counts.entry(c.artist.clone()).or_insert(0) += 1;
+                        }
+                    }
+
+                    rng.shuffle(&mut extra_candidates);
+                    for p in extra_candidates {
+                        if stop_flag.load(Ordering::Relaxed) || candidates.len() >= 150 {
+                            break;
+                        }
+                        let meta = make_metadata(&p);
+                        let count = if !meta.artist.is_empty() {
+                            *artist_counts.get(&meta.artist).unwrap_or(&0)
+                        } else {
+                            0
+                        };
+                        if count < max_per_artist {
+                            if !meta.artist.is_empty() {
+                                *artist_counts.entry(meta.artist.clone()).or_insert(0) += 1;
+                            }
+                            candidates.push(meta);
+                        }
+                    }
+                }
+            } else {
+                // Flat folder with no subdirectories: sample directly from files
+                let mut all_files = immediate_files.clone();
+                if all_files.is_empty() {
+                    for entry in WalkDir::new(&dir)
+                        .max_depth(3)
+                        .follow_links(false)
+                        .into_iter()
+                        .filter_entry(|e| {
+                            let name = e.file_name().to_string_lossy();
+                            !name.starts_with('.') && name != "#recycle" && name != "$RECYCLE.BIN"
+                        })
+                        .filter_map(|e| e.ok())
+                    {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let p = entry.path();
+                        if p.is_file() && is_supported_audio_file(p) {
+                            all_files.push(p.to_path_buf());
+                            if all_files.len() >= 200 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                rng.shuffle(&mut all_files);
+                for p in all_files.into_iter().take(150) {
+                    candidates.push(make_metadata(&p));
+                }
+            }
+
+            if candidates.is_empty() {
+                let _ = tx.send(AutopilotEvent::Finished(0));
+                return;
+            }
+
+            let filtered: Vec<AudioMetadata> = match &profile {
+                crate::analysis::MixProfile::BpmFlow { target_bpm, tolerance } => {
+                    let min_bpm = target_bpm * (1.0 - tolerance);
+                    let max_bpm = target_bpm * (1.0 + tolerance);
+                    let matched: Vec<AudioMetadata> = candidates
+                        .iter()
+                        .filter(|m| {
+                            let feat = db.get_track(&m.filepath);
+                            if let Some(b) = feat.and_then(|f| f.bpm) {
+                                (b >= min_bpm && b <= max_bpm)
+                                    || (b >= min_bpm / 2.0 && b <= max_bpm / 2.0)
+                                    || (b >= min_bpm * 2.0 && b <= max_bpm * 2.0)
+                            } else {
+                                false
+                            }
+                        })
+                        .cloned()
+                        .collect();
+                    if matched.is_empty() {
+                        candidates
+                    } else {
+                        matched
+                    }
+                }
+                crate::analysis::MixProfile::MoodVibe(mood) => {
+                    let matched: Vec<AudioMetadata> = candidates
+                        .iter()
+                        .filter(|m| {
+                            let feat = db.get_track(&m.filepath);
+                            mood.matches_track(m, feat.as_ref())
+                        })
+                        .cloned()
+                        .collect();
+                    if matched.is_empty() {
+                        candidates
+                    } else {
+                        matched
+                    }
+                }
+                crate::analysis::MixProfile::SeedRadio(seed_path) => {
+                    let seed_feat = db.get_track(seed_path).unwrap_or_default();
+                    let (_seed_title, seed_artist, _seed_album) = Self::parse_path_heuristics(seed_path);
+                    let seed_artist = if !seed_feat.artist.is_empty() { seed_feat.artist } else { seed_artist };
+                    let seed_genre = seed_feat.genre;
+
+                    let matched: Vec<AudioMetadata> = candidates
+                        .iter()
+                        .filter(|m| {
+                            if &m.filepath == seed_path {
+                                return false;
+                            }
+                            let feat = db.get_track(&m.filepath);
+                            let artist_match = !seed_artist.is_empty() && m.artist.eq_ignore_ascii_case(&seed_artist);
+                            let genre_match = !seed_genre.is_empty() && (
+                                m.genre.eq_ignore_ascii_case(&seed_genre)
+                                || feat.as_ref().map(|f| f.genre.eq_ignore_ascii_case(&seed_genre)).unwrap_or(false)
+                            );
+                            artist_match || genre_match
+                        })
+                        .cloned()
+                        .collect();
+
+                    if matched.is_empty() {
+                        candidates
+                            .into_iter()
+                            .filter(|m| &m.filepath != seed_path)
+                            .collect()
+                    } else {
+                        matched
+                    }
+                }
+                _ => candidates,
+            };
+
+            let sequenced = crate::analysis::mixer::DjMixer::sequence_mix(filtered, &db, target_limit);
+
+            for track in sequenced {
+                if stop_flag.load(Ordering::Relaxed) {
+                    return;
+                }
+                if tx.send(AutopilotEvent::Track(track)).is_ok() {
+                    total_sent += 1;
+                }
+            }
+
+            if !stop_flag.load(Ordering::Relaxed) {
+                let _ = tx.send(AutopilotEvent::Finished(total_sent));
+            }
+            return;
+        }
+
+        // 3. DiverseShuffle progressive streaming logic:
+        if subdirs.is_empty() {
             if !immediate_files.is_empty() {
                 rng.shuffle(&mut immediate_files);
-                let take_count = if found_subdirs.is_empty() { target_limit } else { 2 };
-                for f in immediate_files.iter().take(take_count) {
+                for f in immediate_files.into_iter().take(target_limit) {
                     if stop_flag.load(Ordering::Relaxed) {
                         return;
                     }
-                    let meta = make_metadata(f);
+                    let meta = make_metadata(&f);
                     if tx.send(AutopilotEvent::Track(meta)).is_ok() {
                         total_sent += 1;
                     }
                 }
-                if found_subdirs.is_empty() {
-                    let _ = tx.send(AutopilotEvent::Finished(total_sent));
-                    return;
-                }
             }
-
-            found_subdirs
-        };
-
-        if subdirs.is_empty() {
             let _ = tx.send(AutopilotEvent::Finished(total_sent));
             return;
         }
 
-        // Shuffle subdirectories for diverse library sampling
-        rng.shuffle(&mut subdirs);
+        // If we found immediate files in root, stream a couple right away
+        if !immediate_files.is_empty() {
+            rng.shuffle(&mut immediate_files);
+            let take_count = if subdirs.is_empty() { target_limit } else { 2 };
+            for f in immediate_files.iter().take(take_count) {
+                if stop_flag.load(Ordering::Relaxed) {
+                    return;
+                }
+                let meta = make_metadata(f);
+                if tx.send(AutopilotEvent::Track(meta)).is_ok() {
+                    total_sent += 1;
+                }
+            }
+        }
 
         if subdirs.len() >= target_limit {
             // Large collection: 1 track per subdirectory across diverse artists

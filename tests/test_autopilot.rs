@@ -616,5 +616,94 @@ fn test_web_mix_profile_and_seed_radio_commands() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_autopilot_mood_vibe_diverse_artist_sampling_no_single_artist_loop() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_diverse_mood_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    // 1. Dominant artist directory with 25 tracks across multiple albums
+    for album in ["Accelerator", "Lifeforms", "ISDN", "Dead Cities"] {
+        let fsol_dir = temp_dir.join("The Future Sound of London").join(album);
+        fs::create_dir_all(&fsol_dir).unwrap();
+        for i in 1..=6 {
+            let track_path = fsol_dir.join(format!("0{} Ambient Cascade {}.wav", i, i));
+            create_dummy_audio(&track_path);
+        }
+    }
+
+    // 2. Several other artist directories with tracks
+    let other_artists = [
+        ("Boards of Canada", "Music Has the Right to Children", "Chill Track"),
+        ("Brian Eno", "Music for Airports", "Ambient 1"),
+        ("Aphex Twin", "Selected Ambient Works", "Xtal"),
+        ("Tycho", "Dive", "Coastal Brake"),
+        ("Global Communication", "76 14", "4 02"),
+    ];
+
+    for (artist, album, song) in &other_artists {
+        let artist_dir = temp_dir.join(artist).join(album);
+        fs::create_dir_all(&artist_dir).unwrap();
+        for i in 1..=4 {
+            let track_path = artist_dir.join(format!("0{} {} {}.wav", i, song, i));
+            create_dummy_audio(&track_path);
+        }
+    }
+
+    let mgr = SettingsManager::default();
+    let mut app = AppUI::new(Some(temp_dir.clone()), mgr);
+
+    // Run 1: Chill & Ambient
+    app.active_mix_profile = quickstream::analysis::MixProfile::MoodVibe(quickstream::analysis::MoodType::Chill);
+    app.start_autopilot(temp_dir.clone());
+    app.wait_for_autopilot_scan(Duration::from_secs(3));
+
+    assert!(!app.queue.is_empty());
+    let mut artists_in_mix = std::collections::HashSet::new();
+    for track in &app.queue.tracks {
+        artists_in_mix.insert(track.artist.clone());
+    }
+
+    // Must sample across multiple artists, NOT 100% Future Sound of London!
+    assert!(
+        artists_in_mix.len() >= 4,
+        "Autopilot mix must contain diverse artists, found only: {:?}",
+        artists_in_mix
+    );
+
+
+    // Verify consecutive tracks are never by the same artist
+    for i in 1..app.queue.len() {
+        assert_ne!(
+            app.queue.tracks[i].artist,
+            app.queue.tracks[i - 1].artist,
+            "Consecutive tracks must not be by the same artist at index {} and {}",
+            i - 1,
+            i
+        );
+    }
+
+    // Run 2: Fresh run with Late Night Groove
+    app.queue.clear();
+    app.active_mix_profile = quickstream::analysis::MixProfile::MoodVibe(quickstream::analysis::MoodType::Groove);
+    app.start_autopilot(temp_dir.clone());
+    app.wait_for_autopilot_scan(Duration::from_secs(3));
+
+    assert!(!app.queue.is_empty());
+    let mut groove_artists = std::collections::HashSet::new();
+    for track in &app.queue.tracks {
+        groove_artists.insert(track.artist.clone());
+    }
+
+    assert!(
+        groove_artists.len() >= 4,
+        "Late Night Groove mix must sample diverse artists, found only: {:?}",
+        groove_artists
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+
 
 
