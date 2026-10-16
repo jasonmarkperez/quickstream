@@ -123,6 +123,16 @@ impl PlaybackQueue {
             self.current_index = 0;
         }
     }
+
+    /// Shuffle only upcoming tracks in the queue from current_index + 1 forward.
+    /// Preserves tracks 0..=current_index in place and does not alter current_index.
+    pub fn shuffle_from_next(&mut self) {
+        if self.current_index + 1 >= self.tracks.len() {
+            return;
+        }
+        let mut rng = FastRng::new();
+        rng.shuffle(&mut self.tracks[self.current_index + 1..]);
+    }
 }
 
 /// Lightweight, zero-external-dependency SplitMix64 pseudo-random number generator.
@@ -296,6 +306,30 @@ mod tests {
         let mut expected: Vec<String> = (1..=10).map(|i| format!("Song {}", i)).collect();
         expected.sort();
         assert_eq!(titles, expected);
+    }
+
+    #[test]
+    fn test_queue_shuffle_from_next() {
+        let mut q = PlaybackQueue::new();
+        for i in 1..=10 {
+            q.add_track(make_test_track(&format!("Song {}", i), 100.0));
+        }
+        q.current_index = 2; // "Song 3"
+
+        q.shuffle_from_next();
+        assert_eq!(q.len(), 10);
+        assert_eq!(q.current_index, 2);
+        // Tracks 0, 1, 2 must be strictly untouched
+        assert_eq!(q.tracks[0].title, "Song 1");
+        assert_eq!(q.tracks[1].title, "Song 2");
+        assert_eq!(q.tracks[2].title, "Song 3");
+
+        // Tracks 3..10 must contain all songs 4..10
+        let mut upcoming: Vec<String> = q.tracks[3..].iter().map(|t| t.title.clone()).collect();
+        upcoming.sort();
+        let mut expected: Vec<String> = (4..=10).map(|i| format!("Song {}", i)).collect();
+        expected.sort();
+        assert_eq!(upcoming, expected);
     }
 
     #[test]

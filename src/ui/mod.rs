@@ -103,6 +103,15 @@ pub struct AppUI {
     pub autopilot_rx: Option<std::sync::mpsc::Receiver<crate::library::AutopilotEvent>>,
     pub autopilot_scan_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub is_autopilot_scanning: bool,
+    pub autopilot_run_mode: AutopilotRunMode,
+    pub autopilot_added_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutopilotRunMode {
+    Fresh,
+    Append,
+    Reshuffle,
 }
 
 impl AppUI {
@@ -192,6 +201,8 @@ impl AppUI {
             autopilot_rx: None,
             autopilot_scan_stop: None,
             is_autopilot_scanning: false,
+            autopilot_run_mode: AutopilotRunMode::Fresh,
+            autopilot_added_count: 0,
         };
         app.refresh_browser();
         app.update_web_state();
@@ -905,7 +916,17 @@ impl AppUI {
                     self.status_message = format!("No audio files found in '{}'", dir_name);
                 } else {
                     let dir_name = self.autopilot_dir.as_ref().and_then(|d| d.file_name()).unwrap_or_default().to_string_lossy();
-                    self.status_message = format!("⚡ Autopilot: {} tracks from '{}'", self.queue.len(), dir_name);
+                    match self.autopilot_run_mode {
+                        AutopilotRunMode::Fresh => {
+                            self.status_message = format!("⚡ Autopilot: {} tracks from '{}'", self.queue.len(), dir_name);
+                        }
+                        AutopilotRunMode::Append => {
+                            self.status_message = format!("⚡ Autopilot: Appended {} tracks (queue: {})", self.autopilot_added_count, self.queue.len());
+                        }
+                        AutopilotRunMode::Reshuffle => {
+                            self.status_message = format!("🎲 Autopilot: Reshuffled {} tracks from next track forward", self.autopilot_added_count);
+                        }
+                    }
                 }
             }
             return;
@@ -917,6 +938,7 @@ impl AppUI {
             if let Some(ref ws) = self.web_server {
                 ws.register_stream_file(&track.filepath);
             }
+            self.autopilot_added_count += 1;
             self.queue.add_track(track);
         }
 
@@ -955,11 +977,31 @@ impl AppUI {
         self.start_queue_metadata_fetch();
         self.update_web_state();
 
+        let dir_name = self.autopilot_dir.as_ref().and_then(|d| d.file_name()).unwrap_or_default().to_string_lossy();
         if self.is_autopilot_scanning {
-            self.status_message = format!("⚡ Autopilot: {} tracks queued (discovering...)", self.queue.len());
+            match self.autopilot_run_mode {
+                AutopilotRunMode::Fresh => {
+                    self.status_message = format!("⚡ Autopilot: {} tracks queued (discovering...)", self.queue.len());
+                }
+                AutopilotRunMode::Append => {
+                    self.status_message = format!("⚡ Autopilot: Appending from '{}' (+{} queued, total: {})...", dir_name, self.autopilot_added_count, self.queue.len());
+                }
+                AutopilotRunMode::Reshuffle => {
+                    self.status_message = format!("🎲 Autopilot: Reshuffling from '{}' (+{} queued)...", dir_name, self.autopilot_added_count);
+                }
+            }
         } else if !self.queue.is_empty() {
-            let dir_name = self.autopilot_dir.as_ref().and_then(|d| d.file_name()).unwrap_or_default().to_string_lossy();
-            self.status_message = format!("⚡ Autopilot: {} tracks from '{}'", self.queue.len(), dir_name);
+            match self.autopilot_run_mode {
+                AutopilotRunMode::Fresh => {
+                    self.status_message = format!("⚡ Autopilot: {} tracks from '{}'", self.queue.len(), dir_name);
+                }
+                AutopilotRunMode::Append => {
+                    self.status_message = format!("⚡ Autopilot: Appended {} tracks (queue: {})", self.autopilot_added_count, self.queue.len());
+                }
+                AutopilotRunMode::Reshuffle => {
+                    self.status_message = format!("🎲 Autopilot: Reshuffled {} tracks from next track forward", self.autopilot_added_count);
+                }
+            }
         }
     }
 
@@ -1798,7 +1840,7 @@ impl AppUI {
                     self.update_web_state();
                 }
             }
-            (KeyCode::Char('p') | KeyCode::Char('P'), _) => {
+            (KeyCode::Char('p'), KeyModifiers::NONE) => {
                 let target_dir = if self.in_bookmarks_view {
                     if self.browser_cursor > 0 && self.browser_cursor < self.browser_entries.len() {
                         self.browser_entries[self.browser_cursor].1.clone()
@@ -1809,6 +1851,19 @@ impl AppUI {
                     self.browser_dir.clone()
                 };
                 self.start_autopilot(target_dir);
+            }
+            (KeyCode::Char('P'), _)
+            | (KeyCode::Char('p'), KeyModifiers::SHIFT) => {
+                let target_dir = if self.in_bookmarks_view {
+                    if self.browser_cursor > 0 && self.browser_cursor < self.browser_entries.len() {
+                        self.browser_entries[self.browser_cursor].1.clone()
+                    } else {
+                        self.browser_dir.clone()
+                    }
+                } else {
+                    self.browser_dir.clone()
+                };
+                self.reshuffle_autopilot(target_dir);
             }
             _ => {
                 // Tab specific key handling
@@ -2388,6 +2443,24 @@ impl AppUI {
     }
 
     pub fn start_autopilot(&mut self, dir: PathBuf) {
+        let mode = if self.queue.is_empty() {
+            AutopilotRunMode::Fresh
+        } else {
+            AutopilotRunMode::Append
+        };
+        self.start_autopilot_with_mode(dir, mode);
+    }
+
+    pub fn reshuffle_autopilot(&mut self, dir: PathBuf) {
+        let mode = if self.queue.is_empty() {
+            AutopilotRunMode::Fresh
+        } else {
+            AutopilotRunMode::Reshuffle
+        };
+        self.start_autopilot_with_mode(dir, mode);
+    }
+
+    pub fn start_autopilot_with_mode(&mut self, dir: PathBuf, mode: AutopilotRunMode) {
         // 1. Cancel any active autopilot scanner
         if let Some(stop) = self.autopilot_scan_stop.take() {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2395,16 +2468,34 @@ impl AppUI {
         let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.autopilot_scan_stop = Some(stop_flag.clone());
 
-        // 2. Clear current queue and stop previous playback
-        self.queue.clear();
-        self.queue.current_index = 0;
-        self.queue_cursor = 0;
         self.autopilot_dir = Some(dir.clone());
         self.is_autopilot_scanning = true;
+        self.autopilot_run_mode = mode;
+        self.autopilot_added_count = 0;
 
         let dir_display = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
-        self.status_message = format!("⚡ Autopilot: Discovering tracks from '{}'...", dir_display);
-        let _ = self.player.stop();
+
+        match mode {
+            AutopilotRunMode::Fresh => {
+                // Clear current queue and stop previous playback
+                self.queue.clear();
+                self.queue.current_index = 0;
+                self.queue_cursor = 0;
+                self.status_message = format!("⚡ Autopilot: Discovering tracks from '{}'...", dir_display);
+                let _ = self.player.stop();
+            }
+            AutopilotRunMode::Append => {
+                // Keep current queue and playback uninterrupted
+                self.status_message = format!("⚡ Autopilot: Appending tracks from '{}'...", dir_display);
+            }
+            AutopilotRunMode::Reshuffle => {
+                // Keep tracks 0..=current_index uninterrupted; truncate everything after current_index
+                if self.queue.current_index < self.queue.len() {
+                    self.queue.tracks.truncate(self.queue.current_index + 1);
+                }
+                self.status_message = format!("🎲 Autopilot: Reshuffling mix from next track forward (from '{}')...", dir_display);
+            }
+        }
 
         // 3. Reuse any subdirectories already discovered by the browser if viewing the same folder
         let known_subdirs: Vec<PathBuf> = if self.browser_dir == dir {
@@ -2757,6 +2848,10 @@ impl AppUI {
                 crate::web::WebCommand::Autopilot(path_opt) => {
                     let target = path_opt.unwrap_or_else(|| self.browser_dir.clone());
                     self.start_autopilot(target);
+                }
+                crate::web::WebCommand::AutopilotReshuffle(path_opt) => {
+                    let target = path_opt.unwrap_or_else(|| self.browser_dir.clone());
+                    self.reshuffle_autopilot(target);
                 }
                 crate::web::WebCommand::ShuffleQueue => {
                     if !self.queue.is_empty() {
@@ -4036,7 +4131,8 @@ impl AppUI {
         let right_lines = vec![
             Self::help_section_header("LIBRARY & QUEUE"),
             Self::help_key_line("Enter", "Open / Queue / Play"),
-            Self::help_key_line("P / p", "Autopilot (randomize & play)"),
+            Self::help_key_line("p", "Autopilot (append if playing)"),
+            Self::help_key_line("P", "Autopilot Reshuffle (next+)"),
             Self::help_key_line("Z / z", "Shuffle current queue"),
             Self::help_key_line("a", "Add all songs in folder"),
             Self::help_key_line("d / x", "Remove track / bookmark"),

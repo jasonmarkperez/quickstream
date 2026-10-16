@@ -150,6 +150,7 @@ pub enum WebCommand {
     SetQueueMode(String),
     SetHome(Option<String>),
     Autopilot(Option<PathBuf>),
+    AutopilotReshuffle(Option<PathBuf>),
     ShuffleQueue,
 }
 
@@ -725,6 +726,10 @@ fn handle_client(
                 "autopilot" => {
                     let p = payload.path.map(PathBuf::from);
                     let _ = cmd_tx.send(WebCommand::Autopilot(p));
+                }
+                "autopilot_reshuffle" | "reshuffle" => {
+                    let p = payload.path.map(PathBuf::from);
+                    let _ = cmd_tx.send(WebCommand::AutopilotReshuffle(p));
                 }
                 "shuffle" => {
                     let _ = cmd_tx.send(WebCommand::ShuffleQueue);
@@ -2585,6 +2590,10 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="16 3 21 3 21 8"></polyline><line x1="4" y1="20" x2="21" y2="3"></line><polyline points="21 16 21 21 16 21"></polyline><line x1="15" y1="15" x2="21" y2="21"></line><line x1="4" y1="4" x2="9" y2="9"></line></svg>
             Shuffle
           </button>
+          <button class="btn-sm" id="btnReshuffleSeed" title="Reshuffle Autopilot Seed (replace upcoming tracks from next track forward without interrupting playback)">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+            Reshuffle Seed
+          </button>
           <button class="btn-text danger" id="btnClearQueue">Clear Queue</button>
         </div>
       </div>
@@ -2629,9 +2638,13 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
           Add All
         </button>
-        <button class="btn-sm accent" id="btnBrowserAutopilot" style="background: linear-gradient(135deg, rgba(234, 179, 8, 0.25), rgba(245, 158, 11, 0.15)); border-color: rgba(234, 179, 8, 0.4); color: #fde047;" title="Start Autopilot (recursive random shuffle & play)">
+        <button class="btn-sm accent" id="btnBrowserAutopilot" style="background: linear-gradient(135deg, rgba(234, 179, 8, 0.25), rgba(245, 158, 11, 0.15)); border-color: rgba(234, 179, 8, 0.4); color: #fde047;" title="Autopilot (start if empty, append 60 tracks if playing)">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
           Autopilot
+        </button>
+        <button class="btn-sm accent" id="btnBrowserReshuffle" style="background: linear-gradient(135deg, rgba(168, 85, 247, 0.25), rgba(139, 92, 246, 0.15)); border-color: rgba(168, 85, 247, 0.4); color: #d8b4fe;" title="Reshuffle Autopilot Seed (replace upcoming tracks from next track forward without interrupting playback)">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="16 3 21 3 21 8"></polyline><line x1="4" y1="20" x2="21" y2="3"></line><polyline points="21 16 21 21 16 21"></polyline><line x1="15" y1="15" x2="21" y2="21"></line><line x1="4" y1="4" x2="9" y2="9"></line></svg>
+          Reshuffle Seed
         </button>
       </div>
 
@@ -3015,6 +3028,11 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       showToast('Queue shuffled');
     });
 
+    document.getElementById('btnReshuffleSeed')?.addEventListener('click', () => {
+      sendAction('autopilot_reshuffle');
+      showToast('Reshuffling Autopilot seed from next track forward...');
+    });
+
     document.querySelectorAll('.mode-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         const mode = btn.getAttribute('data-mode');
@@ -3156,6 +3174,13 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       if (currentBrowserPath) {
         sendAction('autopilot', null, { path: currentBrowserPath });
         showToast('Starting Autopilot on folder...');
+      }
+    });
+
+    document.getElementById('btnBrowserReshuffle')?.addEventListener('click', () => {
+      if (currentBrowserPath) {
+        sendAction('autopilot_reshuffle', null, { path: currentBrowserPath });
+        showToast('Reshuffling Autopilot seed from next track forward...');
       }
     });
 

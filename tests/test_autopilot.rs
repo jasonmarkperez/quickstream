@@ -367,3 +367,144 @@ fn test_autopilot_progressive_streaming_events() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_autopilot_append_mode_does_not_interrupt_playback() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_ap_append_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    for i in 1..=4 {
+        let artist_dir = temp_dir.join(format!("Band_{}", i)).join("Album");
+        fs::create_dir_all(&artist_dir).unwrap();
+        let track_path = artist_dir.join(format!("Track_{}.wav", i));
+        create_dummy_audio(&track_path);
+    }
+
+    let mgr = SettingsManager::default();
+    let mut app = AppUI::new(Some(temp_dir.clone()), mgr);
+
+    // Seed existing queue with 2 tracks
+    for i in 1..=2 {
+        let mut meta = quickstream::metadata::AudioMetadata::default();
+        meta.title = format!("Existing {}", i);
+        meta.filepath = temp_dir.join(format!("Existing_{}.wav", i));
+        app.queue.add_track(meta);
+    }
+    app.queue.current_index = 1; // "Existing 2" is playing
+    assert_eq!(app.queue.len(), 2);
+
+    // Trigger autopilot via start_autopilot (must detect non-empty queue and select Append mode)
+    app.start_autopilot(temp_dir.clone());
+    assert_eq!(app.autopilot_run_mode, quickstream::ui::AutopilotRunMode::Append);
+
+    // Initial tracks must NOT be wiped
+    assert_eq!(app.queue.tracks[0].title, "Existing 1");
+    assert_eq!(app.queue.tracks[1].title, "Existing 2");
+    assert_eq!(app.queue.current_index, 1);
+
+    // Wait for progressive scan to complete
+    app.wait_for_autopilot_scan(Duration::from_secs(3));
+
+    // Queue must now have original 2 tracks + newly appended tracks
+    assert_eq!(app.queue.len(), 6);
+    assert_eq!(app.queue.tracks[0].title, "Existing 1");
+    assert_eq!(app.queue.tracks[1].title, "Existing 2");
+    assert_eq!(app.queue.current_index, 1);
+    assert!(app.status_message.contains("Appended"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_autopilot_reshuffle_from_next_track_forward() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_ap_reshuffle_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    for i in 1..=5 {
+        let artist_dir = temp_dir.join(format!("Artist_{}", i)).join("Album");
+        fs::create_dir_all(&artist_dir).unwrap();
+        let track_path = artist_dir.join(format!("Song_{}.wav", i));
+        create_dummy_audio(&track_path);
+    }
+
+    let mgr = SettingsManager::default();
+    let mut app = AppUI::new(Some(temp_dir.clone()), mgr);
+
+    // Create 4 initial tracks in queue
+    for i in 1..=4 {
+        let mut meta = quickstream::metadata::AudioMetadata::default();
+        meta.title = format!("Original Track {}", i);
+        meta.filepath = temp_dir.join(format!("orig_{}.wav", i));
+        app.queue.add_track(meta);
+    }
+    app.queue.current_index = 1; // "Original Track 2" is playing
+
+    // Trigger reshuffle from next track forward
+    app.reshuffle_autopilot(temp_dir.clone());
+    assert_eq!(app.autopilot_run_mode, quickstream::ui::AutopilotRunMode::Reshuffle);
+
+    // Tracks 0 and 1 must be preserved; tracks 2 and 3 must be truncated immediately
+    assert_eq!(app.queue.len(), 2);
+    assert_eq!(app.queue.tracks[0].title, "Original Track 1");
+    assert_eq!(app.queue.tracks[1].title, "Original Track 2");
+    assert_eq!(app.queue.current_index, 1);
+
+    // Wait for scan to stream new seed into queue
+    app.wait_for_autopilot_scan(Duration::from_secs(3));
+
+    // Queue must now have 2 original tracks + 5 newly seeded tracks
+    assert_eq!(app.queue.len(), 7);
+    assert_eq!(app.queue.tracks[0].title, "Original Track 1");
+    assert_eq!(app.queue.tracks[1].title, "Original Track 2");
+    assert_eq!(app.queue.current_index, 1);
+    assert!(app.status_message.contains("Reshuffled"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_web_autopilot_reshuffle_action() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_web_ap_reshuffle_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    for i in 1..=3 {
+        let artist_dir = temp_dir.join(format!("Singer_{}", i)).join("Album");
+        fs::create_dir_all(&artist_dir).unwrap();
+        let track_path = artist_dir.join(format!("Track_{}.wav", i));
+        create_dummy_audio(&track_path);
+    }
+
+    let mgr = SettingsManager::default();
+    let mut app = AppUI::new(Some(temp_dir.clone()), mgr);
+
+    // Setup web cmd channel
+    let (tx, rx) = mpsc::channel();
+    app.web_cmd_rx = Some(rx);
+
+    // Queue 3 songs
+    for i in 1..=3 {
+        let mut meta = quickstream::metadata::AudioMetadata::default();
+        meta.title = format!("Song {}", i);
+        meta.filepath = temp_dir.join(format!("song_{}.wav", i));
+        app.queue.add_track(meta);
+    }
+    app.queue.current_index = 0;
+
+    // Send WebCommand::AutopilotReshuffle
+    tx.send(WebCommand::AutopilotReshuffle(Some(temp_dir.clone()))).unwrap();
+
+    app.handle_web_commands();
+    assert_eq!(app.autopilot_run_mode, quickstream::ui::AutopilotRunMode::Reshuffle);
+    assert_eq!(app.queue.len(), 1); // Truncated after index 0
+    assert_eq!(app.queue.tracks[0].title, "Song 1");
+
+    app.wait_for_autopilot_scan(Duration::from_secs(3));
+    assert_eq!(app.queue.len(), 4); // 1 + 3 new
+    assert_eq!(app.queue.tracks[0].title, "Song 1");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+
