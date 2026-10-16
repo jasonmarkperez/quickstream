@@ -1,5 +1,6 @@
 //! Quickstream: A lightweight terminal audio player and DLNA network streamer in Rust.
 
+pub mod analysis;
 pub mod discovery;
 pub mod library;
 pub mod logger;
@@ -23,7 +24,7 @@ use crate::ui::AppUI;
 
 #[derive(Parser, Debug)]
 #[command(name = "quickstream")]
-#[command(version = "0.2.0")]
+#[command(version)]
 #[command(about = "A lightweight terminal music player and DLNA network streamer in Rust", long_about = None)]
 struct Cli {
     /// Audio files or directories to load

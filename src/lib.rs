@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod discovery;
 pub mod library;
 pub mod logger;

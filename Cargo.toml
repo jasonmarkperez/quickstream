@@ -1,6 +1,6 @@
 [package]
 name = "quickstream"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Quickstream Contributors"]
 description = "A lightweight terminal music player and DLNA network streamer in Rust"
@@ -30,6 +30,12 @@ serde_json = "1.0"
 
 # Standard XDG Directory Resolution
 directories = "6.0"
+
+# Local Embedded Track Analysis & Feature Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Lightweight HTTP client for optional online metadata enrichment
+ureq = { version = "2.10", features = ["json"] }
 
 # Error Handling & Utilities
 anyhow = "1.0"

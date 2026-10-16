@@ -23,6 +23,10 @@ pub struct Settings {
     pub home_dir: Option<String>,
     #[serde(default = "default_gapless_autopilot")]
     pub gapless_autopilot: bool,
+    #[serde(default = "default_mix_profile")]
+    pub default_mix_profile: String,
+    #[serde(default)]
+    pub online_enrichment: bool,
 }
 
 fn default_web_port() -> u16 {
@@ -31,6 +35,10 @@ fn default_web_port() -> u16 {
 
 fn default_gapless_autopilot() -> bool {
     true
+}
+
+fn default_mix_profile() -> String {
+    "diverse".to_string()
 }
 
 impl Default for Settings {
@@ -47,6 +55,20 @@ impl Default for Settings {
             web_server_port: 8080,
             home_dir: None,
             gapless_autopilot: true,
+            default_mix_profile: "diverse".to_string(),
+            online_enrichment: false,
+        }
+    }
+}
+
+impl Settings {
+    pub fn mix_profile(&self) -> crate::analysis::MixProfile {
+        match self.default_mix_profile.as_str() {
+            "bpm_flow" => crate::analysis::MixProfile::BpmFlow { target_bpm: 120.0, tolerance: 0.15 },
+            "chill" => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Chill),
+            "workout" => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Workout),
+            "groove" => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Groove),
+            _ => crate::analysis::MixProfile::DiverseShuffle,
         }
     }
 }
@@ -102,6 +124,16 @@ pub const SETTING_DEFINITIONS: &[SettingDefinition] = &[
         key: "gapless_autopilot",
         label: "Gapless Continuous Stream",
         description: "Seamlessly splice tracks into a single DLNA PCM stream (Roon-style gapless playback).",
+    },
+    SettingDefinition {
+        key: "default_mix_profile",
+        label: "Autopilot Mix Algorithm",
+        description: "Intelligent mix style: Diverse Shuffle, DJ BPM Flow, Chillout, Workout, or Groove.",
+    },
+    SettingDefinition {
+        key: "online_enrichment",
+        label: "Online Tag Enrichment",
+        description: "Fetch community genre tags and similarity graphs from Last.fm (cached locally, library read-only).",
     },
 ];
 
@@ -261,6 +293,21 @@ impl SettingsManager {
                 // gapless_autopilot
                 self.settings.gapless_autopilot = !self.settings.gapless_autopilot;
             }
+            9 => {
+                // default_mix_profile
+                let profiles = ["diverse", "bpm_flow", "chill", "workout", "groove"];
+                let cur_idx = profiles.iter().position(|&p| p == self.settings.default_mix_profile).unwrap_or(0);
+                let next_idx = if forward {
+                    (cur_idx + 1) % profiles.len()
+                } else {
+                    (cur_idx + profiles.len() - 1) % profiles.len()
+                };
+                self.settings.default_mix_profile = profiles[next_idx].to_string();
+            }
+            10 => {
+                // online_enrichment
+                self.settings.online_enrichment = !self.settings.online_enrichment;
+            }
             _ => {}
         }
         self.save();
@@ -306,6 +353,15 @@ impl SettingsManager {
                 }
             }
             8 => if self.settings.gapless_autopilot { "Enabled (Seamless PCM)" } else { "Disabled (Track-by-track)" }.to_string(),
+            9 => match self.settings.default_mix_profile.as_str() {
+                "diverse" => "Diverse Library Shuffle",
+                "bpm_flow" => "DJ BPM Flow (124 BPM)",
+                "chill" => "Chill & Ambient (Downtempo)",
+                "workout" => "Workout & High Energy",
+                "groove" => "Late Night Groove",
+                other => other,
+            }.to_string(),
+            10 => if self.settings.online_enrichment { "Enabled (Last.fm Cache)" } else { "Disabled (Local Analysis Only)" }.to_string(),
             _ => String::new(),
         }
     }
@@ -380,6 +436,18 @@ mod tests {
         mgr.cycle_setting(8, true);
         assert!(!mgr.settings.gapless_autopilot);
         assert_eq!(mgr.get_display_value(8), "Disabled (Track-by-track)");
+
+        // Setting 9: default_mix_profile
+        assert_eq!(mgr.settings.default_mix_profile, "diverse");
+        mgr.cycle_setting(9, true);
+        assert_eq!(mgr.settings.default_mix_profile, "bpm_flow");
+        assert_eq!(mgr.get_display_value(9), "DJ BPM Flow (124 BPM)");
+
+        // Setting 10: online_enrichment
+        assert!(!mgr.settings.online_enrichment);
+        mgr.cycle_setting(10, true);
+        assert!(mgr.settings.online_enrichment);
+        assert_eq!(mgr.get_display_value(10), "Enabled (Last.fm Cache)");
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

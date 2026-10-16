@@ -105,6 +105,10 @@ pub struct AppUI {
     pub is_autopilot_scanning: bool,
     pub autopilot_run_mode: AutopilotRunMode,
     pub autopilot_added_count: usize,
+    pub analysis_db: crate::analysis::AnalysisDatabase,
+    pub active_mix_profile: crate::analysis::MixProfile,
+    pub show_mix_picker_modal: bool,
+    pub mix_picker_cursor: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +153,9 @@ impl AppUI {
         let (metadata_tx, metadata_rx) = std::sync::mpsc::channel();
         let metadata_cache = crate::library::LibraryManager::load_cache_map();
         let (dir_scan_tx, dir_scan_rx) = std::sync::mpsc::channel();
+        let analysis_db = crate::analysis::AnalysisDatabase::open_default()
+            .unwrap_or_else(|_| crate::analysis::AnalysisDatabase::open_in_memory().unwrap());
+        let active_mix_profile = settings_mgr.settings.mix_profile();
 
         let mut app = Self {
             active_tab: 1,
@@ -203,6 +210,10 @@ impl AppUI {
             is_autopilot_scanning: false,
             autopilot_run_mode: AutopilotRunMode::Fresh,
             autopilot_added_count: 0,
+            analysis_db,
+            active_mix_profile,
+            show_mix_picker_modal: false,
+            mix_picker_cursor: 0,
         };
         app.refresh_browser();
         app.update_web_state();
@@ -1622,6 +1633,57 @@ impl AppUI {
             return Ok(false);
         }
 
+        // If mix picker modal is open, intercept input
+        if self.show_mix_picker_modal {
+            if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+                self.player.stop()?;
+                return Ok(true);
+            }
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('M') => {
+                    self.show_mix_picker_modal = false;
+                    return Ok(false);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.mix_picker_cursor > 0 {
+                        self.mix_picker_cursor -= 1;
+                    } else {
+                        self.mix_picker_cursor = 4;
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.mix_picker_cursor = (self.mix_picker_cursor + 1) % 5;
+                    return Ok(false);
+                }
+                KeyCode::Char('1') => {
+                    self.apply_mix_picker_selection(0);
+                    return Ok(false);
+                }
+                KeyCode::Char('2') => {
+                    self.apply_mix_picker_selection(1);
+                    return Ok(false);
+                }
+                KeyCode::Char('3') => {
+                    self.apply_mix_picker_selection(2);
+                    return Ok(false);
+                }
+                KeyCode::Char('4') => {
+                    self.apply_mix_picker_selection(3);
+                    return Ok(false);
+                }
+                KeyCode::Char('5') => {
+                    self.apply_mix_picker_selection(4);
+                    return Ok(false);
+                }
+                KeyCode::Enter => {
+                    self.apply_mix_picker_selection(self.mix_picker_cursor);
+                    return Ok(false);
+                }
+                _ => return Ok(false),
+            }
+        }
+
         // If editing startup home directory on settings view, intercept text input
         if let Some(ref mut input) = self.editing_home_dir {
             if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
@@ -1865,6 +1927,20 @@ impl AppUI {
                 };
                 self.reshuffle_autopilot(target_dir);
             }
+            (KeyCode::Char('M'), _)
+            | (KeyCode::Char('m'), KeyModifiers::SHIFT) => {
+                self.show_mix_picker_modal = !self.show_mix_picker_modal;
+                self.mix_picker_cursor = match &self.active_mix_profile {
+                    crate::analysis::MixProfile::DiverseShuffle => 0,
+                    crate::analysis::MixProfile::BpmFlow { .. } => 1,
+                    crate::analysis::MixProfile::MoodVibe(m) => match m {
+                        crate::analysis::MoodType::Chill => 2,
+                        crate::analysis::MoodType::Workout => 3,
+                        crate::analysis::MoodType::Groove | crate::analysis::MoodType::Focus => 4,
+                    },
+                    crate::analysis::MixProfile::SeedRadio(_) => 0,
+                };
+            }
             _ => {
                 // Tab specific key handling
                 self.handle_tab_key_with_modifiers(key.code, key.modifiers);
@@ -1934,6 +2010,13 @@ impl AppUI {
                 match (code, modifiers) {
                     (KeyCode::Esc, _) | (KeyCode::Char('q'), KeyModifiers::NONE) => {
                         self.active_tab = 1;
+                    }
+                    (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                        if let Some(current) = self.queue.current_track() {
+                            self.start_seed_radio(current.filepath.clone());
+                        } else {
+                            self.status_message = "No track playing to start Seed Radio".to_string();
+                        }
                     }
                     _ => {}
                 }
@@ -2108,9 +2191,26 @@ impl AppUI {
                         self.status_message = "Cleared queue".to_string();
                     }
                     (KeyCode::Char('r'), KeyModifiers::NONE) if !self.queue_focus => {
+                        if !self.in_bookmarks_view && self.browser_cursor < self.browser_entries.len() {
+                            let (_, p, is_dir) = &self.browser_entries[self.browser_cursor];
+                            if !*is_dir && p.to_string_lossy() != "___MUSIC_HOMES___" {
+                                self.start_seed_radio(p.clone());
+                                return;
+                            }
+                        }
                         self.browser_dir_cache.remove(&self.browser_dir);
                         self.refresh_browser();
                         self.status_message = format!("Refreshing directory '{}'", self.browser_dir.display());
+                    }
+                    (KeyCode::Char('r'), KeyModifiers::NONE) if self.queue_focus => {
+                        if self.queue_cursor < self.queue.len() {
+                            let seed = self.queue.tracks[self.queue_cursor].filepath.clone();
+                            self.start_seed_radio(seed);
+                        } else if let Some(current) = self.queue.current_track() {
+                            self.start_seed_radio(current.filepath.clone());
+                        } else {
+                            self.status_message = "No track in queue to start Seed Radio".to_string();
+                        }
                     }
                     (KeyCode::Char('z') | KeyCode::Char('Z'), _) if self.queue_focus && !self.queue.is_empty() => {
                         self.queue.shuffle();
@@ -2514,17 +2614,70 @@ impl AppUI {
 
         // 4. Spawn background worker to discover tracks and stream them progressively
         let scan_dir = dir.clone();
+        let profile = self.active_mix_profile.clone();
+        let db = self.analysis_db.clone();
         std::thread::spawn(move || {
-            crate::library::LibraryManager::scan_directory_autopilot_progressive(
+            crate::library::LibraryManager::scan_directory_autopilot_with_profile(
                 scan_dir,
                 known_subdirs,
                 cache,
+                profile,
+                db,
                 tx,
                 stop_flag,
             );
         });
 
         self.update_web_state();
+    }
+
+    pub fn apply_mix_picker_selection(&mut self, index: usize) {
+        self.show_mix_picker_modal = false;
+        self.active_mix_profile = match index {
+            1 => crate::analysis::MixProfile::BpmFlow { target_bpm: 120.0, tolerance: 0.15 },
+            2 => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Chill),
+            3 => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Workout),
+            4 => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Groove),
+            _ => crate::analysis::MixProfile::DiverseShuffle,
+        };
+        let profile_name = self.active_mix_profile.name();
+        let scan_dir = if self.browser_dir.exists() && !self.in_bookmarks_view {
+            self.browser_dir.clone()
+        } else if let Some(ref d) = self.autopilot_dir {
+            d.clone()
+        } else {
+            std::env::current_dir().unwrap_or_default()
+        };
+        self.status_message = format!("⚡ Mix Profile: '{}' - Starting Autopilot...", profile_name);
+        self.start_autopilot(scan_dir);
+    }
+
+    pub fn start_seed_radio(&mut self, seed_path: PathBuf) {
+        let scan_dir = if self.browser_dir.exists() && !self.in_bookmarks_view {
+            self.browser_dir.clone()
+        } else {
+            seed_path.parent().unwrap_or(&self.browser_dir).to_path_buf()
+        };
+        self.active_mix_profile = crate::analysis::MixProfile::SeedRadio(seed_path.clone());
+        let track_name = seed_path.file_stem().unwrap_or_default().to_string_lossy();
+        self.status_message = format!("📻 Seed Radio: Initiating station from '{}'...", track_name);
+        self.start_autopilot(scan_dir);
+    }
+
+    pub fn get_selected_track_path(&self) -> Option<PathBuf> {
+        if self.active_tab == 1 {
+            if self.queue_focus {
+                if self.queue_cursor < self.queue.len() {
+                    return Some(self.queue.tracks[self.queue_cursor].filepath.clone());
+                }
+            } else if self.browser_cursor < self.browser_entries.len() {
+                let (_, p, is_dir) = &self.browser_entries[self.browser_cursor];
+                if !is_dir && p.to_string_lossy() != "___MUSIC_HOMES___" {
+                    return Some(p.clone());
+                }
+            }
+        }
+        self.queue.current_track().map(|t| t.filepath.clone())
     }
 
     pub fn ensure_web_server_started(&mut self) -> u16 {
@@ -2860,6 +3013,22 @@ impl AppUI {
                         self.update_web_state();
                     }
                 }
+                crate::web::WebCommand::SetMixProfile(profile_str) => {
+                    let profile = match profile_str.to_lowercase().as_str() {
+                        "bpm_flow" | "bpm" => crate::analysis::MixProfile::BpmFlow { target_bpm: 120.0, tolerance: 0.15 },
+                        "chill" | "ambient" => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Chill),
+                        "workout" | "energy" => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Workout),
+                        "focus" => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Focus),
+                        "groove" => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Groove),
+                        _ => crate::analysis::MixProfile::DiverseShuffle,
+                    };
+                    self.active_mix_profile = profile;
+                    self.status_message = format!("⚡ Mix Profile set to: {}", self.active_mix_profile.name());
+                    self.update_web_state();
+                }
+                crate::web::WebCommand::SeedRadio(path) => {
+                    self.start_seed_radio(path);
+                }
             }
         }
     }
@@ -2887,6 +3056,7 @@ impl AppUI {
             state.current_browser_dir = self.browser_dir.to_string_lossy().to_string();
             state.is_autopilot = self.autopilot_dir.is_some();
             state.autopilot_dir = self.autopilot_dir.as_ref().map(|d| d.to_string_lossy().to_string());
+            state.active_mix_profile = self.active_mix_profile.name();
 
             state.queue = self
                 .queue
@@ -2934,6 +3104,13 @@ impl AppUI {
                 state.channels = track.channels;
                 state.filepath = Some(track.filepath.clone());
                 state.has_cover = true;
+                if let Some(feat) = self.analysis_db.get_features(&track.filepath) {
+                    state.bpm = feat.bpm;
+                    state.key = feat.display_key();
+                } else {
+                    state.bpm = None;
+                    state.key = None;
+                }
             } else {
                 state.title = "No Track Loaded".to_string();
                 state.artist = String::new();
@@ -2945,6 +3122,8 @@ impl AppUI {
                 state.channels = 2;
                 state.filepath = None;
                 state.has_cover = false;
+                state.bpm = None;
+                state.key = None;
             }
 
             if self.queue.len() > 1 && self.queue.current_index + 1 < self.queue.len() {
@@ -2981,6 +3160,8 @@ impl AppUI {
 
         if let Some(ref mut modal) = self.search_modal {
             Self::render_search_modal(modal, f);
+        } else if self.show_mix_picker_modal {
+            self.render_mix_picker_modal(f);
         } else if self.show_help_modal {
             self.render_help_modal(f);
         }
@@ -3951,6 +4132,23 @@ impl AppUI {
                 ));
             }
 
+            if let Some(feat) = self.analysis_db.get_features(&track.filepath) {
+                let mut feat_parts = Vec::new();
+                if let Some(bpm) = feat.bpm {
+                    feat_parts.push(format!("{:.0} BPM", bpm));
+                }
+                if let Some(ref key) = feat.display_key() {
+                    feat_parts.push(key.clone());
+                }
+                if !feat_parts.is_empty() {
+                    spans.push(Span::styled("  •  ", Style::default().fg(Color::DarkGray)));
+                    spans.push(Span::styled(
+                        feat_parts.join(" • "),
+                        Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                    ));
+                }
+            }
+
             Line::from(spans)
         } else {
             Line::from(vec![Span::styled(
@@ -3989,7 +4187,7 @@ impl AppUI {
         if self.autopilot_dir.is_some() {
             row2_spans.push(Span::raw(" "));
             row2_spans.push(Span::styled(
-                "[⚡ AUTOPILOT]",
+                format!("[⚡ {}]", self.active_mix_profile.name()),
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ));
         }
@@ -4133,6 +4331,8 @@ impl AppUI {
             Self::help_key_line("Enter", "Open / Queue / Play"),
             Self::help_key_line("p", "Autopilot (append if playing)"),
             Self::help_key_line("P", "Autopilot Reshuffle (next+)"),
+            Self::help_key_line("M", "Mix Picker modal (vibe/BPM)"),
+            Self::help_key_line("r", "Seed Radio / Rescan dev"),
             Self::help_key_line("Z / z", "Shuffle current queue"),
             Self::help_key_line("a", "Add all songs in folder"),
             Self::help_key_line("d / x", "Remove track / bookmark"),
@@ -4140,14 +4340,100 @@ impl AppUI {
             Self::help_key_line("b", "Bookmark folder in Homes"),
             Self::help_key_line("H", "Set folder as startup home"),
             Self::help_key_line("v", "Toggle tags vs filenames"),
-            Self::help_key_line("r", "Refresh folder contents"),
             Line::from(""),
             Self::help_section_header("SEARCH & DISCOVERY"),
             Self::help_key_line("/", "Spotlight jump in folder"),
             Self::help_key_line("f", "Full library fuzzy search"),
-            Self::help_key_line("r", "Rescan DLNA renderers"),
         ];
         f.render_widget(Paragraph::new(right_lines), cols[1]);
+
+    }
+
+    fn render_mix_picker_modal(&self, f: &mut Frame) {
+        let area = help_modal_rect(f.area());
+        f.render_widget(Clear, area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                " ⚡ AUTOPILOT MIX PROFILE SELECTOR ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ))
+            .border_style(Style::default().fg(Color::Cyan))
+            .style(Style::default().bg(Color::Black));
+        f.render_widget(block, area);
+
+        let inner = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // Subtitle
+                Constraint::Min(10),   // Options list
+                Constraint::Length(2), // Footer instruction
+            ])
+            .margin(1)
+            .split(area);
+
+        if inner.len() < 3 {
+            return;
+        }
+
+        let header_p = Paragraph::new(Line::from(vec![
+            Span::styled("Select a mix profile to sequence cohesive playlists with DJ spacing & transitions:", Style::default().fg(Color::DarkGray)),
+        ]));
+        f.render_widget(header_p, inner[0]);
+
+        let options = [
+            ("Diverse Artists Shuffle", "Fair random sampling across all artists (prevents cluster bias)"),
+            ("BPM Flow (~120 BPM)", "Cohesive tempo gradient with harmonic Camelot wheel transitions"),
+            ("Chill & Ambient", "Downtempo, acoustic, lofi & low energy vibes (60-95 BPM)"),
+            ("Workout & High Energy", "Dance, electronic, rock & upbeat vibes (124-145 BPM)"),
+            ("Late Night Groove", "Soul, funk, disco, house & groove vibes (110-128 BPM)"),
+        ];
+
+        let mut lines = Vec::new();
+        for (idx, (title, desc)) in options.iter().enumerate() {
+            let is_cursor = idx == self.mix_picker_cursor;
+            let is_active = matches!(
+                (&self.active_mix_profile, idx),
+                (crate::analysis::MixProfile::DiverseShuffle, 0)
+                    | (crate::analysis::MixProfile::BpmFlow { .. }, 1)
+                    | (crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Chill), 2)
+                    | (crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Workout), 3)
+                    | (crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Groove), 4)
+            );
+
+            let prefix = if is_cursor { " ▶ " } else { "   " };
+            let active_marker = if is_active { " [ACTIVE] " } else { "          " };
+
+            let num_key = format!("[{}] ", idx + 1);
+
+            let line_style = if is_cursor {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(num_key, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{:<26}", title), line_style),
+                Span::styled(active_marker, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("— {}", desc), Style::default().fg(Color::DarkGray)),
+            ]));
+            lines.push(Line::from(""));
+        }
+
+        f.render_widget(Paragraph::new(lines), inner[1]);
+
+        let footer_line = Line::from(vec![
+            Span::styled(" [1-5 / Enter] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("Select & Launch   ", Style::default().fg(Color::White)),
+            Span::styled(" [r] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("Seed Radio on Track   ", Style::default().fg(Color::White)),
+            Span::styled(" [Esc / q] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled("Close", Style::default().fg(Color::White)),
+        ]);
+        f.render_widget(Paragraph::new(footer_line).alignment(Alignment::Center), inner[2]);
 
         // Footer: dismiss instruction (if vertical room allows)
         if inner.len() >= 2 {

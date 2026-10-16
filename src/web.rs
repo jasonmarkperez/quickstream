@@ -93,6 +93,12 @@ pub struct NowPlayingState {
     pub is_autopilot: bool,
     #[serde(default)]
     pub autopilot_dir: Option<String>,
+    #[serde(default)]
+    pub active_mix_profile: String,
+    #[serde(default)]
+    pub bpm: Option<f64>,
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 impl Default for NowPlayingState {
@@ -125,6 +131,9 @@ impl Default for NowPlayingState {
             current_browser_dir: String::new(),
             is_autopilot: false,
             autopilot_dir: None,
+            active_mix_profile: "Diverse Artists Shuffle".to_string(),
+            bpm: None,
+            key: None,
         }
     }
 }
@@ -152,6 +161,8 @@ pub enum WebCommand {
     Autopilot(Option<PathBuf>),
     AutopilotReshuffle(Option<PathBuf>),
     ShuffleQueue,
+    SetMixProfile(String),
+    SeedRadio(PathBuf),
 }
 
 #[derive(Deserialize)]
@@ -733,6 +744,16 @@ fn handle_client(
                 }
                 "shuffle" => {
                     let _ = cmd_tx.send(WebCommand::ShuffleQueue);
+                }
+                "set_mix_profile" | "mix_profile" => {
+                    if let Some(profile_str) = payload.mode.or(payload.path) {
+                        let _ = cmd_tx.send(WebCommand::SetMixProfile(profile_str));
+                    }
+                }
+                "seed_radio" => {
+                    if let Some(p) = payload.path {
+                        let _ = cmd_tx.send(WebCommand::SeedRadio(PathBuf::from(p)));
+                    }
                 }
                 _ => {}
             }
@@ -2648,6 +2669,15 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
         </button>
       </div>
 
+      <div class="mode-bar" style="margin-top:0.35rem;margin-bottom:0.75rem;">
+        <span class="mode-label">Mix Vibe:</span>
+        <button class="mix-profile-btn mode-btn active" data-profile="diverse" title="Diverse rotation across all artists">Diverse</button>
+        <button class="mix-profile-btn mode-btn" data-profile="bpm_flow" title="Smooth BPM tempo gradient & harmonic keys">BPM Flow</button>
+        <button class="mix-profile-btn mode-btn" data-profile="chill" title="Ambient, acoustic & downtempo vibe">Chill</button>
+        <button class="mix-profile-btn mode-btn" data-profile="workout" title="High energy, dance & electronic vibe">Workout</button>
+        <button class="mix-profile-btn mode-btn" data-profile="groove" title="Soul, funk & disco groove vibe">Groove</button>
+      </div>
+
       <input type="text" id="browserSearchInput" class="search-input" placeholder="Filter files and folders...">
 
       <div class="browser-list" id="browserList"></div>
@@ -2796,9 +2826,18 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       const apBadge = document.getElementById('autopilotBadge');
       if (apBadge) {
         apBadge.style.display = data.is_autopilot ? 'inline-flex' : 'none';
+        if (data.active_mix_profile) {
+          apBadge.textContent = '⚡ ' + data.active_mix_profile;
+        }
       }
 
       let fmtText = data.format || "AUDIO";
+      if (data.bpm) {
+        fmtText += ` · ${Math.round(data.bpm)} BPM`;
+      }
+      if (data.key) {
+        fmtText += ` · ${data.key}`;
+      }
       if (data.sample_rate_hz > 0) {
         fmtText += ` · ${(data.sample_rate_hz / 1000).toFixed(1)}kHz`;
       }
@@ -2807,6 +2846,20 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       }
       document.getElementById('formatBadge').textContent = fmtText;
       document.getElementById('outputBadge').textContent = data.output_device || "Local Audio";
+
+      if (data.active_mix_profile) {
+        const profLower = data.active_mix_profile.toLowerCase();
+        document.querySelectorAll('.mix-profile-btn').forEach(b => {
+          const key = b.getAttribute('data-profile');
+          if (key && profLower.includes(key.replace('_', ' '))) {
+            b.classList.add('active');
+          } else if (key && profLower.includes(key)) {
+            b.classList.add('active');
+          } else {
+            b.classList.remove('active');
+          }
+        });
+      }
 
       if (data.queue_total > 0) {
         document.getElementById('queueBadge').textContent = `Track ${data.queue_index + 1} of ${data.queue_total}`;
@@ -2996,6 +3049,9 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
             </div>
           </div>
           <span class="queue-item-dur">${formatTime(item.duration_seconds)}</span>
+          <button class="btn-icon-sm" onclick="event.stopPropagation(); seedRadio('${escapeAttr(item.filepath)}')" title="Seed Radio station from this track">
+            <span style="font-size:12px;">📻</span>
+          </button>
           <button class="btn-icon-sm danger-hover" onclick="event.stopPropagation(); removeIndex(${item.index})" title="Remove track">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
               <line x1="18" y1="6" x2="6" y2="18"></line>
@@ -3111,12 +3167,17 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
             <div class="browser-item file" onclick="addFile('${escapeAttr(item.path)}')">
               <span class="browser-icon">🎵</span>
               <span class="browser-name">${escapeHtml(item.name)}</span>
-              <button class="btn-icon-sm add-btn" title="Add to queue" onclick="event.stopPropagation(); addFile('${escapeAttr(item.path)}')">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                  <line x1="12" y1="5" x2="12" y2="19"></line>
-                  <line x1="5" y1="12" x2="19" y2="12"></line>
-                </svg>
-              </button>
+              <div style="display:flex;gap:0.35rem;align-items:center;">
+                <button class="btn-icon-sm" title="Seed Radio station from this track" onclick="event.stopPropagation(); seedRadio('${escapeAttr(item.path)}')">
+                  <span style="font-size:12px;">📻</span>
+                </button>
+                <button class="btn-icon-sm add-btn" title="Add to queue" onclick="event.stopPropagation(); addFile('${escapeAttr(item.path)}')">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                  </svg>
+                </button>
+              </div>
             </div>`;
         }
       }).join('');
@@ -3194,6 +3255,22 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       await sendAction('add_file', null, { path });
       showToast('Added track to queue');
     }
+
+    async function seedRadio(path) {
+      if (!path) return;
+      await sendAction('seed_radio', null, { path });
+      showToast('📻 Starting Seed Radio station...');
+    }
+
+    document.querySelectorAll('.mix-profile-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const profile = btn.getAttribute('data-profile');
+        sendAction('set_mix_profile', null, { mode: profile });
+        document.querySelectorAll('.mix-profile-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        showToast(`Mix profile: ${btn.innerText}`);
+      });
+    });
 
     // --- DEVICES TAB ---
     function renderDevices(data) {

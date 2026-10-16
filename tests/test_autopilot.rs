@@ -507,4 +507,114 @@ fn test_web_autopilot_reshuffle_action() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_autopilot_bpm_flow_and_mood_vibe() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_mix_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let db = quickstream::analysis::AnalysisDatabase::open_in_memory().unwrap();
+
+    // Create 6 tracks: 3 high tempo (124-128 BPM), 3 low tempo (70-75 BPM)
+    for i in 1..=6 {
+        let track_path = temp_dir.join(format!("track_{}.wav", i));
+        create_dummy_audio(&track_path);
+
+        let (bpm, genre, mood) = if i <= 3 {
+            (Some(124.0 + (i as f64) * 2.0), "Electronic".to_string(), Some("workout".to_string()))
+        } else {
+            (Some(70.0 + (i as f64)), "Ambient".to_string(), Some("chill".to_string()))
+        };
+
+        let feat = quickstream::analysis::TrackFeatures {
+            filepath: track_path.clone(),
+            title: format!("Track {}", i),
+            artist: format!("Artist {}", i),
+            album: format!("Album {}", i),
+            genre,
+            bpm,
+            energy: if i <= 3 { Some(0.85) } else { Some(0.25) },
+            mood,
+            ..Default::default()
+        };
+        db.upsert_track(&feat).unwrap();
+    }
+
+    let mgr = SettingsManager::default();
+    let mut app = AppUI::new(Some(temp_dir.clone()), mgr);
+    app.analysis_db = db;
+
+    // Test 1: BpmFlow ~125 BPM
+    app.active_mix_profile = quickstream::analysis::MixProfile::BpmFlow {
+        target_bpm: 125.0,
+        tolerance: 0.10,
+    };
+    app.start_autopilot(temp_dir.clone());
+    app.wait_for_autopilot_scan(Duration::from_secs(3));
+
+    // The 3 high tempo tracks (126, 128, 130) should be selected
+    assert!(!app.queue.is_empty());
+    for track in &app.queue.tracks {
+        let feat = app.analysis_db.get_track(&track.filepath).unwrap();
+        assert!(feat.bpm.unwrap() >= 100.0);
+    }
+
+    // Test 2: MoodVibe Chill
+    app.queue.clear();
+    app.active_mix_profile = quickstream::analysis::MixProfile::MoodVibe(quickstream::analysis::MoodType::Chill);
+    app.start_autopilot(temp_dir.clone());
+    app.wait_for_autopilot_scan(Duration::from_secs(3));
+
+    assert!(!app.queue.is_empty());
+    for track in &app.queue.tracks {
+        let feat = app.analysis_db.get_track(&track.filepath).unwrap();
+        assert!(feat.bpm.unwrap() <= 98.0);
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_web_mix_profile_and_seed_radio_commands() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_web_mix_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let seed_track = temp_dir.join("seed.wav");
+    create_dummy_audio(&seed_track);
+
+    for i in 1..=3 {
+        let t = temp_dir.join(format!("t_{}.wav", i));
+        create_dummy_audio(&t);
+    }
+
+    let mgr = SettingsManager::default();
+    let mut app = AppUI::new(Some(temp_dir.clone()), mgr);
+
+    let (tx, rx) = mpsc::channel();
+    app.web_cmd_rx = Some(rx);
+
+    // 1. SetMixProfile
+    tx.send(WebCommand::SetMixProfile("workout".to_string())).unwrap();
+    app.handle_web_commands();
+    assert_eq!(
+        app.active_mix_profile,
+        quickstream::analysis::MixProfile::MoodVibe(quickstream::analysis::MoodType::Workout)
+    );
+
+    // 2. SeedRadio
+    tx.send(WebCommand::SeedRadio(seed_track.clone())).unwrap();
+    app.handle_web_commands();
+    assert_eq!(
+        app.active_mix_profile,
+        quickstream::analysis::MixProfile::SeedRadio(seed_track.clone())
+    );
+
+    app.wait_for_autopilot_scan(Duration::from_secs(3));
+    assert!(!app.queue.is_empty());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+
 
