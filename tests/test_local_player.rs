@@ -5,9 +5,19 @@ use std::time::Duration;
 use quickstream::player::local::LocalPlayer;
 use quickstream::player::AudioPlayer;
 
+fn ensure_test_file() -> PathBuf {
+    let path = std::env::temp_dir().join("test_sine.mp3");
+    if !path.exists() {
+        let _ = std::process::Command::new("ffmpeg")
+            .args(&["-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=10", path.to_str().unwrap()])
+            .output();
+    }
+    path
+}
+
 #[test]
 fn test_local_playback_lifecycle() {
-    let test_file = PathBuf::from("/tmp/test_sine.mp3");
+    let test_file = ensure_test_file();
     assert!(test_file.exists(), "test file must exist");
 
     let mut player = LocalPlayer::new("mpv");
@@ -79,7 +89,7 @@ fn test_local_playback_lifecycle() {
 
 #[test]
 fn test_ffplay_backend_lifecycle() {
-    let test_file = PathBuf::from("/tmp/test_sine.mp3");
+    let test_file = ensure_test_file();
     assert!(test_file.exists(), "test file must exist");
 
     let mut player = LocalPlayer::new("ffplay");

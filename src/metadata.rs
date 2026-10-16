@@ -102,6 +102,90 @@ pub fn get_audio_mime_type(path: &Path) -> &'static str {
     }
 }
 
+/// Derives intelligent heuristic title, artist, and album from file and folder paths
+/// without reading tags from disk, ensuring instant zero-cost initial display.
+pub fn parse_path_heuristics(path: &Path) -> (String, String, String) {
+    let raw_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let mut title = raw_stem.trim().to_string();
+    let mut artist = String::new();
+    let mut album = String::new();
+
+    // 1. Strip leading track number prefixes (e.g. "01-08 ", "01 - ", "03 ", "01. ", "01_")
+    let trimmed = title.as_str();
+    let digit_count = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digit_count > 0 {
+        let after_digits = &trimmed[digit_count..];
+        if after_digits.starts_with('-')
+            || after_digits.starts_with('.')
+            || after_digits.starts_with('_')
+            || after_digits.starts_with(' ')
+        {
+            let mut rest = &after_digits[1..];
+            let digit_count2 = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+            if digit_count2 > 0 {
+                rest = &rest[digit_count2..];
+            }
+            rest = rest.trim_start_matches(|c: char| c == '-' || c == '.' || c == '_' || c.is_whitespace());
+            if !rest.is_empty() {
+                title = rest.to_string();
+            }
+        }
+    }
+
+    // 2. Check if the remaining title contains " - " (e.g. "Artist - Title" or "Album - Artist - Title")
+    if title.contains(" - ") {
+        let parts: Vec<&str> = title.split(" - ").map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+        if parts.len() == 2 {
+            artist = parts[0].to_string();
+            title = parts[1].to_string();
+        } else if parts.len() >= 3 {
+            album = parts[0].to_string();
+            artist = parts[1].to_string();
+            title = parts[2..].join(" - ");
+        }
+    } else if title.contains("- ") {
+        let parts: Vec<&str> = title.split("- ").map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+        if parts.len() == 2 {
+            artist = parts[0].to_string();
+            title = parts[1].to_string();
+        }
+    }
+
+    // 3. Inspect directory hierarchy for artist and album
+    if let Some(parent) = path.parent() {
+        let parent_name = parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let is_root_like = |n: &str| {
+            n.is_empty()
+                || n == "/"
+                || n == "Volumes"
+                || n == "Users"
+                || n == "home"
+                || n == "Music"
+                || n == "var"
+                || n == "tmp"
+        };
+
+        if let Some(grandparent) = parent.parent() {
+            let gp_name = grandparent.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !is_root_like(gp_name) && !is_root_like(parent_name) {
+                // If grandparent folder name is a full artist name, prefer it
+                if artist.is_empty() || gp_name.to_lowercase().contains(&artist.to_lowercase()) {
+                    artist = gp_name.to_string();
+                }
+                if album.is_empty() {
+                    album = parent_name.to_string();
+                }
+            } else if !is_root_like(parent_name) && artist.is_empty() {
+                artist = parent_name.to_string();
+            }
+        } else if !is_root_like(parent_name) && artist.is_empty() {
+            artist = parent_name.to_string();
+        }
+    }
+
+    (title, artist, album)
+}
+
 pub fn extract_metadata(path: &Path) -> anyhow::Result<AudioMetadata> {
     let filename = path
         .file_name()
@@ -154,20 +238,36 @@ pub fn extract_metadata(path: &Path) -> anyhow::Result<AudioMetadata> {
         .and_then(|t| t.genre().map(|s| s.to_string()))
         .unwrap_or_default();
 
+    let (h_title, h_artist, h_album) = parse_path_heuristics(path);
+
     let display_title = if !title.is_empty() {
         title
+    } else if !h_title.is_empty() {
+        h_title
     } else {
         path.file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or(filename.clone())
     };
 
+    let final_artist = if !artist.is_empty() {
+        artist
+    } else {
+        h_artist
+    };
+
+    let final_album = if !album.is_empty() {
+        album
+    } else {
+        h_album
+    };
+
     Ok(AudioMetadata {
         filepath: path.to_path_buf(),
         filename,
         title: display_title,
-        artist,
-        album,
+        artist: final_artist,
+        album: final_album,
         genre,
         format_name: ext,
         duration_seconds,

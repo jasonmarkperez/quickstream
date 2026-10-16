@@ -21,10 +21,16 @@ pub struct Settings {
     pub web_server_port: u16,
     #[serde(default)]
     pub home_dir: Option<String>,
+    #[serde(default = "default_gapless_autopilot")]
+    pub gapless_autopilot: bool,
 }
 
 fn default_web_port() -> u16 {
     8080
+}
+
+fn default_gapless_autopilot() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -40,6 +46,7 @@ impl Default for Settings {
             web_server_enabled: false,
             web_server_port: 8080,
             home_dir: None,
+            gapless_autopilot: true,
         }
     }
 }
@@ -90,6 +97,11 @@ pub const SETTING_DEFINITIONS: &[SettingDefinition] = &[
         key: "home_dir",
         label: "Startup Home Directory",
         description: "Default directory loaded on startup instead of current working directory.",
+    },
+    SettingDefinition {
+        key: "gapless_autopilot",
+        label: "Gapless Continuous Stream",
+        description: "Seamlessly splice tracks into a single DLNA PCM stream (Roon-style gapless playback).",
     },
 ];
 
@@ -245,6 +257,10 @@ impl SettingsManager {
                 };
                 self.settings.home_dir = options[next_idx].clone();
             }
+            8 => {
+                // gapless_autopilot
+                self.settings.gapless_autopilot = !self.settings.gapless_autopilot;
+            }
             _ => {}
         }
         self.save();
@@ -289,6 +305,7 @@ impl SettingsManager {
                     "Default (Launch Directory)".to_string()
                 }
             }
+            8 => if self.settings.gapless_autopilot { "Enabled (Seamless PCM)" } else { "Disabled (Track-by-track)" }.to_string(),
             _ => String::new(),
         }
     }
@@ -308,6 +325,7 @@ mod tests {
         assert_eq!(s.volume_step, 5);
         assert_eq!(s.queue_mode, "loop");
         assert_eq!(s.home_dir, None);
+        assert!(s.gapless_autopilot);
     }
 
     #[test]
@@ -320,12 +338,14 @@ mod tests {
         mgr.settings.metadata_view = false;
         mgr.settings.volume_step = 10;
         mgr.settings.home_dir = Some("/custom/home".to_string());
+        mgr.settings.gapless_autopilot = false;
         assert!(mgr.save());
 
         let loaded = SettingsManager::load_from(&path).expect("should load");
         assert!(!loaded.metadata_view);
         assert_eq!(loaded.volume_step, 10);
         assert_eq!(loaded.home_dir, Some("/custom/home".to_string()));
+        assert!(!loaded.gapless_autopilot);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
@@ -354,6 +374,12 @@ mod tests {
         mgr.cycle_setting(7, true);
         mgr.cycle_setting(7, false);
         assert_eq!(mgr.settings.home_dir, None);
+
+        assert!(mgr.settings.gapless_autopilot);
+        assert_eq!(mgr.get_display_value(8), "Enabled (Seamless PCM)");
+        mgr.cycle_setting(8, true);
+        assert!(!mgr.settings.gapless_autopilot);
+        assert_eq!(mgr.get_display_value(8), "Disabled (Track-by-track)");
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

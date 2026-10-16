@@ -364,14 +364,15 @@ impl UPnPClient {
         }
     }
 
-    /// Send Play command with retries if renderer is transitioning or busy.
+    /// Send Play command with retries if renderer is transitioning, busy, or buffering.
     pub fn play(&self, speed: &str) -> bool {
         for attempt in 0..5 {
-            let res = self.send_soap_action(
+            let res = self.send_soap_action_with_timeout(
                 &self.device.av_transport_control_url,
                 AV_TRANSPORT_SERVICE,
                 "Play",
                 &[("InstanceID", "0"), ("Speed", speed)],
+                Duration::from_millis(6000),
             );
             if res.is_some() {
                 return true;
@@ -383,14 +384,19 @@ impl UPnPClient {
                 || err.contains("Action Failed")
                 || err.contains("705")
                 || err.contains("Transport locked")
+                || err.contains("timeout")
+                || err.contains("Resource temporarily unavailable")
+                || err.contains("os error 35")
+                || err.contains("Connection reset")
+                || err.contains("Broken pipe")
             {
                 crate::log_info!(
                     "upnp",
-                    "Renderer returned '{}' on Play (attempt {}/5); retrying in 300ms...",
+                    "Renderer returned '{}' on Play (attempt {}/5); retrying in 400ms...",
                     err,
                     attempt + 1
                 );
-                std::thread::sleep(Duration::from_millis(300));
+                std::thread::sleep(Duration::from_millis(400));
                 continue;
             }
             break;
@@ -596,6 +602,7 @@ impl UPnPPlayer {
         let last_seek_ref = self.last_seek_time.clone();
 
         let dev_name = self.device.friendly_name.clone();
+        let stream_state = self.stream_state.clone();
 
         std::thread::spawn(move || {
             let mut consecutive_stopped = 0;
@@ -607,6 +614,22 @@ impl UPnPPlayer {
                 std::thread::sleep(Duration::from_millis(900));
                 if stop_flag.load(Ordering::Relaxed) {
                     break;
+                }
+
+                if let Some(ref ss) = stream_state {
+                    if ss.continuous.is_active.load(Ordering::SeqCst) {
+                        let state = client.get_transport_info();
+                        if state == "PLAYING" {
+                            consecutive_stopped = 0;
+                            is_playing_ref.store(true, Ordering::SeqCst);
+                            is_paused_ref.store(false, Ordering::SeqCst);
+                        } else if state == "PAUSED_PLAYBACK" {
+                            consecutive_stopped = 0;
+                            is_playing_ref.store(false, Ordering::SeqCst);
+                            is_paused_ref.store(true, Ordering::SeqCst);
+                        }
+                        continue;
+                    }
                 }
 
                 // If user sought, sync last_seek_instant and reset max_observed_pos / total_playing_seconds
@@ -743,6 +766,16 @@ impl UPnPPlayer {
     }
 
     fn seek_via_stream_offset(&mut self, target: f64) -> anyhow::Result<()> {
+        if let Some(ref ss) = self.stream_state {
+            if ss.continuous.is_active.load(Ordering::SeqCst) {
+                ss.continuous.seek_to(target);
+                self.is_playing.store(true, Ordering::SeqCst);
+                self.is_paused.store(false, Ordering::SeqCst);
+                let _ = self.client.play("1");
+                return Ok(());
+            }
+        }
+
         let filepath = match self.current_filepath.lock().unwrap().clone() {
             Some(p) => p,
             None => anyhow::bail!("No track currently loaded"),
@@ -846,8 +879,11 @@ impl AudioPlayer for UPnPPlayer {
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| "track".to_string());
+        let is_continuous = file_name.contains("continuous.wav") || file_name == "__continuous__.wav";
         let encoded_name = url_encode(&file_name);
-        let stream_url = if position_seconds > 0.0 {
+        let stream_url = if is_continuous {
+            format!("http://{}:{}/stream/continuous.wav", host_ip, self.web_port)
+        } else if position_seconds > 0.0 {
             format!(
                 "http://{}:{}/stream/{}?pos={:.2}",
                 host_ip, self.web_port, encoded_name, position_seconds
@@ -858,8 +894,10 @@ impl AudioPlayer for UPnPPlayer {
         crate::log_info!("player", "UPnP stream URL for '{}': {}", filepath.display(), stream_url);
 
         // 3. Extract audio metadata & MIME type
-        let mime = get_audio_mime_type(filepath);
-        let (title, artist, album, duration) = if let Ok(m) = extract_metadata(filepath) {
+        let mime = if is_continuous { "audio/x-wav" } else { get_audio_mime_type(filepath) };
+        let (title, artist, album, duration) = if is_continuous {
+            ("Autopilot (Gapless Stream)".to_string(), "Quickstream".to_string(), "Autopilot".to_string(), 0.0)
+        } else if let Ok(m) = extract_metadata(filepath) {
             (m.title, m.artist, m.album, m.duration_seconds)
         } else {
             (file_name.clone(), String::new(), String::new(), 0.0)
@@ -879,7 +917,12 @@ impl AudioPlayer for UPnPPlayer {
             anyhow::bail!("SetAVTransportURI failed on {}: {}", self.device.friendly_name, err);
         }
 
-        // 5. Send Play command (UPnPClient::play automatically retries on 501 Action Failed / 701 Transition not available)
+        // Allow renderer audio pipeline to connect and establish initial stream buffer
+        if is_continuous {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+
+        // 5. Send Play command (UPnPClient::play automatically retries on 501 Action Failed / 701 Transition not available / timeout)
         if !self.client.play("1") {
             let err = self.client.last_error.lock().unwrap().clone();
             crate::log_info!("player", "Play command failed on {}: {}", self.device.friendly_name, err);
@@ -986,6 +1029,12 @@ impl AudioPlayer for UPnPPlayer {
     }
 
     fn seek_to(&mut self, position_seconds: f64) -> anyhow::Result<()> {
+        if let Some(ref ss) = self.stream_state {
+            if ss.continuous.is_active.load(Ordering::SeqCst) {
+                ss.continuous.seek_to(position_seconds);
+                return Ok(());
+            }
+        }
         let dur = *self.duration_seconds.lock().unwrap();
         let target = if dur > 0.0 {
             position_seconds.clamp(0.0, dur)
@@ -1028,10 +1077,20 @@ impl AudioPlayer for UPnPPlayer {
     }
 
     fn position_seconds(&self) -> f64 {
+        if let Some(ref ss) = self.stream_state {
+            if ss.continuous.is_active.load(Ordering::SeqCst) {
+                return *ss.continuous.current_position.lock().unwrap();
+            }
+        }
         *self.position_seconds.lock().unwrap()
     }
 
     fn duration_seconds(&self) -> f64 {
+        if let Some(ref ss) = self.stream_state {
+            if ss.continuous.is_active.load(Ordering::SeqCst) {
+                return *ss.continuous.current_duration.lock().unwrap();
+            }
+        }
         *self.duration_seconds.lock().unwrap()
     }
 

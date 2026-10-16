@@ -81,6 +81,7 @@ pub struct AppUI {
     pub metadata_tx: std::sync::mpsc::Sender<crate::metadata::AudioMetadata>,
     pub metadata_rx: std::sync::mpsc::Receiver<crate::metadata::AudioMetadata>,
     pub metadata_worker_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub queue_metadata_worker_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub browser_state: ListState,
     pub queue_state: ListState,
     pub devices_state: ListState,
@@ -98,6 +99,10 @@ pub struct AppUI {
     pub pending_track_skip: bool,
     pub last_track_skip_time: Option<std::time::Instant>,
     pub editing_home_dir: Option<String>,
+    pub autopilot_dir: Option<PathBuf>,
+    pub autopilot_rx: Option<std::sync::mpsc::Receiver<crate::library::AutopilotEvent>>,
+    pub autopilot_scan_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub is_autopilot_scanning: bool,
 }
 
 impl AppUI {
@@ -165,6 +170,7 @@ impl AppUI {
             metadata_tx,
             metadata_rx,
             metadata_worker_stop: None,
+            queue_metadata_worker_stop: None,
             browser_state: ListState::default(),
             queue_state: ListState::default(),
             devices_state: ListState::default(),
@@ -182,6 +188,10 @@ impl AppUI {
             pending_track_skip: false,
             last_track_skip_time: None,
             editing_home_dir: None,
+            autopilot_dir: None,
+            autopilot_rx: None,
+            autopilot_scan_stop: None,
+            is_autopilot_scanning: false,
         };
         app.refresh_browser();
         app.update_web_state();
@@ -768,11 +778,76 @@ impl AppUI {
         });
     }
 
+    pub fn start_queue_metadata_fetch(&mut self) {
+        let paths_to_fetch: Vec<PathBuf> = self
+            .queue
+            .tracks
+            .iter()
+            .filter(|t| t.duration_seconds <= 0.0 || t.artist.is_empty())
+            .map(|t| t.filepath.clone())
+            .collect();
+
+        if paths_to_fetch.is_empty() {
+            return;
+        }
+
+        if let Some(stop) = self.queue_metadata_worker_stop.take() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.queue_metadata_worker_stop = Some(stop.clone());
+        let tx = self.metadata_tx.clone();
+
+        // 4 parallel worker threads to resolve tags and duration concurrently
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(paths_to_fetch));
+        for _ in 0..4 {
+            let q = queue.clone();
+            let tx = tx.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                loop {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let path = {
+                        let mut guard = match q.lock() {
+                            Ok(g) => g,
+                            Err(_) => break,
+                        };
+                        guard.pop()
+                    };
+                    let path = match path {
+                        Some(p) => p,
+                        None => break,
+                    };
+                    if let Ok(meta) = crate::metadata::extract_metadata(&path) {
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        crate::library::LibraryManager::append_to_cache(&meta);
+                        let _ = tx.send(meta);
+                    }
+                }
+            });
+        }
+    }
+
     pub fn poll_background_metadata(&mut self) {
+        let mut queue_updated = false;
         while let Ok(meta) = self.metadata_rx.try_recv() {
             let path = meta.filepath.clone();
             self.metadata_cache.insert(path.clone(), meta.clone());
 
+            // 1. Update matching tracks in queue
+            for track in &mut self.queue.tracks {
+                if track.filepath == path {
+                    *track = meta.clone();
+                    queue_updated = true;
+                }
+            }
+
+            // 2. Update browser entries if active
             if self.settings_mgr.settings.metadata_view {
                 if !self.in_bookmarks_view {
                     for (label, p, is_dir) in &mut self.browser_entries {
@@ -795,6 +870,106 @@ impl AppUI {
                 }
             }
         }
+
+        if queue_updated {
+            self.update_web_state();
+        }
+    }
+
+    pub fn poll_background_autopilot(&mut self) {
+        let mut new_tracks = Vec::new();
+        let mut finished = false;
+
+        if let Some(ref rx) = self.autopilot_rx {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    crate::library::AutopilotEvent::Track(track) => {
+                        new_tracks.push(track);
+                    }
+                    crate::library::AutopilotEvent::Finished(_) => {
+                        finished = true;
+                    }
+                }
+            }
+        }
+
+        if finished {
+            self.is_autopilot_scanning = false;
+            self.autopilot_rx = None;
+        }
+
+        if new_tracks.is_empty() {
+            if finished {
+                if self.queue.is_empty() {
+                    let dir_name = self.autopilot_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default();
+                    self.status_message = format!("No audio files found in '{}'", dir_name);
+                } else {
+                    let dir_name = self.autopilot_dir.as_ref().and_then(|d| d.file_name()).unwrap_or_default().to_string_lossy();
+                    self.status_message = format!("⚡ Autopilot: {} tracks from '{}'", self.queue.len(), dir_name);
+                }
+            }
+            return;
+        }
+
+        let was_empty = self.queue.is_empty();
+
+        for track in new_tracks {
+            if let Some(ref ws) = self.web_server {
+                ws.register_stream_file(&track.filepath);
+            }
+            self.queue.add_track(track);
+        }
+
+        if was_empty && !self.queue.is_empty() {
+            self.queue.current_index = 0;
+            self.queue_cursor = 0;
+
+            let _ = self.ensure_web_server_started();
+            self.update_web_state();
+
+            let is_dlna = self.device_manager.get_active_device().is_some();
+            let gapless = self.settings_mgr.settings.gapless_autopilot;
+
+            if is_dlna && gapless {
+                if let Some(ref ws) = self.web_server {
+                    ws.close_active_streams();
+                    *ws.stream_state().continuous.current_track_index.lock().unwrap() = 0;
+                    *ws.stream_state().continuous.current_position.lock().unwrap() = 0.0;
+                }
+                if let Ok(mut s) = self.web_state.write() {
+                    s.is_autopilot = true;
+                    s.autopilot_dir = self.autopilot_dir.as_ref().map(|d| d.to_string_lossy().to_string());
+                    s.is_playing = true;
+                    s.is_paused = false;
+                }
+                let _ = self.player.play(Path::new("__continuous__.wav"));
+            } else {
+                if let Ok(mut s) = self.web_state.write() {
+                    s.is_autopilot = true;
+                    s.autopilot_dir = self.autopilot_dir.as_ref().map(|d| d.to_string_lossy().to_string());
+                }
+                self.play_current_track();
+            }
+        }
+
+        self.start_queue_metadata_fetch();
+        self.update_web_state();
+
+        if self.is_autopilot_scanning {
+            self.status_message = format!("⚡ Autopilot: {} tracks queued (discovering...)", self.queue.len());
+        } else if !self.queue.is_empty() {
+            let dir_name = self.autopilot_dir.as_ref().and_then(|d| d.file_name()).unwrap_or_default().to_string_lossy();
+            self.status_message = format!("⚡ Autopilot: {} tracks from '{}'", self.queue.len(), dir_name);
+        }
+    }
+
+    pub fn wait_for_autopilot_scan(&mut self, timeout: std::time::Duration) {
+        let start = std::time::Instant::now();
+        while self.is_autopilot_scanning && start.elapsed() < timeout {
+            self.poll_background_autopilot();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        self.poll_background_autopilot();
     }
 
     pub fn navigate_browser(&mut self, path: PathBuf) {
@@ -1018,6 +1193,17 @@ impl AppUI {
                 self.play_next_track();
             }
 
+            // Synchronize continuous gapless stream track index
+            if let Some(ref ws) = self.web_server {
+                if ws.stream_state().continuous.is_active.load(std::sync::atomic::Ordering::SeqCst) {
+                    let cur_idx = *ws.stream_state().continuous.current_track_index.lock().unwrap();
+                    if cur_idx != self.queue.current_index && cur_idx < self.queue.len() {
+                        self.queue.current_index = cur_idx;
+                        self.queue_cursor = cur_idx;
+                    }
+                }
+            }
+
             // Process remote web commands
             self.handle_web_commands();
 
@@ -1029,6 +1215,9 @@ impl AppUI {
 
             // Poll background metadata extraction
             self.poll_background_metadata();
+
+            // Poll progressive background autopilot discovery
+            self.poll_background_autopilot();
 
             if let Some(ref mut modal) = self.search_modal {
                 modal.poll_background_scan();
@@ -1414,8 +1603,8 @@ impl AppUI {
                                 let home = base.home_dir();
                                 if raw == "~" {
                                     home.to_string_lossy().to_string()
-                                } else if raw.starts_with("~/") {
-                                    home.join(&raw[2..]).to_string_lossy().to_string()
+                                } else if let Some(stripped) = raw.strip_prefix("~/") {
+                                    home.join(stripped).to_string_lossy().to_string()
                                 } else {
                                     raw.to_string()
                                 }
@@ -1601,6 +1790,25 @@ impl AppUI {
                 if self.active_tab == 0 || self.active_tab == 1 {
                     self.open_fuzzy_search();
                 }
+            }
+            (KeyCode::Char('z') | KeyCode::Char('Z'), KeyModifiers::NONE) => {
+                if !self.queue.is_empty() {
+                    self.queue.shuffle();
+                    self.status_message = "🔀 Queue shuffled".to_string();
+                    self.update_web_state();
+                }
+            }
+            (KeyCode::Char('p') | KeyCode::Char('P'), _) => {
+                let target_dir = if self.in_bookmarks_view {
+                    if self.browser_cursor > 0 && self.browser_cursor < self.browser_entries.len() {
+                        self.browser_entries[self.browser_cursor].1.clone()
+                    } else {
+                        self.browser_dir.clone()
+                    }
+                } else {
+                    self.browser_dir.clone()
+                };
+                self.start_autopilot(target_dir);
             }
             _ => {
                 // Tab specific key handling
@@ -1849,6 +2057,11 @@ impl AppUI {
                         self.refresh_browser();
                         self.status_message = format!("Refreshing directory '{}'", self.browser_dir.display());
                     }
+                    (KeyCode::Char('z') | KeyCode::Char('Z'), _) if self.queue_focus && !self.queue.is_empty() => {
+                        self.queue.shuffle();
+                        self.status_message = "🔀 Queue shuffled".to_string();
+                        self.update_web_state();
+                    }
                     (KeyCode::Char('H'), _) => {
                         let target = if self.in_bookmarks_view && self.browser_cursor > 0 && self.browser_cursor <= self.bookmarks.len() {
                             self.bookmarks[self.browser_cursor - 1].clone()
@@ -1980,20 +2193,16 @@ impl AppUI {
                     | (KeyCode::Down, KeyModifiers::SHIFT) => {
                         self.settings_cursor = SETTING_DEFINITIONS.len() - 1;
                     }
-                    (KeyCode::Char('e'), KeyModifiers::NONE) => {
-                        if self.settings_cursor == 7 {
-                            let curr = self.settings_mgr.settings.home_dir.clone().unwrap_or_default();
-                            self.editing_home_dir = Some(curr);
-                            self.status_message = "Editing Startup Home Directory (Enter: Save, Esc: Cancel)".to_string();
-                        }
+                    (KeyCode::Char('e'), KeyModifiers::NONE) if self.settings_cursor == 7 => {
+                        let curr = self.settings_mgr.settings.home_dir.clone().unwrap_or_default();
+                        self.editing_home_dir = Some(curr);
+                        self.status_message = "Editing Startup Home Directory (Enter: Save, Esc: Cancel)".to_string();
                     }
-                    (KeyCode::Char('c'), KeyModifiers::NONE) | (KeyCode::Delete, _) => {
-                        if self.settings_cursor == 7 {
-                            self.settings_mgr.settings.home_dir = None;
-                            self.settings_mgr.save();
-                            self.status_message = "Cleared startup home (defaulting to launch directory)".to_string();
-                            self.update_web_state();
-                        }
+                    (KeyCode::Char('c'), KeyModifiers::NONE) | (KeyCode::Delete, _) if self.settings_cursor == 7 => {
+                        self.settings_mgr.settings.home_dir = None;
+                        self.settings_mgr.save();
+                        self.status_message = "Cleared startup home (defaulting to launch directory)".to_string();
+                        self.update_web_state();
                     }
                     (KeyCode::Left, KeyModifiers::NONE)
                     | (KeyCode::Char('h'), KeyModifiers::NONE) => {
@@ -2046,8 +2255,24 @@ impl AppUI {
     pub fn play_current_track(&mut self) {
         self.pending_track_skip = false;
         self.last_track_skip_time = None;
+        if let Some(ref ws) = self.web_server {
+            if ws.stream_state().continuous.is_active.load(std::sync::atomic::Ordering::SeqCst) {
+                ws.stream_state().continuous.skip_to_index(self.queue.current_index);
+                self.update_web_state();
+                return;
+            }
+        }
         if let Some(track) = self.queue.current_track() {
             let path = track.filepath.clone();
+            if track.duration_seconds <= 0.0 || track.artist.is_empty() {
+                if let Ok(meta) = crate::metadata::extract_metadata(&path) {
+                    crate::library::LibraryManager::append_to_cache(&meta);
+                    self.metadata_cache.insert(path.clone(), meta.clone());
+                    if let Some(cur) = self.queue.current_track_mut() {
+                        *cur = meta;
+                    }
+                }
+            }
             if let Some(ref ws) = self.web_server {
                 ws.close_active_streams();
                 ws.register_stream_file(&path);
@@ -2070,9 +2295,30 @@ impl AppUI {
     pub fn play_next_track(&mut self) {
         self.pending_track_skip = false;
         self.last_track_skip_time = None;
+        if let Some(ref ws) = self.web_server {
+            if ws.stream_state().continuous.is_active.load(std::sync::atomic::Ordering::SeqCst)
+                && !self.queue.is_empty()
+            {
+                let next_idx = (self.queue.current_index + 1) % self.queue.len();
+                self.queue.current_index = next_idx;
+                self.queue_cursor = next_idx;
+                ws.stream_state().continuous.skip_to_index(next_idx);
+                self.update_web_state();
+                return;
+            }
+        }
         let mode = self.settings_mgr.settings.queue_mode.clone();
         if let Some(track) = self.queue.next_track(&mode) {
             let path = track.filepath.clone();
+            if track.duration_seconds <= 0.0 || track.artist.is_empty() {
+                if let Ok(meta) = crate::metadata::extract_metadata(&path) {
+                    crate::library::LibraryManager::append_to_cache(&meta);
+                    self.metadata_cache.insert(path.clone(), meta.clone());
+                    if let Some(cur) = self.queue.current_track_mut() {
+                        *cur = meta;
+                    }
+                }
+            }
             if let Some(ref ws) = self.web_server {
                 ws.close_active_streams();
                 ws.register_stream_file(&path);
@@ -2095,8 +2341,33 @@ impl AppUI {
     pub fn play_prev_track(&mut self) {
         self.pending_track_skip = false;
         self.last_track_skip_time = None;
+        if let Some(ref ws) = self.web_server {
+            if ws.stream_state().continuous.is_active.load(std::sync::atomic::Ordering::SeqCst)
+                && !self.queue.is_empty()
+            {
+                let prev_idx = if self.queue.current_index > 0 {
+                    self.queue.current_index - 1
+                } else {
+                    self.queue.len().saturating_sub(1)
+                };
+                self.queue.current_index = prev_idx;
+                self.queue_cursor = prev_idx;
+                ws.stream_state().continuous.skip_to_index(prev_idx);
+                self.update_web_state();
+                return;
+            }
+        }
         if let Some(track) = self.queue.prev_track() {
             let path = track.filepath.clone();
+            if track.duration_seconds <= 0.0 || track.artist.is_empty() {
+                if let Ok(meta) = crate::metadata::extract_metadata(&path) {
+                    crate::library::LibraryManager::append_to_cache(&meta);
+                    self.metadata_cache.insert(path.clone(), meta.clone());
+                    if let Some(cur) = self.queue.current_track_mut() {
+                        *cur = meta;
+                    }
+                }
+            }
             if let Some(ref ws) = self.web_server {
                 ws.close_active_streams();
                 ws.register_stream_file(&path);
@@ -2114,6 +2385,55 @@ impl AppUI {
             }
             self.update_web_state();
         }
+    }
+
+    pub fn start_autopilot(&mut self, dir: PathBuf) {
+        // 1. Cancel any active autopilot scanner
+        if let Some(stop) = self.autopilot_scan_stop.take() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.autopilot_scan_stop = Some(stop_flag.clone());
+
+        // 2. Clear current queue and stop previous playback
+        self.queue.clear();
+        self.queue.current_index = 0;
+        self.queue_cursor = 0;
+        self.autopilot_dir = Some(dir.clone());
+        self.is_autopilot_scanning = true;
+
+        let dir_display = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+        self.status_message = format!("⚡ Autopilot: Discovering tracks from '{}'...", dir_display);
+        let _ = self.player.stop();
+
+        // 3. Reuse any subdirectories already discovered by the browser if viewing the same folder
+        let known_subdirs: Vec<PathBuf> = if self.browser_dir == dir {
+            self.browser_entries
+                .iter()
+                .filter(|(_, p, is_dir)| *is_dir && p.to_string_lossy() != "___MUSIC_HOMES___")
+                .map(|(_, p, _)| p.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let cache = self.metadata_cache.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.autopilot_rx = Some(rx);
+
+        // 4. Spawn background worker to discover tracks and stream them progressively
+        let scan_dir = dir.clone();
+        std::thread::spawn(move || {
+            crate::library::LibraryManager::scan_directory_autopilot_progressive(
+                scan_dir,
+                known_subdirs,
+                cache,
+                tx,
+                stop_flag,
+            );
+        });
+
+        self.update_web_state();
     }
 
     pub fn ensure_web_server_started(&mut self) -> u16 {
@@ -2434,6 +2754,17 @@ impl AppUI {
                     }
                     self.update_web_state();
                 }
+                crate::web::WebCommand::Autopilot(path_opt) => {
+                    let target = path_opt.unwrap_or_else(|| self.browser_dir.clone());
+                    self.start_autopilot(target);
+                }
+                crate::web::WebCommand::ShuffleQueue => {
+                    if !self.queue.is_empty() {
+                        self.queue.shuffle();
+                        self.status_message = "🔀 Queue shuffled (web)".to_string();
+                        self.update_web_state();
+                    }
+                }
             }
         }
     }
@@ -2459,6 +2790,8 @@ impl AppUI {
             state.is_scanning = self.device_manager.is_scanning();
             state.home_dir = self.settings_mgr.settings.home_dir.clone();
             state.current_browser_dir = self.browser_dir.to_string_lossy().to_string();
+            state.is_autopilot = self.autopilot_dir.is_some();
+            state.autopilot_dir = self.autopilot_dir.as_ref().map(|d| d.to_string_lossy().to_string());
 
             state.queue = self
                 .queue
@@ -2705,6 +3038,13 @@ impl AppUI {
 
             // Row 4: Format Quality Badges
             let mut badge_spans = Vec::new();
+            if self.autopilot_dir.is_some() {
+                badge_spans.push(Span::styled(
+                    "[⚡ AUTOPILOT]",
+                    Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ));
+                badge_spans.push(Span::raw(" "));
+            }
             if !track.format_name.is_empty() {
                 badge_spans.push(Span::styled(
                     format!("[{}]", track.format_name.to_uppercase()),
@@ -2895,7 +3235,11 @@ impl AppUI {
                         let rows: Vec<Row> = upcoming
                             .into_iter()
                             .map(|(i, t)| {
-                                let dur_label = format_time(t.duration_seconds);
+                                let dur_label = if t.duration_seconds > 0.0 {
+                                    format_time(t.duration_seconds)
+                                } else {
+                                    "--:--".to_string()
+                                };
                                 let artist_text = if !t.artist.is_empty() {
                                     t.artist.as_str()
                                 } else {
@@ -2928,7 +3272,11 @@ impl AppUI {
                         let rows: Vec<Row> = upcoming
                             .into_iter()
                             .map(|(i, t)| {
-                                let dur_label = format_time(t.duration_seconds);
+                                let dur_label = if t.duration_seconds > 0.0 {
+                                    format_time(t.duration_seconds)
+                                } else {
+                                    "--:--".to_string()
+                                };
                                 let fname = if !t.filename.is_empty() {
                                     t.filename.as_str()
                                 } else {
@@ -3543,6 +3891,14 @@ impl AppUI {
             ));
         }
 
+        if self.autopilot_dir.is_some() {
+            row2_spans.push(Span::raw(" "));
+            row2_spans.push(Span::styled(
+                "[⚡ AUTOPILOT]",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        }
+
         // Output Device (without "Out:" prefix)
         let active_dev_name = self
             .device_manager
@@ -3680,6 +4036,8 @@ impl AppUI {
         let right_lines = vec![
             Self::help_section_header("LIBRARY & QUEUE"),
             Self::help_key_line("Enter", "Open / Queue / Play"),
+            Self::help_key_line("P / p", "Autopilot (randomize & play)"),
+            Self::help_key_line("Z / z", "Shuffle current queue"),
             Self::help_key_line("a", "Add all songs in folder"),
             Self::help_key_line("d / x", "Remove track / bookmark"),
             Self::help_key_line("c", "Clear queue (queue pane)"),

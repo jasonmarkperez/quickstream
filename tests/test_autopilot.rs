@@ -1,0 +1,369 @@
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use quickstream::queue::FastRng;
+use quickstream::settings::SettingsManager;
+use quickstream::ui::AppUI;
+use quickstream::web::{
+    make_continuous_wav_header, NowPlayingState, WebCommand, WebServer,
+};
+
+fn create_dummy_audio(path: &Path) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let data_len = 1000u32;
+    let riff_len = 36 + data_len;
+    let mut file = File::create(path).unwrap();
+    let mut hdr = [0u8; 44];
+    hdr[0..4].copy_from_slice(b"RIFF");
+    hdr[4..8].copy_from_slice(&riff_len.to_le_bytes());
+    hdr[8..12].copy_from_slice(b"WAVE");
+    hdr[12..16].copy_from_slice(b"fmt ");
+    hdr[16..20].copy_from_slice(&16u32.to_le_bytes());
+    hdr[20..22].copy_from_slice(&1u16.to_le_bytes());
+    hdr[22..24].copy_from_slice(&2u16.to_le_bytes());
+    hdr[24..28].copy_from_slice(&44100u32.to_le_bytes());
+    hdr[28..32].copy_from_slice(&(44100u32 * 4).to_le_bytes());
+    hdr[32..34].copy_from_slice(&4u16.to_le_bytes());
+    hdr[34..36].copy_from_slice(&16u16.to_le_bytes());
+    hdr[36..40].copy_from_slice(b"data");
+    hdr[40..44].copy_from_slice(&data_len.to_le_bytes());
+    file.write_all(&hdr).unwrap();
+    file.write_all(&vec![0u8; data_len as usize]).unwrap();
+}
+
+#[test]
+fn test_splitmix64_fast_rng_shuffle() {
+    let mut rng = FastRng::with_seed(42);
+    let mut numbers: Vec<usize> = (0..50).collect();
+    let original = numbers.clone();
+    rng.shuffle(&mut numbers);
+
+    // Verify all original elements are preserved
+    let mut sorted = numbers.clone();
+    sorted.sort();
+    assert_eq!(sorted, original);
+
+    // Verify order was altered
+    assert_ne!(numbers, original);
+}
+
+#[test]
+fn test_continuous_wav_header_format() {
+    let hdr = make_continuous_wav_header();
+    assert_eq!(hdr.len(), 44);
+    assert_eq!(&hdr[0..4], b"RIFF");
+    assert_eq!(&hdr[4..8], &[0xFF, 0xFF, 0xFF, 0xFF]); // Streaming infinite size
+    assert_eq!(&hdr[8..12], b"WAVE");
+    assert_eq!(&hdr[12..16], b"fmt ");
+    assert_eq!(&hdr[16..20], &16u32.to_le_bytes()); // Subchunk size 16
+    assert_eq!(&hdr[20..22], &1u16.to_le_bytes()); // PCM format 1
+    assert_eq!(&hdr[22..24], &2u16.to_le_bytes()); // 2 channels stereo
+    assert_eq!(&hdr[24..28], &44100u32.to_le_bytes()); // 44100 Hz
+    assert_eq!(&hdr[28..32], &(44100u32 * 4).to_le_bytes()); // 176400 B/s
+    assert_eq!(&hdr[32..34], &4u16.to_le_bytes()); // Block align 4
+    assert_eq!(&hdr[34..36], &16u16.to_le_bytes()); // 16-bit
+    assert_eq!(&hdr[36..40], b"data");
+    assert_eq!(&hdr[40..44], &[0xFF, 0xFF, 0xFF, 0xFF]); // Streaming infinite data chunk
+}
+
+#[test]
+fn test_autopilot_recursive_scan_and_queue() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_autopilot_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let track1 = temp_dir.join("root_song.wav");
+    let track2 = temp_dir.join("sub1").join("sub_song.wav");
+    let track3 = temp_dir.join("sub1").join("sub2").join("deep_song.wav");
+
+    create_dummy_audio(&track1);
+    create_dummy_audio(&track2);
+    create_dummy_audio(&track3);
+
+    let mut settings_mgr = SettingsManager::new();
+    settings_mgr.settings.web_server_enabled = false;
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    app.start_autopilot(temp_dir.clone());
+    app.wait_for_autopilot_scan(Duration::from_secs(2));
+
+    // Verify 3 tracks discovered across recursive subdirectories
+    assert_eq!(app.queue.len(), 3);
+    assert_eq!(app.autopilot_dir, Some(temp_dir.clone()));
+    assert!(app.status_message.contains("Autopilot"));
+
+    // Verify all 3 files are present in the queue
+    let queue_paths: Vec<PathBuf> = app.queue.tracks.iter().map(|t| t.filepath.clone()).collect();
+    assert!(queue_paths.contains(&track1));
+    assert!(queue_paths.contains(&track2));
+    assert!(queue_paths.contains(&track3));
+
+    // Verify NowPlayingState reflected is_autopilot
+    if let Ok(s) = app.web_state.read() {
+        assert!(s.is_autopilot);
+        assert_eq!(s.autopilot_dir, Some(temp_dir.to_string_lossy().to_string()));
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_web_autopilot_and_shuffle_actions() {
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (tx, rx) = mpsc::channel();
+    let handle = WebServer::start(0, state, tx).expect("Failed to start test web server");
+    let port = handle.port;
+
+    // 1. Send POST /api/action with action: "autopilot"
+    {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let body = r#"{"action":"autopilot","path":"/music/jazz"}"#;
+        let req = format!(
+            "POST /api/action HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"));
+
+        let cmd = rx.recv_timeout(Duration::from_secs(2)).expect("Command not received");
+        assert_eq!(cmd, WebCommand::Autopilot(Some(PathBuf::from("/music/jazz"))));
+    }
+
+    // 2. Send POST /api/action with action: "shuffle"
+    {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let body = r#"{"action":"shuffle"}"#;
+        let req = format!(
+            "POST /api/action HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"));
+
+        let cmd = rx.recv_timeout(Duration::from_secs(2)).expect("Command not received");
+        assert_eq!(cmd, WebCommand::ShuffleQueue);
+    }
+
+    handle.stop();
+}
+
+#[test]
+fn test_continuous_wav_stream_endpoint() {
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state.clone(), tx).expect("Failed to start test web server");
+    let port = handle.port;
+
+    // Send GET /stream/continuous.wav
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let req = "GET /stream/continuous.wav HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    stream.write_all(req.as_bytes()).unwrap();
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).unwrap();
+    assert_eq!(status_line.trim(), "HTTP/1.1 200 OK");
+
+    let mut headers = Vec::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        if line.trim().is_empty() {
+            break;
+        }
+        headers.push(line);
+    }
+
+    assert!(headers.iter().any(|h| h.to_lowercase().contains("content-type: audio/x-wav")));
+    assert!(headers.iter().any(|h| h.to_lowercase().contains("transfermode.dlna.org: streaming")));
+
+    // Read 44-byte WAV header
+    let mut wav_hdr = [0u8; 44];
+    reader.read_exact(&mut wav_hdr).unwrap();
+    assert_eq!(&wav_hdr[0..4], b"RIFF");
+    assert_eq!(&wav_hdr[8..12], b"WAVE");
+    assert_eq!(&wav_hdr[36..40], b"data");
+
+    // Verify stream controller was marked active
+    assert!(handle.stream_state().continuous.is_active.load(Ordering::SeqCst));
+
+    // Closing client socket triggers clean termination
+    drop(reader);
+    std::thread::sleep(Duration::from_millis(100));
+
+    handle.stop();
+}
+
+#[test]
+fn test_parse_path_heuristics_title_artist_album() {
+    use quickstream::library::LibraryManager;
+
+    // 1. Path with track-disc prefix, artist in filename and folder structure
+    let p1 = Path::new("/Volumes/Music/Ludovico Einaudi/2006 - Divenire/01-08 Einaudi- Come Un Fiore.flac");
+    let (title1, artist1, album1) = LibraryManager::parse_path_heuristics(p1);
+    assert_eq!(title1, "Come Un Fiore");
+    assert_eq!(artist1, "Ludovico Einaudi");
+    assert_eq!(album1, "2006 - Divenire");
+
+    // 2. Path with 3-part "Album - Artist - Title" filename
+    let p2 = Path::new("/Volumes/Music/Podcasts/Mysteries Of The Deep - Eric Cloutier - COLD IS THE VOID.mp3");
+    let (title2, artist2, album2) = LibraryManager::parse_path_heuristics(p2);
+    assert_eq!(title2, "COLD IS THE VOID");
+    assert_eq!(artist2, "Eric Cloutier");
+    assert_eq!(album2, "Mysteries Of The Deep");
+
+    // 3. Simple track number prefix with artist & album folders
+    let p3 = Path::new("/Volumes/Music/Bonobo/Black Sands/03 Paper.flac");
+    let (title3, artist3, album3) = LibraryManager::parse_path_heuristics(p3);
+    assert_eq!(title3, "Paper");
+    assert_eq!(artist3, "Bonobo");
+    assert_eq!(album3, "Black Sands");
+}
+
+#[test]
+fn test_autopilot_diverse_sampling_across_artists() {
+    use quickstream::library::LibraryManager;
+
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_diverse_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    // Create 4 artist directories, each with 5 tracks (20 tracks total)
+    let artists = ["ArtistA", "ArtistB", "ArtistC", "ArtistD"];
+    for artist in &artists {
+        let artist_dir = temp_dir.join(artist).join("Album");
+        fs::create_dir_all(&artist_dir).unwrap();
+        for i in 1..=5 {
+            let track_path = artist_dir.join(format!("0{} Song {}.wav", i, i));
+            create_dummy_audio(&track_path);
+        }
+    }
+
+    let cache = std::collections::HashMap::new();
+    let tracks = LibraryManager::scan_directory_scoped_with_cache(&temp_dir, &cache);
+
+    // Verify tracks are drawn from MULTIPLE artists (not just 1 artist taking all slots)
+    let mut sampled_artists = std::collections::HashSet::new();
+    for t in &tracks {
+        sampled_artists.insert(t.artist.clone());
+    }
+
+    // Must have sampled from all 4 artists
+    assert_eq!(sampled_artists.len(), 4);
+    for artist in &artists {
+        assert!(sampled_artists.contains(*artist));
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_queue_background_metadata_update() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_bg_meta_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let track_path = temp_dir.join("01-08 Einaudi- Come Un Fiore.wav");
+    create_dummy_audio(&track_path);
+
+    let mut settings_mgr = SettingsManager::new();
+    settings_mgr.settings.web_server_enabled = false;
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    app.start_autopilot(temp_dir.clone());
+    app.wait_for_autopilot_scan(Duration::from_secs(2));
+    assert_eq!(app.queue.len(), 1);
+
+    // Initial heuristic state: artist derived from filename or folder
+    assert_eq!(app.queue.tracks[0].title, "Come Un Fiore");
+
+    // Simulate background metadata reception
+    let mut updated_meta = app.queue.tracks[0].clone();
+    updated_meta.artist = "Ludovico Einaudi (Official)".to_string();
+    updated_meta.duration_seconds = 234.0;
+    app.metadata_tx.send(updated_meta).unwrap();
+
+    // Poll background metadata - must update queue tracks in-place
+    app.poll_background_metadata();
+
+    assert_eq!(app.queue.tracks[0].artist, "Ludovico Einaudi (Official)");
+    assert_eq!(app.queue.tracks[0].duration_seconds, 234.0);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_autopilot_progressive_streaming_events() {
+    use quickstream::library::{AutopilotEvent, LibraryManager};
+    use std::sync::atomic::AtomicBool;
+
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_prog_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    // Create 3 artist folders with songs
+    for i in 1..=3 {
+        let artist_dir = temp_dir.join(format!("Artist_{}", i)).join("Album");
+        fs::create_dir_all(&artist_dir).unwrap();
+        let track_path = artist_dir.join(format!("0{} Song.wav", i));
+        create_dummy_audio(&track_path);
+    }
+
+    let cache = std::collections::HashMap::new();
+    let (tx, rx) = mpsc::channel();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+
+    // Run progressive scanner in background thread
+    let dir_clone = temp_dir.clone();
+    let stop_clone = stop_flag.clone();
+    let handle = std::thread::spawn(move || {
+        LibraryManager::scan_directory_autopilot_progressive(
+            dir_clone,
+            Vec::new(),
+            cache,
+            tx,
+            stop_clone,
+        );
+    });
+
+    // Receive events progressively
+    let mut tracks_received = 0;
+    let mut finished = false;
+
+    while let Ok(event) = rx.recv_timeout(Duration::from_secs(2)) {
+        match event {
+            AutopilotEvent::Track(t) => {
+                tracks_received += 1;
+                assert!(!t.title.is_empty());
+            }
+            AutopilotEvent::Finished(cnt) => {
+                finished = true;
+                assert_eq!(cnt, 3);
+                break;
+            }
+        }
+    }
+
+    handle.join().unwrap();
+    assert!(finished);
+    assert_eq!(tracks_received, 3);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+

@@ -85,6 +85,7 @@ impl LocalPlayer {
         let mut cmd = Command::new("mpv");
         cmd.arg("--no-video")
             .arg("--idle")
+            .arg("--gapless-audio=yes")
             .arg(format!("--input-ipc-server={}", self.socket_path.display()))
             .arg(format!("--volume={}", self.volume))
             .arg("--audio-display=no")

@@ -52,6 +52,10 @@ struct Cli {
     /// Set persistent startup home directory and exit (use "default" or "none" to clear)
     #[arg(long)]
     set_home: Option<PathBuf>,
+
+    /// Autopilot mode: recursively discover all audio tracks, build random queue, and start playing immediately
+    #[arg(long, short = 'a', num_args = 0..=1)]
+    autopilot: Option<Option<PathBuf>>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -201,11 +205,27 @@ fn main() -> anyhow::Result<()> {
     });
     let mut app = AppUI::new(start_dir, settings_mgr);
 
-    // Pre-queue any explicit files passed on CLI
-    for path in &cli.paths {
-        if is_supported_audio_file(path) {
-            if let Ok(meta) = extract_metadata(path) {
-                app.queue.add_track(meta);
+    // Check for Autopilot mode
+    if let Some(autopilot_target) = cli.autopilot {
+        let target_dir = autopilot_target
+            .or_else(|| cli.paths.first().filter(|p| !is_supported_audio_file(p)).cloned())
+            .or_else(|| {
+                app.settings_mgr
+                    .settings
+                    .home_dir
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_dir())
+            })
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        app.start_autopilot(target_dir);
+    } else {
+        // Pre-queue any explicit files passed on CLI
+        for path in &cli.paths {
+            if is_supported_audio_file(path) {
+                if let Ok(meta) = extract_metadata(path) {
+                    app.queue.add_track(meta);
+                }
             }
         }
     }

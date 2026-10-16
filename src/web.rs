@@ -89,6 +89,10 @@ pub struct NowPlayingState {
     pub home_dir: Option<String>,
     #[serde(default)]
     pub current_browser_dir: String,
+    #[serde(default)]
+    pub is_autopilot: bool,
+    #[serde(default)]
+    pub autopilot_dir: Option<String>,
 }
 
 impl Default for NowPlayingState {
@@ -119,6 +123,8 @@ impl Default for NowPlayingState {
             is_scanning: false,
             home_dir: None,
             current_browser_dir: String::new(),
+            is_autopilot: false,
+            autopilot_dir: None,
         }
     }
 }
@@ -143,6 +149,8 @@ pub enum WebCommand {
     RescanDevices,
     SetQueueMode(String),
     SetHome(Option<String>),
+    Autopilot(Option<PathBuf>),
+    ShuffleQueue,
 }
 
 #[derive(Deserialize)]
@@ -160,10 +168,51 @@ struct ActionPayload {
     mode: Option<String>,
 }
 
+/// Controls continuous PCM gapless streaming for DLNA renderers.
+#[derive(Debug, Default)]
+pub struct ContinuousStreamController {
+    pub is_active: Arc<AtomicBool>,
+    pub active_conn_id: Arc<AtomicU64>,
+    pub current_track_index: Arc<Mutex<usize>>,
+    pub current_position: Arc<Mutex<f64>>,
+    pub current_duration: Arc<Mutex<f64>>,
+    pub skip_requested: Arc<AtomicBool>,
+    pub target_index: Arc<Mutex<Option<usize>>>,
+    pub seek_requested: Arc<AtomicBool>,
+    pub target_seek: Arc<Mutex<Option<f64>>>,
+    pub active_child: Arc<Mutex<Option<std::process::Child>>>,
+}
+
+impl ContinuousStreamController {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn skip_to_index(&self, index: usize) {
+        *self.target_index.lock().unwrap() = Some(index);
+        self.skip_requested.store(true, Ordering::SeqCst);
+        self.kill_active_decoder();
+    }
+
+    pub fn seek_to(&self, position: f64) {
+        *self.target_seek.lock().unwrap() = Some(position);
+        self.seek_requested.store(true, Ordering::SeqCst);
+        self.kill_active_decoder();
+    }
+
+    pub fn kill_active_decoder(&self) {
+        if let Some(mut child) = self.active_child.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Manages registered media files and active streaming TCP connections.
 pub struct StreamServerState {
     pub active_sockets: Mutex<HashMap<u64, TcpStream>>,
     pub file_registry: RwLock<HashMap<String, PathBuf>>,
+    pub continuous: Arc<ContinuousStreamController>,
     next_conn_id: AtomicU64,
 }
 
@@ -172,6 +221,7 @@ impl Default for StreamServerState {
         Self {
             active_sockets: Mutex::new(HashMap::new()),
             file_registry: RwLock::new(HashMap::new()),
+            continuous: Arc::new(ContinuousStreamController::new()),
             next_conn_id: AtomicU64::new(1),
         }
     }
@@ -222,6 +272,8 @@ impl StreamServerState {
 
     /// Immediately abort and close all active streaming TCP connections to stereos.
     pub fn close_active_streams(&self) {
+        self.continuous.is_active.store(false, Ordering::SeqCst);
+        self.continuous.kill_active_decoder();
         let mut sockets = self.active_sockets.lock().unwrap();
         let count = sockets.len();
         if count > 0 {
@@ -581,6 +633,9 @@ fn handle_client(
                 stream.write_all(body)?;
             }
             stream.flush()?;
+        } else if path.starts_with("/stream/continuous.wav") || path.starts_with("/stream/autopilot.wav") {
+            serve_continuous_stream(stream, is_head, state, cmd_tx, stream_state)?;
+            return Ok(());
         } else if path.starts_with("/stream") {
             // Serve DLNA audio streaming with HTTP byte ranges
             serve_audio_stream(stream, path, range_header.as_deref(), is_head, state, stream_state)?;
@@ -666,6 +721,13 @@ fn handle_client(
                 }
                 "set_home" => {
                     let _ = cmd_tx.send(WebCommand::SetHome(payload.path));
+                }
+                "autopilot" => {
+                    let p = payload.path.map(PathBuf::from);
+                    let _ = cmd_tx.send(WebCommand::Autopilot(p));
+                }
+                "shuffle" => {
+                    let _ = cmd_tx.send(WebCommand::ShuffleQueue);
                 }
                 _ => {}
             }
@@ -1159,6 +1221,270 @@ fn serve_audio_stream(
         display_name,
         content_length
     );
+
+    Ok(())
+}
+
+/// Construct a standard 44-byte RIFF/WAV header for an infinite (live) 16-bit 44.1kHz stereo PCM stream.
+pub fn make_continuous_wav_header() -> [u8; 44] {
+    let mut hdr = [0u8; 44];
+    hdr[0..4].copy_from_slice(b"RIFF");
+    hdr[4..8].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // Streaming/infinite length
+    hdr[8..12].copy_from_slice(b"WAVE");
+    hdr[12..16].copy_from_slice(b"fmt ");
+    hdr[16..20].copy_from_slice(&16u32.to_le_bytes()); // Subchunk1 size: 16
+    hdr[20..22].copy_from_slice(&1u16.to_le_bytes());  // Audio format: PCM (1)
+    hdr[22..24].copy_from_slice(&2u16.to_le_bytes());  // Channels: 2 (Stereo)
+    hdr[24..28].copy_from_slice(&44100u32.to_le_bytes()); // Sample rate: 44,100 Hz
+    hdr[28..32].copy_from_slice(&(44100u32 * 2 * 2).to_le_bytes()); // Byte rate: 176,400 B/s
+    hdr[32..34].copy_from_slice(&4u16.to_le_bytes());  // Block align: 4
+    hdr[34..36].copy_from_slice(&16u16.to_le_bytes()); // Bits per sample: 16
+    hdr[36..40].copy_from_slice(b"data");
+    hdr[40..44].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // Data size: infinite
+    hdr
+}
+
+/// Serve a continuous 16-bit 44.1kHz PCM WAV stream to DLNA renderers.
+/// Slices tracks sequentially directly into the exact same TCP socket without drops or DAC resets.
+pub fn serve_continuous_stream(
+    mut stream: TcpStream,
+    is_head: bool,
+    state: &Arc<RwLock<NowPlayingState>>,
+    cmd_tx: &mpsc::Sender<WebCommand>,
+    stream_state: &Arc<StreamServerState>,
+) -> std::io::Result<()> {
+    let conn_id = stream_state.register_socket(&stream);
+    let _socket_guard = SocketGuard {
+        stream_state: stream_state.clone(),
+        conn_id,
+    };
+
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_nodelay(true);
+
+    crate::log_info!("web", "Continuous gapless stream client connected (conn_id: {:?})", conn_id);
+
+    let headers = concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Content-Type: audio/x-wav\r\n",
+        "Accept-Ranges: none\r\n",
+        "transferMode.dlna.org: Streaming\r\n",
+        "contentFeatures.dlna.org: DLNA.ORG_OP=00;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=01500000000000000000000000000000\r\n",
+        "Connection: close\r\n",
+        "\r\n"
+    );
+    stream.write_all(headers.as_bytes())?;
+    if is_head {
+        stream.flush()?;
+        return Ok(());
+    }
+
+    let wav_hdr = make_continuous_wav_header();
+    stream.write_all(&wav_hdr)?;
+    stream.flush()?;
+
+    let cid = conn_id.unwrap_or(0);
+    let controller = stream_state.continuous.clone();
+    controller.active_conn_id.store(cid, Ordering::SeqCst);
+    controller.is_active.store(true, Ordering::SeqCst);
+
+    struct ContinuousActiveGuard {
+        controller: Arc<ContinuousStreamController>,
+        conn_id: u64,
+    }
+    impl Drop for ContinuousActiveGuard {
+        fn drop(&mut self) {
+            if self.conn_id == 0 || self.controller.active_conn_id.load(Ordering::SeqCst) == self.conn_id {
+                self.controller.is_active.store(false, Ordering::SeqCst);
+                self.controller.kill_active_decoder();
+                crate::log_info!("web", "Continuous gapless stream finished or disconnected (conn_id: {})", self.conn_id);
+            } else {
+                crate::log_info!(
+                    "web",
+                    "Continuous stream connection {} closed (superseded by conn_id {})",
+                    self.conn_id,
+                    self.controller.active_conn_id.load(Ordering::SeqCst)
+                );
+            }
+        }
+    }
+    let _active_guard = ContinuousActiveGuard {
+        controller: controller.clone(),
+        conn_id: cid,
+    };
+
+    while controller.is_active.load(Ordering::SeqCst) {
+        if cid != 0 && controller.active_conn_id.load(Ordering::SeqCst) != cid {
+            crate::log_info!(
+                "web",
+                "Continuous stream connection {} superseded by newer connection {}, closing older stream",
+                cid,
+                controller.active_conn_id.load(Ordering::SeqCst)
+            );
+            return Ok(());
+        }
+
+        // 1. Get current track information
+        let (track_path, track_duration, track_index, queue_len) = {
+            let s = state.read().unwrap();
+            if s.queue.is_empty() {
+                drop(s);
+                // Send a small burst of silence PCM frames so renderer buffer doesn't starve
+                let silence = [0u8; 4096];
+                let _ = stream.write_all(&silence);
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            let idx = *controller.current_track_index.lock().unwrap();
+            let safe_idx = if idx < s.queue.len() { idx } else { 0 };
+            let track = &s.queue[safe_idx];
+            (PathBuf::from(&track.filepath), track.duration_seconds, safe_idx, s.queue.len())
+        };
+
+        *controller.current_track_index.lock().unwrap() = track_index;
+        *controller.current_duration.lock().unwrap() = track_duration;
+        *controller.current_position.lock().unwrap() = 0.0;
+
+        let start_pos = controller.target_seek.lock().unwrap().take().unwrap_or(0.0);
+        controller.seek_requested.store(false, Ordering::SeqCst);
+        controller.skip_requested.store(false, Ordering::SeqCst);
+
+        // Synchronize track info into NowPlayingState
+        if let Ok(mut s) = state.write() {
+            s.queue_index = track_index;
+            if let Some(t) = s.queue.get(track_index).cloned() {
+                s.title = t.title;
+                s.artist = t.artist;
+                s.album = t.album;
+                s.duration_seconds = t.duration_seconds;
+                s.filepath = Some(PathBuf::from(&t.filepath));
+                s.position_seconds = start_pos;
+                s.is_playing = true;
+                s.is_paused = false;
+            }
+            if queue_len > 1 {
+                let next_idx = (track_index + 1) % queue_len;
+                s.next_track_title = s.queue.get(next_idx).map(|t| t.title.clone());
+            }
+        }
+
+        crate::log_info!(
+            "web",
+            "Continuous stream decoding track [{}/{}]: '{}' (seek: {:.2}s)",
+            track_index + 1,
+            queue_len,
+            track_path.display(),
+            start_pos
+        );
+
+        if !track_path.exists() {
+            crate::log_warn!("web", "Continuous stream track missing: {}", track_path.display());
+            let next_idx = (track_index + 1) % queue_len;
+            *controller.current_track_index.lock().unwrap() = next_idx;
+            continue;
+        }
+
+        // 2. Spawn ffmpeg to decode to 44.1kHz 16-bit LE stereo raw PCM
+        let mut cmd = std::process::Command::new("ffmpeg");
+        if start_pos > 0.0 {
+            cmd.arg("-ss").arg(format!("{:.3}", start_pos));
+        }
+        cmd.arg("-v").arg("quiet")
+            .arg("-i").arg(&track_path)
+            .arg("-f").arg("s16le")
+            .arg("-ac").arg("2")
+            .arg("-ar").arg("44100")
+            .arg("-")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                crate::log_warn!("web", "Failed to spawn ffmpeg for continuous stream: {}", e);
+                std::thread::sleep(Duration::from_millis(500));
+                let next_idx = (track_index + 1) % queue_len;
+                *controller.current_track_index.lock().unwrap() = next_idx;
+                continue;
+            }
+        };
+
+        let mut stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                let _ = child.kill();
+                continue;
+            }
+        };
+
+        *controller.active_child.lock().unwrap() = Some(child);
+
+        // 3. Stream PCM chunks
+        let mut buf = [0u8; 32768];
+        let mut bytes_streamed: u64 = (start_pos * 176400.0) as u64;
+        let mut last_pos_update = std::time::Instant::now();
+        let mut track_finished_normally = false;
+
+        loop {
+            if !controller.is_active.load(Ordering::SeqCst) {
+                controller.kill_active_decoder();
+                return Ok(());
+            }
+
+            if cid != 0 && controller.active_conn_id.load(Ordering::SeqCst) != cid {
+                controller.kill_active_decoder();
+                return Ok(());
+            }
+
+            if controller.skip_requested.load(Ordering::SeqCst) || controller.seek_requested.load(Ordering::SeqCst) {
+                controller.kill_active_decoder();
+                if let Some(target) = controller.target_index.lock().unwrap().take() {
+                    *controller.current_track_index.lock().unwrap() = target;
+                }
+                break;
+            }
+
+            match stdout.read(&mut buf) {
+                Ok(0) => {
+                    track_finished_normally = true;
+                    break;
+                }
+                Ok(n) => {
+                    if let Err(e) = stream.write_all(&buf[..n]) {
+                        crate::log_info!("web", "Continuous stream socket closed: {}", e);
+                        controller.kill_active_decoder();
+                        return Ok(());
+                    }
+                    bytes_streamed += n as u64;
+
+                    if last_pos_update.elapsed() >= Duration::from_millis(250) {
+                        last_pos_update = std::time::Instant::now();
+                        let pos = bytes_streamed as f64 / 176400.0;
+                        *controller.current_position.lock().unwrap() = pos;
+                        if let Ok(mut s) = state.write() {
+                            s.position_seconds = pos;
+                        }
+                    }
+                }
+                Err(e) => {
+                    crate::log_warn!("web", "Continuous stream read error: {}", e);
+                    break;
+                }
+            }
+        }
+
+        controller.kill_active_decoder();
+
+        if track_finished_normally {
+            if track_index + 1 >= queue_len && queue_len > 1 {
+                let _ = cmd_tx.send(WebCommand::ShuffleQueue);
+            }
+            let next_idx = (track_index + 1) % queue_len;
+            *controller.current_track_index.lock().unwrap() = next_idx;
+            *controller.current_position.lock().unwrap() = 0.0;
+        }
+    }
 
     Ok(())
 }
@@ -2171,6 +2497,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       </div>
 
       <div class="badges" id="badges">
+        <span class="badge" id="autopilotBadge" style="display:none;background:rgba(234, 179, 8, 0.2);color:#fde047;border:1px solid rgba(234, 179, 8, 0.4);">⚡ AUTOPILOT</span>
         <span class="badge format" id="formatBadge">AUDIO</span>
         <span class="badge" id="outputBadge">Local Audio</span>
         <span class="badge" id="queueBadge">Track 0 of 0</span>
@@ -2253,7 +2580,13 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
           <span class="panel-title">Queue</span>
           <span class="panel-subtitle" id="queueSummaryText">0 tracks</span>
         </div>
-        <button class="btn-text danger" id="btnClearQueue">Clear Queue</button>
+        <div style="display:flex;gap:0.5rem;align-items:center;">
+          <button class="btn-sm" id="btnShuffleQueue" title="Shuffle queue (randomize track order)">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="16 3 21 3 21 8"></polyline><line x1="4" y1="20" x2="21" y2="3"></line><polyline points="21 16 21 21 16 21"></polyline><line x1="15" y1="15" x2="21" y2="21"></line><line x1="4" y1="4" x2="9" y2="9"></line></svg>
+            Shuffle
+          </button>
+          <button class="btn-text danger" id="btnClearQueue">Clear Queue</button>
+        </div>
       </div>
 
       <div class="mode-bar">
@@ -2295,6 +2628,10 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
         <button class="btn-sm accent" id="btnBrowserAddAll" title="Add all audio files in this folder">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
           Add All
+        </button>
+        <button class="btn-sm accent" id="btnBrowserAutopilot" style="background: linear-gradient(135deg, rgba(234, 179, 8, 0.25), rgba(245, 158, 11, 0.15)); border-color: rgba(234, 179, 8, 0.4); color: #fde047;" title="Start Autopilot (recursive random shuffle & play)">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+          Autopilot
         </button>
       </div>
 
@@ -2443,6 +2780,11 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       }
 
       // Badges
+      const apBadge = document.getElementById('autopilotBadge');
+      if (apBadge) {
+        apBadge.style.display = data.is_autopilot ? 'inline-flex' : 'none';
+      }
+
       let fmtText = data.format || "AUDIO";
       if (data.sample_rate_hz > 0) {
         fmtText += ` · ${(data.sample_rate_hz / 1000).toFixed(1)}kHz`;
@@ -2668,6 +3010,11 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       }
     });
 
+    document.getElementById('btnShuffleQueue')?.addEventListener('click', () => {
+      sendAction('shuffle');
+      showToast('Queue shuffled');
+    });
+
     document.querySelectorAll('.mode-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         const mode = btn.getAttribute('data-mode');
@@ -2802,6 +3149,13 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       if (currentBrowserPath) {
         sendAction('add_folder', null, { path: currentBrowserPath });
         showToast('Adding all audio files in folder...');
+      }
+    });
+
+    document.getElementById('btnBrowserAutopilot')?.addEventListener('click', () => {
+      if (currentBrowserPath) {
+        sendAction('autopilot', null, { path: currentBrowserPath });
+        showToast('Starting Autopilot on folder...');
       }
     });
 
