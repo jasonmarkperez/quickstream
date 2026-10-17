@@ -75,6 +75,24 @@ impl SeenPaths {
     }
 }
 
+/// Bounds for gathering profile-mix candidates on large libraries (issue #38).
+#[derive(Debug, Clone, Copy)]
+pub struct ProfileScanLimits {
+    /// Stop after this many top-level folders even if few tracks matched.
+    pub max_folders: usize,
+    /// Stop once gathering has taken this long (at least one folder is always scanned).
+    pub time_budget: Duration,
+}
+
+impl Default for ProfileScanLimits {
+    fn default() -> Self {
+        Self {
+            max_folders: 500,
+            time_budget: Duration::from_secs(20),
+        }
+    }
+}
+
 /// Counters and timings for one autopilot mix build, written to the log as `[autopilot]` PERF
 /// lines so slow mixes show where the time goes (folder walks vs tag reads vs matching).
 #[derive(Default)]
@@ -452,6 +470,30 @@ impl LibraryManager {
         tx: Sender<AutopilotEvent>,
         stop_flag: Arc<AtomicBool>,
     ) {
+        Self::scan_directory_autopilot_with_profile_limits(
+            dir,
+            known_subdirs,
+            cache,
+            profile,
+            db,
+            tx,
+            stop_flag,
+            ProfileScanLimits::default(),
+        )
+    }
+
+    /// Like `scan_directory_autopilot_with_profile`, with explicit bounds on candidate gathering.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_directory_autopilot_with_profile_limits(
+        dir: PathBuf,
+        known_subdirs: Vec<PathBuf>,
+        cache: HashMap<PathBuf, AudioMetadata>,
+        profile: crate::analysis::MixProfile,
+        db: crate::analysis::AnalysisDatabase,
+        tx: Sender<AutopilotEvent>,
+        stop_flag: Arc<AtomicBool>,
+        limits: ProfileScanLimits,
+    ) {
         let scan_start = std::time::Instant::now();
         let target_limit = 60;
         let mut total_sent = 0;
@@ -633,6 +675,10 @@ impl LibraryManager {
                 matched
             };
             let mut last_progress = Instant::now();
+            // The first match is queued at once so playback starts while gathering continues;
+            // the rest of the mix is sequenced to follow it.
+            let mut first_sent: Option<AudioMetadata> = None;
+            let over_budget = || scan_start.elapsed() >= limits.time_budget;
 
             if !subdirs.is_empty() {
                 let per_subdir = if subdirs.len() >= 60 {
@@ -651,18 +697,25 @@ impl LibraryManager {
                     for f in immediate_files.iter().take(per_subdir) {
                         let meta = make_metadata(f);
                         if is_match(&meta) {
+                            if first_sent.is_none() && tx.send(AutopilotEvent::Track(meta.clone())).is_ok() {
+                                total_sent += 1;
+                                first_sent = Some(meta);
+                                continue;
+                            }
                             matched_candidates.push(meta.clone());
                         }
                         all_candidates.push(meta);
                     }
                 }
 
-                // Walk shuffled subdirectories: continue until we have at least 80 matching tracks,
-                // or have visited up to 500 subdirectories, or subdirs are exhausted!
+                // Walk shuffled subdirectories until we have 80 matching tracks, or have visited
+                // `max_folders` subdirectories, or the time budget is spent (after at least one
+                // folder). Shortfalls are filled from diverse candidates below.
                 for (idx, subdir) in subdirs.iter().enumerate() {
                     if stop_flag.load(Ordering::Relaxed)
                         || matched_candidates.len() >= 80
-                        || (idx >= 500 && matched_candidates.len() >= target_limit)
+                        || idx >= limits.max_folders
+                        || (idx > 0 && over_budget())
                     {
                         break;
                     }
@@ -712,8 +765,17 @@ impl LibraryManager {
                         rng.shuffle(&mut folder_tracks);
                         let mut artist_match_count = 0;
                         for p in folder_tracks {
+                            if idx > 0 && over_budget() {
+                                break;
+                            }
                             let meta = make_metadata(&p);
                             if is_match(&meta) {
+                                if first_sent.is_none() && tx.send(AutopilotEvent::Track(meta.clone())).is_ok() {
+                                    total_sent += 1;
+                                    first_sent = Some(meta);
+                                    artist_match_count += 1;
+                                    continue;
+                                }
                                 if artist_match_count < per_subdir && matched_candidates.len() < 120 {
                                     matched_candidates.push(meta.clone());
                                     all_candidates.push(meta);
@@ -754,9 +816,17 @@ impl LibraryManager {
                 }
                 stats.files.set(stats.files.get() + all_files.len().min(200));
                 rng.shuffle(&mut all_files);
-                for p in all_files.into_iter().take(200) {
+                for (i, p) in all_files.into_iter().take(200).enumerate() {
+                    if i > 0 && over_budget() {
+                        break;
+                    }
                     let meta = make_metadata(&p);
                     if is_match(&meta) {
+                        if first_sent.is_none() && tx.send(AutopilotEvent::Track(meta.clone())).is_ok() {
+                            total_sent += 1;
+                            first_sent = Some(meta);
+                            continue;
+                        }
                         matched_candidates.push(meta.clone());
                     }
                     all_candidates.push(meta);
@@ -772,11 +842,12 @@ impl LibraryManager {
             ));
 
             if matched_candidates.is_empty() && all_candidates.is_empty() {
-                let _ = tx.send(AutopilotEvent::Finished(0));
+                let _ = tx.send(AutopilotEvent::Finished(total_sent));
                 return;
             }
 
-            let filtered: Vec<AudioMetadata> = if matched_candidates.len() >= target_limit {
+            let remaining_limit = target_limit - total_sent;
+            let filtered: Vec<AudioMetadata> = if matched_candidates.len() >= remaining_limit {
                 matched_candidates
             } else if !matched_candidates.is_empty() {
                 // If library has fewer than target_limit matches,
@@ -790,7 +861,7 @@ impl LibraryManager {
                     let mut pool = matched_candidates;
                     rng.shuffle(&mut all_candidates);
                     for c in all_candidates {
-                        if pool.len() >= target_limit {
+                        if pool.len() >= remaining_limit {
                             break;
                         }
                         if !pool.iter().any(|m| m.filepath == c.filepath) {
@@ -805,7 +876,8 @@ impl LibraryManager {
 
             let candidate_count = filtered.len();
             let sequence_start = Instant::now();
-            let sequenced = crate::analysis::mixer::DjMixer::sequence_mix(filtered, &db, target_limit);
+            let sequenced =
+                crate::analysis::mixer::DjMixer::sequence_mix_after(first_sent.as_ref(), filtered, &db, remaining_limit);
             log_autopilot(format!(
                 "sequenced {} tracks from candidates={} in {:.2?}",
                 sequenced.len(),
