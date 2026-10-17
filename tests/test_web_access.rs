@@ -184,10 +184,47 @@ fn test_loopback_post_requires_json_and_same_origin() {
 }
 
 #[test]
-fn test_loopback_stream_is_exempt_from_host_check() {
-    // A renderer on this computer may address the stream by any name.
-    let h = headers(&["Host: my-mac.local:8080"]);
-    assert_eq!(authorize(loopback_peer(), PORT, "GET", "/stream/a.mp3", &h, TOKEN), AuthDecision::Allow);
+fn test_loopback_stream_requires_loopback_host() {
+    // DNS rebinding: a page on a foreign name that resolves to 127.0.0.1 must not read streams.
+    for path in ["/stream/a.mp3", "/stream/continuous.wav"] {
+        for method in ["GET", "HEAD"] {
+            let h = headers(&[&format!("Host: evil.example:{}", PORT)]);
+            assert!(
+                matches!(authorize(loopback_peer(), PORT, method, path, &h, TOKEN), AuthDecision::Forbidden(_)),
+                "{} {}",
+                method,
+                path
+            );
+            let h = headers(&[]);
+            assert!(matches!(authorize(loopback_peer(), PORT, method, path, &h, TOKEN), AuthDecision::Forbidden(_)));
+        }
+    }
+    // A renderer on this computer addressing the server by its loopback address still works.
+    for host in ["127.0.0.1", "localhost", "[::1]"] {
+        let h = headers(&[&format!("Host: {}:{}", host, PORT)]);
+        assert_eq!(authorize(loopback_peer(), PORT, "GET", "/stream/a.mp3", &h, TOKEN), AuthDecision::Allow, "{}", host);
+    }
+}
+
+#[test]
+fn test_loopback_server_rejects_foreign_host_on_stream_routes() {
+    let dir = temp_dir("streamhost");
+    let song = dir.join("song.mp3");
+    fs::write(&song, vec![0u8; 2048]).unwrap();
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (handle, _rx) = start(state);
+    handle.register_stream_file(&song);
+    let port = handle.port;
+    let (status, _, body) = raw_request(
+        port,
+        &format!("GET /stream/song.mp3 HTTP/1.1\r\nHost: evil.example:{}\r\nConnection: close\r\n\r\n", port),
+    );
+    assert_eq!(status, 403);
+    assert!(body.len() < 100, "no audio may be served: {} bytes", body.len());
+    let (status, _, _) = get(port, "/stream/song.mp3");
+    assert_eq!(status, 200);
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

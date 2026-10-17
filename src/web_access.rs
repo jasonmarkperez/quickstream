@@ -3,8 +3,8 @@
 //! - Network (non-loopback) peers need the session token, sent as the `qs_token` cookie (set by
 //!   opening the pairing link `/?token=<token>`) or an `Authorization: Bearer` header. `/stream/*`
 //!   is exempt: DLNA renderers cannot authenticate, and it only serves registered files.
-//! - Loopback peers need no token, but the `Host` header must name the loopback address, which
-//!   blocks DNS rebinding.
+//! - Loopback peers need no token, but the `Host` header must name the loopback address on every
+//!   route (including `/stream/*`), which blocks DNS rebinding.
 //! - State-changing requests need `Content-Type: application/json` (a cross-site form or
 //!   `text/plain` fetch cannot send it without a CORS preflight, which is never granted) and, when
 //!   an `Origin` header is present, it must be this server's own origin.
@@ -141,14 +141,14 @@ pub fn authorize(
     let route = path_only(path);
     let read_only = method == "GET" || method == "HEAD";
 
-    if read_only && route.starts_with("/stream/") {
-        return AuthDecision::Allow;
-    }
-
     if is_loopback(peer) {
+        // Applies to every route, /stream/* included: a foreign Host means DNS rebinding.
         if !headers.host.as_deref().is_some_and(|h| is_loopback_host(h, server_port)) {
             return AuthDecision::Forbidden("unexpected Host header");
         }
+    } else if read_only && route.starts_with("/stream/") {
+        // DLNA renderers cannot authenticate.
+        return AuthDecision::Allow;
     } else {
         let is_dashboard = route == "/" || route == "/index.html";
         if read_only && is_dashboard {

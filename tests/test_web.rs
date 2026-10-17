@@ -844,8 +844,8 @@ fn start_range_fixture(tag: &str) -> (WebServerHandle, PathBuf, Vec<u8>) {
 
 fn range_get(port: u16, range: &str) -> (u16, String, Vec<u8>) {
     let req = format!(
-        "GET /stream/range_song.mp3 HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: {}\r\n\r\n",
-        range
+        "GET /stream/range_song.mp3 HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nRange: {}\r\n\r\n",
+        port, range
     );
     http_raw(port, req.as_bytes())
 }
@@ -1152,7 +1152,7 @@ fn open_continuous(port: u16) -> (u16, BufReader<TcpStream>) {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     stream
-        .write_all(b"GET /stream/continuous.wav HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .write_all(format!("GET /stream/continuous.wav HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", port).as_bytes())
         .unwrap();
     let mut reader = BufReader::new(stream);
     let mut status_line = String::new();

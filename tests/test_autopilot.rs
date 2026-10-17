@@ -180,7 +180,7 @@ fn test_continuous_wav_stream_endpoint() {
 
     // Send GET /stream/continuous.wav
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-    let req = "GET /stream/continuous.wav HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    let req = format!("GET /stream/continuous.wav HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", port);
     stream.write_all(req.as_bytes()).unwrap();
 
     let mut reader = BufReader::new(stream);
