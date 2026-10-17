@@ -5,7 +5,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::metadata::AudioMetadata;
 use super::db::{AnalysisDatabase, TrackFeatures};
-use super::harmonic::MusicalKey;
+use super::harmonic::{CamelotKey, MusicalKey};
+
+/// Camelot key stored in a track's features, if any.
+fn camelot_of(feat: Option<&TrackFeatures>) -> Option<CamelotKey> {
+    feat.and_then(|f| f.camelot_key.as_deref())
+        .and_then(MusicalKey::parse_to_camelot)
+}
 
 /// Mood presets for intelligent vibe mixes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,11 +187,13 @@ impl DjMixer {
         }
 
         // 1. Gather TrackFeatures for each candidate (or synthesize defaults)
-        let mut track_items: Vec<(AudioMetadata, Option<TrackFeatures>)> = candidates
+        // Each candidate's features (and parsed Camelot key) are looked up exactly once.
+        let mut track_items: Vec<(AudioMetadata, Option<TrackFeatures>, Option<CamelotKey>)> = candidates
             .into_iter()
             .map(|meta| {
                 let feat = features_db.get_track(&meta.filepath);
-                (meta, feat)
+                let camelot = camelot_of(feat.as_ref());
+                (meta, feat, camelot)
             })
             .collect();
 
@@ -207,21 +215,21 @@ impl DjMixer {
         }
         let skip = sequenced.len();
 
+        // Features of the most recently sequenced track, carried forward from the chosen
+        // candidate instead of being re-queried from SQLite on every iteration.
+        let mut last_bpm: Option<f64> = None;
+        let mut last_camelot: Option<CamelotKey> = None;
+        if let Some(first) = already_queued {
+            let feat = features_db.get_track(&first.filepath);
+            last_bpm = feat.as_ref().and_then(|f| f.bpm);
+            last_camelot = camelot_of(feat.as_ref());
+        }
+
         while !track_items.is_empty() && sequenced.len() - skip < target_limit {
-            let last_bpm = sequenced
-                .last()
-                .and_then(|m| features_db.get_track(&m.filepath))
-                .and_then(|f| f.bpm);
-
-            let last_camelot = sequenced
-                .last()
-                .and_then(|m| features_db.get_track(&m.filepath))
-                .and_then(|f| f.camelot_key.as_deref().and_then(MusicalKey::parse_to_camelot));
-
             let mut best_idx = 0;
             let mut best_score = i64::MIN;
 
-            for (idx, (meta, feat)) in track_items.iter().enumerate() {
+            for (idx, (meta, feat, cur_camelot)) in track_items.iter().enumerate() {
                 let mut score: i64 = 100;
 
                 let is_generic_artist = |a: &str| -> bool {
@@ -276,11 +284,8 @@ impl DjMixer {
                 }
 
                 // Score harmonic key compatibility
-                if let (Some(cur_cam), Some(prev_cam)) = (
-                    feat.as_ref().and_then(|f| f.camelot_key.as_deref().and_then(MusicalKey::parse_to_camelot)),
-                    last_camelot,
-                ) {
-                    let harm_score = prev_cam.compatibility_score(&cur_cam);
+                if let (Some(cur_cam), Some(prev_cam)) = (cur_camelot, last_camelot) {
+                    let harm_score = prev_cam.compatibility_score(cur_cam);
                     score += harm_score as i64 / 2;
                 }
 
@@ -290,7 +295,9 @@ impl DjMixer {
                 }
             }
 
-            let (chosen_meta, _) = track_items.remove(best_idx);
+            let (chosen_meta, chosen_feat, chosen_camelot) = track_items.remove(best_idx);
+            last_bpm = chosen_feat.as_ref().and_then(|f| f.bpm);
+            last_camelot = chosen_camelot;
             if !chosen_meta.artist.is_empty() {
                 recent_artists.push(chosen_meta.artist.clone());
             }
@@ -308,6 +315,45 @@ impl DjMixer {
 mod tests {
     use super::*;
 
+    fn song(dir: &str, artist: &str, i: usize) -> AudioMetadata {
+        AudioMetadata {
+            filepath: PathBuf::from(format!("/music/{}/{}.mp3", dir, i)),
+            artist: artist.to_string(),
+            title: format!("Song {}{}", dir, i),
+            ..Default::default()
+        }
+    }
+
+    fn store_bpm(db: &AnalysisDatabase, meta: &AudioMetadata, bpm: f64) {
+        db.upsert_track(&TrackFeatures {
+            filepath: meta.filepath.clone(),
+            artist: meta.artist.clone(),
+            bpm: Some(bpm),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    /// BPM continuity follows the features of whatever was sequenced last, including the
+    /// already-queued track (whose features are looked up once, not on every iteration).
+    #[test]
+    fn test_dj_mixer_follows_bpm_of_previous_track() {
+        let db = AnalysisDatabase::open_in_memory().unwrap();
+        let queued = song("Q", "Queued", 0);
+        store_bpm(&db, &queued, 128.0);
+
+        let far = song("F", "Far", 1);
+        let near = song("N", "Near", 1);
+        let nearer_to_near = song("M", "Mid", 1);
+        store_bpm(&db, &far, 90.0);
+        store_bpm(&db, &near, 127.0);
+        store_bpm(&db, &nearer_to_near, 125.0);
+
+        let mix = DjMixer::sequence_mix_after(Some(&queued), vec![far, near, nearer_to_near], &db, 3);
+        let order: Vec<&str> = mix.iter().map(|m| m.artist.as_str()).collect();
+        assert_eq!(order, vec!["Near", "Mid", "Far"]);
+    }
+
     #[test]
     fn test_dj_mixer_spacing_rules() {
         let db = AnalysisDatabase::open_in_memory().unwrap();
@@ -315,23 +361,9 @@ mod tests {
 
         // 5 songs by Artist A, 5 songs by Artist B, 5 songs by Artist C
         for i in 1..=5 {
-            let mut m1 = AudioMetadata::default();
-            m1.filepath = PathBuf::from(format!("/music/A/{}.mp3", i));
-            m1.artist = "Artist A".to_string();
-            m1.title = format!("Song A{}", i);
-            candidates.push(m1);
-
-            let mut m2 = AudioMetadata::default();
-            m2.filepath = PathBuf::from(format!("/music/B/{}.mp3", i));
-            m2.artist = "Artist B".to_string();
-            m2.title = format!("Song B{}", i);
-            candidates.push(m2);
-
-            let mut m3 = AudioMetadata::default();
-            m3.filepath = PathBuf::from(format!("/music/C/{}.mp3", i));
-            m3.artist = "Artist C".to_string();
-            m3.title = format!("Song C{}", i);
-            candidates.push(m3);
+            candidates.push(song("A", "Artist A", i));
+            candidates.push(song("B", "Artist B", i));
+            candidates.push(song("C", "Artist C", i));
         }
 
         let mix = DjMixer::sequence_mix(candidates, &db, 15);

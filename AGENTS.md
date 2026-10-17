@@ -37,13 +37,15 @@ This guide is intended for AI coding agents and automated development tools work
 
 6. **SQLite Schema Migration Standard**:
    - The track feature database (`src/analysis/db.rs`) uses SQLite `PRAGMA user_version` for incremental migrations.
-   - When modifying tables or adding columns, increment the version check in `TrackDatabase::new()`:
-     ```sql
-     IF user_version < 2 THEN
-         ALTER TABLE track_features ADD COLUMN ...;
-         PRAGMA user_version = 2;
-     END IF;
+   - When modifying tables or adding columns, append a step to the `MIGRATIONS` array and bump `CURRENT_SCHEMA_VERSION` (a compile-time assert keeps them equal). `MIGRATIONS[i]` upgrades `user_version` `i` → `i + 1`; each step runs in its own transaction together with its `user_version` bump:
+     ```rust
+     const MIGRATIONS: &[&str] = &[
+         /* v1 */ "CREATE TABLE IF NOT EXISTS track_features (...); ...",
+         /* v2 */ "ALTER TABLE track_features ADD COLUMN ...;",
+     ];
      ```
+   - Never edit or remove an existing step, and never change `journal_mode` inside a step. Connection pragmas (`journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout`) are applied on every open.
+   - A database whose `user_version` is newer than the binary is refused (`SchemaTooNewError`) without being modified.
    - Never drop existing user analysis tables or risk data loss.
 
 ---
