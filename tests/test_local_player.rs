@@ -5,11 +5,23 @@ use std::time::Duration;
 use quickstream::player::local::LocalPlayer;
 use quickstream::player::AudioPlayer;
 
+/// 10s of silence, so running the suite never makes audible noise.
 fn ensure_test_file() -> PathBuf {
-    let path = std::env::temp_dir().join("test_sine.mp3");
+    let path = std::env::temp_dir().join("quickstream_test_silence_10s.mp3");
     if !path.exists() {
         let _ = std::process::Command::new("ffmpeg")
-            .args(&["-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=10", path.to_str().unwrap()])
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=44100:cl=stereo",
+                "-t",
+                "10",
+                path.to_str().unwrap(),
+            ])
             .output();
     }
     path

@@ -33,7 +33,7 @@ This guide is intended for AI coding agents and automated development tools work
    - Quickstream abstracts playback through the unified `AudioPlayer` trait (`src/player/mod.rs`):
      - `play(path, offset)` / `pause()` / `resume()` / `stop()` / `seek(seconds)` / `set_volume(level)` / `get_position()` / `get_state()`.
    - **Local Playback**: Implemented by `LocalPlayer` (`src/player/local.rs`) utilizing an `mpv` JSON-RPC IPC Unix domain socket with a dedicated listener thread, falling back to `ffplay` subprocess.
-   - **DLNA / UPnP Streaming**: Implemented by `UPnPPlayer` (`src/player/upnp.rs`) sending SOAP XML payloads (`AVTransport` / `RenderingControl`) to discovered network renderers, while `WebServer` (`src/web.rs`) serves audio over HTTP with Byte-Range support (`206 Partial Content`) and continuous streaming (`/stream/continuous.wav`).
+   - **DLNA / UPnP Streaming**: Implemented by `UPnPPlayer` (`src/player/upnp.rs`) sending SOAP XML payloads (`AVTransport` / `RenderingControl`) to discovered network renderers, while `WebServer` (`src/web.rs`) serves audio over HTTP with Byte-Range support (`206 Partial Content`) and continuous streaming (`/stream/continuous-<nonce>.wav`, armed per UPnP continuous session via `StreamServerState::arm_continuous_session()`; other continuous paths return 404).
 
 6. **SQLite Schema Migration Standard**:
    - The track feature database (`src/analysis/db.rs`) uses SQLite `PRAGMA user_version` for incremental migrations.
@@ -78,6 +78,7 @@ quickstream/
 │   ├── metadata.rs       # Lofty audio metadata extraction, cover art decoding, path heuristics
 │   ├── queue.rs          # PlaybackQueue, FastRng (SplitMix64 deterministic PRNG), shuffle & loop
 │   ├── web.rs            # Embedded HTTP byte-range server, continuous WAV streaming, REST API, Web UI
+│   ├── web_access.rs     # Web access control: pairing token, Host/Origin/Content-Type checks, allowed folders
 │   ├── discovery.rs      # SSDP UDP multicast discovery (239.255.255.250:1900), XML device parsing
 │   ├── settings.rs       # User preferences model, cycle definitions, config.json persistence
 │   ├── paths.rs          # XDG Base Directory resolution and backward-compatible migration

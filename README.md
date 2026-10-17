@@ -67,7 +67,7 @@ It features a native **Ratatui** interactive terminal UI, an in-app recursive **
   - **Camelot Harmonic Mixing & BPM Flow**: Sequences transitions using Camelot wheel harmonic key compatibility and smooth tempo gradients.
   - **Mix Profiles (`M`)**: Diverse Shuffle, BPM Flow, Chill & Ambient, Workout & High Energy, and Late Night Groove.
   - **Seed Radio (`r`)**: Launches dynamic stations seeded by any track in your library or queue.
-  - **Continuous Gapless UPnP Streaming**: Optional `/stream/continuous.wav` continuous PCM WAV stream for seamless gapless playback on UPnP/DLNA stereos.
+  - **Continuous Gapless UPnP Streaming**: Optional continuous PCM WAV stream (served at a per-session `/stream/continuous-<id>.wav` path) for seamless gapless playback on UPnP/DLNA stereos.
   - **Zero-Touch SQLite Feature Store**: Acoustical features and tags stored in `~/.cache/quickstream/track_analysis.db` without ever writing to your music storage.
 
 - **Configurable Startup Home Directory**:
@@ -109,6 +109,7 @@ quickstream/
 │   ├── metadata.rs       # lofty metadata extraction (tags, duration, audio properties, cover art)
 │   ├── queue.rs          # PlaybackQueue: ordered track list, cursors, auto-advance, reordering
 │   ├── web.rs            # Embedded web server, byte-range streaming, continuous WAV, REST API, Web UI
+│   ├── web_access.rs     # Web access control: pairing token, Host/Origin checks, allowed folders
 │   ├── settings.rs       # Preferences model, cycle definitions, JSON persistence (~/.config/quickstream/config.json)
 │   ├── paths.rs          # XDG Base Directory resolution and legacy dotfile migration
 │   └── logger.rs         # Rotating file logger (~/.local/share/quickstream/quickstream.log)
@@ -223,6 +224,14 @@ quickstream --web --web-port 3000
 ```
 
 By default the dashboard only accepts connections from this computer (`127.0.0.1`). To open it from a phone or another device, set **Web Remote Access** to *Any device on your network* in Tab 4 (`[4] Settings`). While a DLNA speaker is the active output, the server always listens on the network so the speaker can fetch the audio stream.
+
+### Access & Pairing
+- **This computer**: open `http://localhost:<port>` (or `http://127.0.0.1:<port>`); no pairing needed. Requests must use one of those loopback names, so other websites cannot reach the dashboard through DNS tricks.
+- **Other devices**: with *Any device on your network* enabled, the **Now Playing Web Server** row in Tab 4 (`[4] Settings`) shows a pairing link such as `http://192.168.1.20:8080/?token=…`. Open it once on your phone; it stores a session cookie and redirects to the dashboard. Until then the dashboard and API answer `401`. Scripts can send `Authorization: Bearer <token>` instead.
+- The token is stored in `~/.config/quickstream/web_token` (readable only by you) and stays the same across restarts, so a bookmark keeps working. Delete the file and restart Quickstream to revoke all paired devices.
+- DLNA speakers fetch `/stream/…` without a token; that path only serves tracks Quickstream has queued.
+- The dashboard's file browser and folder actions are limited to your startup home directory, your bookmarks (Music Homes) and the folder Quickstream opened at launch.
+- Control requests must be same-origin JSON (`Content-Type: application/json`), and the API sends no CORS headers, so other web pages cannot control playback or read your library.
 
 ### Dashboard Tabs
 1. **Now Playing**:

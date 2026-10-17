@@ -1,13 +1,13 @@
 //! UPnP / DLNA MediaRenderer playback implementation using SOAP AVTransport and RenderingControl.
 
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::discovery::{extract_xml_tag, get_local_ip_for_target, DLNADevice};
+use crate::discovery::{
+    extract_xml_tag, get_local_ip_for_target, http_exchange, parse_http_url, DLNADevice, HttpError,
+};
 use crate::metadata::{extract_metadata, get_audio_mime_type};
 use crate::player::AudioPlayer;
 
@@ -129,11 +129,109 @@ pub fn create_didl_lite_xml(
     )
 }
 
+/// Largest SOAP response accepted from a renderer. Real replies, including
+/// GetPositionInfo with its DIDL-Lite track metadata, are a few KiB.
+pub const MAX_SOAP_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Why a SOAP action failed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SoapError {
+    /// Bad or missing control URL.
+    InvalidUrl(String),
+    /// Connection, timeout or framing failure before a response was read.
+    Transport(HttpError),
+    /// The renderer answered with a non-2xx status, usually carrying a UPnP fault.
+    Fault {
+        http_status: u16,
+        upnp_code: Option<u32>,
+        description: Option<String>,
+    },
+}
+
+impl SoapError {
+    /// Numeric UPnP `errorCode` from the fault body, if any.
+    pub fn upnp_code(&self) -> Option<u32> {
+        match self {
+            SoapError::Fault { upnp_code, .. } => *upnp_code,
+            _ => None,
+        }
+    }
+
+    /// For faults without a numeric code, match the standard description text.
+    fn description_matches(&self, phrases: &[&str]) -> bool {
+        match self {
+            SoapError::Fault {
+                upnp_code: None,
+                description: Some(desc),
+                ..
+            } => {
+                let d = desc.to_ascii_lowercase();
+                phrases.iter().any(|p| d.contains(p))
+            }
+            _ => false,
+        }
+    }
+
+    /// UPnP 701 "Transition not available".
+    pub fn is_transition_unavailable(&self) -> bool {
+        self.upnp_code() == Some(701) || self.description_matches(&["transition not available"])
+    }
+
+    /// Errors worth retrying a Play for: the renderer is busy or transitioning
+    /// (501 Action Failed, 701 Transition not available, 705 Transport locked)
+    /// or the connection timed out / dropped.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            SoapError::Transport(e) => e.is_transient(),
+            SoapError::Fault { upnp_code: Some(code), .. } => matches!(code, 501 | 701 | 705),
+            SoapError::Fault { .. } => self.description_matches(&[
+                "transition not available",
+                "action failed",
+                "transport locked",
+            ]),
+            SoapError::InvalidUrl(_) => false,
+        }
+    }
+}
+
+impl std::fmt::Display for SoapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SoapError::InvalidUrl(m) => write!(f, "{}", m),
+            SoapError::Transport(e) => write!(f, "{}", e),
+            SoapError::Fault {
+                http_status,
+                upnp_code,
+                description,
+            } => match (upnp_code, description) {
+                (Some(c), Some(d)) => write!(f, "UPnP error {}: {}", c, d),
+                (Some(c), None) => write!(f, "UPnP error {}", c),
+                (None, Some(d)) => write!(f, "{} (HTTP {})", d, http_status),
+                (None, None) => write!(f, "HTTP {}", http_status),
+            },
+        }
+    }
+}
+
+/// Parse a UPnP fault (`errorCode` / `errorDescription`) from a SOAP error body.
+pub fn parse_soap_fault(http_status: u16, body: &str) -> SoapError {
+    let upnp_code = extract_xml_tag(body, "errorCode").and_then(|c| c.trim().parse::<u32>().ok());
+    let description = extract_xml_tag(body, "errorDescription").filter(|d| !d.is_empty());
+    SoapError::Fault {
+        http_status,
+        upnp_code,
+        description,
+    }
+}
+
 /// SOAP XML client controlling DLNA MediaRenderers.
 pub struct UPnPClient {
     pub device: DLNADevice,
     pub timeout: Duration,
+    /// Human-readable description of the last failure.
     pub last_error: Arc<Mutex<String>>,
+    /// Structured form of the last failure.
+    pub last_fault: Arc<Mutex<Option<SoapError>>>,
 }
 
 impl UPnPClient {
@@ -142,6 +240,7 @@ impl UPnPClient {
             device,
             timeout: Duration::from_millis(4000),
             last_error: Arc::new(Mutex::new(String::new())),
+            last_fault: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -157,6 +256,7 @@ impl UPnPClient {
     }
 
     /// Send a UPnP SOAP POST action with custom timeout and return response XML body.
+    /// On failure, `last_error` / `last_fault` describe what went wrong.
     pub fn send_soap_action_with_timeout(
         &self,
         control_url: &str,
@@ -165,9 +265,47 @@ impl UPnPClient {
         arguments: &[(&str, &str)],
         timeout: Duration,
     ) -> Option<String> {
+        self.call_action(control_url, service_type, action, arguments, timeout).ok()
+    }
+
+    /// Send a UPnP SOAP POST action. `timeout` bounds the whole request (connect,
+    /// send and receive), not each individual read.
+    pub fn call_action(
+        &self,
+        control_url: &str,
+        service_type: &str,
+        action: &str,
+        arguments: &[(&str, &str)],
+        timeout: Duration,
+    ) -> Result<String, SoapError> {
+        let result = self.call_action_inner(control_url, service_type, action, arguments, timeout);
+        if let Err(ref e) = result {
+            *self.last_error.lock().unwrap() = e.to_string();
+            *self.last_fault.lock().unwrap() = Some(e.clone());
+        }
+        result
+    }
+
+    fn call_action_inner(
+        &self,
+        control_url: &str,
+        service_type: &str,
+        action: &str,
+        arguments: &[(&str, &str)],
+        timeout: Duration,
+    ) -> Result<String, SoapError> {
+        let deadline = Instant::now() + timeout;
         if control_url.is_empty() {
-            *self.last_error.lock().unwrap() = "Missing control URL".to_string();
-            return None;
+            return Err(SoapError::InvalidUrl("Missing control URL".to_string()));
+        }
+        let url = parse_http_url(control_url)
+            .ok_or_else(|| SoapError::InvalidUrl(format!("Invalid control URL: {}", control_url)))?;
+        // Host names would need a DNS lookup that the request deadline cannot bound.
+        if url.host.parse::<std::net::IpAddr>().is_err() {
+            return Err(SoapError::InvalidUrl(format!(
+                "Control URL host is not an IP address: {}",
+                control_url
+            )));
         }
 
         let mut args_xml = String::new();
@@ -187,58 +325,6 @@ impl UPnPClient {
             action, service_type, args_xml, action
         );
 
-        let url_trimmed = control_url.trim();
-        let without_proto = match url_trimmed.strip_prefix("http://") {
-            Some(p) => p,
-            None => {
-                *self.last_error.lock().unwrap() = format!("Invalid control URL: {}", control_url);
-                return None;
-            }
-        };
-        let (host_port, path) = if let Some(slash) = without_proto.find('/') {
-            (&without_proto[..slash], &without_proto[slash..])
-        } else {
-            (without_proto, "/")
-        };
-
-        let (host, port) = if let Some(colon) = host_port.find(':') {
-            let h = &host_port[..colon];
-            match host_port[colon + 1..].parse::<u16>() {
-                Ok(p) => (h, p),
-                Err(e) => {
-                    *self.last_error.lock().unwrap() = format!("Invalid port in {}: {}", control_url, e);
-                    return None;
-                }
-            }
-        } else {
-            (host_port, 80)
-        };
-
-        let addrs = match (host, port).to_socket_addrs() {
-            Ok(a) => a,
-            Err(e) => {
-                *self.last_error.lock().unwrap() = format!("Address resolution failed for {}:{}: {}", host, port, e);
-                return None;
-            }
-        };
-
-        let mut stream = None;
-        for addr in addrs {
-            if let Ok(s) = TcpStream::connect_timeout(&addr, timeout) {
-                let _ = s.set_read_timeout(Some(timeout));
-                let _ = s.set_write_timeout(Some(timeout));
-                stream = Some(s);
-                break;
-            }
-        }
-        let mut stream = match stream {
-            Some(s) => s,
-            None => {
-                *self.last_error.lock().unwrap() = format!("Connection timed out to {}:{}", host, port);
-                return None;
-            }
-        };
-
         let request = format!(
             "POST {} HTTP/1.1\r\n\
             Host: {}\r\n\
@@ -248,38 +334,23 @@ impl UPnPClient {
             Content-Length: {}\r\n\
             Connection: close\r\n\r\n\
             {}",
-            path, host_port, service_type, action, body.len(), body
+            url.path, url.host_port, service_type, action, body.len(), body
         );
 
-        if let Err(e) = stream.write_all(request.as_bytes()) {
-            *self.last_error.lock().unwrap() = format!("Write failed: {}", e);
-            return None;
-        }
-        let _ = stream.flush();
+        let response = http_exchange(
+            &url.host,
+            url.port,
+            request.as_bytes(),
+            deadline,
+            MAX_SOAP_RESPONSE_BYTES,
+        )
+        .map_err(SoapError::Transport)?;
 
-        let mut response = Vec::new();
-        if let Err(e) = stream.read_to_end(&mut response) {
-            *self.last_error.lock().unwrap() = format!("SOAP read timeout/error: {}", e);
-            return None;
-        }
-        let resp_str = String::from_utf8_lossy(&response).to_string();
-
-        if let Some(pos) = resp_str.find("\r\n\r\n") {
-            let header_part = &resp_str[..pos];
-            let body_part = &resp_str[pos + 4..];
-
-            if let Some(status_line) = header_part.lines().next() {
-                if !status_line.contains("200") {
-                    let err = extract_xml_tag(body_part, "errorDescription")
-                        .or_else(|| extract_xml_tag(body_part, "errorCode"))
-                        .unwrap_or_else(|| status_line.to_string());
-                    *self.last_error.lock().unwrap() = err;
-                    return None;
-                }
-            }
-            Some(body_part.to_string())
+        let body_text = response.body_text();
+        if (200..300).contains(&response.status) {
+            Ok(body_text)
         } else {
-            Some(resp_str)
+            Err(parse_soap_fault(response.status, &body_text))
         }
     }
 
@@ -305,7 +376,7 @@ impl UPnPClient {
         crate::log_info!("upnp", "Calling SetAVTransportURI on {} with stream URL: {}", self.device.friendly_name, stream_url);
 
         for attempt in 0..3 {
-            let res = self.send_soap_action_with_timeout(
+            let res = self.call_action(
                 &self.device.av_transport_control_url,
                 AV_TRANSPORT_SERVICE,
                 "SetAVTransportURI",
@@ -317,17 +388,17 @@ impl UPnPClient {
                 Duration::from_secs(20),
             );
 
-            if res.is_some() {
-                crate::log_info!("upnp", "SetAVTransportURI with DIDL succeeded on {}", self.device.friendly_name);
-                return true;
+            match res {
+                Ok(_) => {
+                    crate::log_info!("upnp", "SetAVTransportURI with DIDL succeeded on {}", self.device.friendly_name);
+                    return true;
+                }
+                Err(e) if e.is_transition_unavailable() && attempt < 2 => {
+                    std::thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+                Err(_) => break,
             }
-
-            let err = self.last_error.lock().unwrap().clone();
-            if (err.contains("701") || err.contains("Transition not available")) && attempt < 2 {
-                std::thread::sleep(Duration::from_millis(250));
-                continue;
-            }
-            break;
         }
 
         crate::log_info!(
@@ -367,78 +438,60 @@ impl UPnPClient {
     /// Send Play command with retries if renderer is transitioning, busy, or buffering.
     pub fn play(&self, speed: &str) -> bool {
         for attempt in 0..5 {
-            let res = self.send_soap_action_with_timeout(
+            let res = self.call_action(
                 &self.device.av_transport_control_url,
                 AV_TRANSPORT_SERVICE,
                 "Play",
                 &[("InstanceID", "0"), ("Speed", speed)],
                 Duration::from_millis(6000),
             );
-            if res.is_some() {
-                return true;
+            match res {
+                Ok(_) => return true,
+                Err(e) if e.is_transient() => {
+                    crate::log_info!(
+                        "upnp",
+                        "Renderer returned '{}' on Play (attempt {}/5); retrying in 400ms...",
+                        e,
+                        attempt + 1
+                    );
+                    std::thread::sleep(Duration::from_millis(400));
+                }
+                Err(_) => break,
             }
-            let err = self.last_error.lock().unwrap().clone();
-            if err.contains("701")
-                || err.contains("Transition not available")
-                || err.contains("501")
-                || err.contains("Action Failed")
-                || err.contains("705")
-                || err.contains("Transport locked")
-                || err.contains("timeout")
-                || err.contains("Resource temporarily unavailable")
-                || err.contains("os error 35")
-                || err.contains("Connection reset")
-                || err.contains("Broken pipe")
-            {
-                crate::log_info!(
-                    "upnp",
-                    "Renderer returned '{}' on Play (attempt {}/5); retrying in 400ms...",
-                    err,
-                    attempt + 1
-                );
-                std::thread::sleep(Duration::from_millis(400));
-                continue;
-            }
-            break;
         }
         false
     }
 
-    /// Send Pause command with fallback to Stop if unsupported.
+    /// Send Pause command, falling back to Stop if the renderer rejects it
+    /// (many reject Pause on progressive HTTP streams, e.g. 401 Invalid Action).
     pub fn pause(&self) -> bool {
-        let res = self.send_soap_action(
+        match self.call_action(
             &self.device.av_transport_control_url,
             AV_TRANSPORT_SERVICE,
             "Pause",
             &[("InstanceID", "0")],
-        );
-        if res.is_some() {
-            return true;
+            self.timeout,
+        ) {
+            Ok(_) => true,
+            Err(e) => {
+                crate::log_info!("upnp", "Pause failed ('{}'); falling back to Stop", e);
+                self.stop()
+            }
         }
-        let err = self.last_error.lock().unwrap().clone();
-        if err.contains("401") || err.contains("Invalid Action") || err.contains("501") || err.contains("Not Implemented") {
-            return self.stop();
-        }
-        // Fallback: If Pause failed for any reason on a progressive stream, try Stop
-        self.stop()
     }
 
-    /// Send Stop command.
+    /// Send Stop command. A 701 reply means the renderer is already stopped.
     pub fn stop(&self) -> bool {
-        let res = self.send_soap_action(
+        match self.call_action(
             &self.device.av_transport_control_url,
             AV_TRANSPORT_SERVICE,
             "Stop",
             &[("InstanceID", "0")],
-        );
-        if res.is_some() {
-            return true;
+            self.timeout,
+        ) {
+            Ok(_) => true,
+            Err(e) => e.is_transition_unavailable(),
         }
-        let err = self.last_error.lock().unwrap().clone();
-        if err.contains("701") || err.contains("Transition not available") {
-            return true;
-        }
-        false
     }
 
     /// Seek to specific position in track (REL_TIME).
@@ -531,6 +584,55 @@ impl UPnPClient {
     }
 }
 
+/// Coordinates the background poll thread with player commands.
+///
+/// Every command (play, pause, resume, seek, stop) bumps `epoch` when it starts and
+/// again when it ends, and counts itself in `active_commands` meanwhile. The poll thread
+/// snapshots the epoch before its SOAP calls and applies what it observed only if the
+/// epoch is unchanged and no command is running, checked and written under this lock.
+/// A poll thread from an earlier session, or one whose SOAP call overlapped a command,
+/// therefore cannot write stale state (e.g. `track_finished`) into the current session.
+#[derive(Default)]
+struct PollControl {
+    epoch: u64,
+    active_commands: u32,
+}
+
+fn lock_poll_control(ctl: &Mutex<PollControl>) -> std::sync::MutexGuard<'_, PollControl> {
+    ctl.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// RAII marker for a running player command; see [`PollControl`].
+struct CommandGuard {
+    ctl: Arc<Mutex<PollControl>>,
+}
+
+impl CommandGuard {
+    fn begin(ctl: &Arc<Mutex<PollControl>>) -> Self {
+        {
+            let mut c = lock_poll_control(ctl);
+            c.epoch = c.epoch.wrapping_add(1);
+            c.active_commands += 1;
+        }
+        Self { ctl: ctl.clone() }
+    }
+}
+
+impl Drop for CommandGuard {
+    fn drop(&mut self) {
+        let mut c = lock_poll_control(&self.ctl);
+        c.epoch = c.epoch.wrapping_add(1);
+        c.active_commands = c.active_commands.saturating_sub(1);
+    }
+}
+
+/// What one poll tick learned from the renderer.
+enum PollObservation {
+    /// Continuous (gapless) stream: only the transport state is tracked.
+    Continuous { state: String },
+    Track { rel_sec: f64, dur_sec: f64, state: String },
+}
+
 /// An `AudioPlayer` implementation streaming audio over DLNA/UPnP to remote renderers.
 pub struct UPnPPlayer {
     pub device: DLNADevice,
@@ -547,6 +649,7 @@ pub struct UPnPPlayer {
     current_filepath: Arc<Mutex<Option<PathBuf>>>,
     playback_stream_offset: Arc<Mutex<f64>>,
     last_seek_time: Arc<Mutex<Instant>>,
+    poll_control: Arc<Mutex<PollControl>>,
 }
 
 impl UPnPPlayer {
@@ -576,7 +679,13 @@ impl UPnPPlayer {
             current_filepath: Arc::new(Mutex::new(None)),
             playback_stream_offset: Arc::new(Mutex::new(0.0)),
             last_seek_time: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(10))),
+            poll_control: Arc::new(Mutex::new(PollControl::default())),
         }
+    }
+
+    /// Mark a player command as running until the returned guard is dropped.
+    fn begin_command(&self) -> CommandGuard {
+        CommandGuard::begin(&self.poll_control)
     }
 
     pub fn with_stream_state(mut self, stream_state: Option<Arc<crate::web::StreamServerState>>) -> Self {
@@ -603,6 +712,7 @@ impl UPnPPlayer {
 
         let dev_name = self.device.friendly_name.clone();
         let stream_state = self.stream_state.clone();
+        let poll_control = self.poll_control.clone();
 
         std::thread::spawn(move || {
             let mut consecutive_stopped = 0;
@@ -616,9 +726,43 @@ impl UPnPPlayer {
                     break;
                 }
 
-                if let Some(ref ss) = stream_state {
-                    if ss.continuous.is_active.load(Ordering::SeqCst) {
-                        let state = client.get_transport_info();
+                // Snapshot the command epoch before querying the renderer. Skip the tick
+                // entirely while a command is changing the renderer's state.
+                let epoch = {
+                    let ctl = lock_poll_control(&poll_control);
+                    if ctl.active_commands > 0 {
+                        continue;
+                    }
+                    ctl.epoch
+                };
+                let current_seek_instant = *last_seek_ref.lock().unwrap();
+
+                let continuous = stream_state
+                    .as_ref()
+                    .is_some_and(|ss| ss.continuous.is_active.load(Ordering::SeqCst));
+                let observation = if continuous {
+                    PollObservation::Continuous {
+                        state: client.get_transport_info(),
+                    }
+                } else {
+                    let (rel_sec, dur_sec) = client.get_position_info();
+                    let state = client.get_transport_info();
+                    PollObservation::Track { rel_sec, dur_sec, state }
+                };
+
+                // The SOAP calls above can take seconds. Apply their result only if this
+                // thread still belongs to the current session and no command ran in the
+                // meantime; hold the lock while writing so no command can start mid-write.
+                let ctl = lock_poll_control(&poll_control);
+                if stop_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                if ctl.epoch != epoch || ctl.active_commands > 0 {
+                    continue;
+                }
+
+                let (rel_sec, dur_sec, state) = match observation {
+                    PollObservation::Continuous { state } => {
                         if state == "PLAYING" {
                             consecutive_stopped = 0;
                             is_playing_ref.store(true, Ordering::SeqCst);
@@ -630,10 +774,10 @@ impl UPnPPlayer {
                         }
                         continue;
                     }
-                }
+                    PollObservation::Track { rel_sec, dur_sec, state } => (rel_sec, dur_sec, state),
+                };
 
                 // If user sought, sync last_seek_instant and reset max_observed_pos / total_playing_seconds
-                let current_seek_instant = *last_seek_ref.lock().unwrap();
                 if current_seek_instant != last_seek_instant {
                     last_seek_instant = current_seek_instant;
                     let target_pos = *pos_ref.lock().unwrap();
@@ -643,12 +787,10 @@ impl UPnPPlayer {
 
                 let time_since_seek = current_seek_instant.elapsed();
 
-                let (rel_sec, dur_sec) = client.get_position_info();
                 if dur_sec > 0.0 {
                     *dur_ref.lock().unwrap() = dur_sec;
                 }
 
-                let state = client.get_transport_info();
                 match state.as_str() {
                     "PLAYING" => {
                         consecutive_stopped = 0;
@@ -842,6 +984,7 @@ impl UPnPPlayer {
 
 impl Drop for UPnPPlayer {
     fn drop(&mut self) {
+        let _cmd = self.begin_command();
         self.poll_stop_flag.store(true, Ordering::SeqCst);
         if let Some(ref ss) = self.stream_state {
             ss.close_active_streams();
@@ -867,12 +1010,20 @@ impl AudioPlayer for UPnPPlayer {
             position_seconds,
             self.device.friendly_name
         );
+        let _cmd = self.begin_command();
 
-        // 1. Terminate any previous polling thread, close streaming sockets, & stop renderer
+        // 1. Terminate any previous polling thread, close streaming sockets, & stop renderer.
+        // The old thread is not joined (it may be inside a multi-second SOAP call); the
+        // command epoch bumped above makes it drop whatever it observes from now on.
+        // `__continuous__.wav` is a placeholder that selects the gapless continuous stream.
+        let is_continuous = filepath.file_name().is_some_and(|f| f == "__continuous__.wav");
         self.poll_stop_flag.store(true, Ordering::SeqCst);
         if let Some(ref ss) = self.stream_state {
+            // Also ends any previous continuous session.
             ss.close_active_streams();
-            ss.register_file(filepath);
+            if !is_continuous {
+                ss.register_file(filepath);
+            }
         }
         let _ = self.client.stop();
         std::thread::sleep(Duration::from_millis(100));
@@ -883,10 +1034,13 @@ impl AudioPlayer for UPnPPlayer {
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| "track".to_string());
-        let is_continuous = file_name.contains("continuous.wav") || file_name == "__continuous__.wav";
         let encoded_name = url_encode(&file_name);
         let stream_url = if is_continuous {
-            format!("http://{}:{}/stream/continuous.wav", host_ip, self.web_port)
+            // Each continuous session is served at its own unguessable path.
+            let Some(ref ss) = self.stream_state else {
+                anyhow::bail!("Continuous streaming needs the streaming server");
+            };
+            format!("http://{}:{}{}", host_ip, self.web_port, ss.arm_continuous_session())
         } else if position_seconds > 0.0 {
             format!(
                 "http://{}:{}/stream/{}?pos={:.2}",
@@ -945,6 +1099,7 @@ impl AudioPlayer for UPnPPlayer {
     }
 
     fn pause(&mut self) -> anyhow::Result<()> {
+        let _cmd = self.begin_command();
         let (rel_sec, _) = self.client.get_position_info();
         if rel_sec > 0.0 {
             let offset = *self.playback_stream_offset.lock().unwrap();
@@ -967,6 +1122,7 @@ impl AudioPlayer for UPnPPlayer {
     }
 
     fn resume(&mut self) -> anyhow::Result<()> {
+        let _cmd = self.begin_command();
         let current_pos = *self.position_seconds.lock().unwrap();
         crate::log_info!("player", "UPnPPlayer::resume at {:.2}s", current_pos);
 
@@ -1013,6 +1169,7 @@ impl AudioPlayer for UPnPPlayer {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        let _cmd = self.begin_command();
         self.poll_stop_flag.store(true, Ordering::SeqCst);
         if let Some(ref ss) = self.stream_state {
             ss.close_active_streams();
@@ -1033,6 +1190,7 @@ impl AudioPlayer for UPnPPlayer {
     }
 
     fn seek_to(&mut self, position_seconds: f64) -> anyhow::Result<()> {
+        let _cmd = self.begin_command();
         if let Some(ref ss) = self.stream_state {
             if ss.continuous.is_active.load(Ordering::SeqCst) {
                 ss.continuous.seek_to(position_seconds);

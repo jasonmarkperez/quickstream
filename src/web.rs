@@ -2,12 +2,12 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +99,10 @@ pub struct NowPlayingState {
     pub bpm: Option<f64>,
     #[serde(default)]
     pub key: Option<String>,
+    /// Folders the web dashboard may browse and act on (startup home, bookmarks, launch folder).
+    /// Never sent to clients.
+    #[serde(skip)]
+    pub allowed_roots: Vec<PathBuf>,
 }
 
 impl Default for NowPlayingState {
@@ -134,6 +138,7 @@ impl Default for NowPlayingState {
             active_mix_profile: "Diverse Artists Shuffle".to_string(),
             bpm: None,
             key: None,
+            allowed_roots: Vec::new(),
         }
     }
 }
@@ -163,6 +168,8 @@ pub enum WebCommand {
     ShuffleQueue,
     SetMixProfile(String),
     SeedRadio(PathBuf),
+    /// A web request named a path outside the allowed folders; it was ignored.
+    PathRejected(PathBuf),
 }
 
 #[derive(Deserialize)]
@@ -180,6 +187,39 @@ struct ActionPayload {
     mode: Option<String>,
 }
 
+/// An armed continuous stream: the renderer must request `/stream/continuous-<nonce>.wav`.
+#[derive(Debug)]
+struct ContinuousSession {
+    nonce: String,
+    /// The first peer that connected; other hosts are refused for the rest of the session.
+    peer: Option<IpAddr>,
+}
+
+/// Whether a request for a continuous stream path may be served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContinuousAdmission {
+    /// Serve the stream for the session with this nonce.
+    Admitted(String),
+    /// No session is armed, or the path does not name it (404).
+    NotFound,
+    /// The session belongs to another host (409).
+    Conflict,
+}
+
+const CONTINUOUS_PREFIX: &str = "/stream/continuous-";
+const CONTINUOUS_SUFFIX: &str = ".wav";
+
+/// The nonce in a `/stream/continuous-<32 hex>.wav` route, if `route` has that shape.
+fn continuous_route_nonce(route: &str) -> Option<&str> {
+    let nonce = route.strip_prefix(CONTINUOUS_PREFIX)?.strip_suffix(CONTINUOUS_SUFFIX)?;
+    (nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_hexdigit())).then_some(nonce)
+}
+
+/// Whether `route` (path without query) addresses the continuous stream, armed or not.
+fn is_continuous_route(route: &str) -> bool {
+    route == "/stream/continuous.wav" || route == "/stream/autopilot.wav" || continuous_route_nonce(route).is_some()
+}
+
 /// Controls continuous PCM gapless streaming for DLNA renderers.
 #[derive(Debug, Default)]
 pub struct ContinuousStreamController {
@@ -193,11 +233,62 @@ pub struct ContinuousStreamController {
     pub seek_requested: Arc<AtomicBool>,
     pub target_seek: Arc<Mutex<Option<f64>>>,
     pub active_child: Arc<Mutex<Option<std::process::Child>>>,
+    session: Mutex<Option<ContinuousSession>>,
 }
 
 impl ContinuousStreamController {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Start a new continuous session (replacing any previous one) and return the URL path the
+    /// renderer must request.
+    pub fn arm_session(&self) -> String {
+        let nonce = crate::web_access::generate_token();
+        let path = format!("{}{}{}", CONTINUOUS_PREFIX, nonce, CONTINUOUS_SUFFIX);
+        *self.session.lock().unwrap() = Some(ContinuousSession { nonce, peer: None });
+        path
+    }
+
+    /// End the continuous session: its path stops being served.
+    pub fn disarm_session(&self) {
+        *self.session.lock().unwrap() = None;
+    }
+
+    /// The URL path of the armed session, if any.
+    pub fn session_path(&self) -> Option<String> {
+        self.session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| format!("{}{}{}", CONTINUOUS_PREFIX, s.nonce, CONTINUOUS_SUFFIX))
+    }
+
+    /// Decide whether `peer` may stream `route` (a path without query). The first admitted peer
+    /// owns the session.
+    pub fn admit(&self, route: &str, peer: IpAddr) -> ContinuousAdmission {
+        let Some(requested) = continuous_route_nonce(route) else {
+            return ContinuousAdmission::NotFound;
+        };
+        let mut guard = self.session.lock().unwrap();
+        let Some(session) = guard.as_mut() else {
+            return ContinuousAdmission::NotFound;
+        };
+        if !crate::web_access::constant_time_eq(requested, &session.nonce) {
+            return ContinuousAdmission::NotFound;
+        }
+        match session.peer {
+            Some(owner) if owner != peer => ContinuousAdmission::Conflict,
+            _ => {
+                session.peer = Some(peer);
+                ContinuousAdmission::Admitted(session.nonce.clone())
+            }
+        }
+    }
+
+    /// Whether the session with `nonce` is still the armed one.
+    fn is_session(&self, nonce: &str) -> bool {
+        self.session.lock().unwrap().as_ref().is_some_and(|s| s.nonce == nonce)
     }
 
     pub fn skip_to_index(&self, index: usize) {
@@ -283,8 +374,20 @@ impl StreamServerState {
         self.active_sockets.lock().unwrap().remove(&id);
     }
 
-    /// Immediately abort and close all active streaming TCP connections to stereos.
+    /// Start a continuous session; see [`ContinuousStreamController::arm_session`].
+    pub fn arm_continuous_session(&self) -> String {
+        self.continuous.arm_session()
+    }
+
+    /// The URL path of the armed continuous session, if any.
+    pub fn continuous_session_path(&self) -> Option<String> {
+        self.continuous.session_path()
+    }
+
+    /// Immediately abort and close all active streaming TCP connections to stereos, and end any
+    /// continuous session.
     pub fn close_active_streams(&self) {
+        self.continuous.disarm_session();
         self.continuous.is_active.store(false, Ordering::SeqCst);
         self.continuous.kill_active_decoder();
         let mut sockets = self.active_sockets.lock().unwrap();
@@ -363,6 +466,327 @@ impl Drop for WebServerHandle {
     }
 }
 
+/// Resource limits for the embedded HTTP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerLimits {
+    /// Connections allowed at once while reading a request or serving a non-stream route.
+    pub max_connections: usize,
+    /// `/stream/...` responses allowed at once. Streams are long-lived, so they move out of the
+    /// `max_connections` pool once the route is known.
+    pub max_streams: usize,
+    /// Total time allowed to receive the request line, headers and body (not per read).
+    pub request_timeout: Duration,
+    /// Longest request line or header line, in bytes.
+    pub max_line_bytes: usize,
+    /// Most header fields in one request.
+    pub max_headers: usize,
+    /// Most bytes in the request line plus headers.
+    pub max_head_bytes: usize,
+    /// Largest request body (`Content-Length`), in bytes.
+    pub max_body_bytes: usize,
+}
+
+impl Default for ServerLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: 64,
+            max_streams: 16,
+            request_timeout: Duration::from_secs(10),
+            max_line_bytes: 8 * 1024,
+            max_headers: 100,
+            max_head_bytes: 64 * 1024,
+            max_body_bytes: 64 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermitKind {
+    Request,
+    Stream,
+}
+
+/// Counts live connection handlers so a flood of connections cannot spawn unbounded threads.
+struct ConnectionLimiter {
+    limits: ServerLimits,
+    requests: AtomicUsize,
+    streams: AtomicUsize,
+}
+
+impl ConnectionLimiter {
+    fn new(limits: ServerLimits) -> Self {
+        Self {
+            limits,
+            requests: AtomicUsize::new(0),
+            streams: AtomicUsize::new(0),
+        }
+    }
+
+    fn counter(&self, kind: PermitKind) -> &AtomicUsize {
+        match kind {
+            PermitKind::Request => &self.requests,
+            PermitKind::Stream => &self.streams,
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>, kind: PermitKind) -> Option<ConnectionPermit> {
+        let max = match kind {
+            PermitKind::Request => self.limits.max_connections,
+            PermitKind::Stream => self.limits.max_streams,
+        };
+        self.counter(kind)
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < max).then_some(n + 1))
+            .ok()?;
+        Some(ConnectionPermit {
+            limiter: self.clone(),
+            kind,
+        })
+    }
+}
+
+/// A slot in one of the limiter's pools, released on drop.
+struct ConnectionPermit {
+    limiter: Arc<ConnectionLimiter>,
+    kind: PermitKind,
+}
+
+impl ConnectionPermit {
+    /// Move a request-pool slot to the stream pool; returns `self` unchanged if the stream pool is full.
+    fn into_stream(self) -> Result<ConnectionPermit, ConnectionPermit> {
+        match self.limiter.try_acquire(PermitKind::Stream) {
+            Some(stream_permit) => Ok(stream_permit),
+            None => Err(self),
+        }
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.limiter.counter(self.kind).fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Error statuses the server sends before routing a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rejection {
+    BadRequest,
+    RequestTimeout,
+    PayloadTooLarge,
+    UriTooLong,
+    HeadersTooLarge,
+    Busy,
+}
+
+impl Rejection {
+    fn status_line(self) -> &'static str {
+        match self {
+            Rejection::BadRequest => "400 Bad Request",
+            Rejection::RequestTimeout => "408 Request Timeout",
+            Rejection::PayloadTooLarge => "413 Content Too Large",
+            Rejection::UriTooLong => "414 URI Too Long",
+            Rejection::HeadersTooLarge => "431 Request Header Fields Too Large",
+            Rejection::Busy => "503 Service Unavailable",
+        }
+    }
+
+    fn response(self) -> String {
+        format!(
+            "HTTP/1.1 {}\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n",
+            self.status_line(),
+            if self == Rejection::Busy { "Retry-After: 1\r\n" } else { "" }
+        )
+    }
+}
+
+/// Answer a connection the accept loop has no slot for. Runs on the accept thread, so it never
+/// waits on the client: the response fits in a fresh socket's send buffer.
+fn refuse_busy_connection(mut stream: TcpStream) {
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.write_all(Rejection::Busy.response().as_bytes());
+    let _ = stream.flush();
+}
+
+/// Send an error response, then drain unread request bytes for a moment before closing: closing
+/// with unread data makes the kernel send a reset, which can discard the response at the client.
+fn reject_request(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, rejection: Rejection) {
+    let _ = stream.write_all(rejection.response().as_bytes());
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+
+    const DRAIN_TIME: Duration = Duration::from_millis(500);
+    const DRAIN_BYTES: usize = 256 * 1024;
+    let deadline = Instant::now() + DRAIN_TIME;
+    let mut drained = 0usize;
+    let mut buf = [0u8; 8192];
+    while drained < DRAIN_BYTES {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || reader.get_ref().set_read_timeout(Some(remaining)).is_err() {
+            break;
+        }
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => drained += n,
+        }
+    }
+}
+
+/// Request line and headers of an incoming request.
+struct RequestHead {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    content_length: usize,
+}
+
+impl RequestHead {
+    /// Value of the first header named `name` (case-insensitive).
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+enum LineError {
+    /// The peer closed the connection or the socket failed.
+    Closed,
+    TooLong,
+    Timeout,
+}
+
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+}
+
+/// Set the socket read timeout to the time left before `deadline`.
+fn arm_read_deadline(stream: &TcpStream, deadline: Instant) -> Result<(), LineError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(LineError::Timeout);
+    }
+    stream.set_read_timeout(Some(remaining)).map_err(|_| LineError::Closed)
+}
+
+/// Read one line (including its `\n`) of at most `max` bytes, finishing before `deadline`.
+fn read_line_bounded(
+    reader: &mut BufReader<TcpStream>,
+    deadline: Instant,
+    max: usize,
+) -> Result<Vec<u8>, LineError> {
+    let mut line = Vec::new();
+    loop {
+        arm_read_deadline(reader.get_ref(), deadline)?;
+        let available = match reader.fill_buf() {
+            Ok(buf) => buf,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if is_timeout(&e) => return Err(LineError::Timeout),
+            Err(_) => return Err(LineError::Closed),
+        };
+        if available.is_empty() {
+            return Err(LineError::Closed);
+        }
+        let (take, done) = match available.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (available.len(), false),
+        };
+        if line.len() + take > max {
+            return Err(LineError::TooLong);
+        }
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if done {
+            return Ok(line);
+        }
+    }
+}
+
+/// Read the request line and headers within the configured limits. `Ok(None)` means the client
+/// closed the connection before sending a request line.
+fn read_request_head(
+    reader: &mut BufReader<TcpStream>,
+    deadline: Instant,
+    limits: &ServerLimits,
+) -> Result<Option<RequestHead>, Rejection> {
+    let request_line = match read_line_bounded(reader, deadline, limits.max_line_bytes) {
+        Ok(line) => line,
+        Err(LineError::Closed) => return Ok(None),
+        Err(LineError::TooLong) => return Err(Rejection::UriTooLong),
+        Err(LineError::Timeout) => return Err(Rejection::RequestTimeout),
+    };
+    let mut head_bytes = request_line.len();
+    let request_line = std::str::from_utf8(&request_line).map_err(|_| Rejection::BadRequest)?;
+    let mut parts = request_line.split_whitespace();
+    let (Some(method), Some(path)) = (parts.next(), parts.next()) else {
+        return Err(Rejection::BadRequest);
+    };
+    let mut head = RequestHead {
+        method: method.to_string(),
+        path: path.to_string(),
+        headers: Vec::new(),
+        content_length: 0,
+    };
+
+    loop {
+        let line = match read_line_bounded(reader, deadline, limits.max_line_bytes) {
+            Ok(line) => line,
+            // A client that half-closes after its last header still gets an answer.
+            Err(LineError::Closed) => break,
+            Err(LineError::TooLong) => return Err(Rejection::HeadersTooLarge),
+            Err(LineError::Timeout) => return Err(Rejection::RequestTimeout),
+        };
+        head_bytes += line.len();
+        if head_bytes > limits.max_head_bytes {
+            return Err(Rejection::HeadersTooLarge);
+        }
+        let text = String::from_utf8_lossy(&line);
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if head.headers.len() >= limits.max_headers {
+            return Err(Rejection::HeadersTooLarge);
+        }
+        let Some((name, value)) = trimmed.split_once(':') else {
+            return Err(Rejection::BadRequest);
+        };
+        let (name, value) = (name.trim(), value.trim());
+        if name.eq_ignore_ascii_case("content-length") {
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(Rejection::BadRequest);
+            }
+            // Digits only, so a parse failure means the value overflowed usize.
+            let declared = value.parse::<usize>().map_err(|_| Rejection::PayloadTooLarge)?;
+            if declared > limits.max_body_bytes {
+                return Err(Rejection::PayloadTooLarge);
+            }
+            head.content_length = declared;
+        }
+        head.headers.push((name.to_string(), value.to_string()));
+    }
+    Ok(Some(head))
+}
+
+/// Read a request body of `len` bytes (already checked against the body limit) before `deadline`.
+fn read_request_body(
+    reader: &mut BufReader<TcpStream>,
+    len: usize,
+    deadline: Instant,
+) -> Option<Vec<u8>> {
+    let mut body = vec![0u8; len];
+    let mut filled = 0;
+    while filled < len {
+        arm_read_deadline(reader.get_ref(), deadline).ok()?;
+        match reader.read(&mut body[filled..]) {
+            Ok(0) => return None,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    Some(body)
+}
+
 pub struct WebServer;
 
 impl WebServer {
@@ -393,6 +817,18 @@ impl WebServer {
         cmd_tx: mpsc::Sender<WebCommand>,
         stream_state: Arc<StreamServerState>,
     ) -> anyhow::Result<WebServerHandle> {
+        Self::start_with_options(bind, port, state, cmd_tx, stream_state, ServerLimits::default())
+    }
+
+    /// Start the local web server with a shared StreamServerState and explicit resource limits.
+    pub fn start_with_options(
+        bind: WebBind,
+        port: u16,
+        state: Arc<RwLock<NowPlayingState>>,
+        cmd_tx: mpsc::Sender<WebCommand>,
+        stream_state: Arc<StreamServerState>,
+        limits: ServerLimits,
+    ) -> anyhow::Result<WebServerHandle> {
         let candidate_ports = [port, 8080, 8090, 8091, 0];
         let mut listener_opt = None;
         // Never fall back to the other interface: if another app holds *:port, binding
@@ -415,6 +851,7 @@ impl WebServer {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_thread = stop_flag.clone();
         let stream_state_thread = stream_state.clone();
+        let limiter = Arc::new(ConnectionLimiter::new(limits));
 
         // Non-blocking accept so the loop sees the stop flag within one poll interval. A wake-up
         // connection to 127.0.0.1:port is not reliable: another listener bound to 127.0.0.1 on
@@ -425,18 +862,41 @@ impl WebServer {
             .spawn(move || {
                 while !stop_flag_thread.load(Ordering::SeqCst) {
                     match listener.accept() {
-                        Ok((stream, _)) => {
+                        Ok((stream, peer)) => {
                             if stop_flag_thread.load(Ordering::SeqCst) {
                                 break;
                             }
                             // Accepted sockets inherit O_NONBLOCK on macOS/BSD.
                             let _ = stream.set_nonblocking(false);
+                            let Some(permit) = limiter.try_acquire(PermitKind::Request) else {
+                                crate::log_warn!(
+                                    "web",
+                                    "Connection limit ({}) reached; refusing {}",
+                                    limits.max_connections,
+                                    peer
+                                );
+                                refuse_busy_connection(stream);
+                                continue;
+                            };
                             let state_clone = state.clone();
                             let cmd_tx_clone = cmd_tx.clone();
                             let stream_state_clone = stream_state_thread.clone();
-                            std::thread::spawn(move || {
-                                let _ = handle_client(stream, &state_clone, &cmd_tx_clone, &stream_state_clone);
-                            });
+                            let spawned = std::thread::Builder::new()
+                                .name("QuickstreamWebConn".to_string())
+                                .spawn(move || {
+                                    let _ = handle_client(
+                                        stream,
+                                        permit,
+                                        &limits,
+                                        &state_clone,
+                                        &cmd_tx_clone,
+                                        &stream_state_clone,
+                                    );
+                                });
+                            if let Err(e) = spawned {
+                                // The closure (socket and permit) is dropped with the error.
+                                crate::log_warn!("web", "Failed to spawn connection handler for {}: {}", peer, e);
+                            }
                         }
                         Err(_) => {
                             std::thread::sleep(Duration::from_millis(20));
@@ -457,58 +917,65 @@ impl WebServer {
 
 fn handle_client(
     mut stream: TcpStream,
+    permit: ConnectionPermit,
+    limits: &ServerLimits,
     state: &Arc<RwLock<NowPlayingState>>,
     cmd_tx: &mpsc::Sender<WebCommand>,
     stream_state: &Arc<StreamServerState>,
 ) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(4)))?;
     stream.set_write_timeout(Some(Duration::from_secs(4)))?;
 
+    // One deadline for the whole request (line, headers and body), so a client cannot hold the
+    // connection open by sending a byte at a time.
+    let deadline = Instant::now() + limits.request_timeout;
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
-        return Ok(());
+    let head = match read_request_head(&mut reader, deadline, limits) {
+        Ok(Some(head)) => head,
+        Ok(None) => return Ok(()),
+        Err(rejection) => {
+            reject_request(&mut stream, &mut reader, rejection);
+            return Ok(());
+        }
+    };
+
+    let method = head.method.as_str();
+    let path = head.path.as_str();
+    // The path without its query string or fragment.
+    let route = path.split(['?', '#']).next().unwrap_or(path);
+    let content_length = head.content_length;
+    let range_header = head.header("range").map(str::to_string);
+    let mut auth_headers = crate::web_access::AuthHeaders::default();
+    for (name, value) in &head.headers {
+        auth_headers.observe(&format!("{}: {}", name, value));
     }
 
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
-    if parts.len() < 2 {
+    // Streams can run for hours: move them to their own pool so they do not use up the slots
+    // for short requests.
+    let _permit = if (method == "GET" || method == "HEAD") && path.starts_with("/stream") {
+        match permit.into_stream() {
+            Ok(stream_permit) => stream_permit,
+            Err(_request_permit) => {
+                crate::log_warn!("web", "Stream limit ({}) reached; refusing {}", limits.max_streams, path);
+                reject_request(&mut stream, &mut reader, Rejection::Busy);
+                return Ok(());
+            }
+        }
+    } else {
+        permit
+    };
+
+    if !crate::web_access::check_request(&mut stream, method, path, &auth_headers)? {
         return Ok(());
-    }
-
-    let method = parts[0];
-    let path = parts[1];
-
-    // Read remaining headers
-    let mut content_length = 0usize;
-    let mut range_header = None;
-    loop {
-        let mut header_line = String::new();
-        if reader.read_line(&mut header_line)? == 0 {
-            break;
-        }
-        let trimmed = header_line.trim();
-        if trimmed.is_empty() {
-            break;
-        }
-        if trimmed.to_lowercase().starts_with("content-length:") {
-            if let Some(val_str) = trimmed.split(':').nth(1) {
-                content_length = val_str.trim().parse::<usize>().unwrap_or(0);
-            }
-        } else if trimmed.to_lowercase().starts_with("range:") {
-            if let Some(val_str) = trimmed.split(':').nth(1) {
-                range_header = Some(val_str.trim().to_string());
-            }
-        }
     }
 
     // Route dispatch
     if method == "GET" || method == "HEAD" {
         let is_head = method == "HEAD";
-        if path == "/" || path == "/index.html" {
+        if route == "/" || route == "/index.html" {
             // Serve single-page dashboard
             let body = NOW_PLAYING_HTML.as_bytes();
             let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             stream.write_all(header.as_bytes())?;
@@ -518,14 +985,37 @@ fn handle_client(
             stream.flush()?;
         } else if path.starts_with("/api/status") {
             // Serve JSON playback status
-            let current = {
+            let mut current = {
                 let s = state.read().unwrap();
                 s.clone()
             };
+            // Only reveal where the terminal is browsing when the dashboard may go there too.
+            if !current.current_browser_dir.is_empty()
+                && crate::web_access::resolve_allowed_path(Path::new(&current.current_browser_dir), &current.allowed_roots)
+                    .is_none()
+            {
+                current.current_browser_dir.clear();
+            }
+            // Likewise for track and folder paths outside the allowed folders: queue entries lose
+            // their path, the current track keeps only its file name.
+            let visible = crate::web_access::VisibleRoots::new(&current.allowed_roots);
+            for item in &mut current.queue {
+                if !visible.contains(Path::new(&item.filepath)) {
+                    item.filepath.clear();
+                }
+            }
+            if let Some(ref fp) = current.filepath {
+                if !visible.contains(fp) {
+                    current.filepath = fp.file_name().map(PathBuf::from);
+                }
+            }
+            if current.autopilot_dir.as_deref().is_some_and(|d| !visible.contains(Path::new(d))) {
+                current.autopilot_dir = None;
+            }
             let json = serde_json::to_string(&current).unwrap_or_else(|_| "{}".to_string());
             let body = json.as_bytes();
             let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             stream.write_all(header.as_bytes())?;
@@ -543,7 +1033,7 @@ fn handle_client(
             let art_opt = filepath.as_deref().and_then(extract_cover_art);
             if let Some((bytes, mime)) = art_opt {
                 let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: public, max-age=10\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nCache-Control: public, max-age=10\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     mime,
                     bytes.len()
                 );
@@ -555,7 +1045,7 @@ fn handle_client(
             } else {
                 let svg = default_cover_svg().as_bytes();
                 let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: public, max-age=10\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nCache-Control: public, max-age=10\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     svg.len()
                 );
                 stream.write_all(header.as_bytes())?;
@@ -582,35 +1072,34 @@ fn handle_client(
                 None
             };
 
-            let (current_home_dir, current_terminal_dir) = {
+            let (current_home_dir, current_terminal_dir, roots) = {
                 let s = state.read().unwrap();
-                (s.home_dir.clone(), s.current_browser_dir.clone())
+                (s.home_dir.clone(), s.current_browser_dir.clone(), s.allowed_roots.clone())
             };
-
-            let target_dir = if let Some(ref p) = requested_path {
-                let pb = PathBuf::from(p);
-                if pb.is_dir() {
-                    pb
-                } else if !current_terminal_dir.is_empty() && PathBuf::from(&current_terminal_dir).is_dir() {
-                    PathBuf::from(&current_terminal_dir)
-                } else {
-                    current_home_dir
-                        .as_ref()
-                        .map(PathBuf::from)
-                        .filter(|p| p.is_dir())
-                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-                }
-            } else if !current_terminal_dir.is_empty() && PathBuf::from(&current_terminal_dir).is_dir() {
-                PathBuf::from(&current_terminal_dir)
+            // Only folders inside the allowed roots (startup home, bookmarks, launch folder).
+            let allowed_dir = |p: &Path| crate::web_access::resolve_allowed_path(p, &roots).filter(|d| d.is_dir());
+            let terminal_dir = if current_terminal_dir.is_empty() {
+                None
             } else {
-                current_home_dir
-                    .as_ref()
-                    .map(PathBuf::from)
-                    .filter(|p| p.is_dir())
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+                allowed_dir(Path::new(&current_terminal_dir)).map(|_| current_terminal_dir.clone())
+            };
+            let target_opt = match requested_path {
+                Some(ref p) => allowed_dir(Path::new(p)),
+                None => terminal_dir
+                    .as_deref()
+                    .and_then(|t| allowed_dir(Path::new(t)))
+                    .or_else(|| current_home_dir.as_deref().and_then(|h| allowed_dir(Path::new(h))))
+                    .or_else(|| roots.iter().find_map(|r| allowed_dir(r))),
+            };
+            let Some(target_dir) = target_opt else {
+                crate::web_access::write_path_forbidden(&mut stream)?;
+                return Ok(());
             };
 
-            let parent_path = target_dir.parent().map(|p| p.to_string_lossy().to_string());
+            let parent_path = target_dir
+                .parent()
+                .and_then(allowed_dir)
+                .map(|p| p.to_string_lossy().to_string());
 
             let bookmarks_file = crate::paths::get_bookmarks_path();
             let bookmarks: Vec<String> = if bookmarks_file.exists() {
@@ -663,17 +1152,13 @@ fn handle_client(
                 bookmarks,
                 entries: all_entries,
                 home_dir: current_home_dir,
-                terminal_dir: if current_terminal_dir.is_empty() {
-                    None
-                } else {
-                    Some(current_terminal_dir)
-                },
+                terminal_dir,
             };
 
             let json = serde_json::to_string(&resp_data).unwrap_or_else(|_| "{}".to_string());
             let body = json.as_bytes();
             let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             stream.write_all(header.as_bytes())?;
@@ -681,8 +1166,24 @@ fn handle_client(
                 stream.write_all(body)?;
             }
             stream.flush()?;
-        } else if path.starts_with("/stream/continuous.wav") || path.starts_with("/stream/autopilot.wav") {
-            serve_continuous_stream(stream, is_head, state, cmd_tx, stream_state)?;
+        } else if is_continuous_route(route) {
+            // Only the armed UPnP continuous session's path is served, to the first host that
+            // connects to it.
+            let peer = stream.peer_addr()?.ip();
+            match stream_state.continuous.admit(route, peer) {
+                ContinuousAdmission::Admitted(nonce) => {
+                    serve_continuous_stream(stream, is_head, state, cmd_tx, stream_state, &nonce)?;
+                }
+                ContinuousAdmission::NotFound => {
+                    stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found")?;
+                    stream.flush()?;
+                }
+                ContinuousAdmission::Conflict => {
+                    crate::log_warn!("web", "Refusing continuous stream request from {}: the session belongs to another host", peer);
+                    stream.write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 8\r\nConnection: close\r\n\r\nConflict")?;
+                    stream.flush()?;
+                }
+            }
             return Ok(());
         } else if path.starts_with("/stream") {
             // Serve DLNA audio streaming with HTTP byte ranges
@@ -694,11 +1195,19 @@ fn handle_client(
             stream.flush()?;
         }
     } else if method == "POST" && path.starts_with("/api/action") {
-        let mut body_bytes = vec![0u8; content_length];
-        if content_length > 0 {
-            let _ = reader.read_exact(&mut body_bytes);
-        }
+        // content_length was checked against limits.max_body_bytes with the headers.
+        let body_bytes = read_request_body(&mut reader, content_length, deadline).unwrap_or_default();
 
+        // Paths must resolve inside the allowed folders; commands carry the resolved path.
+        let roots = state.read().unwrap().allowed_roots.clone();
+        let mut rejected: Option<PathBuf> = None;
+        let mut allow = |p: String| -> Option<PathBuf> {
+            let resolved = crate::web_access::resolve_allowed_path(Path::new(&p), &roots);
+            if resolved.is_none() {
+                rejected = Some(PathBuf::from(p));
+            }
+            resolved
+        };
         if let Ok(payload) = serde_json::from_slice::<ActionPayload>(&body_bytes) {
             match payload.action.as_str() {
                 "toggle_pause" => {
@@ -745,13 +1254,13 @@ fn handle_client(
                     let _ = cmd_tx.send(WebCommand::ClearQueue);
                 }
                 "add_file" | "add_track" => {
-                    if let Some(p) = payload.path {
-                        let _ = cmd_tx.send(WebCommand::AddFile(PathBuf::from(p)));
+                    if let Some(p) = payload.path.and_then(&mut allow) {
+                        let _ = cmd_tx.send(WebCommand::AddFile(p));
                     }
                 }
                 "add_folder" => {
-                    if let Some(p) = payload.path {
-                        let _ = cmd_tx.send(WebCommand::AddFolder(PathBuf::from(p)));
+                    if let Some(p) = payload.path.and_then(&mut allow) {
+                        let _ = cmd_tx.send(WebCommand::AddFolder(p));
                     }
                 }
                 "select_device" => {
@@ -767,17 +1276,36 @@ fn handle_client(
                         let _ = cmd_tx.send(WebCommand::SetQueueMode(mode));
                     }
                 }
-                "set_home" => {
-                    let _ = cmd_tx.send(WebCommand::SetHome(payload.path));
-                }
-                "autopilot" => {
-                    let p = payload.path.map(PathBuf::from);
-                    let _ = cmd_tx.send(WebCommand::Autopilot(p));
-                }
-                "autopilot_reshuffle" | "reshuffle" => {
-                    let p = payload.path.map(PathBuf::from);
-                    let _ = cmd_tx.send(WebCommand::AutopilotReshuffle(p));
-                }
+                "set_home" => match payload.path {
+                    None => {
+                        let _ = cmd_tx.send(WebCommand::SetHome(None));
+                    }
+                    Some(p) => {
+                        if let Some(dir) = allow(p) {
+                            let _ = cmd_tx.send(WebCommand::SetHome(Some(dir.to_string_lossy().to_string())));
+                        }
+                    }
+                },
+                "autopilot" => match payload.path {
+                    None => {
+                        let _ = cmd_tx.send(WebCommand::Autopilot(None));
+                    }
+                    Some(p) => {
+                        if let Some(dir) = allow(p) {
+                            let _ = cmd_tx.send(WebCommand::Autopilot(Some(dir)));
+                        }
+                    }
+                },
+                "autopilot_reshuffle" | "reshuffle" => match payload.path {
+                    None => {
+                        let _ = cmd_tx.send(WebCommand::AutopilotReshuffle(None));
+                    }
+                    Some(p) => {
+                        if let Some(dir) = allow(p) {
+                            let _ = cmd_tx.send(WebCommand::AutopilotReshuffle(Some(dir)));
+                        }
+                    }
+                },
                 "shuffle" => {
                     let _ = cmd_tx.send(WebCommand::ShuffleQueue);
                 }
@@ -787,15 +1315,21 @@ fn handle_client(
                     }
                 }
                 "seed_radio" => {
-                    if let Some(p) = payload.path {
-                        let _ = cmd_tx.send(WebCommand::SeedRadio(PathBuf::from(p)));
+                    if let Some(p) = payload.path.and_then(&mut allow) {
+                        let _ = cmd_tx.send(WebCommand::SeedRadio(p));
                     }
                 }
                 _ => {}
             }
         }
 
-        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}";
+        if let Some(path) = rejected {
+            let _ = cmd_tx.send(WebCommand::PathRejected(path));
+            crate::web_access::write_path_forbidden(&mut stream)?;
+            return Ok(());
+        }
+
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}";
         stream.write_all(resp)?;
         stream.flush()?;
     } else {
@@ -988,6 +1522,80 @@ fn resolve_stream_file(name: &str, stream_state: &StreamServerState, current: Op
     found.is_file().then_some(found)
 }
 
+/// How a `Range` request header applies to a representation of a given length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteRange {
+    /// No usable range: send the whole representation with `200 OK`.
+    Full,
+    /// Send bytes `start..=end` with `206 Partial Content`.
+    Partial { start: u64, end: u64 },
+    /// No requested range overlaps the representation: send `416`.
+    Unsatisfiable,
+}
+
+/// Evaluate a `Range` header value against a representation of `len` bytes (RFC 9110 §14).
+///
+/// - Invalid syntax or a unit other than `bytes` is ignored (`Full`), as RFC 9110 allows.
+/// - Suffix ranges (`bytes=-N`) select the last N bytes.
+/// - With several ranges, only the first satisfiable one is served, as a single-part 206 whose
+///   `Content-Range` says which bytes it holds. Renderers do not send multi-range requests, and
+///   this avoids multipart/byteranges responses; a 416 would wrongly claim nothing overlaps.
+/// - `Unsatisfiable` only when no range overlaps the representation (including `first > last`).
+pub fn parse_byte_range(header: &str, len: u64) -> ByteRange {
+    fn decimal(s: &str) -> Option<u64> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        // Digits only, so a parse failure means overflow; any such value is past the end.
+        Some(s.parse().unwrap_or(u64::MAX))
+    }
+
+    let Some((unit, set)) = header.trim().split_once('=') else {
+        return ByteRange::Full;
+    };
+    if !unit.trim().eq_ignore_ascii_case("bytes") {
+        return ByteRange::Full;
+    }
+
+    let mut any_spec = false;
+    let mut first_satisfiable = None;
+    for spec in set.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        any_spec = true;
+        let Some((first, last)) = spec.split_once('-') else {
+            return ByteRange::Full;
+        };
+        let range = if first.is_empty() {
+            let Some(suffix) = decimal(last) else {
+                return ByteRange::Full;
+            };
+            (suffix > 0 && len > 0).then(|| (len.saturating_sub(suffix), len - 1))
+        } else {
+            let Some(start) = decimal(first) else {
+                return ByteRange::Full;
+            };
+            let end = if last.is_empty() {
+                u64::MAX
+            } else {
+                match decimal(last) {
+                    Some(end) => end,
+                    None => return ByteRange::Full,
+                }
+            };
+            (start <= end && start < len).then(|| (start, end.min(len - 1)))
+        };
+        // Keep parsing so a later malformed spec still makes the whole header invalid.
+        if first_satisfiable.is_none() {
+            first_satisfiable = range;
+        }
+    }
+
+    match first_satisfiable {
+        Some((start, end)) => ByteRange::Partial { start, end },
+        None if any_spec => ByteRange::Unsatisfiable,
+        None => ByteRange::Full,
+    }
+}
+
 fn serve_audio_stream(
     mut stream: TcpStream,
     path: &str,
@@ -1075,44 +1683,29 @@ fn serve_audio_stream(
     };
 
     // 3. Parse Range header if present
-    let mut req_start = 0u64;
-    let mut req_end = effective_total.saturating_sub(1);
-    let mut is_range = false;
-
-    if let Some(range) = range_header {
-        if let Some(spec) = range.strip_prefix("bytes=") {
-            let parts: Vec<&str> = spec.split('-').collect();
-            if parts.len() == 2 {
-                if let Ok(s) = parts[0].parse::<u64>() {
-                    req_start = s;
-                    is_range = true;
-                    if let Ok(e) = parts[1].parse::<u64>() {
-                        req_end = e.min(effective_total.saturating_sub(1));
-                    }
-                }
-            }
+    let range = range_header.map_or(ByteRange::Full, |h| parse_byte_range(h, effective_total));
+    let (req_start, req_end, is_range) = match range {
+        ByteRange::Full => (0, effective_total.saturating_sub(1), false),
+        ByteRange::Partial { start, end } => (start, end, true),
+        ByteRange::Unsatisfiable => {
+            crate::log_warn!(
+                "web",
+                "Stream 416 Range Not Satisfiable: {:?} of {} bytes for client {}",
+                range_header,
+                effective_total,
+                client_ip
+            );
+            let err_resp = format!(
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                effective_total
+            );
+            stream.write_all(err_resp.as_bytes())?;
+            stream.flush()?;
+            return Ok(());
         }
-    }
+    };
 
-    if req_start >= effective_total || req_start > req_end {
-        crate::log_warn!(
-            "web",
-            "Stream 416 Range Not Satisfiable: bytes={}-{}/{} for client {}",
-            req_start,
-            req_end,
-            effective_total,
-            client_ip
-        );
-        let err_resp = format!(
-            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nConnection: close\r\n\r\n",
-            effective_total
-        );
-        stream.write_all(err_resp.as_bytes())?;
-        stream.flush()?;
-        return Ok(());
-    }
-
-    let content_length = req_end - req_start + 1;
+    let content_length = if is_range { req_end - req_start + 1 } else { effective_total };
 
     // 4. Write DLNA HTTP headers
     let status_line = if is_range {
@@ -1147,7 +1740,7 @@ fn serve_audio_stream(
         Accept-Ranges: bytes\r\n\
         transferMode.dlna.org: Streaming\r\n\
         contentFeatures.dlna.org: DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000\r\n\
-        Connection: keep-alive\r\n",
+        Connection: close\r\n",
         status_line, mime, content_length
     );
 
@@ -1250,6 +1843,21 @@ fn serve_audio_stream(
     }
     let _ = stream.flush();
 
+    if streamed_count < content_length {
+        // The file shrank or failed to read after Content-Length was sent. Close at once so the
+        // client sees an incomplete response instead of a silently short body.
+        crate::log_warn!(
+            "web",
+            "Source for '{}' ended after {} of {} advertised bytes; closing connection to {}",
+            display_name,
+            streamed_count,
+            content_length,
+            client_ip
+        );
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return Ok(());
+    }
+
     crate::log_info!(
         "web",
         "Streamed {} bytes to {} for '{}' (requested: {})",
@@ -1283,12 +1891,15 @@ pub fn make_continuous_wav_header() -> [u8; 44] {
 
 /// Serve a continuous 16-bit 44.1kHz PCM WAV stream to DLNA renderers.
 /// Slices tracks sequentially directly into the exact same TCP socket without drops or DAC resets.
+/// `session` is the nonce of the armed session the request was admitted to; the stream ends when
+/// that session ends.
 pub fn serve_continuous_stream(
     mut stream: TcpStream,
     is_head: bool,
     state: &Arc<RwLock<NowPlayingState>>,
     cmd_tx: &mpsc::Sender<WebCommand>,
     stream_state: &Arc<StreamServerState>,
+    session: &str,
 ) -> std::io::Result<()> {
     let conn_id = stream_state.register_socket(&stream);
     let _socket_guard = SocketGuard {
@@ -1352,6 +1963,10 @@ pub fn serve_continuous_stream(
     };
 
     while controller.is_active.load(Ordering::SeqCst) {
+        if !controller.is_session(session) {
+            crate::log_info!("web", "Continuous stream connection {} outlived its session, closing", cid);
+            return Ok(());
+        }
         if cid != 0 && controller.active_conn_id.load(Ordering::SeqCst) != cid {
             crate::log_info!(
                 "web",
@@ -1369,7 +1984,10 @@ pub fn serve_continuous_stream(
                 drop(s);
                 // Send a small burst of silence PCM frames so renderer buffer doesn't starve
                 let silence = [0u8; 4096];
-                let _ = stream.write_all(&silence);
+                if let Err(e) = stream.write_all(&silence) {
+                    crate::log_info!("web", "Continuous stream socket closed while idle: {}", e);
+                    return Ok(());
+                }
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
             }
@@ -1514,7 +2132,10 @@ pub fn serve_continuous_stream(
         controller.kill_active_decoder();
 
         if track_finished_normally {
-            if track_index + 1 >= queue_len && queue_len > 1 {
+            // Reshuffle once per wrap, and only from the current connection of the armed session.
+            let owns_session = controller.is_session(session)
+                && (cid == 0 || controller.active_conn_id.load(Ordering::SeqCst) == cid);
+            if track_index + 1 >= queue_len && queue_len > 1 && owns_session {
                 let _ = cmd_tx.send(WebCommand::ShuffleQueue);
             }
             let next_idx = (track_index + 1) % queue_len;
@@ -2735,19 +3356,51 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
     }
 
-    function escapeHtml(str) {
-      if (!str) return '';
-      return String(str)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
+    // --- SAFE DOM BUILDING ---
+    // Track titles, file names, paths and device names are untrusted (tags,
+    // shared volumes, SSDP). They are only ever written with textContent or
+    // dataset, never parsed as HTML or JS. Markup strings are constants only.
+    const ICON_SEED_RADIO = '<span style="font-size:12px;">📻</span>';
+    const ICON_REMOVE = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>';
+    const ICON_ADD = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>';
+
+    function el(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined && text !== null) node.textContent = String(text);
+      return node;
     }
 
-    function escapeAttr(str) {
-      if (!str) return '';
-      return String(str).replace(/'/g, "\\'").replace(/"/g, '&quot;');
+    function iconButton(className, title, action, iconMarkup) {
+      const btn = el('button', className);
+      btn.title = title;
+      btn.dataset.action = action;
+      btn.innerHTML = iconMarkup;
+      return btn;
+    }
+
+    function clearChildren(node) {
+      node.textContent = '';
+    }
+
+    // Find the innermost element carrying a data-action between the click
+    // target and the delegating container.
+    function findActionTarget(target, container) {
+      for (let n = target; n && n !== container; n = n.parentNode) {
+        if (n.dataset && n.dataset.action) return n;
+      }
+      return null;
+    }
+
+    function delegateClicks(containerId, handlers) {
+      const container = document.getElementById(containerId);
+      if (!container) return;
+      container.addEventListener('click', (e) => {
+        const node = findActionTarget(e.target, container);
+        if (!node) return;
+        const handler = handlers[node.dataset.action];
+        if (handler) handler(node.dataset);
+      });
     }
 
     function showToast(msg) {
@@ -3050,28 +3703,43 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
         return;
       }
 
-      list.innerHTML = queue.map(item => `
-        <div class="queue-item ${item.is_current ? 'current' : ''}">
-          <div class="queue-item-main" onclick="playIndex(${item.index})">
-            <span class="queue-num">${item.is_current ? '▶' : (item.index + 1) + '.'}</span>
-            <div class="queue-item-meta">
-              <div class="queue-item-title">${escapeHtml(item.title)}</div>
-              <div class="queue-item-artist">${escapeHtml(item.artist || 'Unknown Artist')}</div>
-            </div>
-          </div>
-          <span class="queue-item-dur">${formatTime(item.duration_seconds)}</span>
-          <button class="btn-icon-sm" onclick="event.stopPropagation(); seedRadio('${escapeAttr(item.filepath)}')" title="Seed Radio station from this track">
-            <span style="font-size:12px;">📻</span>
-          </button>
-          <button class="btn-icon-sm danger-hover" onclick="event.stopPropagation(); removeIndex(${item.index})" title="Remove track">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <line x1="18" y1="6" x2="6" y2="18"></line>
-              <line x1="6" y1="6" x2="18" y2="18"></line>
-            </svg>
-          </button>
-        </div>
-      `).join('');
+      clearChildren(list);
+      for (const item of queue) {
+        const index = String(item.index);
+        const row = el('div', item.is_current ? 'queue-item current' : 'queue-item');
+
+        const main = el('div', 'queue-item-main');
+        main.dataset.action = 'play';
+        main.dataset.index = index;
+        main.appendChild(el('span', 'queue-num', item.is_current ? '▶' : (item.index + 1) + '.'));
+        const meta = el('div', 'queue-item-meta');
+        meta.appendChild(el('div', 'queue-item-title', item.title || ''));
+        meta.appendChild(el('div', 'queue-item-artist', item.artist || 'Unknown Artist'));
+        main.appendChild(meta);
+        row.appendChild(main);
+
+        row.appendChild(el('span', 'queue-item-dur', formatTime(item.duration_seconds)));
+
+        // Tracks outside the allowed folders are listed without a path and cannot seed a station.
+        if (item.filepath) {
+          const seedBtn = iconButton('btn-icon-sm', 'Seed Radio station from this track', 'seed', ICON_SEED_RADIO);
+          seedBtn.dataset.path = item.filepath;
+          row.appendChild(seedBtn);
+        }
+
+        const removeBtn = iconButton('btn-icon-sm danger-hover', 'Remove track', 'remove', ICON_REMOVE);
+        removeBtn.dataset.index = index;
+        row.appendChild(removeBtn);
+
+        list.appendChild(row);
+      }
     }
+
+    delegateClicks('queueList', {
+      play: (d) => playIndex(Number(d.index)),
+      seed: (d) => seedRadio(d.path),
+      remove: (d) => removeIndex(Number(d.index)),
+    });
 
     function playIndex(idx) {
       sendAction('play_index', null, { index: idx });
@@ -3144,11 +3812,15 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       const bmRow = document.getElementById('bookmarksRow');
       if (data.bookmarks && data.bookmarks.length > 0) {
         bmRow.style.display = "flex";
-        bmRow.innerHTML = data.bookmarks.map(b => {
-          const parts = b.split(/[/\\]/);
+        clearChildren(bmRow);
+        for (const b of data.bookmarks) {
+          const parts = String(b).split(/[/\\]/);
           const name = parts[parts.length - 1] || parts[parts.length - 2] || b;
-          return `<button class="chip-btn" onclick="browseTo('${escapeAttr(b)}')">★ ${escapeHtml(name)}</button>`;
-        }).join('');
+          const chip = el('button', 'chip-btn', '★ ' + name);
+          chip.dataset.action = 'browse';
+          chip.dataset.path = b;
+          bmRow.appendChild(chip);
+        }
       } else {
         bmRow.style.display = "none";
       }
@@ -3165,34 +3837,46 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
         return;
       }
 
-      list.innerHTML = entries.map(item => {
+      clearChildren(list);
+      for (const item of entries) {
+        const path = item.path || '';
         if (item.is_dir) {
-          return `
-            <div class="browser-item dir" onclick="browseTo('${escapeAttr(item.path)}')">
-              <span class="browser-icon">📁</span>
-              <span class="browser-name">${escapeHtml(item.name)}/</span>
-              <span class="browser-arrow">›</span>
-            </div>`;
+          const row = el('div', 'browser-item dir');
+          row.dataset.action = 'browse';
+          row.dataset.path = path;
+          row.appendChild(el('span', 'browser-icon', '📁'));
+          row.appendChild(el('span', 'browser-name', (item.name || '') + '/'));
+          row.appendChild(el('span', 'browser-arrow', '›'));
+          list.appendChild(row);
         } else {
-          return `
-            <div class="browser-item file" onclick="addFile('${escapeAttr(item.path)}')">
-              <span class="browser-icon">🎵</span>
-              <span class="browser-name">${escapeHtml(item.name)}</span>
-              <div style="display:flex;gap:0.35rem;align-items:center;">
-                <button class="btn-icon-sm" title="Seed Radio station from this track" onclick="event.stopPropagation(); seedRadio('${escapeAttr(item.path)}')">
-                  <span style="font-size:12px;">📻</span>
-                </button>
-                <button class="btn-icon-sm add-btn" title="Add to queue" onclick="event.stopPropagation(); addFile('${escapeAttr(item.path)}')">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                    <line x1="12" y1="5" x2="12" y2="19"></line>
-                    <line x1="5" y1="12" x2="19" y2="12"></line>
-                  </svg>
-                </button>
-              </div>
-            </div>`;
+          const row = el('div', 'browser-item file');
+          row.dataset.action = 'add';
+          row.dataset.path = path;
+          row.appendChild(el('span', 'browser-icon', '🎵'));
+          row.appendChild(el('span', 'browser-name', item.name || ''));
+          const actions = el('div');
+          actions.style.display = 'flex';
+          actions.style.gap = '0.35rem';
+          actions.style.alignItems = 'center';
+          const seedBtn = iconButton('btn-icon-sm', 'Seed Radio station from this track', 'seed', ICON_SEED_RADIO);
+          seedBtn.dataset.path = path;
+          actions.appendChild(seedBtn);
+          const addBtn = iconButton('btn-icon-sm add-btn', 'Add to queue', 'add', ICON_ADD);
+          addBtn.dataset.path = path;
+          actions.appendChild(addBtn);
+          row.appendChild(actions);
+          list.appendChild(row);
         }
-      }).join('');
+      }
     }
+
+    const browserClickHandlers = {
+      browse: (d) => browseTo(d.path),
+      add: (d) => addFile(d.path),
+      seed: (d) => seedRadio(d.path),
+    };
+    delegateClicks('browserList', browserClickHandlers);
+    delegateClicks('bookmarksRow', browserClickHandlers);
 
     function browseTo(path) {
       document.getElementById('browserSearchInput').value = "";
@@ -3299,19 +3983,28 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
         return;
       }
 
-      list.innerHTML = devices.map(dev => `
-        <div class="device-item ${dev.is_active ? 'active' : ''}" onclick="selectDevice(${dev.id})">
-          <div class="device-radio">${dev.is_active ? '●' : '○'}</div>
-          <div class="device-info">
-            <div class="device-name">
-              ${escapeHtml(dev.name)}
-              ${dev.is_active ? '<span class="active-tag">ACTIVE</span>' : ''}
-            </div>
-            <div class="device-host">${escapeHtml(dev.host_port)}</div>
-          </div>
-        </div>
-      `).join('');
+      clearChildren(list);
+      for (const dev of devices) {
+        const row = el('div', dev.is_active ? 'device-item active' : 'device-item');
+        row.dataset.action = 'select';
+        row.dataset.id = String(dev.id);
+        row.appendChild(el('div', 'device-radio', dev.is_active ? '●' : '○'));
+        const info = el('div', 'device-info');
+        const name = el('div', 'device-name');
+        name.appendChild(document.createTextNode(dev.name || ''));
+        if (dev.is_active) {
+          name.appendChild(el('span', 'active-tag', 'ACTIVE'));
+        }
+        info.appendChild(name);
+        info.appendChild(el('div', 'device-host', dev.host_port || ''));
+        row.appendChild(info);
+        list.appendChild(row);
+      }
     }
+
+    delegateClicks('devicesList', {
+      select: (d) => selectDevice(Number(d.id)),
+    });
 
     function selectDevice(id) {
       sendAction('select_device', null, { id });

@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -83,159 +83,805 @@ pub fn extract_xml_tag(xml: &str, tag_name: &str) -> Option<String> {
         }
     }
 
-    // Try tag with namespace (e.g. <u:tag> or <ns:tag>) or attributes (<tag attr="x">)
-    let search_open = "<";
+    // Try tag with namespace (e.g. <u:tag> or <ns:tag>) or attributes (<tag attr="x">).
+    // One forward pass over the `<...>` regions: find the first matching opening tag,
+    // then the first matching closing tag after it. Every byte is looked at a bounded
+    // number of times, so hostile input cannot make this quadratic.
+    fn local_name(name: &str) -> &str {
+        match name.find(':') {
+            Some(colon) => &name[colon + 1..],
+            None => name,
+        }
+    }
+    let mut content_start: Option<usize> = None;
     let mut cursor = 0;
-    while let Some(open_idx) = xml[cursor..].find(search_open) {
-        let abs_open = cursor + open_idx;
-        let tag_close_idx = match xml[abs_open..].find('>') {
-            Some(idx) => abs_open + idx,
+    while let Some(rel) = xml[cursor..].find('<') {
+        let mut open = cursor + rel;
+        let close = match xml[open + 1..].find('>') {
+            Some(i) => open + 1 + i,
             None => break,
         };
-        let tag_header = &xml[abs_open + 1..tag_close_idx];
-        let tag_name_part = tag_header.split_whitespace().next().unwrap_or("");
-        let base_name = if let Some(colon) = tag_name_part.find(':') {
-            &tag_name_part[colon + 1..]
-        } else {
-            tag_name_part
-        };
-
-        if base_name == tag_name {
-            // Found opening tag, find corresponding closing tag
-            let content_start = tag_close_idx + 1;
-            let close_search = "</";
-            let mut search_cursor = content_start;
-            while let Some(close_idx) = xml[search_cursor..].find(close_search) {
-                let abs_close = search_cursor + close_idx;
-                if let Some(end_tag_bracket) = xml[abs_close..].find('>') {
-                    let end_header = &xml[abs_close + 2..abs_close + end_tag_bracket];
-                    let end_base = if let Some(colon) = end_header.find(':') {
-                        &end_header[colon + 1..]
-                    } else {
-                        end_header
-                    };
-                    if end_base.trim() == tag_name {
-                        return Some(xml[content_start..abs_close].trim().to_string());
+        match content_start {
+            None => {
+                let header = &xml[open + 1..close];
+                let name = header.split_whitespace().next().unwrap_or("");
+                if local_name(name) == tag_name {
+                    content_start = Some(close + 1);
+                }
+            }
+            Some(start) => {
+                // A stray '<' in the content must not hide the closing tag: the tag
+                // ending at `close` starts at the last '<' before it.
+                if let Some(inner) = xml[open + 1..close].rfind('<') {
+                    open = open + 1 + inner;
+                }
+                if let Some(end_header) = xml[open + 1..close].strip_prefix('/') {
+                    if local_name(end_header).trim() == tag_name {
+                        return Some(xml[start..open].trim().to_string());
                     }
                 }
-                search_cursor = abs_close + 2;
             }
         }
-        cursor = tag_close_idx + 1;
+        cursor = close + 1;
     }
 
     None
 }
 
-/// Robust HTTP GET to download device XML over TcpStream with Content-Length support.
-pub fn fetch_xml(url: &str) -> Option<String> {
-    let url_trimmed = url.trim();
-    let without_proto = url_trimmed.strip_prefix("http://")?;
-    let (host_port, path) = if let Some(slash) = without_proto.find('/') {
-        (&without_proto[..slash], &without_proto[slash..])
-    } else {
-        (without_proto, "/")
-    };
+/// Parsed `http://` URL.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HttpUrl {
+    /// Host without brackets (an IPv6 literal is returned bare).
+    pub host: String,
+    pub port: u16,
+    /// Authority as written in the URL, used for the `Host:` header.
+    pub host_port: String,
+    pub path: String,
+}
 
-    let (host, port) = if let Some(colon) = host_port.find(':') {
-        let h = &host_port[..colon];
-        let p = host_port[colon + 1..].parse::<u16>().ok()?;
-        (h, p)
-    } else {
-        (host_port, 80)
+/// Parse an `http://host[:port][/path]` URL. Returns `None` for other schemes or bad ports.
+pub fn parse_http_url(url: &str) -> Option<HttpUrl> {
+    let trimmed = url.trim();
+    let scheme_end = trimmed.find("://")?;
+    if !trimmed[..scheme_end].eq_ignore_ascii_case("http") {
+        return None;
+    }
+    let without_proto = &trimmed[scheme_end + 3..];
+    let (host_port, path) = match without_proto.find('/') {
+        Some(slash) => (&without_proto[..slash], &without_proto[slash..]),
+        None => (without_proto, "/"),
     };
+    if host_port.is_empty() || host_port.contains('@') {
+        return None;
+    }
+    let (host, port_str) = if let Some(rest) = host_port.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let after = &rest[close + 1..];
+        let port = match after.strip_prefix(':') {
+            Some(p) => Some(p),
+            None if after.is_empty() => None,
+            None => return None,
+        };
+        (&rest[..close], port)
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (host_port, None),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let port = match port_str {
+        Some(p) => p.parse::<u16>().ok()?,
+        None => 80,
+    };
+    Some(HttpUrl {
+        host: host.to_string(),
+        port,
+        host_port: host_port.to_string(),
+        path: path.to_string(),
+    })
+}
 
-    let addrs = (host, port).to_socket_addrs().ok()?;
-    let mut stream = None;
-    for addr in addrs {
-        if let Ok(s) = TcpStream::connect_timeout(&addr, Duration::from_millis(1500)) {
-            let _ = s.set_read_timeout(Some(Duration::from_millis(1500)));
-            let _ = s.set_write_timeout(Some(Duration::from_millis(1500)));
-            stream = Some(s);
-            break;
+/// HTTP response returned by [`http_exchange`], with any chunked framing removed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl HttpResponse {
+    /// First header value with the given (case-insensitive) name.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    pub fn body_text(&self) -> String {
+        String::from_utf8_lossy(&self.body).to_string()
+    }
+}
+
+/// Transport-level failure of an HTTP exchange.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HttpError {
+    Resolve(String),
+    Connect(String),
+    Io { kind: std::io::ErrorKind, message: String },
+    /// The overall deadline passed before a complete response arrived.
+    DeadlineExceeded,
+    /// The response grew past the byte limit.
+    TooLarge(usize),
+    Malformed(String),
+}
+
+impl HttpError {
+    /// Errors worth retrying: timeouts and dropped connections, not refusals or bad replies.
+    pub fn is_transient(&self) -> bool {
+        use std::io::ErrorKind;
+        match self {
+            HttpError::DeadlineExceeded => true,
+            HttpError::Io { kind, .. } => matches!(
+                kind,
+                ErrorKind::TimedOut
+                    | ErrorKind::WouldBlock
+                    | ErrorKind::Interrupted
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+            ),
+            _ => false,
         }
     }
-    let mut stream = stream?;
+}
 
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Quickstream/0.2.0 UPnP/1.1\r\nConnection: close\r\n\r\n",
-        path, host_port
-    );
-
-    stream.write_all(request.as_bytes()).ok()?;
-
-    let mut buffer = Vec::new();
-    let mut chunk = [0u8; 1024];
-    let mut header_end = None;
-
-    while let Ok(n) = stream.read(&mut chunk) {
-        if n == 0 {
-            break;
-        }
-        buffer.extend_from_slice(&chunk[..n]);
-        if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-            header_end = Some(pos);
-            break;
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HttpError::Resolve(m) => write!(f, "address resolution failed: {}", m),
+            HttpError::Connect(m) => write!(f, "connection failed: {}", m),
+            HttpError::Io { message, .. } => write!(f, "I/O error: {}", message),
+            HttpError::DeadlineExceeded => write!(f, "request timeout (deadline exceeded)"),
+            HttpError::TooLarge(limit) => write!(f, "response larger than {} bytes", limit),
+            HttpError::Malformed(m) => write!(f, "malformed HTTP response: {}", m),
         }
     }
+}
 
-    let header_pos = match header_end {
-        Some(p) => p,
-        None => {
-            if let Some(p) = buffer.windows(2).position(|w| w == b"\n\n") {
-                p
-            } else {
-                return if !buffer.is_empty() {
-                    Some(String::from_utf8_lossy(&buffer).to_string())
+/// Parse the numeric status code from an HTTP status line such as `HTTP/1.1 200 OK`.
+pub fn parse_status_code(status_line: &str) -> Option<u16> {
+    let mut parts = status_line.split_whitespace();
+    let version = parts.next()?;
+    if !version.starts_with("HTTP/") {
+        return None;
+    }
+    let code = parts.next()?;
+    if code.len() != 3 || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    code.parse().ok()
+}
+
+/// Decode an HTTP/1.1 chunked body.
+///
+/// Returns `Ok(Some(body))` once the terminating zero-size chunk has been read,
+/// `Ok(None)` if more data is needed, and `Err` if the framing is invalid.
+pub fn decode_chunked(data: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    loop {
+        let line_end = match data[pos..].iter().position(|&b| b == b'\n') {
+            Some(i) => pos + i,
+            None => return Ok(None),
+        };
+        let line = String::from_utf8_lossy(&data[pos..line_end]);
+        let size_str = line.trim_end_matches('\r').split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_str, 16)
+            .map_err(|_| format!("invalid chunk size '{}'", size_str))?;
+        pos = line_end + 1;
+        if size == 0 {
+            // Trailers (if any) carry nothing we need.
+            return Ok(Some(out));
+        }
+        let chunk_end = pos.checked_add(size).ok_or("chunk size overflow")?;
+        if data.len() < chunk_end {
+            return Ok(None);
+        }
+        out.extend_from_slice(&data[pos..chunk_end]);
+        pos = chunk_end;
+        // Each chunk's data is followed by CRLF (tolerate a bare LF).
+        if data[pos..].starts_with(b"\r\n") {
+            pos += 2;
+        } else if data[pos..].starts_with(b"\n") {
+            pos += 1;
+        } else if data.len() - pos < 2 {
+            return Ok(None);
+        } else {
+            return Err("missing CRLF after chunk data".to_string());
+        }
+    }
+}
+
+/// Largest header section accepted, counting any interim (1xx) responses before the
+/// final one. Real renderers send well under 4 KiB.
+pub const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+/// Interim (1xx) responses skipped before the final response; more is an error.
+pub const MAX_INTERIM_RESPONSES: usize = 8;
+
+/// Find the end of the header block starting at `start`: returns the offset of the
+/// blank-line delimiter and its length. Only the first [`MAX_HTTP_HEADER_BYTES`] of
+/// `buf` are searched, so a delimiter beyond the cap is never found.
+fn find_header_end(buf: &[u8], start: usize) -> Option<(usize, usize)> {
+    let limit = buf.len().min(MAX_HTTP_HEADER_BYTES);
+    if start >= limit {
+        return None;
+    }
+    let window = &buf[start..limit];
+    let crlf = window.windows(4).position(|w| w == b"\r\n\r\n").map(|p| (p, 4));
+    let lf = window.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2));
+    let (pos, len) = match (crlf, lf) {
+        (Some(a), Some(b)) => if a.0 <= b.0 { a } else { b },
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => return None,
+    };
+    Some((start + pos, len))
+}
+
+/// Try to parse a complete HTTP response from `buf`.
+///
+/// Returns `Ok(None)` while more data is needed. With `eof = true` the peer has closed
+/// the connection, so whatever has arrived is final. A body shorter than its
+/// Content-Length is accepted at EOF because some renderers send a wrong length.
+///
+/// Up to [`MAX_INTERIM_RESPONSES`] interim 1xx responses are skipped, and the header
+/// section (interim responses included) may not exceed [`MAX_HTTP_HEADER_BYTES`].
+pub fn parse_http_response(buf: &[u8], eof: bool) -> Result<Option<HttpResponse>, HttpError> {
+    let mut start = 0;
+    let mut interim = 0;
+    let (status, headers, body_start) = loop {
+        let (header_end, delim_len) = match find_header_end(buf, start) {
+            Some(found) => found,
+            None => {
+                if buf.len() >= MAX_HTTP_HEADER_BYTES {
+                    return Err(HttpError::Malformed(format!(
+                        "header section larger than {} bytes",
+                        MAX_HTTP_HEADER_BYTES
+                    )));
+                }
+                return if eof {
+                    Err(HttpError::Malformed(if buf.len() == start {
+                        "empty response".to_string()
+                    } else {
+                        "no end of headers".to_string()
+                    }))
                 } else {
-                    None
+                    Ok(None)
                 };
+            }
+        };
+        let body_start = header_end + delim_len;
+        if body_start > MAX_HTTP_HEADER_BYTES {
+            return Err(HttpError::Malformed(format!(
+                "header section larger than {} bytes",
+                MAX_HTTP_HEADER_BYTES
+            )));
+        }
+
+        let head = String::from_utf8_lossy(&buf[start..header_end]);
+        let mut lines = head.lines();
+        let status_line = lines.next().unwrap_or("");
+        let status = parse_status_code(status_line)
+            .ok_or_else(|| HttpError::Malformed(format!("bad status line '{}'", status_line)))?;
+
+        // Skip interim 1xx responses (e.g. "100 Continue").
+        if (100..200).contains(&status) {
+            interim += 1;
+            if interim > MAX_INTERIM_RESPONSES {
+                return Err(HttpError::Malformed(format!(
+                    "more than {} interim responses",
+                    MAX_INTERIM_RESPONSES
+                )));
+            }
+            start = body_start;
+            continue;
+        }
+
+        let headers: Vec<(String, String)> = lines
+            .filter_map(|l| l.split_once(':'))
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .collect();
+        break (status, headers, body_start);
+    };
+    let body = &buf[body_start..];
+
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    let chunked = header("transfer-encoding")
+        .map(|v| v.to_ascii_lowercase().contains("chunked"))
+        .unwrap_or(false);
+
+    let body = if status == 204 || status == 304 {
+        Vec::new()
+    } else if chunked {
+        match decode_chunked(body) {
+            Ok(Some(decoded)) => decoded,
+            Ok(None) if eof => return Err(HttpError::Malformed("truncated chunked body".to_string())),
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(HttpError::Malformed(e)),
+        }
+    } else if let Some(cl) = header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+        if body.len() >= cl {
+            body[..cl].to_vec()
+        } else if eof {
+            body.to_vec()
+        } else {
+            return Ok(None);
+        }
+    } else if eof {
+        body.to_vec()
+    } else {
+        return Ok(None);
+    };
+
+    Ok(Some(HttpResponse { status, headers, body }))
+}
+
+fn remaining_until(deadline: Instant) -> Result<Duration, HttpError> {
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(HttpError::DeadlineExceeded);
+    }
+    Ok((deadline - now).max(Duration::from_millis(1)))
+}
+
+/// Send a raw HTTP/1.x request to `host:port` and read the response.
+///
+/// `host` must be an IP literal (IPv6 without brackets); host names are refused with
+/// [`HttpError::Resolve`] rather than looked up, since a DNS lookup cannot be bounded
+/// by the deadline. The whole exchange (connect, write, read) must finish by `deadline`, and the
+/// raw response may not exceed `max_bytes`; a peer that trickles bytes or never closes
+/// the connection cannot hold the caller past the deadline or grow memory without bound.
+pub fn http_exchange(
+    host: &str,
+    port: u16,
+    request: &[u8],
+    deadline: Instant,
+    max_bytes: usize,
+) -> Result<HttpResponse, HttpError> {
+    http_exchange_with_first_byte_deadline(host, port, request, deadline, deadline, max_bytes)
+}
+
+/// Like [`http_exchange`], but connecting and receiving the first response byte must
+/// also happen by `first_byte_deadline` (clamped to `deadline`), so a peer that accepts
+/// the connection and then stays silent is dropped early.
+pub fn http_exchange_with_first_byte_deadline(
+    host: &str,
+    port: u16,
+    request: &[u8],
+    first_byte_deadline: Instant,
+    deadline: Instant,
+    max_bytes: usize,
+) -> Result<HttpResponse, HttpError> {
+    let first_byte_deadline = first_byte_deadline.min(deadline);
+    // Only IP literals are accepted: a DNS lookup cannot be bounded by the deadline,
+    // and device descriptions and SSDP replies use addresses anyway.
+    let ip: IpAddr = host.parse().map_err(|_| {
+        HttpError::Resolve(format!("{}:{}: host is not an IP address", host, port))
+    })?;
+    let addr = SocketAddr::new(ip, port);
+    let mut stream = TcpStream::connect_timeout(&addr, remaining_until(first_byte_deadline)?)
+        .map_err(|e| HttpError::Connect(format!("{}: {}", addr, e)))?;
+
+    let io_err = |e: std::io::Error| {
+        if Instant::now() >= deadline {
+            HttpError::DeadlineExceeded
+        } else {
+            HttpError::Io {
+                kind: e.kind(),
+                message: e.to_string(),
             }
         }
     };
 
-    let header_str = String::from_utf8_lossy(&buffer[..header_pos]);
-    let delimiter_len = if buffer[header_pos..].starts_with(b"\r\n\r\n") { 4 } else { 2 };
-    let body_start = header_pos + delimiter_len;
+    let _ = stream.set_write_timeout(Some(remaining_until(first_byte_deadline)?));
+    stream.write_all(request).map_err(io_err)?;
+    let _ = stream.flush();
 
-    // Check Content-Length header
-    let content_length: Option<usize> = header_str.lines().find_map(|line| {
-        if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("content-length") {
-                return v.trim().parse::<usize>().ok();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        if let Some(resp) = parse_http_response(&buf, false)? {
+            return Ok(resp);
+        }
+        let read_deadline = if buf.is_empty() { first_byte_deadline } else { deadline };
+        let _ = stream.set_read_timeout(Some(remaining_until(read_deadline)?));
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                return parse_http_response(&buf, true)?
+                    .ok_or_else(|| HttpError::Malformed("incomplete response".to_string()));
+            }
+            Ok(n) => {
+                if buf.len() + n > max_bytes {
+                    return Err(HttpError::TooLarge(max_bytes));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) =>
+            {
+                if Instant::now() >= read_deadline {
+                    return Err(HttpError::DeadlineExceeded);
+                }
+            }
+            Err(e) => return Err(io_err(e)),
+        }
+    }
+}
+
+/// Largest device description accepted from a renderer.
+pub const MAX_DESCRIPTION_BYTES: usize = 256 * 1024;
+/// Overall deadline for fetching one device description.
+pub const DESCRIPTION_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
+/// Device descriptions fetched concurrently during a scan.
+pub const MAX_PARALLEL_DESCRIPTION_FETCHES: usize = 8;
+/// Distinct LOCATION URLs followed per scan; further responders are ignored.
+pub const MAX_LOCATIONS_PER_SCAN: usize = 64;
+/// Description fetches running at once against a single host.
+pub const MAX_PARALLEL_FETCHES_PER_HOST: usize = 2;
+/// Distinct LOCATION URLs followed per host per scan. Real devices advertise one or
+/// two root descriptions; the cap keeps one host from using up the per-scan budget.
+pub const MAX_LOCATIONS_PER_HOST: usize = 4;
+/// Time allowed to connect to a device and receive the first byte of its description.
+pub const DESCRIPTION_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Download a device description with the default deadline and size cap.
+pub fn fetch_xml(url: &str) -> Option<String> {
+    fetch_xml_with_limits(url, DESCRIPTION_FETCH_TIMEOUT, MAX_DESCRIPTION_BYTES)
+}
+
+/// Download a device description. The whole request must finish within `timeout`
+/// (connecting and the first response byte within [`DESCRIPTION_FIRST_BYTE_TIMEOUT`])
+/// and the body may not exceed `max_body_bytes`; otherwise `None` is returned.
+pub fn fetch_xml_with_limits(url: &str, timeout: Duration, max_body_bytes: usize) -> Option<String> {
+    let now = Instant::now();
+    fetch_xml_by(url, now + DESCRIPTION_FIRST_BYTE_TIMEOUT, now + timeout, max_body_bytes)
+}
+
+fn fetch_xml_by(url: &str, first_byte_deadline: Instant, deadline: Instant, max_body_bytes: usize) -> Option<String> {
+    let u = parse_http_url(url)?;
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Quickstream/0.2.0 UPnP/1.1\r\nConnection: close\r\n\r\n",
+        u.path, u.host_port
+    );
+    // Leave room for the status line and headers on top of the body cap.
+    let resp = match http_exchange_with_first_byte_deadline(
+        &u.host,
+        u.port,
+        request.as_bytes(),
+        first_byte_deadline,
+        deadline,
+        max_body_bytes + 16 * 1024,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            crate::log_info!("discovery", "Device description fetch from {} failed: {}", url, e);
+            return None;
+        }
+    };
+    if !(200..300).contains(&resp.status) || resp.body.is_empty() || resp.body.len() > max_body_bytes {
+        crate::log_info!(
+            "discovery",
+            "Ignoring device description from {} (HTTP {}, {} bytes)",
+            url,
+            resp.status,
+            resp.body.len()
+        );
+        return None;
+    }
+    Some(resp.body_text())
+}
+
+/// Extract the LOCATION URL from an SSDP response, but only if its host is the IP
+/// address the response came from.
+///
+/// Without this check any host on the network (or a spoofed packet) could point
+/// discovery at an arbitrary URL. LOCATION hosts that are names rather than IP
+/// literals are rejected too, since they cannot be checked without a DNS lookup.
+pub fn ssdp_location_for_sender(response: &str, sender: std::net::IpAddr) -> Option<String> {
+    let location = response.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case("location") {
+            Some(value.trim().to_string())
+        } else {
+            None
+        }
+    })?;
+    let url = parse_http_url(&location)?;
+    let host_ip: std::net::IpAddr = url.host.parse().ok()?;
+    if host_ip.to_canonical() == sender.to_canonical() {
+        Some(location)
+    } else {
+        None
+    }
+}
+
+/// Scheduling key for a LOCATION URL: its host, with IP literals in canonical form.
+fn location_host_key(url: &str) -> Option<String> {
+    let u = parse_http_url(url)?;
+    Some(match u.host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.to_canonical().to_string(),
+        Err(_) => u.host.to_ascii_lowercase(),
+    })
+}
+
+#[derive(Debug)]
+struct HostQueue {
+    key: String,
+    pending: std::collections::VecDeque<(usize, String)>,
+    in_flight: usize,
+    accepted: usize,
+}
+
+/// A LOCATION chosen by [`FetchScheduler::next_job`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct FetchJob {
+    /// Submission order, used to keep results in a stable order.
+    pub index: usize,
+    pub url: String,
+    /// Scheduling key of the URL's host; pass it back to [`FetchScheduler::complete`].
+    pub host: String,
+}
+
+/// Decides which device descriptions to fetch and when. Pure state, no I/O.
+///
+/// LOCATIONs are grouped by host and started round-robin across hosts, with at most
+/// `max_per_host` running per host and `max_parallel` overall. Each host may contribute
+/// at most `max_locations_per_host` LOCATIONs and the scan at most `max_locations`, so
+/// one host answering with many LOCATIONs cannot crowd out the others.
+#[derive(Debug)]
+pub struct FetchScheduler {
+    max_parallel: usize,
+    max_per_host: usize,
+    max_locations_per_host: usize,
+    max_locations: usize,
+    seen: HashSet<String>,
+    hosts: Vec<HostQueue>,
+    next_host: usize,
+    in_flight: usize,
+}
+
+impl FetchScheduler {
+    pub fn new(max_parallel: usize, max_per_host: usize, max_locations_per_host: usize, max_locations: usize) -> Self {
+        Self {
+            max_parallel: max_parallel.max(1),
+            max_per_host: max_per_host.max(1),
+            max_locations_per_host,
+            max_locations,
+            seen: HashSet::new(),
+            hosts: Vec::new(),
+            next_host: 0,
+            in_flight: 0,
+        }
+    }
+
+    /// Scheduler with the limits used for SSDP scans.
+    pub fn for_scan(max_parallel: usize) -> Self {
+        Self::new(
+            max_parallel,
+            MAX_PARALLEL_FETCHES_PER_HOST,
+            MAX_LOCATIONS_PER_HOST,
+            MAX_LOCATIONS_PER_SCAN,
+        )
+    }
+
+    /// Queue a LOCATION URL. Returns `false` if it was ignored: a duplicate, not an
+    /// `http://` URL, or over the per-host or per-scan budget.
+    pub fn submit(&mut self, url: String) -> bool {
+        let Some(key) = location_host_key(&url) else {
+            return false;
+        };
+        if self.seen.len() >= self.max_locations || self.seen.contains(&url) {
+            return false;
+        }
+        let slot = match self.hosts.iter().position(|h| h.key == key) {
+            Some(i) => i,
+            None => {
+                self.hosts.push(HostQueue {
+                    key,
+                    pending: std::collections::VecDeque::new(),
+                    in_flight: 0,
+                    accepted: 0,
+                });
+                self.hosts.len() - 1
+            }
+        };
+        let host = &mut self.hosts[slot];
+        if host.accepted >= self.max_locations_per_host {
+            return false;
+        }
+        host.accepted += 1;
+        let index = self.seen.len();
+        self.seen.insert(url.clone());
+        host.pending.push_back((index, url));
+        true
+    }
+
+    /// Next LOCATION to start, if the overall and per-host limits allow one.
+    pub fn next_job(&mut self) -> Option<FetchJob> {
+        if self.in_flight >= self.max_parallel || self.hosts.is_empty() {
+            return None;
+        }
+        let n = self.hosts.len();
+        for step in 0..n {
+            let slot = (self.next_host + step) % n;
+            let host = &mut self.hosts[slot];
+            if host.in_flight >= self.max_per_host {
+                continue;
+            }
+            if let Some((index, url)) = host.pending.pop_front() {
+                host.in_flight += 1;
+                self.in_flight += 1;
+                self.next_host = (slot + 1) % n;
+                return Some(FetchJob {
+                    index,
+                    url,
+                    host: host.key.clone(),
+                });
             }
         }
         None
-    });
+    }
 
-    if let Some(cl) = content_length {
-        let needed = cl.saturating_sub(buffer.len() - body_start);
-        let mut read_remaining = 0;
-        while read_remaining < needed {
-            let to_read = (needed - read_remaining).min(chunk.len());
-            match stream.read(&mut chunk[..to_read]) {
-                Ok(0) => break,
-                Ok(n) => {
-                    buffer.extend_from_slice(&chunk[..n]);
-                    read_remaining += n;
-                }
+    /// Mark a job started by [`next_job`](Self::next_job) as finished.
+    pub fn complete(&mut self, host: &str) {
+        if let Some(h) = self.hosts.iter_mut().find(|h| h.key == host) {
+            if h.in_flight > 0 {
+                h.in_flight -= 1;
+                self.in_flight = self.in_flight.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Fetches currently running.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight
+    }
+
+    /// Nothing queued and nothing running.
+    pub fn is_idle(&self) -> bool {
+        self.in_flight == 0 && self.hosts.iter().all(|h| h.pending.is_empty())
+    }
+}
+
+/// Fetches device descriptions on background threads, at most `max_parallel` at once
+/// and at most [`MAX_PARALLEL_FETCHES_PER_HOST`] per host (see [`FetchScheduler`]).
+///
+/// Each fetch is bounded by `fetch_timeout`, must connect and start answering within
+/// [`DESCRIPTION_FIRST_BYTE_TIMEOUT`], and never runs past the scan deadline, so a slow
+/// or silent device delays only itself.
+pub struct DescriptionFetcher {
+    scheduler: FetchScheduler,
+    fetch_timeout: Duration,
+    first_byte_timeout: Duration,
+    deadline: Option<Instant>,
+    tx: std::sync::mpsc::Sender<(usize, String, Option<DLNADevice>)>,
+    rx: std::sync::mpsc::Receiver<(usize, String, Option<DLNADevice>)>,
+    results: Vec<(usize, DLNADevice)>,
+}
+
+impl DescriptionFetcher {
+    pub fn new(max_parallel: usize, fetch_timeout: Duration) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            scheduler: FetchScheduler::for_scan(max_parallel),
+            fetch_timeout,
+            first_byte_timeout: DESCRIPTION_FIRST_BYTE_TIMEOUT.min(fetch_timeout),
+            deadline: None,
+            tx,
+            rx,
+            results: Vec::new(),
+        }
+    }
+
+    /// Overall scan deadline: no fetch is started after it, and running fetches are
+    /// cut off at it. An earlier deadline replaces a later one, never the reverse.
+    pub fn set_deadline(&mut self, deadline: Instant) {
+        self.deadline = Some(match self.deadline {
+            Some(d) => d.min(deadline),
+            None => deadline,
+        });
+    }
+
+    /// Queue a LOCATION URL. Duplicates and URLs over the per-host or per-scan budget
+    /// ([`MAX_LOCATIONS_PER_HOST`], [`MAX_LOCATIONS_PER_SCAN`]) are ignored.
+    pub fn submit(&mut self, url: String) {
+        if self.scheduler.submit(url) {
+            self.pump();
+        }
+    }
+
+    /// Collect finished fetches and start queued ones. Never blocks.
+    pub fn pump(&mut self) {
+        while let Ok(msg) = self.rx.try_recv() {
+            self.record(msg);
+        }
+        loop {
+            let now = Instant::now();
+            if self.deadline.is_some_and(|d| now >= d) {
+                break;
+            }
+            let Some(job) = self.scheduler.next_job() else {
+                break;
+            };
+            let mut deadline = now + self.fetch_timeout;
+            if let Some(scan_deadline) = self.deadline {
+                deadline = deadline.min(scan_deadline);
+            }
+            let first_byte_deadline = (now + self.first_byte_timeout).min(deadline);
+            let tx = self.tx.clone();
+            thread::spawn(move || {
+                let device = fetch_xml_by(&job.url, first_byte_deadline, deadline, MAX_DESCRIPTION_BYTES)
+                    .and_then(|xml| parse_device_description(&xml, &job.url));
+                let _ = tx.send((job.index, job.host, device));
+            });
+        }
+    }
+
+    fn record(&mut self, (index, host, device): (usize, String, Option<DLNADevice>)) {
+        self.scheduler.complete(&host);
+        if let Some(dev) = device {
+            self.results.push((index, dev));
+        }
+    }
+
+    /// Keep starting queued fetches and collecting results until everything is done or
+    /// `deadline` passes, then return the devices found, in the order their LOCATIONs
+    /// were submitted. Fetches still running at the deadline are cut off by it.
+    pub fn finish(mut self, deadline: Instant) -> Vec<DLNADevice> {
+        self.set_deadline(deadline);
+        let deadline = self.deadline.unwrap_or(deadline);
+        loop {
+            self.pump();
+            if self.scheduler.is_idle() {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match self.rx.recv_timeout(deadline - now) {
+                Ok(msg) => self.record(msg),
                 Err(_) => break,
             }
         }
-    } else {
-        while let Ok(n) = stream.read(&mut chunk) {
-            if n == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&chunk[..n]);
-        }
+        self.results.sort_by_key(|(i, _)| *i);
+        self.results.into_iter().map(|(_, d)| d).collect()
     }
+}
 
-    if buffer.len() > body_start {
-        Some(String::from_utf8_lossy(&buffer[body_start..]).to_string())
-    } else {
-        None
+/// Fetch and parse several device descriptions concurrently (at most `max_parallel`
+/// at a time and [`MAX_PARALLEL_FETCHES_PER_HOST`] per host, each bounded by
+/// `fetch_timeout`).
+pub fn fetch_device_descriptions(urls: &[String], max_parallel: usize, fetch_timeout: Duration) -> Vec<DLNADevice> {
+    let mut fetcher = DescriptionFetcher::new(max_parallel, fetch_timeout);
+    for url in urls {
+        fetcher.submit(url.clone());
     }
+    // Worst case every URL is on the same host, which runs the fewest at once.
+    let per_round = max_parallel.clamp(1, MAX_PARALLEL_FETCHES_PER_HOST);
+    let rounds = urls.len().div_ceil(per_round).max(1) as u32;
+    fetcher.finish(Instant::now() + fetch_timeout * rounds + Duration::from_millis(250))
 }
 
 /// Parse UPnP Device Description XML and extract device information and service URLs.
@@ -327,7 +973,8 @@ pub fn discover_devices(timeout: Duration) -> Vec<DLNADevice> {
         Err(_) => return Vec::new(),
     };
 
-    let _ = socket.set_read_timeout(Some(Duration::from_millis(400)));
+    // Short read timeout so finished description fetches are collected promptly.
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
     let _ = socket.set_multicast_ttl_v4(2);
 
     for target in &search_targets {
@@ -344,33 +991,35 @@ pub fn discover_devices(timeout: Duration) -> Vec<DLNADevice> {
     }
 
     let start = Instant::now();
-    let mut discovered_locations = HashSet::new();
-    let mut devices = Vec::new();
+    // Listening plus one description timeout: the whole scan ends by then, however
+    // many LOCATIONs arrive or how they behave.
+    let scan_deadline = start + timeout + DESCRIPTION_FETCH_TIMEOUT;
+    let mut fetcher = DescriptionFetcher::new(MAX_PARALLEL_DESCRIPTION_FETCHES, DESCRIPTION_FETCH_TIMEOUT);
+    fetcher.set_deadline(scan_deadline);
+    let mut rejected = HashSet::new();
     let mut buf = [0u8; 4096];
 
     while start.elapsed() < timeout {
-        if let Ok((len, _)) = socket.recv_from(&mut buf) {
+        if let Ok((len, src)) = socket.recv_from(&mut buf) {
             let resp = String::from_utf8_lossy(&buf[..len]);
-            for line in resp.lines() {
-                if let Some((header_name, header_val)) = line.split_once(':') {
-                    if header_name.trim().eq_ignore_ascii_case("location") {
-                        let url = header_val.trim().to_string();
-                        if !discovered_locations.contains(&url) {
-                            discovered_locations.insert(url.clone());
-                            if let Some(xml) = fetch_xml(&url) {
-                                if let Some(dev) = parse_device_description(&xml, &url) {
-                                    devices.push(dev);
-                                }
-                            }
-                        }
-                        break;
+            match ssdp_location_for_sender(&resp, src.ip()) {
+                Some(url) => fetcher.submit(url),
+                None => {
+                    if rejected.insert(src.ip()) {
+                        crate::log_info!(
+                            "discovery",
+                            "Ignoring SSDP response from {}: no LOCATION on the sender's own IP",
+                            src.ip()
+                        );
                     }
                 }
             }
         }
+        fetcher.pump();
     }
 
-    devices
+    // Queued and running descriptions get until the overall scan deadline.
+    fetcher.finish(scan_deadline)
 }
 
 /// Asynchronous background device discovery manager.

@@ -346,10 +346,16 @@ impl SettingsManager {
                 } else {
                     "127.0.0.1".to_string()
                 };
-                if ip != "127.0.0.1" || !self.settings.web_server_lan {
-                    format!("Enabled (http://{}:{})", ip, self.settings.web_server_port)
+                if self.settings.web_server_lan {
+                    // Other devices need the pairing link; it carries the session token.
+                    let link = crate::web_access::pairing_url(
+                        &ip,
+                        self.settings.web_server_port,
+                        crate::web_access::web_token(),
+                    );
+                    format!("Enabled ({})", link)
                 } else {
-                    format!("Enabled (Port {})", self.settings.web_server_port)
+                    format!("Enabled (http://{}:{})", ip, self.settings.web_server_port)
                 }
             } else {
                 "Disabled".to_string()

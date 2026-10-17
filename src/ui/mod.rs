@@ -166,6 +166,8 @@ pub struct AppUI {
     pub web_server: Option<crate::web::WebServerHandle>,
     pub web_state: std::sync::Arc<std::sync::RwLock<crate::web::NowPlayingState>>,
     pub web_cmd_rx: Option<std::sync::mpsc::Receiver<crate::web::WebCommand>>,
+    /// Folder the browser opened at launch; one of the folders the web dashboard may reach.
+    pub launch_dir: PathBuf,
     pub pending_seek_delta: f64,
     pub pending_seek_target: Option<f64>,
     pub last_seek_key_time: Option<std::time::Instant>,
@@ -243,6 +245,7 @@ impl AppUI {
         let mut app = Self {
             active_tab: 1,
             queue_focus: false,
+            launch_dir: cwd.clone(),
             browser_dir: cwd,
             browser_entries: Vec::new(),
             browser_cursor: 0,
@@ -3085,12 +3088,14 @@ impl AppUI {
                     self.update_web_state();
                 }
                 crate::web::WebCommand::Autopilot(path_opt) => {
-                    let target = path_opt.unwrap_or_else(|| self.browser_dir.clone());
-                    self.start_autopilot(target);
+                    if let Some(target) = path_opt.or_else(|| self.web_terminal_folder()) {
+                        self.start_autopilot(target);
+                    }
                 }
                 crate::web::WebCommand::AutopilotReshuffle(path_opt) => {
-                    let target = path_opt.unwrap_or_else(|| self.browser_dir.clone());
-                    self.reshuffle_autopilot(target);
+                    if let Some(target) = path_opt.or_else(|| self.web_terminal_folder()) {
+                        self.reshuffle_autopilot(target);
+                    }
                 }
                 crate::web::WebCommand::ShuffleQueue => {
                     if !self.queue.is_empty() {
@@ -3115,8 +3120,61 @@ impl AppUI {
                 crate::web::WebCommand::SeedRadio(path) => {
                     self.start_seed_radio(path);
                 }
+                crate::web::WebCommand::PathRejected(path) => {
+                    self.status_message = format!(
+                        "Ignored web request: {} is outside your home, bookmarks and launch folder",
+                        path.display()
+                    );
+                }
             }
         }
+    }
+
+    /// The folder the terminal is browsing, for web commands that name no folder. `None` (with a
+    /// status message) when it lies outside the folders the web dashboard may act on.
+    fn web_terminal_folder(&mut self) -> Option<PathBuf> {
+        let resolved = crate::web_access::resolve_allowed_path(&self.browser_dir, &self.web_allowed_roots());
+        if resolved.is_none() {
+            self.status_message = format!(
+                "Ignored web request: {} is outside your home, bookmarks and launch folder",
+                self.browser_dir.display()
+            );
+        }
+        resolved
+    }
+
+    /// Folders the web dashboard may browse and act on: the startup home, the bookmarks and the
+    /// folder the browser opened at launch. Folders browsed later in the TUI are not included,
+    /// and neither are the filesystem root or the home folder itself (too broad).
+    pub fn web_allowed_roots(&self) -> Vec<PathBuf> {
+        static LOGGED_SKIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let home = crate::web_access::home_dir();
+        let mut roots: Vec<PathBuf> = Vec::new();
+        let candidates = self
+            .settings_mgr
+            .settings
+            .home_dir
+            .iter()
+            .chain(self.bookmarks.iter())
+            .map(PathBuf::from)
+            .chain(std::iter::once(self.launch_dir.clone()));
+        for root in candidates {
+            if roots.contains(&root) {
+                continue;
+            }
+            if !crate::web_access::is_acceptable_root(&root, home.as_deref()) {
+                if root.is_absolute() && !LOGGED_SKIP.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::log_info!(
+                        "web",
+                        "Not letting the web dashboard reach {}: too broad (use a music folder, bookmark or startup home)",
+                        root.display()
+                    );
+                }
+                continue;
+            }
+            roots.push(root);
+        }
+        roots
     }
 
     pub fn update_web_state(&mut self) {
@@ -3140,6 +3198,7 @@ impl AppUI {
             state.is_scanning = self.device_manager.is_scanning();
             state.home_dir = self.settings_mgr.settings.home_dir.clone();
             state.current_browser_dir = self.browser_dir.to_string_lossy().to_string();
+            state.allowed_roots = self.web_allowed_roots();
             state.is_autopilot = self.autopilot_dir.is_some();
             state.autopilot_dir = self.autopilot_dir.as_ref().map(|d| d.to_string_lossy().to_string());
             state.active_mix_profile = self.active_mix_profile.name();
