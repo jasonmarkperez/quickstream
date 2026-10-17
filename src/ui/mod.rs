@@ -214,7 +214,8 @@ pub struct AppUI {
     pub player: Box<dyn AudioPlayer>,
     pub device_manager: DeviceManager,
     pub settings_mgr: SettingsManager,
-    pub metadata_cache: std::collections::HashMap<PathBuf, crate::metadata::AudioMetadata>,
+    /// Shared with background scanners; clone the handle, never the map (issue #4).
+    pub metadata_cache: crate::library::MetadataCache,
     pub metadata_tx: std::sync::mpsc::Sender<crate::metadata::AudioMetadata>,
     pub metadata_rx: std::sync::mpsc::Receiver<crate::metadata::AudioMetadata>,
     pub queue_add_tx: std::sync::mpsc::Sender<Vec<crate::metadata::AudioMetadata>>,
@@ -305,7 +306,7 @@ impl AppUI {
 
         let (metadata_tx, metadata_rx) = std::sync::mpsc::channel();
         let (queue_add_tx, queue_add_rx) = std::sync::mpsc::channel();
-        let metadata_cache = crate::library::LibraryManager::load_cache_map();
+        let metadata_cache = crate::library::MetadataCache::from(crate::library::LibraryManager::load_cache_map());
         let (dir_scan_tx, dir_scan_rx) = std::sync::mpsc::channel();
         let analysis_db = crate::analysis::AnalysisDatabase::open_default()
             .unwrap_or_else(|_| crate::analysis::AnalysisDatabase::open_in_memory().unwrap());
@@ -404,7 +405,7 @@ impl AppUI {
     pub fn format_file_label(
         path: &Path,
         metadata_view: bool,
-        cache: &std::collections::HashMap<PathBuf, crate::metadata::AudioMetadata>,
+        cache: &crate::library::MetadataCache,
     ) -> String {
         if metadata_view {
             if let Some(m) = cache.get(path) {
@@ -423,7 +424,7 @@ impl AppUI {
             for (label, path, is_dir) in &mut self.browser_entries {
                 if !*is_dir {
                     *label = Self::format_file_label(path, metadata_view, &self.metadata_cache);
-                    if metadata_view && !self.metadata_cache.contains_key(path) {
+                    if metadata_view && !self.metadata_cache.contains(path) {
                         unfetched.push(path.clone());
                     }
                 }
@@ -612,7 +613,7 @@ impl AppUI {
         self.dir_scan_stop = Some(stop_flag.clone());
         let tx = self.dir_scan_tx.clone();
         let metadata_view = self.settings_mgr.settings.metadata_view;
-        let cached_map = self.metadata_cache.clone();
+        let cached_map = self.metadata_cache.clone(); // shared handle, not a copy
 
         std::thread::spawn(move || {
             let thread_start = std::time::Instant::now();
@@ -642,7 +643,7 @@ impl AppUI {
                         // Optimization: Check supported audio file by extension first to avoid expensive stat calls
                         if is_supported_audio_file(&path) {
                             let label = Self::format_file_label(&path, metadata_view, &cached_map);
-                            if metadata_view && !cached_map.contains_key(&path) {
+                            if metadata_view && !cached_map.contains(&path) {
                                 batch_unfetched.push(path.clone());
                             }
                             batch_files.push((label, path, false));
@@ -1001,7 +1002,7 @@ impl AppUI {
         while let Ok(tracks) = self.queue_add_rx.try_recv() {
             let tracks: Vec<_> = tracks
                 .into_iter()
-                .map(|t| self.metadata_cache.get(&t.filepath).cloned().unwrap_or(t))
+                .map(|t| self.metadata_cache.get(&t.filepath).unwrap_or(t))
                 .collect();
             let added = self.enqueue_tracks(tracks);
             self.status_message = format!("Added {} tracks (web)", added);
@@ -1013,7 +1014,6 @@ impl AppUI {
     fn quick_metadata(&self, path: &std::path::Path) -> crate::metadata::AudioMetadata {
         self.metadata_cache
             .get(path)
-            .cloned()
             .unwrap_or_else(|| crate::metadata::fallback_metadata(path))
     }
 
@@ -1055,7 +1055,7 @@ impl AppUI {
         let mut queue_updated = false;
         while let Ok(meta) = self.metadata_rx.try_recv() {
             let path = meta.filepath.clone();
-            self.metadata_cache.insert(path.clone(), meta.clone());
+            self.metadata_cache.insert(meta.clone());
 
             // 1. Update matching tracks in queue
             for track in &mut self.queue.tracks {
@@ -2768,7 +2768,7 @@ impl AppUI {
             Vec::new()
         };
 
-        let cache = self.metadata_cache.clone();
+        let cache = self.metadata_cache.clone(); // shared handle, not a copy
         let (tx, rx) = std::sync::mpsc::channel();
         self.autopilot_rx = Some(rx);
 
