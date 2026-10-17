@@ -1,6 +1,8 @@
 //! Autopilot mix generation with a profile logs where its time goes.
 //!
-//! Own test binary: points XDG_DATA_HOME (log location) at a temp dir for the whole process.
+//! Own test binary: it initializes the process-wide logger in the isolated XDG data dir.
+
+mod common;
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -35,9 +37,7 @@ fn create_silent_wav(path: &Path) {
 
 #[test]
 fn test_profile_mix_logs_phase_timings() {
-    let root = std::env::temp_dir().join(format!("qs_autopilot_trace_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    std::env::set_var("XDG_DATA_HOME", root.join("data"));
+    let root = common::isolate();
     let log_path = quickstream::logger::init();
 
     let library = root.join("library");
@@ -85,7 +85,15 @@ fn test_profile_mix_logs_phase_timings() {
     let gathered = find("candidates gathered");
     assert!(gathered.contains("folders=6"), "{}", gathered);
     assert!(gathered.contains("files=18"), "{}", gathered);
-    for field in ["walk=", "metadata=", "tag_reads=", "cache_hits=", "db_hits=", "matching=", "matched="] {
+    for field in [
+        "walk=",
+        "metadata=",
+        "tag_reads=",
+        "cache_hits=",
+        "db_hits=",
+        "matching=",
+        "matched=",
+    ] {
         assert!(gathered.contains(field), "missing {} in: {}", field, gathered);
     }
 

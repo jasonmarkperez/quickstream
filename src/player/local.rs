@@ -47,7 +47,10 @@ pub fn create_private_ipc_dir(path: &Path) -> io::Result<()> {
     fs::DirBuilder::new().mode(0o700).create(path)?;
     let meta = fs::symlink_metadata(path)?;
     if !meta.file_type().is_dir() || meta.uid() != current_uid() {
-        return Err(permission_error(format!("{:?} is not a directory owned by the current user", path)));
+        return Err(permission_error(format!(
+            "{:?} is not a directory owned by the current user",
+            path
+        )));
     }
     // The umask can only clear bits; make sure the owner still has full access.
     if meta.mode() & 0o777 != 0o700 {
@@ -75,7 +78,9 @@ pub fn verify_ipc_socket(path: &Path) -> io::Result<()> {
 
 fn random_hex(n_bytes: usize) -> String {
     let mut buf = vec![0u8; n_bytes];
-    let from_os = fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).is_ok();
+    let from_os = fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok();
     if !from_os {
         // RandomState is seeded from the OS RNG; mix in time and a counter per chunk.
         use std::collections::hash_map::RandomState;
@@ -84,7 +89,12 @@ fn random_hex(n_bytes: usize) -> String {
         for chunk in buf.chunks_mut(8) {
             let mut h = RandomState::new().build_hasher();
             h.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
-            h.write_u128(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+            h.write_u128(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            );
             let bytes = h.finish().to_ne_bytes();
             chunk.copy_from_slice(&bytes[..chunk.len()]);
         }
@@ -327,7 +337,9 @@ impl LocalPlayer {
                             }
                         }
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock =>
+                    {
                         continue;
                     }
                     Err(_) => break,
@@ -434,8 +446,11 @@ impl LocalPlayer {
         let duration = crate::metadata::extract_metadata(filepath)
             .map(|m| m.duration_seconds)
             .unwrap_or(0.0);
-        *self.shared_state.duration.lock().unwrap() =
-            if duration.is_finite() && duration > 0.0 { duration } else { 0.0 };
+        *self.shared_state.duration.lock().unwrap() = if duration.is_finite() && duration > 0.0 {
+            duration
+        } else {
+            0.0
+        };
         Ok(())
     }
 }
@@ -466,7 +481,12 @@ impl Drop for LocalPlayer {
 
 impl AudioPlayer for LocalPlayer {
     fn play(&mut self, filepath: &Path) -> anyhow::Result<()> {
-        let _timer = crate::log_perf!("player", "LocalPlayer::play '{}' via {}", filepath.display(), self.backend);
+        let _timer = crate::log_perf!(
+            "player",
+            "LocalPlayer::play '{}' via {}",
+            filepath.display(),
+            self.backend
+        );
         let abs_path = if filepath.is_absolute() {
             filepath.to_path_buf()
         } else {
@@ -595,7 +615,12 @@ impl AudioPlayer for LocalPlayer {
             position_seconds.max(0.0)
         };
 
-        crate::log_info!("player", "LocalPlayer::seek_to target={:.2}s via {}", target, self.backend);
+        crate::log_info!(
+            "player",
+            "LocalPlayer::seek_to target={:.2}s via {}",
+            target,
+            self.backend
+        );
 
         if self.current_file.is_none() {
             self.accumulated_offset = target;

@@ -65,9 +65,15 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// backup already holds exactly these bytes (the same broken file loaded on every launch)
 /// no new copy is made.
 pub fn backup_corrupt_file(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
-    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
     let bak_prefix = format!("{}.bak", name);
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
 
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -108,12 +114,20 @@ pub fn load_json_or_backup<T: DeserializeOwned>(path: &Path, what: &str) -> Opti
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
         Err(e) => {
-            crate::logger::log_raw("WARN", "persist", &format!("could not read {} file '{}': {}", what, path.display(), e));
+            crate::logger::log_raw(
+                "WARN",
+                "persist",
+                &format!("could not read {} file '{}': {}", what, path.display(), e),
+            );
             return None;
         }
     };
     if bytes.iter().all(|b| b.is_ascii_whitespace()) {
-        crate::logger::log_raw("WARN", "persist", &format!("{} file '{}' is empty; using defaults", what, path.display()));
+        crate::logger::log_raw(
+            "WARN",
+            "persist",
+            &format!("{} file '{}' is empty; using defaults", what, path.display()),
+        );
         return None;
     }
     match serde_json::from_slice(&bytes) {
@@ -126,7 +140,13 @@ pub fn load_json_or_backup<T: DeserializeOwned>(path: &Path, what: &str) -> Opti
             crate::logger::log_raw(
                 "WARN",
                 "persist",
-                &format!("{} file '{}' failed to parse ({}); {}; using defaults", what, path.display(), e, saved),
+                &format!(
+                    "{} file '{}' failed to parse ({}); {}; using defaults",
+                    what,
+                    path.display(),
+                    e,
+                    saved
+                ),
             );
             None
         }
@@ -202,7 +222,11 @@ impl PersistenceWorker {
                 let _ = done_tx.send(());
             })
             .ok();
-        Self { handle: PersistHandle { tx, writer }, done_rx, thread }
+        Self {
+            handle: PersistHandle { tx, writer },
+            done_rx,
+            thread,
+        }
     }
 
     pub fn handle(&self) -> PersistHandle {
@@ -227,7 +251,11 @@ impl Drop for PersistenceWorker {
                     let _ = thread.join();
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    crate::logger::log_raw("WARN", "persist", "persistence worker still writing at shutdown; not waiting");
+                    crate::logger::log_raw(
+                        "WARN",
+                        "persist",
+                        "persistence worker still writing at shutdown; not waiting",
+                    );
                 }
             }
         }
@@ -236,7 +264,11 @@ impl Drop for PersistenceWorker {
 
 fn write_logged(writer: &Writer, path: &Path, bytes: &[u8]) {
     if let Err(e) = writer(path, bytes) {
-        crate::logger::log_raw("WARN", "persist", &format!("failed to write '{}': {}", path.display(), e));
+        crate::logger::log_raw(
+            "WARN",
+            "persist",
+            &format!("failed to write '{}': {}", path.display(), e),
+        );
     }
 }
 

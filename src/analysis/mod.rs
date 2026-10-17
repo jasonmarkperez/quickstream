@@ -1,8 +1,8 @@
 //! Intelligent Autopilot Mix Engine: acoustic analysis, harmonic mixing, and feature caching.
 
+pub mod bpm;
 pub mod db;
 pub mod harmonic;
-pub mod bpm;
 pub mod mixer;
 pub mod online;
 pub mod worker;

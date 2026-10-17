@@ -9,7 +9,6 @@ use std::time::Duration;
 use clap::Parser;
 
 use quickstream::discovery;
-use quickstream::library::LibraryManager;
 use quickstream::metadata::{extract_metadata, is_supported_audio_file};
 use quickstream::settings::SettingsManager;
 use quickstream::ui::AppUI;
@@ -25,10 +24,6 @@ struct Cli {
     /// Inspect audio metadata tags and exit
     #[arg(long)]
     info: Option<PathBuf>,
-
-    /// Launch directly into Skim interactive fuzzy finder mode
-    #[arg(long, short)]
-    search: bool,
 
     /// Scan local network for DLNA / UPnP MediaRenderers
     #[arg(long)]
@@ -161,30 +156,6 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
-    }
-
-    // Direct Skim search mode
-    if cli.search {
-        println!("Loading library index for Skim search...");
-        let start_dir = cli.paths.first().cloned().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let mut tracks = LibraryManager::load_cache();
-        if tracks.is_empty() {
-            println!("Indexing '{}'...", start_dir.display());
-            tracks = LibraryManager::scan_directory(&start_dir);
-            LibraryManager::save_cache(&tracks);
-        }
-
-        let selected = LibraryManager::search_with_skim(&tracks);
-        if selected.is_empty() {
-            println!("No tracks selected.");
-            return Ok(());
-        }
-
-        println!("Selected {} tracks:", selected.len());
-        for t in &selected {
-            println!("  - {}", t.format_display_label(true));
-        }
-        return Ok(());
     }
 
     // Network scan

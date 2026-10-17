@@ -165,10 +165,11 @@ Execute the full test suite using Cargo with single-threaded test execution (req
 cargo test -- --test-threads=1
 ```
 
-Tests that bind all network interfaces (real SSDP discovery, LAN web server binding) are marked `#[ignore]` so local runs do not trigger macOS firewall prompts. Run them explicitly, and in CI:
+Tests that bind all network interfaces (real SSDP discovery, LAN web server binding) are marked `#[ignore]` so local runs do not trigger macOS firewall prompts. CI runs them on Linux (`.github/workflows/ci.yml`); to run them yourself:
 ```bash
-cargo test -- --test-threads=1 --include-ignored
+cargo test -- --test-threads=1 --ignored --skip test_discover_devices_real
 ```
+(`test_discover_devices_real` scans your LAN for real renderers and asserts nothing; drop the `--skip` to include it.)
 
 To run a specific test:
 ```bash
@@ -176,10 +177,12 @@ cargo test --test test_autopilot test_autopilot_mix_generates_full_queue_when_li
 ```
 
 ### Code Quality & Lints
-Always verify zero compiler and clippy warnings before committing:
+Always verify formatting and zero compiler and clippy warnings (including test code) before committing. CI (`.github/workflows/ci.yml`, Ubuntu + macOS) runs the same checks plus the test suite on every push and pull request to `main`:
 ```bash
-cargo clippy -- -D warnings
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 ```
+Formatting follows `rustfmt.toml`; the one-time bulk reformat commit is listed in `.git-blame-ignore-revs` (`git config blame.ignoreRevsFile .git-blame-ignore-revs`).
 
 ### Release Build
 ```bash
@@ -188,5 +191,6 @@ cargo build --release
 
 ### Important Rules for Future Agents
 - **No Temporary Root Scripts**: Do not create ad-hoc test scripts (e.g. `test_something.py`, `scratch.rs`, `patch.py`) in the repository root. Always place unit and integration tests inside `tests/` following the `test_*.rs` naming convention.
+- **Test Isolation**: Every integration test file declares `mod common;` and every `#[test]` starts with `common::isolate();` (`tests/common/mod.rs`), which points `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` / `XDG_DATA_HOME` at a per-process temp dir so tests never read or write the real `~/.config`, `~/.cache` or `~/.local/share` quickstream dirs. `tests/test_isolation.rs` fails if a test skips it.
 - **Graceful Resource Cleanup**: All networking threads (`DLNAScanner`), streaming HTTP sockets, Tokio runtimes, and subprocesses (`mpv`, `ffplay`) must terminate cleanly upon shutdown or `ctrlc` signal.
 - **File Modifications**: Use targeted file editing tools (`replace_file_content` or `write_to_file`) rather than shell sed/cat scripts.

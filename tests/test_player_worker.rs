@@ -1,3 +1,5 @@
+mod common;
+
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -143,6 +145,7 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
 
 #[test]
 fn test_async_player_commands_do_not_block_caller() {
+    common::isolate();
     let probe = Probe::default();
     let p = probe.clone();
     let mut player = AsyncPlayer::spawn(move || Box::new(SlowPlayer::new(Duration::from_millis(400), &p)), 50);
@@ -160,6 +163,7 @@ fn test_async_player_commands_do_not_block_caller() {
 
 #[test]
 fn test_async_player_constructs_inner_player_off_caller_thread() {
+    common::isolate();
     let probe = Probe::default();
     let p = probe.clone();
     let start = Instant::now();
@@ -175,6 +179,7 @@ fn test_async_player_constructs_inner_player_off_caller_thread() {
 
 #[test]
 fn test_async_player_applies_commands_in_order() {
+    common::isolate();
     let probe = Probe::default();
     let p = probe.clone();
     let mut player = AsyncPlayer::spawn(move || Box::new(SlowPlayer::new(Duration::from_millis(20), &p)), 50);
@@ -186,7 +191,11 @@ fn test_async_player_applies_commands_in_order() {
     assert!(wait_until(Duration::from_secs(2), || probe.calls.lock().unwrap().len() == 3));
     assert_eq!(
         *probe.calls.lock().unwrap(),
-        vec!["play_at 42".to_string(), "pause".to_string(), "set_volume 30".to_string()]
+        vec![
+            "play_at 42".to_string(),
+            "pause".to_string(),
+            "set_volume 30".to_string()
+        ]
     );
     assert!(wait_until(Duration::from_secs(1), || player.is_paused()));
     assert!((player.position_seconds() - 42.0).abs() < 0.01);
@@ -194,6 +203,7 @@ fn test_async_player_applies_commands_in_order() {
 
 #[test]
 fn test_async_player_state_reflects_commands_immediately() {
+    common::isolate();
     let probe = Probe::default();
     let p = probe.clone();
     let mut player = AsyncPlayer::spawn(move || Box::new(SlowPlayer::new(Duration::from_millis(300), &p)), 50);
@@ -217,6 +227,7 @@ fn test_async_player_state_reflects_commands_immediately() {
 
 #[test]
 fn test_async_player_reports_errors_via_take_error() {
+    common::isolate();
     let probe = Probe::default();
     let p = probe.clone();
     let mut player = AsyncPlayer::spawn(
@@ -240,6 +251,7 @@ fn test_async_player_reports_errors_via_take_error() {
 
 #[test]
 fn test_async_player_track_finished_round_trip() {
+    common::isolate();
     let probe = Probe::default();
     let p = probe.clone();
     let mut player = AsyncPlayer::spawn(move || Box::new(SlowPlayer::new(Duration::ZERO, &p)), 50);
@@ -250,13 +262,16 @@ fn test_async_player_track_finished_round_trip() {
 
     player.reset_finished();
     assert!(!player.is_track_finished());
-    assert!(wait_until(Duration::from_secs(2), || !probe.finished.load(Ordering::SeqCst)));
+    assert!(wait_until(Duration::from_secs(2), || !probe
+        .finished
+        .load(Ordering::SeqCst)));
     std::thread::sleep(Duration::from_millis(300));
     assert!(!player.is_track_finished());
 }
 
 #[test]
 fn test_async_player_drop_releases_inner_player() {
+    common::isolate();
     let probe = Probe::default();
     let p = probe.clone();
     let player = AsyncPlayer::spawn(move || Box::new(SlowPlayer::new(Duration::ZERO, &p)), 50);
@@ -284,6 +299,7 @@ fn spawn_unresponsive_renderer() -> u16 {
 
 #[test]
 fn test_switching_to_unresponsive_renderer_does_not_block_ui() {
+    common::isolate();
     use quickstream::discovery::DLNADevice;
     use quickstream::settings::SettingsManager;
     use quickstream::ui::AppUI;
@@ -311,11 +327,16 @@ fn test_switching_to_unresponsive_renderer_does_not_block_ui() {
     app.player.play(Path::new("/music/a.flac")).unwrap();
     app.player.stop().unwrap();
     let elapsed = start.elapsed();
-    assert!(elapsed < Duration::from_millis(500), "UI thread blocked for {:?}", elapsed);
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "UI thread blocked for {:?}",
+        elapsed
+    );
 }
 
 #[test]
 fn test_async_player_reports_backend_volume_while_commands_are_pending() {
+    common::isolate();
     // Switching to a renderer: the proxy is created with a placeholder volume and play_at is
     // queued at once. The renderer's real volume must be visible as soon as the player exists,
     // or a volume key would send placeholder ± step to the speaker.
@@ -332,11 +353,15 @@ fn test_async_player_reports_backend_volume_while_commands_are_pending() {
     player.play_at(Path::new("/music/a.flac"), 10.0).unwrap();
 
     assert!(wait_until(Duration::from_millis(400), || player.volume() == 20));
-    assert!(player.is_playing(), "optimistic play state is kept while play_at is pending");
+    assert!(
+        player.is_playing(),
+        "optimistic play state is kept while play_at is pending"
+    );
 }
 
 #[test]
 fn test_async_player_pending_volume_change_is_not_overwritten() {
+    common::isolate();
     let probe = Probe::default();
     let p = probe.clone();
     let mut player = AsyncPlayer::spawn(
@@ -355,6 +380,7 @@ fn test_async_player_pending_volume_change_is_not_overwritten() {
 
 #[test]
 fn test_async_player_optimistic_pause_matches_backends() {
+    common::isolate();
     let probe = Probe::default();
     let p = probe.clone();
     let mut player = AsyncPlayer::spawn(move || Box::new(SlowPlayer::new(Duration::from_millis(300), &p)), 50);
@@ -390,6 +416,7 @@ fn hung_device(port: u16, udn: &str) -> quickstream::discovery::DLNADevice {
 
 #[test]
 fn test_switching_to_renderer_does_not_carry_local_volume() {
+    common::isolate();
     use quickstream::settings::SettingsManager;
     use quickstream::ui::AppUI;
 
@@ -407,6 +434,7 @@ fn test_switching_to_renderer_does_not_carry_local_volume() {
 
 #[test]
 fn test_reselecting_active_renderer_keeps_current_player() {
+    common::isolate();
     use quickstream::settings::SettingsManager;
     use quickstream::ui::AppUI;
 
@@ -419,5 +447,8 @@ fn test_reselecting_active_renderer_keeps_current_player() {
     let first = &*app.player as *const dyn quickstream::player::AudioPlayer as *const u8;
     app.switch_to_upnp_player(hung_device(port, "uuid:hung-same"));
     let second = &*app.player as *const dyn quickstream::player::AudioPlayer as *const u8;
-    assert_eq!(first, second, "re-selecting the active renderer must not restart playback on it");
+    assert_eq!(
+        first, second,
+        "re-selecting the active renderer must not restart playback on it"
+    );
 }

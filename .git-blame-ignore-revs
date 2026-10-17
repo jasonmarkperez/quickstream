@@ -1,0 +1,5 @@
+# Bulk formatting commits for `git blame` to skip. GitHub uses this file automatically;
+# locally run: git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# style: run cargo fmt (max_width = 120)
+727082aed09182c8ff3e6fda6c1bc5dab33aeef3

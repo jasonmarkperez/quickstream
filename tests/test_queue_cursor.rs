@@ -1,6 +1,8 @@
 //! The queue cursor stays inside the queue after removals, clears and reshuffles (issue #16).
 
-use std::path::PathBuf;
+mod common;
+
+use std::path::{Path, PathBuf};
 
 use crossterm::event::KeyCode;
 use quickstream::metadata::AudioMetadata;
@@ -25,10 +27,10 @@ fn track(n: usize) -> AudioMetadata {
     }
 }
 
-fn app_with_queue(dir: &PathBuf, n: usize) -> AppUI {
+fn app_with_queue(dir: &Path, n: usize) -> AppUI {
     let mut settings_mgr = SettingsManager::new();
     settings_mgr.settings.web_server_enabled = false;
-    let mut app = AppUI::new(Some(dir.clone()), settings_mgr);
+    let mut app = AppUI::new(Some(dir.to_path_buf()), settings_mgr);
     for i in 1..=n {
         app.queue.add_track(track(i));
     }
@@ -39,6 +41,7 @@ fn app_with_queue(dir: &PathBuf, n: usize) -> AppUI {
 
 #[test]
 fn test_removing_last_queue_row_clamps_cursor() {
+    common::isolate();
     let dir = temp_dir("remove_last");
     let mut app = app_with_queue(&dir, 3);
     app.queue_cursor = 2;
@@ -54,6 +57,7 @@ fn test_removing_last_queue_row_clamps_cursor() {
 
 #[test]
 fn test_removing_row_before_current_keeps_current_track() {
+    common::isolate();
     let dir = temp_dir("remove_before");
     let mut app = app_with_queue(&dir, 4);
     app.queue.current_index = 2; // Song 3
@@ -64,6 +68,7 @@ fn test_removing_row_before_current_keeps_current_track() {
 
 #[test]
 fn test_clearing_queue_resets_cursor() {
+    common::isolate();
     let dir = temp_dir("clear");
     let mut app = app_with_queue(&dir, 5);
     app.queue_cursor = 4;
@@ -74,11 +79,17 @@ fn test_clearing_queue_resets_cursor() {
 
 #[test]
 fn test_reshuffle_truncation_clamps_cursor() {
+    common::isolate();
     let dir = temp_dir("reshuffle");
     let mut app = app_with_queue(&dir, 5);
     app.queue.current_index = 1;
     app.queue_cursor = 4;
     app.reshuffle_autopilot(dir.clone());
     assert_eq!(app.queue.len(), 2);
-    assert!(app.queue_cursor < app.queue.len(), "cursor {} past queue of {}", app.queue_cursor, app.queue.len());
+    assert!(
+        app.queue_cursor < app.queue.len(),
+        "cursor {} past queue of {}",
+        app.queue_cursor,
+        app.queue.len()
+    );
 }

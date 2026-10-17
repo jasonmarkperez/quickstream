@@ -1,3 +1,5 @@
+mod common;
+
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -27,8 +29,19 @@ fn ensure_test_file() -> PathBuf {
     path
 }
 
+/// The mpv lifecycle test needs mpv itself: without it LocalPlayer falls back to ffplay, which
+/// exits at once on machines without an audio device (CI runners).
+fn mpv_available() -> bool {
+    std::process::Command::new("mpv").arg("--version").output().is_ok()
+}
+
 #[test]
 fn test_local_playback_lifecycle() {
+    common::isolate();
+    if !mpv_available() {
+        eprintln!("SKIPPED: mpv not installed");
+        return;
+    }
     let test_file = ensure_test_file();
     assert!(test_file.exists(), "test file must exist");
 
@@ -85,7 +98,10 @@ fn test_local_playback_lifecycle() {
         "Position when seeking while paused should be ~6.0s, got {:.3}s",
         player.position_seconds()
     );
-    assert!(player.is_paused(), "Player should remain paused after seeking while paused");
+    assert!(
+        player.is_paused(),
+        "Player should remain paused after seeking while paused"
+    );
     assert!(player.resume().is_ok());
     assert!(player.is_playing());
 
@@ -101,6 +117,7 @@ fn test_local_playback_lifecycle() {
 
 #[test]
 fn test_ffplay_backend_lifecycle() {
+    common::isolate();
     let test_file = ensure_test_file();
     assert!(test_file.exists(), "test file must exist");
 

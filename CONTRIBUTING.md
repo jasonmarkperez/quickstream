@@ -19,7 +19,7 @@ Thank you for your interest in contributing to Quickstream! This project aims to
 ## 2. Setting Up the Environment
 
 1. Clone or open the repository.
-2. Ensure you have the Rust toolchain (1.75+ or newer):
+2. Ensure you have the Rust toolchain (1.89 or newer, see `rust-version` in `Cargo.toml`):
    ```bash
    rustc --version
    cargo --version
@@ -56,10 +56,18 @@ Run the full integration test suite with single-threaded execution (required for
 cargo test -- --test-threads=1
 ```
 
-Run lints:
+Tests that bind all network interfaces are `#[ignore]`d so local runs do not trigger macOS firewall prompts; CI runs them on Linux. To run them yourself (`test_discover_devices_real` scans your LAN and asserts nothing, so it is skipped here):
 ```bash
-cargo clippy -- -D warnings
+cargo test -- --test-threads=1 --ignored --skip test_discover_devices_real
 ```
+
+Check formatting and lints (including test code):
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+```
+
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test -- --test-threads=1` on Ubuntu and macOS for every push and pull request to `main`, plus the ignored tests on Ubuntu. The one-time bulk `cargo fmt` commit is listed in `.git-blame-ignore-revs`; run `git config blame.ignoreRevsFile .git-blame-ignore-revs` once so `git blame` skips it.
 
 Build the optimized release binary:
 ```bash
@@ -67,7 +75,7 @@ cargo build --release
 ```
 
 When contributing:
-- Ensure all tests pass and `cargo clippy` has zero warnings before opening a PR or committing.
-- Add integration tests in `tests/test_<feature>.rs` for any new functionality or bug fixes.
+- Ensure all tests pass, `cargo fmt --check` is clean and `cargo clippy --all-targets` has zero warnings before opening a PR or committing.
+- Add integration tests in `tests/test_<feature>.rs` for any new functionality or bug fixes. Each test file declares `mod common;` and each test starts with `common::isolate();` so it never touches your real `~/.config`, `~/.cache` or `~/.local/share` quickstream dirs (`tests/test_isolation.rs` enforces this).
 - Mock all network requests and external subprocesses in unit tests where practical.
 - Use Conventional Commits (e.g. `feat:`, `fix:`, `docs:`, `test:`, `refactor:`).

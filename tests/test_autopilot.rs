@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -10,9 +12,7 @@ use std::time::Duration;
 use quickstream::queue::FastRng;
 use quickstream::settings::SettingsManager;
 use quickstream::ui::AppUI;
-use quickstream::web::{
-    make_continuous_wav_header, NowPlayingState, WebCommand, WebServer,
-};
+use quickstream::web::{make_continuous_wav_header, NowPlayingState, WebCommand, WebServer};
 
 fn create_dummy_audio(path: &Path) {
     if let Some(parent) = path.parent() {
@@ -41,6 +41,7 @@ fn create_dummy_audio(path: &Path) {
 
 #[test]
 fn test_splitmix64_fast_rng_shuffle() {
+    common::isolate();
     let mut rng = FastRng::with_seed(42);
     let mut numbers: Vec<usize> = (0..50).collect();
     let original = numbers.clone();
@@ -57,6 +58,7 @@ fn test_splitmix64_fast_rng_shuffle() {
 
 #[test]
 fn test_continuous_wav_header_format() {
+    common::isolate();
     let hdr = make_continuous_wav_header();
     assert_eq!(hdr.len(), 44);
     assert_eq!(&hdr[0..4], b"RIFF");
@@ -76,6 +78,7 @@ fn test_continuous_wav_header_format() {
 
 #[test]
 fn test_autopilot_recursive_scan_and_queue() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_autopilot_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -117,6 +120,7 @@ fn test_autopilot_recursive_scan_and_queue() {
 
 #[test]
 fn test_web_autopilot_and_shuffle_actions() {
+    common::isolate();
     // Web commands only reach folders inside the allowed roots.
     let music = std::env::temp_dir().join(format!("qs_web_autopilot_{}", std::process::id()));
     fs::create_dir_all(music.join("jazz")).unwrap();
@@ -130,7 +134,10 @@ fn test_web_autopilot_and_shuffle_actions() {
     // 1. Send POST /api/action with action: "autopilot"
     {
         let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-        let body = format!(r#"{{"action":"autopilot","path":{}}}"#, serde_json::to_string(&jazz.to_string_lossy()).unwrap());
+        let body = format!(
+            r#"{{"action":"autopilot","path":{}}}"#,
+            serde_json::to_string(&jazz.to_string_lossy()).unwrap()
+        );
         let req = format!(
             "POST /api/action HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             port,
@@ -173,6 +180,7 @@ fn test_web_autopilot_and_shuffle_actions() {
 
 #[test]
 fn test_continuous_wav_stream_endpoint() {
+    common::isolate();
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
     let (tx, _rx) = mpsc::channel();
     let handle = WebServer::start(0, state.clone(), tx).expect("Failed to start test web server");
@@ -181,7 +189,10 @@ fn test_continuous_wav_stream_endpoint() {
     // The continuous stream is served at the armed session's path.
     let session = handle.stream_state().arm_continuous_session();
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-    let req = format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", session, port);
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        session, port
+    );
     stream.write_all(req.as_bytes()).unwrap();
 
     let mut reader = BufReader::new(stream);
@@ -199,8 +210,12 @@ fn test_continuous_wav_stream_endpoint() {
         headers.push(line);
     }
 
-    assert!(headers.iter().any(|h| h.to_lowercase().contains("content-type: audio/x-wav")));
-    assert!(headers.iter().any(|h| h.to_lowercase().contains("transfermode.dlna.org: streaming")));
+    assert!(headers
+        .iter()
+        .any(|h| h.to_lowercase().contains("content-type: audio/x-wav")));
+    assert!(headers
+        .iter()
+        .any(|h| h.to_lowercase().contains("transfermode.dlna.org: streaming")));
 
     // Read 44-byte WAV header
     let mut wav_hdr = [0u8; 44];
@@ -221,6 +236,7 @@ fn test_continuous_wav_stream_endpoint() {
 
 #[test]
 fn test_parse_path_heuristics_title_artist_album() {
+    common::isolate();
     use quickstream::library::LibraryManager;
 
     // 1. Path with track-disc prefix, artist in filename and folder structure
@@ -247,6 +263,7 @@ fn test_parse_path_heuristics_title_artist_album() {
 
 #[test]
 fn test_autopilot_diverse_sampling_across_artists() {
+    common::isolate();
     use quickstream::library::LibraryManager;
 
     let temp_dir = std::env::temp_dir().join(format!("quickstream_diverse_test_{}", std::process::id()));
@@ -284,6 +301,7 @@ fn test_autopilot_diverse_sampling_across_artists() {
 
 #[test]
 fn test_queue_background_metadata_update() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_bg_meta_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -319,6 +337,7 @@ fn test_queue_background_metadata_update() {
 
 #[test]
 fn test_autopilot_progressive_streaming_events() {
+    common::isolate();
     use quickstream::library::{AutopilotEvent, LibraryManager};
     use std::sync::atomic::AtomicBool;
 
@@ -342,13 +361,7 @@ fn test_autopilot_progressive_streaming_events() {
     let dir_clone = temp_dir.clone();
     let stop_clone = stop_flag.clone();
     let handle = std::thread::spawn(move || {
-        LibraryManager::scan_directory_autopilot_progressive(
-            dir_clone,
-            Vec::new(),
-            cache,
-            tx,
-            stop_clone,
-        );
+        LibraryManager::scan_directory_autopilot_progressive(dir_clone, Vec::new(), cache, tx, stop_clone);
     });
 
     // Receive events progressively
@@ -378,6 +391,7 @@ fn test_autopilot_progressive_streaming_events() {
 
 #[test]
 fn test_autopilot_append_mode_does_not_interrupt_playback() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_ap_append_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -394,9 +408,11 @@ fn test_autopilot_append_mode_does_not_interrupt_playback() {
 
     // Seed existing queue with 2 tracks
     for i in 1..=2 {
-        let mut meta = quickstream::metadata::AudioMetadata::default();
-        meta.title = format!("Existing {}", i);
-        meta.filepath = temp_dir.join(format!("Existing_{}.wav", i));
+        let meta = quickstream::metadata::AudioMetadata {
+            title: format!("Existing {}", i),
+            filepath: temp_dir.join(format!("Existing_{}.wav", i)),
+            ..Default::default()
+        };
         app.queue.add_track(meta);
     }
     app.queue.current_index = 1; // "Existing 2" is playing
@@ -426,6 +442,7 @@ fn test_autopilot_append_mode_does_not_interrupt_playback() {
 
 #[test]
 fn test_autopilot_reshuffle_from_next_track_forward() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_ap_reshuffle_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -442,9 +459,11 @@ fn test_autopilot_reshuffle_from_next_track_forward() {
 
     // Create 4 initial tracks in queue
     for i in 1..=4 {
-        let mut meta = quickstream::metadata::AudioMetadata::default();
-        meta.title = format!("Original Track {}", i);
-        meta.filepath = temp_dir.join(format!("orig_{}.wav", i));
+        let meta = quickstream::metadata::AudioMetadata {
+            title: format!("Original Track {}", i),
+            filepath: temp_dir.join(format!("orig_{}.wav", i)),
+            ..Default::default()
+        };
         app.queue.add_track(meta);
     }
     app.queue.current_index = 1; // "Original Track 2" is playing
@@ -474,6 +493,7 @@ fn test_autopilot_reshuffle_from_next_track_forward() {
 
 #[test]
 fn test_web_autopilot_reshuffle_action() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_web_ap_reshuffle_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -494,9 +514,11 @@ fn test_web_autopilot_reshuffle_action() {
 
     // Queue 3 songs
     for i in 1..=3 {
-        let mut meta = quickstream::metadata::AudioMetadata::default();
-        meta.title = format!("Song {}", i);
-        meta.filepath = temp_dir.join(format!("song_{}.wav", i));
+        let meta = quickstream::metadata::AudioMetadata {
+            title: format!("Song {}", i),
+            filepath: temp_dir.join(format!("song_{}.wav", i)),
+            ..Default::default()
+        };
         app.queue.add_track(meta);
     }
     app.queue.current_index = 0;
@@ -518,6 +540,7 @@ fn test_web_autopilot_reshuffle_action() {
 
 #[test]
 fn test_autopilot_bpm_flow_and_mood_vibe() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_mix_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -530,9 +553,17 @@ fn test_autopilot_bpm_flow_and_mood_vibe() {
         create_dummy_audio(&track_path);
 
         let (bpm, genre, mood) = if i <= 3 {
-            (Some(124.0 + (i as f64) * 2.0), "Electronic".to_string(), Some("workout".to_string()))
+            (
+                Some(124.0 + (i as f64) * 2.0),
+                "Electronic".to_string(),
+                Some("workout".to_string()),
+            )
         } else {
-            (Some(70.0 + (i as f64)), "Ambient".to_string(), Some("chill".to_string()))
+            (
+                Some(70.0 + (i as f64)),
+                "Ambient".to_string(),
+                Some("chill".to_string()),
+            )
         };
 
         let feat = quickstream::analysis::TrackFeatures {
@@ -585,6 +616,7 @@ fn test_autopilot_bpm_flow_and_mood_vibe() {
 
 #[test]
 fn test_web_mix_profile_and_seed_radio_commands() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_web_mix_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -627,6 +659,7 @@ fn test_web_mix_profile_and_seed_radio_commands() {
 
 #[test]
 fn test_autopilot_mood_vibe_diverse_artist_sampling_no_single_artist_loop() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_diverse_mood_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -680,7 +713,6 @@ fn test_autopilot_mood_vibe_diverse_artist_sampling_no_single_artist_loop() {
         artists_in_mix
     );
 
-
     // Verify consecutive tracks are never by the same artist
     for i in 1..app.queue.len() {
         assert_ne!(
@@ -715,6 +747,7 @@ fn test_autopilot_mood_vibe_diverse_artist_sampling_no_single_artist_loop() {
 
 #[test]
 fn test_autopilot_mix_generates_full_queue_when_library_has_sparse_matches() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_sparse_mix_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -751,7 +784,3 @@ fn test_autopilot_mix_generates_full_queue_when_library_has_sparse_matches() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
-
-
-
-

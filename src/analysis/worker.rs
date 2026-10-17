@@ -166,7 +166,9 @@ fn worker_loop(rx: Arc<Mutex<Receiver<PathBuf>>>, shared: Arc<Shared>, db: Analy
 }
 
 fn process_track(path: &Path, shared: &Shared, db: &AnalysisDatabase) {
-    let Some((mtime, file_size)) = file_stamp(path) else { return };
+    let Some((mtime, file_size)) = file_stamp(path) else {
+        return;
+    };
 
     if let Some(existing) = db.get_track(path) {
         if existing.mtime == mtime && existing.file_size == file_size {
@@ -185,7 +187,11 @@ fn process_track(path: &Path, shared: &Shared, db: &AnalysisDatabase) {
         Err(AnalysisError::AcousticFailed) => {
             // Not stored, so the stamp check above does not skip it next session.
             shared.failed.fetch_add(1, Ordering::SeqCst);
-            crate::log_info!("analysis", "Acoustic analysis failed for '{}'; will retry later", path.display());
+            crate::log_info!(
+                "analysis",
+                "Acoustic analysis failed for '{}'; will retry later",
+                path.display()
+            );
             return;
         }
         Err(AnalysisError::Unreadable | AnalysisError::Cancelled) => return,
@@ -243,7 +249,8 @@ fn analyze_track_with(
     let tags = read_tags(path);
 
     let (h_title, h_artist, h_album) = crate::metadata::parse_path_heuristics(path);
-    let or_else = |tagged: Option<String>, fallback: String| tagged.filter(|s| !s.trim().is_empty()).unwrap_or(fallback);
+    let or_else =
+        |tagged: Option<String>, fallback: String| tagged.filter(|s| !s.trim().is_empty()).unwrap_or(fallback);
 
     let mut features = TrackFeatures {
         filepath: path.to_path_buf(),
@@ -305,7 +312,9 @@ fn read_tags(path: &Path) -> TagInfo {
     use lofty::probe::Probe;
     use lofty::tag::ItemKey;
 
-    let Ok(probe) = Probe::open(path) else { return TagInfo::default() };
+    let Ok(probe) = Probe::open(path) else {
+        return TagInfo::default();
+    };
     let Ok(tagged_file) = probe.options(ParseOptions::new().read_cover_art(false)).read() else {
         return TagInfo::default();
     };
@@ -316,7 +325,9 @@ fn read_tags(path: &Path) -> TagInfo {
     let mut tags: Vec<&lofty::tag::Tag> = primary.into_iter().collect();
     tags.extend(tagged_file.tags().iter().filter(|t| Some(t.tag_type()) != primary_type));
 
-    let text = |f: &dyn Fn(&lofty::tag::Tag) -> Option<String>| tags.iter().find_map(|t| f(t).filter(|s| !s.trim().is_empty()));
+    let text = |f: &dyn Fn(&lofty::tag::Tag) -> Option<String>| {
+        tags.iter().find_map(|t| f(t).filter(|s| !s.trim().is_empty()))
+    };
 
     TagInfo {
         title: text(&|t| t.title().map(|s| s.to_string())),

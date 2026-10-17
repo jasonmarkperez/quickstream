@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -97,6 +99,7 @@ fn sample_tracks() -> (PathBuf, Vec<AudioMetadata>) {
 
 #[test]
 fn test_fuzzy_search_multi_field_matching() {
+    common::isolate();
     let (root, tracks) = sample_tracks();
     let mut modal = SearchModalState::new(root, tracks);
 
@@ -135,6 +138,7 @@ fn test_fuzzy_search_multi_field_matching() {
 
 #[test]
 fn test_fuzzy_search_query_edits_and_navigation() {
+    common::isolate();
     let (root, tracks) = sample_tracks();
     let mut modal = SearchModalState::new(root, tracks);
 
@@ -169,6 +173,7 @@ fn test_fuzzy_search_query_edits_and_navigation() {
 
 #[test]
 fn test_scoped_directory_scan() {
+    common::isolate();
     let temp_root = std::env::temp_dir().join(format!("quickstream_scan_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_root);
     fs::create_dir_all(&temp_root).unwrap();
@@ -193,7 +198,11 @@ fn test_scoped_directory_scan() {
     fs::write(&txt, b"liner notes").unwrap();
 
     let scanned = LibraryManager::scan_directory_scoped(&temp_root);
-    assert_eq!(scanned.len(), 2, "Should find exactly 2 tracks, ignoring hidden and non-audio files");
+    assert_eq!(
+        scanned.len(),
+        2,
+        "Should find exactly 2 tracks, ignoring hidden and non-audio files"
+    );
 
     let filenames: Vec<String> = scanned.iter().map(|t| t.filename.clone()).collect();
     assert!(filenames.contains(&"track1.wav".to_string()));
@@ -205,6 +214,7 @@ fn test_scoped_directory_scan() {
 
 #[test]
 fn test_multi_token_out_of_order_search() {
+    common::isolate();
     let (root, tracks) = sample_tracks();
     let mut modal = SearchModalState::new(root, tracks);
 
@@ -222,37 +232,31 @@ fn test_multi_token_out_of_order_search() {
 
 #[test]
 fn test_background_streaming_scanner() {
+    common::isolate();
     let root = PathBuf::from("/music");
     let (tx, rx) = std::sync::mpsc::channel();
     let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let mut modal = SearchModalState::new_with_scanner(
-        root.clone(),
-        Vec::new(),
-        Some(rx),
-        Some(stop_flag),
-    );
+    let mut modal = SearchModalState::new_with_scanner(root.clone(), Vec::new(), Some(rx), Some(stop_flag));
 
     assert!(modal.is_scanning);
     assert_eq!(modal.all_tracks.len(), 0);
 
     // Stream first batch
-    let batch1 = vec![
-        AudioMetadata {
-            filepath: root.join("track1.flac"),
-            filename: "track1.flac".to_string(),
-            title: "Track 1".to_string(),
-            artist: "Artist A".to_string(),
-            album: "Album A".to_string(),
-            genre: "Rock".to_string(),
-            format_name: "FLAC".to_string(),
-            duration_seconds: 180.0,
-            file_size: 1000,
-            bitrate_kbps: 900,
-            sample_rate_hz: 44100,
-            channels: 2,
-        },
-    ];
+    let batch1 = vec![AudioMetadata {
+        filepath: root.join("track1.flac"),
+        filename: "track1.flac".to_string(),
+        title: "Track 1".to_string(),
+        artist: "Artist A".to_string(),
+        album: "Album A".to_string(),
+        genre: "Rock".to_string(),
+        format_name: "FLAC".to_string(),
+        duration_seconds: 180.0,
+        file_size: 1000,
+        bitrate_kbps: 900,
+        sample_rate_hz: 44100,
+        channels: 2,
+    }];
     tx.send(batch1).unwrap();
 
     modal.poll_background_scan();
@@ -260,39 +264,46 @@ fn test_background_streaming_scanner() {
     assert!(modal.is_scanning);
 
     // Stream second batch and close sender
-    let batch2 = vec![
-        AudioMetadata {
-            filepath: root.join("track2.flac"),
-            filename: "track2.flac".to_string(),
-            title: "Track 2".to_string(),
-            artist: "Artist B".to_string(),
-            album: "Album B".to_string(),
-            genre: "Jazz".to_string(),
-            format_name: "FLAC".to_string(),
-            duration_seconds: 240.0,
-            file_size: 1500,
-            bitrate_kbps: 900,
-            sample_rate_hz: 44100,
-            channels: 2,
-        },
-    ];
+    let batch2 = vec![AudioMetadata {
+        filepath: root.join("track2.flac"),
+        filename: "track2.flac".to_string(),
+        title: "Track 2".to_string(),
+        artist: "Artist B".to_string(),
+        album: "Album B".to_string(),
+        genre: "Jazz".to_string(),
+        format_name: "FLAC".to_string(),
+        duration_seconds: 240.0,
+        file_size: 1500,
+        bitrate_kbps: 900,
+        sample_rate_hz: 44100,
+        channels: 2,
+    }];
     tx.send(batch2).unwrap();
     drop(tx);
 
     modal.poll_background_scan();
     assert_eq!(modal.all_tracks.len(), 2);
-    assert!(!modal.is_scanning, "Scanner should be marked complete when channel disconnects");
+    assert!(
+        !modal.is_scanning,
+        "Scanner should be marked complete when channel disconnects"
+    );
 }
 
 #[test]
 fn test_large_library_search_performance() {
+    common::isolate();
     let root = PathBuf::from("/large_library");
     let mut large_tracks = Vec::with_capacity(20_000);
 
     // Generate 20,000 synthetic tracks
     for i in 0..20_000 {
         large_tracks.push(AudioMetadata {
-            filepath: root.join(format!("artist_{:04}/album_{:03}/track_{:05}.flac", i % 100, i % 500, i)),
+            filepath: root.join(format!(
+                "artist_{:04}/album_{:03}/track_{:05}.flac",
+                i % 100,
+                i % 500,
+                i
+            )),
             filename: format!("track_{:05}.flac", i),
             title: format!("Song Title {:05}", i),
             artist: format!("Popular Artist {:03}", i % 200),
@@ -319,15 +330,20 @@ fn test_large_library_search_performance() {
     println!("Fuzzy query across 20,000 tracks took: {:?}", search_elapsed);
 
     assert!(!modal.filtered.is_empty());
+    // Shared CI runners are slower and noisier than a dev machine; the CI budget still catches
+    // algorithmic regressions (e.g. quadratic filtering), which cost seconds here.
+    let budget_ms = if std::env::var_os("CI").is_some() { 1000 } else { 250 };
     assert!(
-        search_elapsed.as_millis() < 250,
-        "Search across 20,000 tracks must be fast (<250ms in unoptimized debug, ~11ms in release), took {:?}",
+        search_elapsed.as_millis() < budget_ms,
+        "Search across 20,000 tracks must be fast (<{}ms in unoptimized debug, ~11ms in release), took {:?}",
+        budget_ms,
         search_elapsed
     );
 }
 
 #[test]
 fn test_flutter_vs_future_sound_of_london() {
+    common::isolate();
     let root = PathBuf::from("/Volumes/Music");
     let tracks = vec![
         AudioMetadata {
@@ -364,13 +380,18 @@ fn test_flutter_vs_future_sound_of_london() {
     modal.update_query("flutter".to_string());
 
     // Only Autechre - Flutter should match! The Future Sound of London should NOT match!
-    assert_eq!(modal.filtered.len(), 1, "Should strictly match Flutter and exclude Future Sound of London");
+    assert_eq!(
+        modal.filtered.len(),
+        1,
+        "Should strictly match Flutter and exclude Future Sound of London"
+    );
     assert_eq!(modal.selected_track().unwrap().artist, "Autechre");
     assert_eq!(modal.selected_track().unwrap().title, "Flutter");
 }
 
 #[test]
 fn test_search_modal_paging_and_jumping() {
+    common::isolate();
     let root = PathBuf::from("/music");
     let tracks: Vec<AudioMetadata> = (0..30)
         .map(|i| AudioMetadata {
@@ -422,9 +443,6 @@ fn test_search_modal_paging_and_jumping() {
     assert_eq!(modal.selected_index, 0);
 }
 
-
-
-
 fn streamed_track(root: &Path, i: usize) -> AudioMetadata {
     AudioMetadata {
         filepath: root.join(format!("track{}.flac", i)),
@@ -444,6 +462,7 @@ fn streamed_track(root: &Path, i: usize) -> AudioMetadata {
 
 #[test]
 fn test_streaming_batches_coalesce_filter_updates() {
+    common::isolate();
     let root = PathBuf::from("/music");
     let (tx, rx) = std::sync::mpsc::channel();
     let mut modal = SearchModalState::new_with_scanner(root.clone(), Vec::new(), Some(rx), None);

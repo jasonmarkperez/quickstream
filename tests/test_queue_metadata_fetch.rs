@@ -1,6 +1,8 @@
 //! Queue metadata is resolved at most once per track per session (PR #32 review).
 //!
-//! Own test binary: points XDG dirs at a temp dir for the whole process.
+//! The XDG dirs point at a temp dir for the whole process (`common::isolate()`).
+
+mod common;
 
 use std::time::{Duration, Instant};
 
@@ -29,11 +31,7 @@ fn write_silent_wav(path: &std::path::Path) {
 
 #[test]
 fn test_unresolvable_queue_track_is_read_once_per_session() {
-    let root = std::env::temp_dir().join(format!("qs_queue_meta_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    for var in ["XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"] {
-        std::env::set_var(var, root.join(var.to_lowercase()));
-    }
+    let root = common::isolate();
     // Untagged file directly under a "Music" folder: tags and path heuristics give no artist,
     // so it never leaves the "needs metadata" set.
     let music = root.join("Music");
@@ -55,8 +53,12 @@ fn test_unresolvable_queue_track_is_read_once_per_session() {
         }
     }
 
-    let index = root.join("xdg_cache_home").join("quickstream").join("music_index.jsonl");
+    let index = root.join("cache").join("quickstream").join("music_index.jsonl");
     let lines = std::fs::read_to_string(&index).unwrap_or_default();
     let appended = lines.lines().filter(|l| l.contains("song.wav")).count();
-    assert_eq!(appended, 1, "track was read and appended to the cache {} times", appended);
+    assert_eq!(
+        appended, 1,
+        "track was read and appended to the cache {} times",
+        appended
+    );
 }

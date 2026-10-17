@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -10,6 +12,7 @@ use quickstream::ui::AppUI;
 
 #[test]
 fn test_now_playing_tab_key_navigation() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_np_keys_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -54,6 +57,7 @@ fn test_now_playing_tab_key_navigation() {
 
 #[test]
 fn test_render_now_playing_tab_empty_and_populated() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_np_render_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -71,7 +75,10 @@ fn test_render_now_playing_tab_empty_and_populated() {
 
     let view = terminal.backend().to_string();
     assert!(view.contains("NOW PLAYING"), "Should render NOW PLAYING title in view");
-    assert!(view.contains("No Track Loaded"), "Should render No Track Loaded when queue is empty");
+    assert!(
+        view.contains("No Track Loaded"),
+        "Should render No Track Loaded when queue is empty"
+    );
 
     // 2. Add tracks to queue and render populated hero layout
     let meta1 = AudioMetadata {
@@ -103,19 +110,31 @@ fn test_render_now_playing_tab_empty_and_populated() {
     let view2 = terminal.backend().to_string();
     assert!(view2.contains("Starlight"), "Hero title should appear in render");
     assert!(view2.contains("Muse"), "Hero artist should appear in render");
-    assert!(view2.contains("UP NEXT IN QUEUE"), "Up Next section should appear in render");
+    assert!(
+        view2.contains("UP NEXT IN QUEUE"),
+        "Up Next section should appear in render"
+    );
     assert!(view2.contains("TITLE"), "Table header TITLE should appear in render");
     assert!(view2.contains("ARTIST"), "Table header ARTIST should appear in render");
     assert!(view2.contains("TIME"), "Table header TIME should appear in render");
     assert!(view2.contains("#02"), "Track index #02 should appear in table");
-    assert!(view2.contains("Supermassive Black Hole"), "Next track title should appear in render");
+    assert!(
+        view2.contains("Supermassive Black Hole"),
+        "Next track title should appear in render"
+    );
 
     // 3. Toggle to Filenames mode -> Up Next table shows #, FILE, TIME
     app.settings_mgr.settings.metadata_view = false;
     terminal.draw(|f| app.render(f)).unwrap();
     let view3 = terminal.backend().to_string();
-    assert!(view3.contains("FILE"), "Table header FILE should appear in filename mode");
-    assert!(view3.contains("TIME"), "Table header TIME should appear in filename mode");
+    assert!(
+        view3.contains("FILE"),
+        "Table header FILE should appear in filename mode"
+    );
+    assert!(
+        view3.contains("TIME"),
+        "Table header TIME should appear in filename mode"
+    );
     assert!(view3.contains("song2.flac"), "Filename should appear in table");
 
     let _ = fs::remove_dir_all(&temp_dir);

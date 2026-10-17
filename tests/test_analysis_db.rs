@@ -5,6 +5,8 @@
 //! Every database here lives in a scratch dir under the OS temp dir; nothing touches the
 //! user's real `~/.cache/quickstream/track_analysis.db`.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,6 +54,7 @@ fn sample_track(path: &str) -> TrackFeatures {
 
 #[test]
 fn test_fresh_database_is_migrated_to_current_schema_version() {
+    common::isolate();
     let dir = scratch_dir("fresh");
     let path = dir.join("track_analysis.db");
     let db = AnalysisDatabase::open_at(&path).unwrap();
@@ -65,6 +68,7 @@ fn test_fresh_database_is_migrated_to_current_schema_version() {
 
 #[test]
 fn test_reopening_database_preserves_rows_and_uses_wal() {
+    common::isolate();
     let dir = scratch_dir("reopen");
     let path = dir.join("track_analysis.db");
     {
@@ -85,6 +89,7 @@ fn test_reopening_database_preserves_rows_and_uses_wal() {
 /// unchanged and keep its rows.
 #[test]
 fn test_legacy_v1_database_opens_without_data_loss() {
+    common::isolate();
     let dir = scratch_dir("legacy");
     let path = dir.join("track_analysis.db");
     {
@@ -108,7 +113,9 @@ fn test_legacy_v1_database_opens_without_data_loss() {
     }
 
     let db = AnalysisDatabase::open_at(&path).unwrap();
-    let legacy = db.get_track(Path::new("/music/legacy.flac")).expect("legacy row survives");
+    let legacy = db
+        .get_track(Path::new("/music/legacy.flac"))
+        .expect("legacy row survives");
     assert_eq!(legacy.title, "Legacy");
     assert_eq!(legacy.bpm, Some(124.0));
     drop(db);
@@ -120,6 +127,7 @@ fn test_legacy_v1_database_opens_without_data_loss() {
 /// clear, typed error and left byte-for-byte untouched.
 #[test]
 fn test_database_from_newer_build_is_refused_untouched() {
+    common::isolate();
     let dir = scratch_dir("newer");
     let path = dir.join("track_analysis.db");
     let future = CURRENT_SCHEMA_VERSION + 7;
@@ -143,11 +151,20 @@ fn test_database_from_newer_build_is_refused_untouched() {
     assert_eq!(typed.found, future);
     assert_eq!(typed.supported, CURRENT_SCHEMA_VERSION);
     let msg = err.to_string();
-    assert!(msg.contains(&future.to_string()) && msg.contains("newer"), "unclear error: {msg}");
+    assert!(
+        msg.contains(&future.to_string()) && msg.contains("newer"),
+        "unclear error: {msg}"
+    );
 
     assert_eq!(fs::read(&path).unwrap(), before, "newer database must not be modified");
-    assert!(!table_exists(&path, "track_features"), "no tables may be created in a newer database");
-    assert!(!dir.join("track_analysis.db-wal").exists(), "journal mode must not be switched");
+    assert!(
+        !table_exists(&path, "track_features"),
+        "no tables may be created in a newer database"
+    );
+    assert!(
+        !dir.join("track_analysis.db-wal").exists(),
+        "journal mode must not be switched"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -155,6 +172,7 @@ fn test_database_from_newer_build_is_refused_untouched() {
 /// concurrently without `database is locked` errors.
 #[test]
 fn test_two_handles_on_same_file_can_write_concurrently() {
+    common::isolate();
     let dir = scratch_dir("two_handles");
     let path = dir.join("track_analysis.db");
     let a = AnalysisDatabase::open_at(&path).unwrap();

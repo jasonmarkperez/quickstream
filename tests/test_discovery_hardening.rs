@@ -2,6 +2,8 @@
 //! misbehaving responders. Every server here binds a loopback address; nothing is
 //! sent to the LAN.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,6 +109,7 @@ fn interim_flood(count: usize) -> Vec<u8> {
 /// unbounded recursion.
 #[test]
 fn test_parse_http_response_rejects_interim_flood() {
+    common::isolate();
     let raw = interim_flood(50_000);
     assert!(matches!(parse_http_response(&raw, false), Err(HttpError::Malformed(_))));
     assert!(matches!(parse_http_response(&raw, true), Err(HttpError::Malformed(_))));
@@ -115,6 +118,7 @@ fn test_parse_http_response_rejects_interim_flood() {
 /// A few interim responses before the final one are still skipped.
 #[test]
 fn test_parse_http_response_skips_a_few_interim_responses() {
+    common::isolate();
     let raw = interim_flood(3);
     let resp = parse_http_response(&raw, false).unwrap().unwrap();
     assert_eq!(resp.status, 200);
@@ -127,6 +131,7 @@ fn test_parse_http_response_skips_a_few_interim_responses() {
 /// More than the allowed number of interim responses is an error.
 #[test]
 fn test_parse_http_response_limits_interim_count() {
+    common::isolate();
     assert!(parse_http_response(&interim_flood(8), false).unwrap().is_some());
     assert!(parse_http_response(&interim_flood(9), false).is_err());
 }
@@ -134,6 +139,7 @@ fn test_parse_http_response_limits_interim_count() {
 /// The header section is bounded even while the peer keeps the connection open.
 #[test]
 fn test_parse_http_response_limits_header_section() {
+    common::isolate();
     let mut raw = b"HTTP/1.1 200 OK\r\n".to_vec();
     while raw.len() < 70 * 1024 {
         raw.extend_from_slice(b"X-Filler: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
@@ -153,6 +159,7 @@ fn test_parse_http_response_limits_header_section() {
 /// fail promptly instead of taking the process down.
 #[test]
 fn test_fetch_xml_survives_interim_flood() {
+    common::isolate();
     let server = spawn_server(Arc::new(|s: &mut TcpStream| {
         let _ = s.write_all(&interim_flood(5_000));
     }));
@@ -192,6 +199,7 @@ fn hanging_server() -> LoopbackServer {
 /// overall description deadline.
 #[test]
 fn test_fetch_xml_gives_up_early_without_first_byte() {
+    common::isolate();
     let server = hanging_server();
     let start = Instant::now();
     assert!(fetch_xml(&server.url()).is_none());
@@ -227,13 +235,18 @@ fn repeat_to(parts: &[&str], target_len: usize) -> String {
 /// tags) must be scanned in roughly linear time.
 #[test]
 fn test_extract_xml_tag_is_linear_on_hostile_input() {
+    common::isolate();
     let half = 128 * 1024;
     let mut xml = repeat_to(&["<u:friendlyName>"], half);
     xml.push_str(&repeat_to(&["</a>"], half));
     let start = Instant::now();
     let res = finishes_within(Duration::from_secs(2), move || extract_xml_tag(&xml, "friendlyName"));
     assert_eq!(res, None);
-    assert!(start.elapsed() < Duration::from_millis(500), "took {:?}", start.elapsed());
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "took {:?}",
+        start.elapsed()
+    );
 
     // Unterminated closing tags after a matching opening tag.
     let mut xml = String::from("<u:CurrentVolume>");
@@ -252,6 +265,7 @@ fn test_extract_xml_tag_is_linear_on_hostile_input() {
 
 #[test]
 fn test_extract_xml_tag_behaviour() {
+    common::isolate();
     let x = |xml: &str, tag: &str| extract_xml_tag(xml, tag);
     assert_eq!(x("<a><b> hi </b></a>", "b").as_deref(), Some("hi"));
     assert_eq!(x("<u:b xmlns:u=\"urn:x\">v</u:b>", "b").as_deref(), Some("v"));
@@ -278,6 +292,7 @@ fn test_extract_xml_tag_behaviour() {
 /// SOAP responses are capped at a realistic size.
 #[test]
 fn test_soap_response_size_is_capped() {
+    common::isolate();
     let server = spawn_server(Arc::new(|s: &mut TcpStream| {
         let filler = "x".repeat(200 * 1024);
         let body = format!(
@@ -325,6 +340,7 @@ fn test_soap_response_size_is_capped() {
 /// of waiting on a DNS lookup outside the request deadline.
 #[test]
 fn test_soap_control_url_must_be_ip_literal() {
+    common::isolate();
     let device = DLNADevice {
         friendly_name: "Named".to_string(),
         location: "http://10.0.0.9:49152/desc.xml".to_string(),
@@ -350,6 +366,7 @@ fn test_soap_control_url_must_be_ip_literal() {
 /// The shared HTTP client never resolves host names.
 #[test]
 fn test_http_exchange_rejects_host_names() {
+    common::isolate();
     let deadline = Instant::now() + Duration::from_secs(1);
     let res = http_exchange("renderer.invalid", 80, b"GET / HTTP/1.1\r\n\r\n", deadline, 1024);
     assert!(matches!(res, Err(HttpError::Resolve(_))), "got {:?}", res);
@@ -377,6 +394,7 @@ fn drain(s: &mut FetchScheduler) -> Vec<FetchJob> {
 /// Per-host budgets: concurrency, LOCATIONs per scan, and round-robin across hosts.
 #[test]
 fn test_fetch_scheduler_is_fair_across_hosts() {
+    common::isolate();
     let mut s = FetchScheduler::new(8, 2, 4, 64);
     let mut accepted = 0;
     for i in 0..50 {
@@ -408,6 +426,7 @@ fn test_fetch_scheduler_is_fair_across_hosts() {
 /// still applies.
 #[test]
 fn test_fetch_scheduler_global_limits() {
+    common::isolate();
     let mut s = FetchScheduler::new(3, 2, 4, 5);
     for i in 0..10 {
         s.submit(format!("http://10.0.1.{}/desc.xml", i));
@@ -431,6 +450,7 @@ fn test_fetch_scheduler_global_limits() {
 /// host from being found within the normal post-listen window.
 #[test]
 fn test_one_host_cannot_starve_description_fetches() {
+    common::isolate();
     let Some(real) = spawn_server_on(
         "::1",
         Arc::new(|s: &mut TcpStream| write_xml(s, &renderer_xml("Real Renderer"))),

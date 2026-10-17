@@ -1,5 +1,7 @@
 //! Background worker threads are tracked, stopped and joined on shutdown (issue #5).
 
+mod common;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -48,12 +50,14 @@ fn app_at(dir: &std::path::Path) -> AppUI {
 
 #[test]
 fn test_shutdown_stops_and_joins_every_worker_kind() {
+    common::isolate();
     let root = library("all");
     let mut app = app_at(&root);
 
     app.refresh_browser(); // directory listing thread
     app.start_background_metadata_fetch(vec![root.join("loose.wav")]); // browser tag reader
-    app.queue.add_track(quickstream::metadata::fallback_metadata(&root.join("loose.wav")));
+    app.queue
+        .add_track(quickstream::metadata::fallback_metadata(&root.join("loose.wav")));
     app.start_queue_metadata_fetch(); // persistent 4-thread queue metadata pool
     app.open_fuzzy_search(); // search scanner
     app.start_autopilot(root.clone()); // autopilot scanner
@@ -68,9 +72,11 @@ fn test_shutdown_stops_and_joins_every_worker_kind() {
 
 #[test]
 fn test_shutdown_wait_is_bounded_for_stuck_workers() {
+    common::isolate();
     let root = library("stuck");
     let mut app = app_at(&root);
-    app.workers.spawn("stuck-test", || std::thread::sleep(Duration::from_secs(10)));
+    app.workers
+        .spawn("stuck-test", || std::thread::sleep(Duration::from_secs(10)));
 
     let start = Instant::now();
     let still_running = app.shutdown_workers(Duration::from_millis(200));
@@ -81,6 +87,7 @@ fn test_shutdown_wait_is_bounded_for_stuck_workers() {
 
 #[test]
 fn test_finished_workers_are_reaped() {
+    common::isolate();
     let root = library("reap");
     let mut app = app_at(&root);
     let _ = app.shutdown_workers(Duration::from_secs(2));

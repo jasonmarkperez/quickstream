@@ -1,6 +1,8 @@
 //! The web server listens on loopback unless LAN access is needed (DLNA renderer active or
 //! the "Web Remote Access" setting is set to the network).
 
+mod common;
+
 use quickstream::discovery::DLNADevice;
 use quickstream::settings::SettingsManager;
 use quickstream::ui::AppUI;
@@ -44,6 +46,7 @@ fn app(web_enabled: bool, lan: bool) -> AppUI {
 
 #[test]
 fn test_web_remote_binds_loopback_by_default() {
+    common::isolate();
     let app = app(true, false);
     assert_eq!(app.web_server.as_ref().expect("server running").bind, WebBind::Loopback);
 }
@@ -51,6 +54,7 @@ fn test_web_remote_binds_loopback_by_default() {
 #[test]
 #[ignore = "binds all network interfaces (macOS firewall prompt); run with --include-ignored"]
 fn test_web_remote_binds_lan_when_setting_enabled() {
+    common::isolate();
     let app = app(true, true);
     assert_eq!(app.web_server.as_ref().expect("server running").bind, WebBind::Lan);
 }
@@ -58,6 +62,7 @@ fn test_web_remote_binds_lan_when_setting_enabled() {
 #[test]
 #[ignore = "binds all network interfaces (macOS firewall prompt); run with --include-ignored"]
 fn test_dlna_renderer_switches_server_to_lan_and_back() {
+    common::isolate();
     let mut app = app(true, false);
     app.switch_to_upnp_player(network_renderer());
     assert_eq!(app.web_server.as_ref().unwrap().bind, WebBind::Lan);
@@ -69,8 +74,9 @@ fn test_dlna_renderer_switches_server_to_lan_and_back() {
 #[test]
 #[ignore = "binds all network interfaces (macOS firewall prompt); run with --include-ignored"]
 fn test_lan_request_never_falls_back_to_loopback_on_busy_port() {
-    use std::sync::{mpsc, Arc, RwLock};
+    common::isolate();
     use quickstream::web::{NowPlayingState, WebServer};
+    use std::sync::{mpsc, Arc, RwLock};
 
     // Another app holds *:port. Binding 127.0.0.1:port would still succeed on macOS, which
     // would send renderers' LAN requests to that other app.
@@ -87,6 +93,7 @@ fn test_lan_request_never_falls_back_to_loopback_on_busy_port() {
 
 #[test]
 fn test_switching_back_to_local_keeps_output_status_message() {
+    common::isolate();
     let mut app = app(true, false);
     app.switch_to_upnp_player(fake_renderer());
     app.switch_to_local_player();
@@ -95,14 +102,19 @@ fn test_switching_back_to_local_keeps_output_status_message() {
 
 #[test]
 fn test_creating_app_does_not_start_network_discovery() {
+    common::isolate();
     let app = app(false, false);
     // Discovery runs on a background thread for ~2.5s once started.
     std::thread::sleep(std::time::Duration::from_millis(300));
-    assert!(!app.device_manager.is_scanning(), "discovery must start from run(), not AppUI::new");
+    assert!(
+        !app.device_manager.is_scanning(),
+        "discovery must start from run(), not AppUI::new"
+    );
 }
 
 #[test]
 fn test_renderer_on_this_computer_keeps_server_on_loopback() {
+    common::isolate();
     // A renderer at 127.0.0.1 reaches the stream over loopback; no network exposure needed.
     let mut app = app(true, false);
     app.switch_to_upnp_player(fake_renderer());

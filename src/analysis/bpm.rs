@@ -83,7 +83,13 @@ impl BpmAnalyzer {
 
     /// Perform acoustic onset autocorrelation on a 20-second mono 11.025kHz slice.
     pub fn analyze_acoustic_tempo(path: &Path) -> Option<f64> {
-        let samples = Self::decode_pcm_slice(path, ACOUSTIC_SEEK_SECS, ACOUSTIC_SLICE_SECS, ANALYSIS_SAMPLE_RATE, None)?;
+        let samples = Self::decode_pcm_slice(
+            path,
+            ACOUSTIC_SEEK_SECS,
+            ACOUSTIC_SLICE_SECS,
+            ANALYSIS_SAMPLE_RATE,
+            None,
+        )?;
         Self::compute_bpm_from_samples(&samples, ANALYSIS_SAMPLE_RATE as f32)
     }
 
@@ -133,7 +139,14 @@ impl BpmAnalyzer {
         sample_rate: u32,
         cancel: Option<&AtomicBool>,
     ) -> Option<Vec<f32>> {
-        Self::decode_pcm_slice_with(&FfmpegConfig::default(), path, offset_secs, duration_secs, sample_rate, cancel)
+        Self::decode_pcm_slice_with(
+            &FfmpegConfig::default(),
+            path,
+            offset_secs,
+            duration_secs,
+            sample_rate,
+            cancel,
+        )
     }
 
     /// [`Self::decode_pcm_slice`] using an explicit ffmpeg binary and timeout.
@@ -179,17 +192,28 @@ impl BpmAnalyzer {
         cancel: Option<&AtomicBool>,
     ) -> Option<Vec<f32>> {
         let mut cmd = Command::new(&ffmpeg.binary);
-        cmd.args(["-nostdin", "-ss", &offset_secs.to_string(), "-t", &duration_secs.to_string(), "-i"])
-            .arg(path)
-            .args([
-                "-vn",
-                "-sn",
-                "-ar", &sample_rate.to_string(),
-                "-ac", "1",
-                "-f", "s16le",
-                "-loglevel", "error",
-                "-",
-            ]);
+        cmd.args([
+            "-nostdin",
+            "-ss",
+            &offset_secs.to_string(),
+            "-t",
+            &duration_secs.to_string(),
+            "-i",
+        ])
+        .arg(path)
+        .args([
+            "-vn",
+            "-sn",
+            "-ar",
+            &sample_rate.to_string(),
+            "-ac",
+            "1",
+            "-f",
+            "s16le",
+            "-loglevel",
+            "error",
+            "-",
+        ]);
         let pcm_bytes = Self::run_with_timeout(cmd, ffmpeg.timeout, cancel)?;
         Some(
             pcm_bytes
@@ -467,7 +491,10 @@ mod tests {
     fn test_short_click_track_detected_within_two_bpm() {
         let samples = click_track(128.0, 8.0);
         let detected = BpmAnalyzer::compute_bpm_from_samples(&samples, SR).expect("tempo for 8 s clip");
-        assert!((detected - 128.0).abs() <= 2.0, "128 BPM 8 s clip detected as {detected}");
+        assert!(
+            (detected - 128.0).abs() <= 2.0,
+            "128 BPM 8 s clip detected as {detected}"
+        );
     }
 
     #[test]
@@ -487,6 +514,9 @@ mod tests {
         let r10 = normalized_autocorrelation(&flux, 10);
         let r40 = normalized_autocorrelation(&flux, 40);
         assert!(r10 > 0.0);
-        assert!((r10 - r40).abs() / r10 < 0.05, "r(10)={r10}, r(40)={r40}: biased toward short lags");
+        assert!(
+            (r10 - r40).abs() / r10 < 0.05,
+            "r(10)={r10}, r(40)={r40}: biased toward short lags"
+        );
     }
 }

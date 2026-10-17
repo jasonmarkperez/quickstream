@@ -5,6 +5,8 @@
 //! Distances are measured by queue position (untagged / generic tracks count as tracks), the
 //! rules are hard whenever an eligible candidate exists, and generic artists are exempt.
 
+mod common;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -49,6 +51,7 @@ fn album(t: &AudioMetadata) -> Option<String> {
 
 #[test]
 fn test_cooldown_constants_match_agents_md() {
+    common::isolate();
     assert_eq!(ARTIST_COOLDOWN, 8);
     assert_eq!(ALBUM_COOLDOWN, 12);
 }
@@ -57,6 +60,7 @@ fn test_cooldown_constants_match_agents_md() {
 /// repeat must have 8 other tracks in between (gap >= 9), never only 7.
 #[test]
 fn test_artist_cooldown_with_nine_artists() {
+    common::isolate();
     let db = AnalysisDatabase::open_in_memory().unwrap();
     let artists = ["A", "B", "C", "D", "E", "F", "G", "H", "I"];
     let mut candidates = Vec::new();
@@ -76,9 +80,13 @@ fn test_artist_cooldown_with_nine_artists() {
 /// Same rule with more artists and uneven track counts per artist.
 #[test]
 fn test_artist_cooldown_with_uneven_artist_pools() {
+    common::isolate();
     let db = AnalysisDatabase::open_in_memory().unwrap();
     let mut candidates = Vec::new();
-    for (i, a) in ["Big", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"].iter().enumerate() {
+    for (i, a) in ["Big", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]
+        .iter()
+        .enumerate()
+    {
         let count = if i == 0 { 12 } else { 3 };
         for n in 0..count {
             candidates.push(track(a, &format!("{a} album {n}"), n));
@@ -93,6 +101,7 @@ fn test_artist_cooldown_with_uneven_artist_pools() {
 /// Albums shared by different artists (e.g. compilations) need 12 other tracks in between.
 #[test]
 fn test_album_cooldown_counts_queue_positions() {
+    common::isolate();
     let db = AnalysisDatabase::open_in_memory().unwrap();
     let mut candidates = vec![track("Comp One", "Hits", 1), track("Comp Two", "Hits", 2)];
     for n in 0..14 {
@@ -108,6 +117,7 @@ fn test_album_cooldown_counts_queue_positions() {
 /// mix, not by counting only tagged tracks. Untagged / generic tracks are themselves exempt.
 #[test]
 fn test_untagged_tracks_count_as_positions_and_are_exempt() {
+    common::isolate();
     let db = AnalysisDatabase::open_in_memory().unwrap();
     let mut candidates = vec![track("Solo", "Solo A", 1), track("Solo", "Solo B", 2)];
     for n in 0..9 {
@@ -115,9 +125,17 @@ fn test_untagged_tracks_count_as_positions_and_are_exempt() {
     }
     let mix = DjMixer::sequence_mix(candidates, &db, 11);
     assert_eq!(mix.len(), 11);
-    let solo: Vec<usize> = mix.iter().enumerate().filter(|(_, t)| t.artist == "Solo").map(|(i, _)| i).collect();
+    let solo: Vec<usize> = mix
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.artist == "Solo")
+        .map(|(i, _)| i)
+        .collect();
     assert_eq!(solo.len(), 2);
-    assert!(solo[1] - solo[0] > ARTIST_COOLDOWN, "Solo repeated at positions {solo:?}");
+    assert!(
+        solo[1] - solo[0] > ARTIST_COOLDOWN,
+        "Solo repeated at positions {solo:?}"
+    );
 
     // Untagged tracks are allowed back-to-back.
     let untagged_adjacent = mix.windows(2).any(|w| w[0].artist.is_empty() && w[1].artist.is_empty());
@@ -126,6 +144,7 @@ fn test_untagged_tracks_count_as_positions_and_are_exempt() {
 
 #[test]
 fn test_generic_artists_are_exempt_from_artist_cooldown() {
+    common::isolate();
     let db = AnalysisDatabase::open_in_memory().unwrap();
     let mut candidates = Vec::new();
     for n in 0..4 {
@@ -139,6 +158,7 @@ fn test_generic_artists_are_exempt_from_artist_cooldown() {
 /// The track already sent to the queue occupies position 0 for cooldown purposes.
 #[test]
 fn test_already_queued_track_starts_the_artist_cooldown() {
+    common::isolate();
     let db = AnalysisDatabase::open_in_memory().unwrap();
     let queued = track("Alpha", "Alpha one", 0);
     let mut candidates = vec![track("Alpha", "Alpha two", 1)];
@@ -146,15 +166,23 @@ fn test_already_queued_track_starts_the_artist_cooldown() {
         candidates.push(track(&format!("Other {n}"), &format!("Other album {n}"), n));
     }
     let rest = DjMixer::sequence_mix_after(Some(&queued), candidates, &db, 11);
-    let alpha = rest.iter().position(|t| t.artist == "Alpha").expect("Alpha is still sequenced");
+    let alpha = rest
+        .iter()
+        .position(|t| t.artist == "Alpha")
+        .expect("Alpha is still sequenced");
     // Position in the full queue is alpha + 1 (queued track is position 0).
-    assert!(alpha + 1 > ARTIST_COOLDOWN, "Alpha repeated at queue position {}", alpha + 1);
+    assert!(
+        alpha + 1 > ARTIST_COOLDOWN,
+        "Alpha repeated at queue position {}",
+        alpha + 1
+    );
 }
 
 /// When too few artists exist to honour the cooldown, every candidate is still used and the
 /// mixer spreads repeats as far apart as possible (never back-to-back when avoidable).
 #[test]
 fn test_cooldown_falls_back_gracefully_with_few_artists() {
+    common::isolate();
     let db = AnalysisDatabase::open_in_memory().unwrap();
     let mut candidates = Vec::new();
     for n in 0..5 {
@@ -171,6 +199,7 @@ fn test_cooldown_falls_back_gracefully_with_few_artists() {
 /// The hard artist rule outranks the album rule and BPM/key flow.
 #[test]
 fn test_artist_cooldown_beats_bpm_continuity() {
+    common::isolate();
     use quickstream::analysis::TrackFeatures;
     let db = AnalysisDatabase::open_in_memory().unwrap();
     let with_bpm = |t: &AudioMetadata, bpm: f64| {

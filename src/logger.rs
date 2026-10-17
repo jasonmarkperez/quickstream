@@ -108,7 +108,9 @@ impl Logger {
         if !self.send_control(Msg::Flush(ack_tx), deadline) {
             return false;
         }
-        ack_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).is_ok()
+        ack_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .is_ok()
     }
 
     /// Send a control message, retrying while the queue is full until `deadline`.
@@ -155,7 +157,12 @@ impl LogFile {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let mut file = Self { path, config, out: None, size: 0 };
+        let mut file = Self {
+            path,
+            config,
+            out: None,
+            size: 0,
+        };
         file.reopen();
         file
     }
@@ -281,7 +288,11 @@ pub(crate) fn init_at(log_path: PathBuf) -> PathBuf {
     }
 
     let active = get_log_file_path();
-    log_raw("INFO", "logger", &format!("Logging initialized at {}", active.display()));
+    log_raw(
+        "INFO",
+        "logger",
+        &format!("Logging initialized at {}", active.display()),
+    );
     active
 }
 

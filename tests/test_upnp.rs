@@ -1,3 +1,5 @@
+mod common;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,13 +8,14 @@ use std::time::Duration;
 
 use quickstream::discovery::DLNADevice;
 use quickstream::player::upnp::{
-    create_didl_lite_xml, format_seconds_to_upnp_time, parse_upnp_time_to_seconds,
-    quick_xml_escape, url_decode, url_encode, UPnPClient, UPnPPlayer,
+    create_didl_lite_xml, format_seconds_to_upnp_time, parse_upnp_time_to_seconds, quick_xml_escape, url_decode,
+    url_encode, UPnPClient, UPnPPlayer,
 };
 use quickstream::player::AudioPlayer;
 
 #[test]
 fn test_upnp_time_conversions() {
+    common::isolate();
     assert_eq!(format_seconds_to_upnp_time(0.0), "00:00:00");
     assert_eq!(format_seconds_to_upnp_time(65.0), "00:01:05");
     assert_eq!(format_seconds_to_upnp_time(3665.0), "01:01:05");
@@ -26,12 +29,10 @@ fn test_upnp_time_conversions() {
 
 #[test]
 fn test_upnp_xml_escape_and_url_encoding() {
+    common::isolate();
     let unescaped = "<Rock & Roll \"Greatest\" 'Hits'>";
     let escaped = quick_xml_escape(unescaped);
-    assert_eq!(
-        escaped,
-        "&lt;Rock &amp; Roll &quot;Greatest&quot; &apos;Hits&apos;&gt;"
-    );
+    assert_eq!(escaped, "&lt;Rock &amp; Roll &quot;Greatest&quot; &apos;Hits&apos;&gt;");
 
     let raw = "/Music/Rock & Roll/01. Track.flac";
     let encoded = url_encode(raw);
@@ -44,6 +45,7 @@ fn test_upnp_xml_escape_and_url_encoding() {
 
 #[test]
 fn test_didl_lite_metadata_generation() {
+    common::isolate();
     let xml = create_didl_lite_xml(
         "http://192.168.1.50:8080/stream/song.flac",
         "A Nice Song & Melody",
@@ -71,11 +73,14 @@ fn spawn_mock_upnp_renderer() -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<
 
     let handle = std::thread::spawn(move || {
         while !stop_flag_thread.load(Ordering::SeqCst) {
-            listener
-                .set_nonblocking(true)
-                .expect("set nonblocking");
+            listener.set_nonblocking(true).expect("set nonblocking");
             let stream_opt = match listener.accept() {
-                Ok((s, _)) => Some(s),
+                Ok((s, _)) => {
+                    // On macOS/BSD an accepted socket inherits the listener's non-blocking
+                    // mode; reads must wait for the client's request instead of failing.
+                    s.set_nonblocking(false).expect("set blocking");
+                    Some(s)
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(15));
                     continue;
@@ -84,9 +89,7 @@ fn spawn_mock_upnp_renderer() -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<
             };
 
             if let Some(mut stream) = stream_opt {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut request_line = String::new();
                 if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
@@ -154,6 +157,7 @@ fn spawn_mock_upnp_renderer() -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<
 
 #[test]
 fn test_upnp_client_soap_methods() {
+    common::isolate();
     let (port, stop_flag, handle) = spawn_mock_upnp_renderer();
 
     let device = DLNADevice {
@@ -211,6 +215,7 @@ fn test_upnp_client_soap_methods() {
 
 #[test]
 fn test_upnp_player_audio_player_trait_lifecycle() {
+    common::isolate();
     let (port, stop_flag, handle) = spawn_mock_upnp_renderer();
 
     let device = DLNADevice {
@@ -273,6 +278,7 @@ fn test_upnp_player_audio_player_trait_lifecycle() {
 
 #[test]
 fn test_upnp_player_seek_mode_not_supported_fallback() {
+    common::isolate();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock renderer");
     let port = listener.local_addr().unwrap().port();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -284,7 +290,12 @@ fn test_upnp_player_seek_mode_not_supported_fallback() {
         while !stop_flag_thread.load(Ordering::SeqCst) {
             listener.set_nonblocking(true).expect("set nonblocking");
             let stream_opt = match listener.accept() {
-                Ok((s, _)) => Some(s),
+                Ok((s, _)) => {
+                    // On macOS/BSD an accepted socket inherits the listener's non-blocking
+                    // mode; reads must wait for the client's request instead of failing.
+                    s.set_nonblocking(false).expect("set blocking");
+                    Some(s)
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(15));
                     continue;
@@ -383,7 +394,11 @@ fn test_upnp_player_seek_mode_not_supported_fallback() {
 
     // Perform seek_to(45.0) which fails with 710 on SOAP Seek, triggering reload
     let seek_res = player.seek_to(45.0);
-    assert!(seek_res.is_ok(), "seek_to should succeed via stream offset fallback: {:?}", seek_res);
+    assert!(
+        seek_res.is_ok(),
+        "seek_to should succeed via stream offset fallback: {:?}",
+        seek_res
+    );
 
     // Verify URI was reloaded with ?pos=45.00
     let reloaded_uri = last_set_uri.lock().unwrap().clone();
@@ -404,6 +419,7 @@ fn test_upnp_player_seek_mode_not_supported_fallback() {
 
 #[test]
 fn test_upnp_player_pause_resume_after_seek() {
+    common::isolate();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock renderer");
     let port = listener.local_addr().unwrap().port();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -419,7 +435,12 @@ fn test_upnp_player_pause_resume_after_seek() {
         while !stop_flag_thread.load(Ordering::SeqCst) {
             listener.set_nonblocking(true).expect("set nonblocking");
             let stream_opt = match listener.accept() {
-                Ok((s, _)) => Some(s),
+                Ok((s, _)) => {
+                    // On macOS/BSD an accepted socket inherits the listener's non-blocking
+                    // mode; reads must wait for the client's request instead of failing.
+                    s.set_nonblocking(false).expect("set blocking");
+                    Some(s)
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(15));
                     continue;
@@ -551,7 +572,10 @@ fn test_upnp_player_pause_resume_after_seek() {
 
     // Wait past poller tick: renderer is STOPPED, but player is paused -> must NOT be finished!
     std::thread::sleep(Duration::from_millis(1100));
-    assert!(!player.is_track_finished(), "Poller must not mark track finished while paused!");
+    assert!(
+        !player.is_track_finished(),
+        "Poller must not mark track finished while paused!"
+    );
 
     // 4. Resume playback:
     // Renderer is STOPPED (and would return 701 on direct Play);
@@ -575,6 +599,7 @@ fn test_upnp_player_pause_resume_after_seek() {
 
 #[test]
 fn test_upnp_player_with_stream_server_state_socket_closure_and_registration() {
+    common::isolate();
     let (port, stop_flag, handle) = spawn_mock_upnp_renderer();
 
     let device = DLNADevice {
@@ -590,8 +615,7 @@ fn test_upnp_player_with_stream_server_state_socket_closure_and_registration() {
     };
 
     let stream_state = Arc::new(quickstream::web::StreamServerState::new());
-    let mut player = UPnPPlayer::new(device, 8080)
-        .with_stream_state(Some(stream_state.clone()));
+    let mut player = UPnPPlayer::new(device, 8080).with_stream_state(Some(stream_state.clone()));
 
     // Create a dummy audio file
     let temp_file = std::env::temp_dir().join("test_registered_upnp.mp3");
@@ -626,6 +650,7 @@ fn test_upnp_player_with_stream_server_state_socket_closure_and_registration() {
 
 #[test]
 fn test_upnp_player_auto_advance_when_renderer_resets_rel_time_on_stop() {
+    common::isolate();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock renderer");
     let port = listener.local_addr().unwrap().port();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -639,7 +664,12 @@ fn test_upnp_player_auto_advance_when_renderer_resets_rel_time_on_stop() {
         while !stop_flag_thread.load(Ordering::SeqCst) {
             listener.set_nonblocking(true).expect("set nonblocking");
             let stream_opt = match listener.accept() {
-                Ok((s, _)) => Some(s),
+                Ok((s, _)) => {
+                    // On macOS/BSD an accepted socket inherits the listener's non-blocking
+                    // mode; reads must wait for the client's request instead of failing.
+                    s.set_nonblocking(false).expect("set blocking");
+                    Some(s)
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(15));
                     continue;
@@ -684,7 +714,7 @@ fn test_upnp_player_auto_advance_when_renderer_resets_rel_time_on_stop() {
                         format!(
                             r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetTransportInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><CurrentTransportState>{}</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed></u:GetTransportInfoResponse></s:Body></s:Envelope>"#,
                             st
-                        )
+                        ),
                     )
                 } else if soap_action.contains("GetPositionInfo") {
                     let rel = current_rel_time_thread.lock().unwrap().clone();
@@ -693,7 +723,7 @@ fn test_upnp_player_auto_advance_when_renderer_resets_rel_time_on_stop() {
                         format!(
                             r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetPositionInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><TrackDuration>00:03:00</TrackDuration><RelTime>{}</RelTime></u:GetPositionInfoResponse></s:Body></s:Envelope>"#,
                             rel
-                        )
+                        ),
                     )
                 } else {
                     ("HTTP/1.1 200 OK", r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:SuccessResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1" /></s:Body></s:Envelope>"#.to_string())
@@ -731,8 +761,8 @@ fn test_upnp_player_auto_advance_when_renderer_resets_rel_time_on_stop() {
     assert!(player.is_playing());
     assert!(!player.is_track_finished());
 
-    // Wait past one poller tick (900ms) for player to query position at 175s
-    std::thread::sleep(Duration::from_millis(1100));
+    // Wait for a poller tick (every 900ms) to report position 175s.
+    wait_until(|| player.position_seconds() == 175.0);
     assert_eq!(player.position_seconds(), 175.0);
     assert!(player.is_playing());
     assert!(!player.is_track_finished());
@@ -741,15 +771,18 @@ fn test_upnp_player_auto_advance_when_renderer_resets_rel_time_on_stop() {
     *current_state.lock().unwrap() = "STOPPED".to_string();
     *current_rel_time.lock().unwrap() = "00:00:00".to_string();
 
-    // Wait for the next poller tick to detect completion
-    std::thread::sleep(Duration::from_millis(1100));
+    // Wait for a poller tick to detect completion.
+    wait_until(|| player.is_track_finished());
 
     // Player must detect that track finished playing!
     assert!(
         player.is_track_finished(),
         "Track finish must be detected even when RelTime is reset to 00:00:00!"
     );
-    assert!(!player.is_playing(), "Player must not be marked as playing once track finished");
+    assert!(
+        !player.is_playing(),
+        "Player must not be marked as playing once track finished"
+    );
     // Position must be clamped to duration (180s), NOT 0.0s
     assert_eq!(
         player.position_seconds(),
@@ -770,6 +803,7 @@ fn test_upnp_player_auto_advance_when_renderer_resets_rel_time_on_stop() {
 
 #[test]
 fn test_upnp_player_stopped_early_does_not_auto_advance() {
+    common::isolate();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock renderer");
     let port = listener.local_addr().unwrap().port();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -783,7 +817,12 @@ fn test_upnp_player_stopped_early_does_not_auto_advance() {
         while !stop_flag_thread.load(Ordering::SeqCst) {
             listener.set_nonblocking(true).expect("set nonblocking");
             let stream_opt = match listener.accept() {
-                Ok((s, _)) => Some(s),
+                Ok((s, _)) => {
+                    // On macOS/BSD an accepted socket inherits the listener's non-blocking
+                    // mode; reads must wait for the client's request instead of failing.
+                    s.set_nonblocking(false).expect("set blocking");
+                    Some(s)
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(15));
                     continue;
@@ -828,7 +867,7 @@ fn test_upnp_player_stopped_early_does_not_auto_advance() {
                         format!(
                             r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetTransportInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><CurrentTransportState>{}</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed></u:GetTransportInfoResponse></s:Body></s:Envelope>"#,
                             st
-                        )
+                        ),
                     )
                 } else if soap_action.contains("GetPositionInfo") {
                     let rel = current_rel_time_thread.lock().unwrap().clone();
@@ -837,7 +876,7 @@ fn test_upnp_player_stopped_early_does_not_auto_advance() {
                         format!(
                             r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetPositionInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><TrackDuration>00:03:00</TrackDuration><RelTime>{}</RelTime></u:GetPositionInfoResponse></s:Body></s:Envelope>"#,
                             rel
-                        )
+                        ),
                     )
                 } else {
                     ("HTTP/1.1 200 OK", r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:SuccessResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1" /></s:Body></s:Envelope>"#.to_string())
@@ -873,8 +912,8 @@ fn test_upnp_player_stopped_early_does_not_auto_advance() {
 
     assert!(player.play(&temp_file).is_ok());
 
-    // Wait past one poller tick (900ms) for player to query position at 30s
-    std::thread::sleep(Duration::from_millis(1100));
+    // Wait for a poller tick (every 900ms) to report position 30s.
+    wait_until(|| player.position_seconds() == 30.0);
     assert_eq!(player.position_seconds(), 30.0);
 
     // Renderer stops early (at 30s)
@@ -899,6 +938,7 @@ fn test_upnp_player_stopped_early_does_not_auto_advance() {
 
 #[test]
 fn test_upnp_client_play_retries_on_action_failed() {
+    common::isolate();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock renderer");
     let port = listener.local_addr().unwrap().port();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -910,7 +950,12 @@ fn test_upnp_client_play_retries_on_action_failed() {
         while !stop_flag_thread.load(Ordering::SeqCst) {
             listener.set_nonblocking(true).expect("set nonblocking");
             let stream_opt = match listener.accept() {
-                Ok((s, _)) => Some(s),
+                Ok((s, _)) => {
+                    // On macOS/BSD an accepted socket inherits the listener's non-blocking
+                    // mode; reads must wait for the client's request instead of failing.
+                    s.set_nonblocking(false).expect("set blocking");
+                    Some(s)
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(15));
                     continue;
@@ -992,8 +1037,15 @@ fn test_upnp_client_play_retries_on_action_failed() {
     };
 
     let client = UPnPClient::new(device);
-    assert!(client.play("1"), "Play must succeed after retrying on 501 Action Failed");
-    assert_eq!(play_attempts.load(Ordering::SeqCst), 3, "Play should have retried and succeeded on attempt 3");
+    assert!(
+        client.play("1"),
+        "Play must succeed after retrying on 501 Action Failed"
+    );
+    assert_eq!(
+        play_attempts.load(Ordering::SeqCst),
+        3,
+        "Play should have retried and succeeded on attempt 3"
+    );
 
     stop_flag.store(true, Ordering::SeqCst);
     let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
@@ -1002,6 +1054,7 @@ fn test_upnp_client_play_retries_on_action_failed() {
 
 #[test]
 fn test_upnp_player_play_at_starts_directly_with_pos_offset() {
+    common::isolate();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock renderer");
     let port = listener.local_addr().unwrap().port();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -1013,7 +1066,12 @@ fn test_upnp_player_play_at_starts_directly_with_pos_offset() {
         while !stop_flag_thread.load(Ordering::SeqCst) {
             listener.set_nonblocking(true).expect("set nonblocking");
             let stream_opt = match listener.accept() {
-                Ok((s, _)) => Some(s),
+                Ok((s, _)) => {
+                    // On macOS/BSD an accepted socket inherits the listener's non-blocking
+                    // mode; reads must wait for the client's request instead of failing.
+                    s.set_nonblocking(false).expect("set blocking");
+                    Some(s)
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(15));
                     continue;
@@ -1089,7 +1147,11 @@ fn test_upnp_player_play_at_starts_directly_with_pos_offset() {
     assert!(player.is_playing());
 
     let uri = last_set_uri.lock().unwrap().clone();
-    assert!(uri.contains("?pos=4.67"), "URI must directly include ?pos=4.67 on initial handoff, got: {}", uri);
+    assert!(
+        uri.contains("?pos=4.67"),
+        "URI must directly include ?pos=4.67 on initial handoff, got: {}",
+        uri
+    );
 
     let _ = player.stop();
     let _ = std::fs::remove_file(temp_file);
@@ -1098,9 +1160,9 @@ fn test_upnp_player_play_at_starts_directly_with_pos_offset() {
     let _ = handle.join();
 }
 
-
 #[test]
 fn test_upnp_player_detached_from_stream_state_does_not_close_shared_streams() {
+    common::isolate();
     use std::sync::atomic::Ordering;
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = closed.local_addr().unwrap().port();
@@ -1129,4 +1191,13 @@ fn test_upnp_player_detached_from_stream_state_does_not_close_shared_streams() {
         shared.continuous.is_active.load(Ordering::SeqCst),
         "a retired player must not close the streams of the new renderer"
     );
+}
+
+/// Poll `cond` until it holds or 5s pass. Poller ticks are 900ms apart but SOAP round-trips
+/// take longer on loaded CI runners, so fixed one-tick sleeps are not enough.
+fn wait_until(mut cond: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !cond() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

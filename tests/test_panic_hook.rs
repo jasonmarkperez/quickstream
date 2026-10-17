@@ -2,12 +2,15 @@
 //!
 //! Own test binary: it replaces the process-wide panic hook.
 
+mod common;
+
 use std::sync::{Arc, Mutex};
 
 use quickstream::ui;
 
 #[test]
 fn test_panic_hook_restores_terminal_before_printing_message() {
+    common::isolate();
     let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let (restore_log, prev_log) = (events.clone(), events.clone());
 
@@ -28,11 +31,15 @@ fn test_panic_hook_restores_terminal_before_printing_message() {
     std::panic::set_hook(original);
 
     assert!(result.is_err());
-    assert_eq!(*events.lock().unwrap(), vec!["restore".to_string(), "prev: boom".to_string()]);
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["restore".to_string(), "prev: boom".to_string()]
+    );
 }
 
 #[test]
 fn test_restore_terminal_is_noop_when_tui_never_started() {
+    common::isolate();
     assert!(!ui::restore_terminal());
     assert!(!ui::restore_terminal());
 }

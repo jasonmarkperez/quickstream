@@ -1,12 +1,12 @@
 //! Intelligent Mix Engine: sequences tracks into cohesive mixes using tempo, harmonic keys, and mood.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
 
-use crate::metadata::AudioMetadata;
 use super::db::{AnalysisDatabase, TrackFeatures};
 use super::harmonic::{CamelotKey, MusicalKey};
+use crate::metadata::AudioMetadata;
 
 /// After a real artist plays, this many following tracks must be by other artists.
 pub const ARTIST_COOLDOWN: usize = 8;
@@ -22,10 +22,10 @@ fn camelot_of(feat: Option<&TrackFeatures>) -> Option<CamelotKey> {
 /// Mood presets for intelligent vibe mixes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MoodType {
-    Chill,     // Ambient, downtempo, acoustic, classical, lofi (60-95 BPM, low energy)
-    Workout,   // Electronic, rock, dance, hip-hop (125-140 BPM, high energy)
-    Focus,     // Instrumental, synthwave, minimalist, piano
-    Groove,    // Funk, soul, disco, house (115-128 BPM)
+    Chill,   // Ambient, downtempo, acoustic, classical, lofi (60-95 BPM, low energy)
+    Workout, // Electronic, rock, dance, hip-hop (125-140 BPM, high energy)
+    Focus,   // Instrumental, synthwave, minimalist, piano
+    Groove,  // Funk, soul, disco, house (115-128 BPM)
 }
 
 impl MoodType {
@@ -99,38 +99,98 @@ impl MoodType {
         match self {
             MoodType::Chill => {
                 let chill_terms = [
-                    "chill", "ambient", "downtempo", "lofi", "lo-fi", "acoustic",
-                    "classical", "meditation", "sleep", "drone", "trip hop", "trip-hop",
-                    "idm", "easy listening", "new age", "relax", "mellow", "piano",
-                    "peaceful", "soft", "calm", "zen",
+                    "chill",
+                    "ambient",
+                    "downtempo",
+                    "lofi",
+                    "lo-fi",
+                    "acoustic",
+                    "classical",
+                    "meditation",
+                    "sleep",
+                    "drone",
+                    "trip hop",
+                    "trip-hop",
+                    "idm",
+                    "easy listening",
+                    "new age",
+                    "relax",
+                    "mellow",
+                    "piano",
+                    "peaceful",
+                    "soft",
+                    "calm",
+                    "zen",
                 ];
                 let energy_ok = energy.map(|e| e <= 0.50).unwrap_or(false);
                 bpm_ok && (has_term(&chill_terms) || energy_ok)
             }
             MoodType::Workout => {
                 let workout_terms = [
-                    "dance", "electronic", "rock", "house", "techno", "upbeat",
-                    "workout", "fitness", "metal", "drum and bass", "dnb", "trance",
-                    "edm", "hip hop", "hip-hop", "rap", "punk", "hardcore", "club",
-                    "gym", "fast", "party",
+                    "dance",
+                    "electronic",
+                    "rock",
+                    "house",
+                    "techno",
+                    "upbeat",
+                    "workout",
+                    "fitness",
+                    "metal",
+                    "drum and bass",
+                    "dnb",
+                    "trance",
+                    "edm",
+                    "hip hop",
+                    "hip-hop",
+                    "rap",
+                    "punk",
+                    "hardcore",
+                    "club",
+                    "gym",
+                    "fast",
+                    "party",
                 ];
                 let energy_ok = energy.map(|e| e >= 0.65).unwrap_or(false);
                 bpm_ok && (has_term(&workout_terms) || energy_ok)
             }
             MoodType::Focus => {
                 let focus_terms = [
-                    "instrumental", "piano", "soundtrack", "synthwave", "minimal",
-                    "minimalist", "ambient", "classical", "study", "post-rock",
-                    "score", "film score", "neo-classical", "electronic", "meditation",
+                    "instrumental",
+                    "piano",
+                    "soundtrack",
+                    "synthwave",
+                    "minimal",
+                    "minimalist",
+                    "ambient",
+                    "classical",
+                    "study",
+                    "post-rock",
+                    "score",
+                    "film score",
+                    "neo-classical",
+                    "electronic",
+                    "meditation",
                 ];
                 let energy_ok = energy.map(|e| e <= 0.60).unwrap_or(false);
                 has_term(&focus_terms) || energy_ok
             }
             MoodType::Groove => {
                 let groove_terms = [
-                    "funk", "soul", "disco", "groove", "r&b", "rhythm and blues",
-                    "house", "boogie", "nu-disco", "motown", "afrobeat", "jazz-funk",
-                    "acid jazz", "dance", "funky",
+                    "funk",
+                    "soul",
+                    "disco",
+                    "groove",
+                    "r&b",
+                    "rhythm and blues",
+                    "house",
+                    "boogie",
+                    "nu-disco",
+                    "motown",
+                    "afrobeat",
+                    "jazz-funk",
+                    "acid jazz",
+                    "dance",
+                    "funky",
                 ];
                 bpm_ok && has_term(&groove_terms)
             }
@@ -384,9 +444,11 @@ mod tests {
         // Verify no consecutive identical artists
         for i in 1..mix.len() {
             assert_ne!(
-                mix[i].artist, mix[i - 1].artist,
+                mix[i].artist,
+                mix[i - 1].artist,
                 "Consecutive tracks must not be by the same artist (track {} and {})",
-                i - 1, i
+                i - 1,
+                i
             );
         }
     }

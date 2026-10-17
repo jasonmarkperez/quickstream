@@ -23,8 +23,7 @@ walkdir = "2.5"
 ratatui = "0.29"
 crossterm = "0.28"
 
-# Interactive Fuzzy Finding & Live Previews (modeled on mpv-music)
-skim = "0.10"
+# In-app fuzzy search (`f` modal)
 fuzzy-matcher = "0.3"
 
 # CLI Parsing (modeled on mpv-music)

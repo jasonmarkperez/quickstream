@@ -1,16 +1,17 @@
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use quickstream::discovery::{
-    discover_devices, fetch_device_descriptions, fetch_xml, ssdp_location_for_sender,
-};
+use quickstream::discovery::{discover_devices, fetch_device_descriptions, fetch_xml, ssdp_location_for_sender};
 
 #[test]
 #[ignore = "real SSDP scan on the local network (macOS firewall prompt); run with --include-ignored"]
 fn test_discover_devices_real() {
+    common::isolate();
     let devices = discover_devices(Duration::from_millis(3000));
     println!("Found {} devices:", devices.len());
     for d in &devices {
@@ -101,6 +102,7 @@ fn write_xml(s: &mut TcpStream, xml: &str) {
 /// A device that trickles its description must not hold discovery past a fixed deadline.
 #[test]
 fn test_fetch_xml_has_overall_deadline() {
+    common::isolate();
     let server = spawn_desc_server(Arc::new(|s: &mut TcpStream| {
         let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\n\r\n<root>");
         for _ in 0..60 {
@@ -120,6 +122,7 @@ fn test_fetch_xml_has_overall_deadline() {
 /// Description bodies are capped (~256 KB) so a responder cannot exhaust memory.
 #[test]
 fn test_fetch_xml_rejects_oversized_body() {
+    common::isolate();
     let server = spawn_desc_server(Arc::new(|s: &mut TcpStream| {
         let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nConnection: close\r\n\r\n<root>");
         let filler = vec![b' '; 64 * 1024];
@@ -130,12 +133,16 @@ fn test_fetch_xml_rejects_oversized_body() {
         }
         let _ = s.write_all(b"</root>");
     }));
-    assert!(fetch_xml(&server.url()).is_none(), "a 2 MB description must be rejected");
+    assert!(
+        fetch_xml(&server.url()).is_none(),
+        "a 2 MB description must be rejected"
+    );
 }
 
 /// Chunked descriptions are decoded.
 #[test]
 fn test_fetch_xml_decodes_chunked_body() {
+    common::isolate();
     let xml = renderer_xml("Chunky");
     let xml_t = xml.clone();
     let server = spawn_desc_server(Arc::new(move |s: &mut TcpStream| {
@@ -154,6 +161,7 @@ fn test_fetch_xml_decodes_chunked_body() {
 
 #[test]
 fn test_ssdp_location_must_match_sender_ip() {
+    common::isolate();
     let resp = "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\nLOCATION: http://192.168.1.50:49152/desc.xml\r\nST: upnp:rootdevice\r\n\r\n";
     let sender: IpAddr = "192.168.1.50".parse().unwrap();
     assert_eq!(
@@ -187,6 +195,7 @@ fn delayed_renderer(name: &'static str, delay: Duration) -> DescServer {
 /// Descriptions are fetched concurrently, and results keep submission order.
 #[test]
 fn test_fetch_device_descriptions_runs_in_parallel() {
+    common::isolate();
     let names = ["Alpha", "Bravo", "Charlie", "Delta"];
     let servers: Vec<DescServer> = names
         .iter()
@@ -207,6 +216,7 @@ fn test_fetch_device_descriptions_runs_in_parallel() {
 /// Concurrency is bounded.
 #[test]
 fn test_fetch_device_descriptions_bounds_concurrency() {
+    common::isolate();
     let servers: Vec<DescServer> = ["A", "B", "C", "D"]
         .iter()
         .map(|n| delayed_renderer(n, Duration::from_millis(500)))
@@ -216,13 +226,18 @@ fn test_fetch_device_descriptions_bounds_concurrency() {
     let devices = fetch_device_descriptions(&urls, 2, Duration::from_secs(3));
     let elapsed = start.elapsed();
     assert_eq!(devices.len(), 4);
-    assert!(elapsed >= Duration::from_millis(1000), "2 at a time needs two rounds, took {:?}", elapsed);
+    assert!(
+        elapsed >= Duration::from_millis(1000),
+        "2 at a time needs two rounds, took {:?}",
+        elapsed
+    );
     assert!(elapsed < Duration::from_millis(2500), "took {:?}", elapsed);
 }
 
 /// One stalled device does not delay the others beyond its own fetch timeout.
 #[test]
 fn test_fetch_device_descriptions_slow_device_does_not_block_others() {
+    common::isolate();
     let stalled = spawn_desc_server(Arc::new(|s: &mut TcpStream| {
         let _ = s.write_all(b"HTTP/1.1 200 OK\r\n");
         std::thread::sleep(Duration::from_secs(6));
@@ -239,6 +254,7 @@ fn test_fetch_device_descriptions_slow_device_does_not_block_others() {
 
 #[test]
 fn test_fetch_xml_plain_body() {
+    common::isolate();
     let xml = renderer_xml("Plain");
     let xml_t = xml.clone();
     let server = spawn_desc_server(Arc::new(move |s: &mut TcpStream| write_xml(s, &xml_t)));

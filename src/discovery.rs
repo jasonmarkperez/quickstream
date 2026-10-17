@@ -55,7 +55,13 @@ pub fn get_local_ip_for_target(target_host: &str, target_port: u16) -> String {
         }
     }
     // Fallback probes to common gateway destinations
-    for probe in ["192.168.1.1:80", "192.168.0.1:80", "10.0.0.1:80", "8.8.8.8:80", "1.1.1.1:80"] {
+    for probe in [
+        "192.168.1.1:80",
+        "192.168.0.1:80",
+        "10.0.0.1:80",
+        "8.8.8.8:80",
+        "1.1.1.1:80",
+    ] {
         if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
             if socket.connect(probe).is_ok() {
                 if let Ok(local_addr) = socket.local_addr() {
@@ -211,7 +217,10 @@ impl HttpResponse {
 pub enum HttpError {
     Resolve(String),
     Connect(String),
-    Io { kind: std::io::ErrorKind, message: String },
+    Io {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
     /// The overall deadline passed before a complete response arrived.
     DeadlineExceeded,
     /// The response grew past the byte limit.
@@ -281,8 +290,7 @@ pub fn decode_chunked(data: &[u8]) -> Result<Option<Vec<u8>>, String> {
         };
         let line = String::from_utf8_lossy(&data[pos..line_end]);
         let size_str = line.trim_end_matches('\r').split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_str, 16)
-            .map_err(|_| format!("invalid chunk size '{}'", size_str))?;
+        let size = usize::from_str_radix(size_str, 16).map_err(|_| format!("invalid chunk size '{}'", size_str))?;
         pos = line_end + 1;
         if size == 0 {
             // Trailers (if any) carry nothing we need.
@@ -325,7 +333,13 @@ fn find_header_end(buf: &[u8], start: usize) -> Option<(usize, usize)> {
     let crlf = window.windows(4).position(|w| w == b"\r\n\r\n").map(|p| (p, 4));
     let lf = window.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2));
     let (pos, len) = match (crlf, lf) {
-        (Some(a), Some(b)) => if a.0 <= b.0 { a } else { b },
+        (Some(a), Some(b)) => {
+            if a.0 <= b.0 {
+                a
+            } else {
+                b
+            }
+        }
         (Some(a), None) => a,
         (None, Some(b)) => b,
         (None, None) => return None,
@@ -475,9 +489,9 @@ pub fn http_exchange_with_first_byte_deadline(
     let first_byte_deadline = first_byte_deadline.min(deadline);
     // Only IP literals are accepted: a DNS lookup cannot be bounded by the deadline,
     // and device descriptions and SSDP replies use addresses anyway.
-    let ip: IpAddr = host.parse().map_err(|_| {
-        HttpError::Resolve(format!("{}:{}: host is not an IP address", host, port))
-    })?;
+    let ip: IpAddr = host
+        .parse()
+        .map_err(|_| HttpError::Resolve(format!("{}:{}: host is not an IP address", host, port)))?;
     let addr = SocketAddr::new(ip, port);
     let mut stream = TcpStream::connect_timeout(&addr, remaining_until(first_byte_deadline)?)
         .map_err(|e| HttpError::Connect(format!("{}: {}", addr, e)))?;
@@ -517,9 +531,7 @@ pub fn http_exchange_with_first_byte_deadline(
                 buf.extend_from_slice(&chunk[..n]);
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e)
-                if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) =>
-            {
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
                 if Instant::now() >= read_deadline {
                     return Err(HttpError::DeadlineExceeded);
                 }
@@ -902,8 +914,8 @@ pub fn parse_device_description(xml_data: &str, location_url: &str) -> Option<DL
         (host_port, 80)
     };
 
-    let friendly_name = extract_xml_tag(xml_data, "friendlyName")
-        .unwrap_or_else(|| format!("MediaRenderer ({})", host));
+    let friendly_name =
+        extract_xml_tag(xml_data, "friendlyName").unwrap_or_else(|| format!("MediaRenderer ({})", host));
     let manufacturer = extract_xml_tag(xml_data, "manufacturer").unwrap_or_default();
     let model_name = extract_xml_tag(xml_data, "modelName").unwrap_or_default();
     let udn = extract_xml_tag(xml_data, "UDN").unwrap_or_default();
@@ -1136,8 +1148,14 @@ mod tests {
         assert_eq!(dev.friendly_name, "Living Room Stereo");
         assert_eq!(dev.manufacturer, "Primare");
         assert_eq!(dev.model_name, "I15 Prisma");
-        assert_eq!(dev.av_transport_control_url, "http://192.168.1.50:8000/AVTransport/control");
-        assert_eq!(dev.rendering_control_url, "http://192.168.1.50:8000/RenderingControl/control");
+        assert_eq!(
+            dev.av_transport_control_url,
+            "http://192.168.1.50:8000/AVTransport/control"
+        );
+        assert_eq!(
+            dev.rendering_control_url,
+            "http://192.168.1.50:8000/RenderingControl/control"
+        );
         assert_eq!(dev.display_label(), "Living Room Stereo [Primare, I15 Prisma]");
     }
 }

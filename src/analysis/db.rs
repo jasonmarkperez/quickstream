@@ -1,11 +1,11 @@
 //! SQLite storage for track features, acoustic metrics, and mix vectors.
 //! Strictly isolated inside ~/.cache/quickstream/track_analysis.db (never touches user library).
 
+use rusqlite::{params, Connection, Result, TransactionBehavior};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use rusqlite::{params, Connection, Result, TransactionBehavior};
-use serde::{Deserialize, Serialize};
 
 /// Current database schema version (tracked via PRAGMA user_version).
 /// Always equal to `MIGRATIONS.len()` (checked at compile time below).
@@ -89,10 +89,10 @@ pub struct TrackFeatures {
     pub bpm: Option<f64>,
     pub initial_key: Option<String>,
     pub camelot_key: Option<String>,
-    pub energy: Option<f64>,        // 0.0 (very low energy / ambient) to 1.0 (very energetic / peak)
+    pub energy: Option<f64>, // 0.0 (very low energy / ambient) to 1.0 (very energetic / peak)
     pub loudness_lufs: Option<f64>, // Integrated LUFS
-    pub mood: Option<String>,       // "chill", "workout", "focus", "groove"
-    pub tags_json: String,          // JSON array of community / style tags
+    pub mood: Option<String>, // "chill", "workout", "focus", "groove"
+    pub tags_json: String,   // JSON array of community / style tags
     pub analyzed_at: u64,
 }
 
@@ -280,15 +280,17 @@ impl AnalysisDatabase {
     pub fn get_track(&self, path: &Path) -> Option<TrackFeatures> {
         let conn = self.conn.lock().unwrap();
         let path_str = path.to_string_lossy().to_string();
-        let mut stmt = conn.prepare(
-            r#"
+        let mut stmt = conn
+            .prepare(
+                r#"
             SELECT filepath, mtime, file_size, title, artist, album, genre,
                    year, bpm, initial_key, camelot_key, energy, loudness_lufs,
                    mood, tags_json, analyzed_at
             FROM track_features
             WHERE filepath = ?1
             "#,
-        ).ok()?;
+            )
+            .ok()?;
 
         stmt.query_row(params![path_str], |row| {
             Ok(TrackFeatures {
@@ -309,7 +311,8 @@ impl AnalysisDatabase {
                 tags_json: row.get(14)?,
                 analyzed_at: row.get::<_, i64>(15)? as u64,
             })
-        }).ok()
+        })
+        .ok()
     }
 
     /// Query tracks by tempo / BPM window.
@@ -477,7 +480,11 @@ mod tests {
         drop(AnalysisDatabase::open_at(&path).unwrap()); // creates + migrates
 
         let reopened = AnalysisDatabase::open_at(&path).unwrap(); // no migration runs now
-        assert_eq!(pragma_i64(&reopened, "synchronous"), 1, "synchronous must be NORMAL (1)");
+        assert_eq!(
+            pragma_i64(&reopened, "synchronous"),
+            1,
+            "synchronous must be NORMAL (1)"
+        );
         assert_eq!(pragma_i64(&reopened, "busy_timeout"), BUSY_TIMEOUT.as_millis() as i64);
         let mode: String = reopened
             .conn
@@ -523,7 +530,10 @@ mod tests {
         assert_eq!(count(&conn, "step_two"), 0, "partial step must not be left behind");
 
         // Re-running resumes from the recorded version rather than replaying step 1.
-        let fixed: &[&str] = &["CREATE TABLE step_one (x INTEGER);", "CREATE TABLE step_two (y INTEGER);"];
+        let fixed: &[&str] = &[
+            "CREATE TABLE step_one (x INTEGER);",
+            "CREATE TABLE step_two (y INTEGER);",
+        ];
         apply_migrations(&mut conn, fixed, ":memory:").unwrap();
         let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(version, 2);

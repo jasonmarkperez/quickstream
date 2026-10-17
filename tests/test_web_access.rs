@@ -1,6 +1,8 @@
 //! Access control for the embedded web server: session token for network peers, Host check
 //! for loopback peers, CSRF checks on state-changing requests, and folder restrictions.
 
+mod common;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpStream};
@@ -16,16 +18,6 @@ use quickstream::web_access::{
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const PORT: u16 = 8080;
-
-/// Point the config dir at a temp folder before anything loads the web token, so tests never
-/// create `web_token` in the developer's real ~/.config/quickstream.
-fn isolate_config() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let dir = std::env::temp_dir().join(format!("qs_web_access_cfg_{}", std::process::id()));
-        std::env::set_var("XDG_CONFIG_HOME", dir);
-    });
-}
 
 fn lan_peer() -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))
@@ -53,23 +45,40 @@ fn lan_host() -> String {
 
 #[test]
 fn test_remote_dashboard_without_token_is_unauthorized() {
+    common::isolate();
     let h = headers(&[&lan_host()]);
-    assert_eq!(authorize(lan_peer(), PORT, "GET", "/", &h, TOKEN), AuthDecision::Unauthorized);
-    assert_eq!(authorize(lan_peer(), PORT, "GET", "/index.html", &h, TOKEN), AuthDecision::Unauthorized);
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", "/", &h, TOKEN),
+        AuthDecision::Unauthorized
+    );
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", "/index.html", &h, TOKEN),
+        AuthDecision::Unauthorized
+    );
 }
 
 #[test]
 fn test_remote_api_without_token_is_unauthorized() {
+    common::isolate();
     let h = headers(&[&lan_host()]);
     for path in ["/api/status", "/api/browser?path=/", "/api/cover", "/favicon.ico"] {
-        assert_eq!(authorize(lan_peer(), PORT, "GET", path, &h, TOKEN), AuthDecision::Unauthorized, "{}", path);
+        assert_eq!(
+            authorize(lan_peer(), PORT, "GET", path, &h, TOKEN),
+            AuthDecision::Unauthorized,
+            "{}",
+            path
+        );
     }
     let post = headers(&[&lan_host(), "Content-Type: application/json"]);
-    assert_eq!(authorize(lan_peer(), PORT, "POST", "/api/action", &post, TOKEN), AuthDecision::Unauthorized);
+    assert_eq!(
+        authorize(lan_peer(), PORT, "POST", "/api/action", &post, TOKEN),
+        AuthDecision::Unauthorized
+    );
 }
 
 #[test]
 fn test_remote_pairing_link_with_valid_token_pairs() {
+    common::isolate();
     let h = headers(&[&lan_host()]);
     let path = format!("/?token={}", TOKEN);
     assert_eq!(authorize(lan_peer(), PORT, "GET", &path, &h, TOKEN), AuthDecision::Pair);
@@ -77,151 +86,274 @@ fn test_remote_pairing_link_with_valid_token_pairs() {
 
 #[test]
 fn test_remote_pairing_link_with_wrong_token_is_unauthorized() {
+    common::isolate();
     let h = headers(&[&lan_host()]);
     let wrong = "/?token=ffffffffffffffffffffffffffffffff";
-    assert_eq!(authorize(lan_peer(), PORT, "GET", wrong, &h, TOKEN), AuthDecision::Unauthorized);
-    assert_eq!(authorize(lan_peer(), PORT, "GET", "/?token=", &h, TOKEN), AuthDecision::Unauthorized);
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", wrong, &h, TOKEN),
+        AuthDecision::Unauthorized
+    );
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", "/?token=", &h, TOKEN),
+        AuthDecision::Unauthorized
+    );
     // A prefix of the real token must not match.
     let prefix = format!("/?token={}", &TOKEN[..16]);
-    assert_eq!(authorize(lan_peer(), PORT, "GET", &prefix, &h, TOKEN), AuthDecision::Unauthorized);
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", &prefix, &h, TOKEN),
+        AuthDecision::Unauthorized
+    );
 }
 
 #[test]
 fn test_remote_token_in_query_of_api_does_not_authorize() {
+    common::isolate();
     // The query token only pairs the dashboard; API calls need the cookie or bearer header.
     let h = headers(&[&lan_host()]);
     let path = format!("/api/status?token={}", TOKEN);
-    assert_eq!(authorize(lan_peer(), PORT, "GET", &path, &h, TOKEN), AuthDecision::Unauthorized);
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", &path, &h, TOKEN),
+        AuthDecision::Unauthorized
+    );
 }
 
 #[test]
 fn test_remote_cookie_token_is_accepted() {
+    common::isolate();
     let cookie = format!("Cookie: theme=dark; qs_token_{}={}; other=1", PORT, TOKEN);
     let h = headers(&[&lan_host(), &cookie]);
     assert_eq!(authorize(lan_peer(), PORT, "GET", "/", &h, TOKEN), AuthDecision::Allow);
-    assert_eq!(authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN), AuthDecision::Allow);
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+        AuthDecision::Allow
+    );
 }
 
 #[test]
 fn test_session_cookie_is_scoped_to_the_server_port() {
+    common::isolate();
     // Cookies are shared by every port on a host, so the cookie name carries the port.
     let unscoped = format!("Cookie: qs_token={}", TOKEN);
     let other_port = format!("Cookie: qs_token_9999={}", TOKEN);
     for cookie in [unscoped, other_port] {
         let h = headers(&[&lan_host(), &cookie]);
-        assert_eq!(authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN), AuthDecision::Unauthorized, "{}", cookie);
+        assert_eq!(
+            authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+            AuthDecision::Unauthorized,
+            "{}",
+            cookie
+        );
     }
     assert_eq!(quickstream::web_access::token_cookie_name(8080), "qs_token_8080");
 }
 
 #[test]
 fn test_remote_bearer_token_is_accepted() {
+    common::isolate();
     let auth = format!("Authorization: Bearer {}", TOKEN);
     let h = headers(&[&lan_host(), &auth]);
-    assert_eq!(authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN), AuthDecision::Allow);
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+        AuthDecision::Allow
+    );
 }
 
 #[test]
 fn test_remote_wrong_cookie_or_bearer_is_unauthorized() {
-    let h = headers(&[&lan_host(), &format!("Cookie: qs_token_{}=ffffffffffffffffffffffffffffffff", PORT)]);
-    assert_eq!(authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN), AuthDecision::Unauthorized);
+    common::isolate();
+    let h = headers(&[
+        &lan_host(),
+        &format!("Cookie: qs_token_{}=ffffffffffffffffffffffffffffffff", PORT),
+    ]);
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+        AuthDecision::Unauthorized
+    );
     let h = headers(&[&lan_host(), "Authorization: Bearer nope"]);
-    assert_eq!(authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN), AuthDecision::Unauthorized);
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+        AuthDecision::Unauthorized
+    );
     // A cookie whose name merely ends in the session cookie name is not the session cookie.
     let h = headers(&[&lan_host(), &format!("Cookie: xqs_token_{}={}", PORT, TOKEN)]);
-    assert_eq!(authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN), AuthDecision::Unauthorized);
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+        AuthDecision::Unauthorized
+    );
 }
 
 #[test]
 fn test_remote_stream_requests_need_no_token() {
+    common::isolate();
     // DLNA renderers cannot authenticate; /stream only serves registered files.
     let h = headers(&[&lan_host()]);
-    assert_eq!(authorize(lan_peer(), PORT, "GET", "/stream/song.flac", &h, TOKEN), AuthDecision::Allow);
-    assert_eq!(authorize(lan_peer(), PORT, "HEAD", "/stream/song.flac", &h, TOKEN), AuthDecision::Allow);
-    assert_eq!(authorize(lan_peer(), PORT, "GET", "/stream/continuous.wav", &h, TOKEN), AuthDecision::Allow);
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", "/stream/song.flac", &h, TOKEN),
+        AuthDecision::Allow
+    );
+    assert_eq!(
+        authorize(lan_peer(), PORT, "HEAD", "/stream/song.flac", &h, TOKEN),
+        AuthDecision::Allow
+    );
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", "/stream/continuous.wav", &h, TOKEN),
+        AuthDecision::Allow
+    );
     // Only /stream/... paths are exempt.
-    assert_eq!(authorize(lan_peer(), PORT, "GET", "/streamx", &h, TOKEN), AuthDecision::Unauthorized);
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", "/streamx", &h, TOKEN),
+        AuthDecision::Unauthorized
+    );
 }
 
 #[test]
 fn test_remote_post_requires_json_content_type() {
+    common::isolate();
     let cookie = format!("Cookie: qs_token_{}={}", PORT, TOKEN);
     let h = headers(&[&lan_host(), &cookie, "Content-Type: text/plain"]);
-    assert!(matches!(authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN), AuthDecision::Forbidden(_)));
+    assert!(matches!(
+        authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        AuthDecision::Forbidden(_)
+    ));
     let h = headers(&[&lan_host(), &cookie]);
-    assert!(matches!(authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN), AuthDecision::Forbidden(_)));
+    assert!(matches!(
+        authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        AuthDecision::Forbidden(_)
+    ));
     let h = headers(&[&lan_host(), &cookie, "Content-Type: application/json; charset=utf-8"]);
-    assert_eq!(authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN), AuthDecision::Allow);
+    assert_eq!(
+        authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        AuthDecision::Allow
+    );
 }
 
 #[test]
 fn test_remote_post_with_foreign_origin_is_forbidden() {
+    common::isolate();
     let cookie = format!("Cookie: qs_token_{}={}", PORT, TOKEN);
-    let h = headers(&[&lan_host(), &cookie, "Content-Type: application/json", "Origin: http://evil.example"]);
-    assert!(matches!(authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN), AuthDecision::Forbidden(_)));
+    let h = headers(&[
+        &lan_host(),
+        &cookie,
+        "Content-Type: application/json",
+        "Origin: http://evil.example",
+    ]);
+    assert!(matches!(
+        authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        AuthDecision::Forbidden(_)
+    ));
     let h = headers(&[&lan_host(), &cookie, "Content-Type: application/json", "Origin: null"]);
-    assert!(matches!(authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN), AuthDecision::Forbidden(_)));
+    assert!(matches!(
+        authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        AuthDecision::Forbidden(_)
+    ));
     let origin = format!("Origin: http://192.168.1.10:{}", PORT);
     let h = headers(&[&lan_host(), &cookie, "Content-Type: application/json", &origin]);
-    assert_eq!(authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN), AuthDecision::Allow);
+    assert_eq!(
+        authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        AuthDecision::Allow
+    );
 }
 
 #[test]
 fn test_loopback_needs_no_token_but_requires_loopback_host() {
+    common::isolate();
     for host in ["127.0.0.1", "localhost", "LOCALHOST", "[::1]"] {
         let h = headers(&[&format!("Host: {}:{}", host, PORT)]);
-        assert_eq!(authorize(loopback_peer(), PORT, "GET", "/api/status", &h, TOKEN), AuthDecision::Allow, "{}", host);
+        assert_eq!(
+            authorize(loopback_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+            AuthDecision::Allow,
+            "{}",
+            host
+        );
     }
     // DNS rebinding: an attacker's name resolving to 127.0.0.1.
     let h = headers(&[&format!("Host: rebind.evil.example:{}", PORT)]);
-    assert!(matches!(authorize(loopback_peer(), PORT, "GET", "/api/status", &h, TOKEN), AuthDecision::Forbidden(_)));
-    assert!(matches!(authorize(loopback_peer(), PORT, "GET", "/", &h, TOKEN), AuthDecision::Forbidden(_)));
+    assert!(matches!(
+        authorize(loopback_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+        AuthDecision::Forbidden(_)
+    ));
+    assert!(matches!(
+        authorize(loopback_peer(), PORT, "GET", "/", &h, TOKEN),
+        AuthDecision::Forbidden(_)
+    ));
     // Wrong port and missing Host are rejected too.
     let h = headers(&["Host: 127.0.0.1:9999"]);
-    assert!(matches!(authorize(loopback_peer(), PORT, "GET", "/api/status", &h, TOKEN), AuthDecision::Forbidden(_)));
+    assert!(matches!(
+        authorize(loopback_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+        AuthDecision::Forbidden(_)
+    ));
     let h = headers(&[]);
-    assert!(matches!(authorize(loopback_peer(), PORT, "GET", "/api/status", &h, TOKEN), AuthDecision::Forbidden(_)));
+    assert!(matches!(
+        authorize(loopback_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+        AuthDecision::Forbidden(_)
+    ));
 }
 
 #[test]
 fn test_loopback_post_requires_json_and_same_origin() {
+    common::isolate();
     let host = format!("Host: 127.0.0.1:{}", PORT);
     let h = headers(&[&host, "Content-Type: text/plain"]);
-    assert!(matches!(authorize(loopback_peer(), PORT, "POST", "/api/action", &h, TOKEN), AuthDecision::Forbidden(_)));
+    assert!(matches!(
+        authorize(loopback_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        AuthDecision::Forbidden(_)
+    ));
     let h = headers(&[&host, "Content-Type: application/json", "Origin: http://evil.example"]);
-    assert!(matches!(authorize(loopback_peer(), PORT, "POST", "/api/action", &h, TOKEN), AuthDecision::Forbidden(_)));
+    assert!(matches!(
+        authorize(loopback_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        AuthDecision::Forbidden(_)
+    ));
     let origin = format!("Origin: http://127.0.0.1:{}", PORT);
     let h = headers(&[&host, "Content-Type: application/json", &origin]);
-    assert_eq!(authorize(loopback_peer(), PORT, "POST", "/api/action", &h, TOKEN), AuthDecision::Allow);
+    assert_eq!(
+        authorize(loopback_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        AuthDecision::Allow
+    );
     let h = headers(&[&host, "Content-Type: application/json"]);
-    assert_eq!(authorize(loopback_peer(), PORT, "POST", "/api/action", &h, TOKEN), AuthDecision::Allow);
+    assert_eq!(
+        authorize(loopback_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        AuthDecision::Allow
+    );
 }
 
 #[test]
 fn test_loopback_stream_requires_loopback_host() {
+    common::isolate();
     // DNS rebinding: a page on a foreign name that resolves to 127.0.0.1 must not read streams.
     for path in ["/stream/a.mp3", "/stream/continuous.wav"] {
         for method in ["GET", "HEAD"] {
             let h = headers(&[&format!("Host: evil.example:{}", PORT)]);
             assert!(
-                matches!(authorize(loopback_peer(), PORT, method, path, &h, TOKEN), AuthDecision::Forbidden(_)),
+                matches!(
+                    authorize(loopback_peer(), PORT, method, path, &h, TOKEN),
+                    AuthDecision::Forbidden(_)
+                ),
                 "{} {}",
                 method,
                 path
             );
             let h = headers(&[]);
-            assert!(matches!(authorize(loopback_peer(), PORT, method, path, &h, TOKEN), AuthDecision::Forbidden(_)));
+            assert!(matches!(
+                authorize(loopback_peer(), PORT, method, path, &h, TOKEN),
+                AuthDecision::Forbidden(_)
+            ));
         }
     }
     // A renderer on this computer addressing the server by its loopback address still works.
     for host in ["127.0.0.1", "localhost", "[::1]"] {
         let h = headers(&[&format!("Host: {}:{}", host, PORT)]);
-        assert_eq!(authorize(loopback_peer(), PORT, "GET", "/stream/a.mp3", &h, TOKEN), AuthDecision::Allow, "{}", host);
+        assert_eq!(
+            authorize(loopback_peer(), PORT, "GET", "/stream/a.mp3", &h, TOKEN),
+            AuthDecision::Allow,
+            "{}",
+            host
+        );
     }
 }
 
 #[test]
 fn test_loopback_server_rejects_foreign_host_on_stream_routes() {
+    common::isolate();
     let dir = temp_dir("streamhost");
     let song = dir.join("song.mp3");
     fs::write(&song, vec![0u8; 2048]).unwrap();
@@ -231,7 +363,10 @@ fn test_loopback_server_rejects_foreign_host_on_stream_routes() {
     let port = handle.port;
     let (status, _, body) = raw_request(
         port,
-        &format!("GET /stream/song.mp3 HTTP/1.1\r\nHost: evil.example:{}\r\nConnection: close\r\n\r\n", port),
+        &format!(
+            "GET /stream/song.mp3 HTTP/1.1\r\nHost: evil.example:{}\r\nConnection: close\r\n\r\n",
+            port
+        ),
     );
     assert_eq!(status, 403);
     assert!(body.len() < 100, "no audio may be served: {} bytes", body.len());
@@ -243,9 +378,13 @@ fn test_loopback_server_rejects_foreign_host_on_stream_routes() {
 
 #[test]
 fn test_ipv4_mapped_loopback_peer_counts_as_loopback() {
+    common::isolate();
     let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
     let h = headers(&[&format!("Host: localhost:{}", PORT)]);
-    assert_eq!(authorize(mapped, PORT, "GET", "/api/status", &h, TOKEN), AuthDecision::Allow);
+    assert_eq!(
+        authorize(mapped, PORT, "GET", "/api/status", &h, TOKEN),
+        AuthDecision::Allow
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -262,6 +401,7 @@ fn temp_dir(name: &str) -> PathBuf {
 
 #[test]
 fn test_token_is_created_persisted_and_private() {
+    common::isolate();
     let dir = temp_dir("token");
     let path = dir.join("nested").join("web_token");
     let token = load_or_create_token(&path).expect("create token");
@@ -287,6 +427,7 @@ fn test_token_is_created_persisted_and_private() {
 
 #[test]
 fn test_invalid_token_file_is_replaced() {
+    common::isolate();
     let dir = temp_dir("badtoken");
     let path = dir.join("web_token");
     fs::write(&path, "short").unwrap();
@@ -302,6 +443,7 @@ fn test_invalid_token_file_is_replaced() {
 
 #[test]
 fn test_resolve_allowed_path_accepts_only_paths_inside_roots() {
+    common::isolate();
     let dir = temp_dir("roots");
     let music = dir.join("Music");
     let outside = dir.join("Private");
@@ -311,7 +453,10 @@ fn test_resolve_allowed_path_accepts_only_paths_inside_roots() {
     let roots = vec![music.clone()];
 
     assert_eq!(resolve_allowed_path(&music, &roots), Some(music.clone()));
-    assert_eq!(resolve_allowed_path(&music.join("Album"), &roots), Some(music.join("Album")));
+    assert_eq!(
+        resolve_allowed_path(&music.join("Album"), &roots),
+        Some(music.join("Album"))
+    );
     assert_eq!(resolve_allowed_path(&outside, &roots), None);
     assert_eq!(resolve_allowed_path(Path::new("/"), &roots), None);
     // Traversal out of a root.
@@ -329,7 +474,10 @@ fn test_resolve_allowed_path_accepts_only_paths_inside_roots() {
         // A symlink inside a root that points outside it is rejected.
         std::os::unix::fs::symlink(&outside, music.join("escape")).unwrap();
         assert_eq!(resolve_allowed_path(&music.join("escape"), &roots), None);
-        assert_eq!(resolve_allowed_path(&music.join("escape").join("secret.mp3"), &roots), None);
+        assert_eq!(
+            resolve_allowed_path(&music.join("escape").join("secret.mp3"), &roots),
+            None
+        );
     }
     let _ = fs::remove_dir_all(&dir);
 }
@@ -341,7 +489,11 @@ fn test_resolve_allowed_path_accepts_only_paths_inside_roots() {
 fn parse_http_response(raw: &[u8]) -> (u16, String, Vec<u8>) {
     let header_end = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(raw.len());
     let header_str = String::from_utf8_lossy(&raw[..header_end]).to_string();
-    let body = if header_end + 4 <= raw.len() { raw[header_end + 4..].to_vec() } else { Vec::new() };
+    let body = if header_end + 4 <= raw.len() {
+        raw[header_end + 4..].to_vec()
+    } else {
+        Vec::new()
+    };
     let status_code = header_str
         .lines()
         .next()
@@ -361,7 +513,13 @@ fn raw_request(port: u16, req: &str) -> (u16, String, Vec<u8>) {
 }
 
 fn get(port: u16, path: &str) -> (u16, String, Vec<u8>) {
-    raw_request(port, &format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", path, port))
+    raw_request(
+        port,
+        &format!(
+            "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            path, port
+        ),
+    )
 }
 
 fn post_with(port: u16, extra_headers: &str, body: &str) -> (u16, String, Vec<u8>) {
@@ -382,7 +540,6 @@ fn post_json(port: u16, body: &str) -> (u16, String, Vec<u8>) {
 }
 
 fn start(state: Arc<RwLock<NowPlayingState>>) -> (quickstream::web::WebServerHandle, mpsc::Receiver<WebCommand>) {
-    isolate_config();
     let (tx, rx) = mpsc::channel();
     let handle = WebServer::start(0, state, tx).expect("start web server");
     (handle, rx)
@@ -390,11 +547,15 @@ fn start(state: Arc<RwLock<NowPlayingState>>) -> (quickstream::web::WebServerHan
 
 #[test]
 fn test_loopback_server_rejects_foreign_host_header() {
+    common::isolate();
     let (handle, _rx) = start(Arc::new(RwLock::new(NowPlayingState::default())));
     let port = handle.port;
     let (status, _, body) = raw_request(
         port,
-        &format!("GET /api/status HTTP/1.1\r\nHost: rebind.evil.example:{}\r\nConnection: close\r\n\r\n", port),
+        &format!(
+            "GET /api/status HTTP/1.1\r\nHost: rebind.evil.example:{}\r\nConnection: close\r\n\r\n",
+            port
+        ),
     );
     assert_eq!(status, 403);
     assert!(!String::from_utf8_lossy(&body).contains("is_playing"));
@@ -405,6 +566,7 @@ fn test_loopback_server_rejects_foreign_host_header() {
 
 #[test]
 fn test_loopback_server_rejects_cross_site_style_posts() {
+    common::isolate();
     let (handle, rx) = start(Arc::new(RwLock::new(NowPlayingState::default())));
     let port = handle.port;
 
@@ -421,10 +583,16 @@ fn test_loopback_server_rejects_cross_site_style_posts() {
         r#"{"action":"next"}"#,
     );
     assert_eq!(status, 403);
-    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "rejected requests must not dispatch commands");
+    assert!(
+        rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "rejected requests must not dispatch commands"
+    );
 
     // Same-origin dashboard request goes through.
-    let origin = format!("Content-Type: application/json\r\nOrigin: http://127.0.0.1:{}\r\n", port);
+    let origin = format!(
+        "Content-Type: application/json\r\nOrigin: http://127.0.0.1:{}\r\n",
+        port
+    );
     let (status, _, _) = post_with(port, &origin, r#"{"action":"next"}"#);
     assert_eq!(status, 200);
     assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::Next);
@@ -433,6 +601,7 @@ fn test_loopback_server_rejects_cross_site_style_posts() {
 
 #[test]
 fn test_responses_do_not_allow_cross_origin_reads() {
+    common::isolate();
     let dir = temp_dir("cors");
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
     state.write().unwrap().allowed_roots = vec![dir.clone()];
@@ -441,7 +610,12 @@ fn test_responses_do_not_allow_cross_origin_reads() {
     for path in ["/", "/api/status", "/api/cover", "/api/browser"] {
         let (status, headers, _) = get(port, path);
         assert_eq!(status, 200, "{}", path);
-        assert!(!headers.to_lowercase().contains("access-control-allow-origin"), "{}: {}", path, headers);
+        assert!(
+            !headers.to_lowercase().contains("access-control-allow-origin"),
+            "{}: {}",
+            path,
+            headers
+        );
     }
     let (_, headers, _) = post_json(port, r#"{"action":"next"}"#);
     assert!(!headers.to_lowercase().contains("access-control-allow-origin"));
@@ -451,6 +625,7 @@ fn test_responses_do_not_allow_cross_origin_reads() {
 
 #[test]
 fn test_dashboard_forbids_framing() {
+    common::isolate();
     let (handle, _rx) = start(Arc::new(RwLock::new(NowPlayingState::default())));
     let (status, headers, _) = get(handle.port, "/");
     assert_eq!(status, 200);
@@ -460,6 +635,7 @@ fn test_dashboard_forbids_framing() {
 
 #[test]
 fn test_loopback_dashboard_ignores_query_strings() {
+    common::isolate();
     let (handle, _rx) = start(Arc::new(RwLock::new(NowPlayingState::default())));
     let port = handle.port;
     for path in ["/?token=bad", "/?foo", "/index.html?x=1", "/#top"] {
@@ -472,17 +648,25 @@ fn test_loopback_dashboard_ignores_query_strings() {
 
 #[test]
 fn test_pairing_link_sets_session_cookie_and_redirects() {
-    isolate_config();
+    common::isolate();
     let token = quickstream::web_access::web_token();
     let (handle, _rx) = start(Arc::new(RwLock::new(NowPlayingState::default())));
     let (status, headers, _) = get(handle.port, &format!("/?token={}", token));
     assert_eq!(status, 303);
-    assert!(headers.contains("Location: /\r\n") || headers.ends_with("Location: /"), "{}", headers);
+    assert!(
+        headers.contains("Location: /\r\n") || headers.ends_with("Location: /"),
+        "{}",
+        headers
+    );
     let cookie_line = headers
         .lines()
         .find(|l| l.to_lowercase().starts_with("set-cookie:"))
         .expect("Set-Cookie header");
-    assert!(cookie_line.contains(&format!("qs_token_{}={}", handle.port, token)), "{}", cookie_line);
+    assert!(
+        cookie_line.contains(&format!("qs_token_{}={}", handle.port, token)),
+        "{}",
+        cookie_line
+    );
     assert!(cookie_line.contains("HttpOnly"));
     assert!(cookie_line.contains("SameSite=Strict"));
     assert!(cookie_line.contains("Path=/"));
@@ -491,6 +675,7 @@ fn test_pairing_link_sets_session_cookie_and_redirects() {
 
 #[test]
 fn test_browser_api_rejects_paths_outside_allowed_roots() {
+    common::isolate();
     let dir = temp_dir("browse");
     let music = dir.join("Music");
     fs::create_dir_all(music.join("Rock")).unwrap();
@@ -541,6 +726,7 @@ fn test_browser_api_rejects_paths_outside_allowed_roots() {
 
 #[test]
 fn test_browser_api_without_roots_never_lists_process_directory() {
+    common::isolate();
     let (handle, _rx) = start(Arc::new(RwLock::new(NowPlayingState::default())));
     let (status, _, _) = get(handle.port, "/api/browser");
     assert_eq!(status, 403);
@@ -549,6 +735,7 @@ fn test_browser_api_without_roots_never_lists_process_directory() {
 
 #[test]
 fn test_path_commands_outside_roots_are_rejected() {
+    common::isolate();
     let dir = temp_dir("cmds");
     let music = dir.join("Music");
     fs::create_dir_all(music.join("Album")).unwrap();
@@ -564,7 +751,15 @@ fn test_path_commands_outside_roots_are_rejected() {
     let json_path = |p: &Path| serde_json::to_string(&p.to_string_lossy()).unwrap();
 
     let outside_file = private.join("b.mp3");
-    for action in ["add_file", "add_track", "add_folder", "set_home", "autopilot", "autopilot_reshuffle", "seed_radio"] {
+    for action in [
+        "add_file",
+        "add_track",
+        "add_folder",
+        "set_home",
+        "autopilot",
+        "autopilot_reshuffle",
+        "seed_radio",
+    ] {
         let target = if action.contains("file") || action.contains("track") || action == "seed_radio" {
             outside_file.clone()
         } else {
@@ -581,28 +776,58 @@ fn test_path_commands_outside_roots_are_rejected() {
 
     // Inside the roots the commands carry the resolved path.
     let inside_file = music.join("Album").join("a.mp3");
-    let (status, _, _) = post_json(port, &format!(r#"{{"action":"add_file","path":{}}}"#, json_path(&inside_file)));
+    let (status, _, _) = post_json(
+        port,
+        &format!(r#"{{"action":"add_file","path":{}}}"#, json_path(&inside_file)),
+    );
     assert_eq!(status, 200);
-    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::AddFile(inside_file.clone()));
-    let (status, _, _) = post_json(port, &format!(r#"{{"action":"add_folder","path":{}}}"#, json_path(&music.join("Album"))));
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        WebCommand::AddFile(inside_file.clone())
+    );
+    let (status, _, _) = post_json(
+        port,
+        &format!(
+            r#"{{"action":"add_folder","path":{}}}"#,
+            json_path(&music.join("Album"))
+        ),
+    );
     assert_eq!(status, 200);
-    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::AddFolder(music.join("Album")));
-    let (status, _, _) = post_json(port, &format!(r#"{{"action":"set_home","path":{}}}"#, json_path(&music)));
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        WebCommand::AddFolder(music.join("Album"))
+    );
+    let (status, _, _) = post_json(
+        port,
+        &format!(r#"{{"action":"set_home","path":{}}}"#, json_path(&music)),
+    );
     assert_eq!(status, 200);
     assert_eq!(
         rx.recv_timeout(Duration::from_secs(1)).unwrap(),
         WebCommand::SetHome(Some(music.to_string_lossy().to_string()))
     );
-    let (status, _, _) = post_json(port, &format!(r#"{{"action":"seed_radio","path":{}}}"#, json_path(&inside_file)));
+    let (status, _, _) = post_json(
+        port,
+        &format!(r#"{{"action":"seed_radio","path":{}}}"#, json_path(&inside_file)),
+    );
     assert_eq!(status, 200);
-    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::SeedRadio(inside_file));
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        WebCommand::SeedRadio(inside_file)
+    );
     // Path-less variants still work.
     let (status, _, _) = post_json(port, r#"{"action":"autopilot"}"#);
     assert_eq!(status, 200);
-    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::Autopilot(None));
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        WebCommand::Autopilot(None)
+    );
     let (status, _, _) = post_json(port, r#"{"action":"set_home"}"#);
     assert_eq!(status, 200);
-    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::SetHome(None));
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        WebCommand::SetHome(None)
+    );
 
     handle.stop();
     let _ = fs::remove_dir_all(&dir);
@@ -623,6 +848,7 @@ fn web_app(start_dir: PathBuf, home: Option<String>) -> quickstream::ui::AppUI {
 
 #[test]
 fn test_app_publishes_allowed_roots_to_web_state() {
+    common::isolate();
     let dir = temp_dir("approots");
     let launch = dir.join("Launch");
     let home = dir.join("Home");
@@ -647,6 +873,7 @@ fn test_app_publishes_allowed_roots_to_web_state() {
 
 #[test]
 fn test_filesystem_root_and_home_are_never_allowed_roots() {
+    common::isolate();
     let dir = temp_dir("broadroots");
     let home = dir.join("home").join("me");
     let music = home.join("Music");
@@ -667,7 +894,10 @@ fn test_filesystem_root_and_home_are_never_allowed_roots() {
         // A root that is a symlink to / grants nothing.
         let link = dir.join("everything");
         std::os::unix::fs::symlink("/", &link).unwrap();
-        assert_eq!(resolve_allowed_path(Path::new("/etc"), &[link.clone()]), None);
+        assert_eq!(
+            resolve_allowed_path(Path::new("/etc"), std::slice::from_ref(&link)),
+            None
+        );
         assert_eq!(resolve_allowed_path(&music, &[link]), None);
     }
     let _ = fs::remove_dir_all(&dir);
@@ -675,15 +905,22 @@ fn test_filesystem_root_and_home_are_never_allowed_roots() {
 
 #[test]
 fn test_app_never_publishes_root_or_home_as_allowed_roots() {
+    common::isolate();
     let dir = temp_dir("approots_broad");
     let music = dir.join("Music");
     fs::create_dir_all(&music).unwrap();
-    let real_home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()).expect("home dir");
+    let real_home = directories::BaseDirs::new()
+        .map(|b| b.home_dir().to_path_buf())
+        .expect("home dir");
 
     let mut app = web_app(music.clone(), Some(real_home.to_string_lossy().to_string()));
     // Launched from / with the home folder bookmarked.
     app.launch_dir = PathBuf::from("/");
-    app.bookmarks = vec!["/".to_string(), real_home.to_string_lossy().to_string(), music.to_string_lossy().to_string()];
+    app.bookmarks = vec![
+        "/".to_string(),
+        real_home.to_string_lossy().to_string(),
+        music.to_string_lossy().to_string(),
+    ];
     app.update_web_state();
 
     let roots = app.web_state.read().unwrap().allowed_roots.clone();
@@ -693,6 +930,7 @@ fn test_app_never_publishes_root_or_home_as_allowed_roots() {
 
 #[test]
 fn test_pathless_web_autopilot_only_uses_terminal_folder_inside_roots() {
+    common::isolate();
     let dir = temp_dir("pathless_ap");
     let music = dir.join("Music");
     let elsewhere = dir.join("Elsewhere");
@@ -709,7 +947,12 @@ fn test_pathless_web_autopilot_only_uses_terminal_folder_inside_roots() {
         tx.send(cmd.clone()).unwrap();
         app.handle_web_commands();
         assert_eq!(app.autopilot_dir, None, "{:?}", cmd);
-        assert!(app.status_message.contains("Elsewhere"), "{:?}: {}", cmd, app.status_message);
+        assert!(
+            app.status_message.contains("Elsewhere"),
+            "{:?}: {}",
+            cmd,
+            app.status_message
+        );
     }
 
     // Inside the allowed folders the terminal folder is used.
@@ -722,6 +965,7 @@ fn test_pathless_web_autopilot_only_uses_terminal_folder_inside_roots() {
 
 #[test]
 fn test_status_api_hides_paths_outside_allowed_roots() {
+    common::isolate();
     let dir = temp_dir("status_paths");
     let music = dir.join("Music");
     let private = dir.join("Private");
@@ -752,7 +996,11 @@ fn test_status_api_hides_paths_outside_allowed_roots() {
 
     let (status, _, body) = get(port, "/api/status");
     assert_eq!(status, 200);
-    assert!(!String::from_utf8_lossy(&body).contains("Private"), "{}", String::from_utf8_lossy(&body));
+    assert!(
+        !String::from_utf8_lossy(&body).contains("Private"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["queue"][0]["filepath"], "");
     assert_eq!(json["queue"][1]["filepath"], inside.to_string_lossy().as_ref());
@@ -778,6 +1026,7 @@ fn test_status_api_hides_paths_outside_allowed_roots() {
 
 #[test]
 fn test_rejected_web_path_shows_status_message() {
+    common::isolate();
     let dir = temp_dir("rejectmsg");
     let mut app = web_app(dir.clone(), None);
     let (tx, rx) = mpsc::channel();
@@ -790,6 +1039,7 @@ fn test_rejected_web_path_shows_status_message() {
 
 #[test]
 fn test_settings_show_pairing_link_when_lan_access_enabled() {
+    common::isolate();
     let mut mgr = quickstream::settings::SettingsManager::new();
     mgr.settings.web_server_enabled = true;
     mgr.settings.web_server_port = 8080;
@@ -797,7 +1047,6 @@ fn test_settings_show_pairing_link_when_lan_access_enabled() {
     let local = mgr.get_display_value(6);
     assert!(!local.contains("token"), "{}", local);
 
-    isolate_config();
     mgr.settings.web_server_lan = true;
     let lan = mgr.get_display_value(6);
     let token = quickstream::web_access::web_token();
