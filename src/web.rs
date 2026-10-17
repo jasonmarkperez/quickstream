@@ -617,6 +617,9 @@ fn handle_client(
 
             dirs.sort_by_key(|a| a.name.to_lowercase());
             files.sort_by_key(|a| a.name.to_lowercase());
+            // Some SMB shares return each entry several times (issue #35).
+            dirs.dedup_by(|a, b| a.path == b.path);
+            files.dedup_by(|a, b| a.path == b.path);
 
             let mut all_entries = dirs;
             all_entries.extend(files);

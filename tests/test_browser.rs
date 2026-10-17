@@ -1269,3 +1269,41 @@ fn test_settings_view_file_actions_disabled_and_home_dir_editing() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+
+#[test]
+fn test_browser_drops_duplicate_directory_entries_from_os() {
+    // Some SMB shares return each directory entry several times (issue #35).
+    use quickstream::ui::DirScanEvent;
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_dupes_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let sub = temp_dir.join("Artist");
+    fs::create_dir_all(&sub).unwrap();
+
+    let mut settings_mgr = SettingsManager::new();
+    settings_mgr.settings.web_server_enabled = false;
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while app.browser_loading && std::time::Instant::now() < deadline {
+        app.poll_background_dir_scan();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    app.navigate_browser(temp_dir.clone());
+
+    // The same entry arrives again in later batches of the same scan.
+    for _ in 0..2 {
+        app.dir_scan_tx
+            .send(DirScanEvent::Batch {
+                scan_id: app.dir_scan_id,
+                dir: app.browser_dir.clone(),
+                dirs: vec![("📁 Artist/".to_string(), sub.clone(), true)],
+                files: vec![],
+                unfetched_tracks: vec![],
+            })
+            .unwrap();
+    }
+    app.poll_background_dir_scan();
+
+    let shown = app.browser_entries.iter().filter(|(_, p, _)| p == &sub).count();
+    assert_eq!(shown, 1, "Artist/ listed {} times", shown);
+    let _ = fs::remove_dir_all(&temp_dir);
+}
