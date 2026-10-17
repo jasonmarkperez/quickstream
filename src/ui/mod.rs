@@ -106,6 +106,8 @@ pub struct AppUI {
     pub autopilot_run_mode: AutopilotRunMode,
     pub autopilot_added_count: usize,
     pub analysis_db: crate::analysis::AnalysisDatabase,
+    /// Background BPM/key/energy analysis of discovered tracks (stops and joins on drop).
+    pub analysis_worker: crate::analysis::worker::AnalysisWorker,
     pub active_mix_profile: crate::analysis::MixProfile,
     pub show_mix_picker_modal: bool,
     pub mix_picker_cursor: usize,
@@ -210,6 +212,7 @@ impl AppUI {
             is_autopilot_scanning: false,
             autopilot_run_mode: AutopilotRunMode::Fresh,
             autopilot_added_count: 0,
+            analysis_worker: crate::analysis::worker::AnalysisWorker::spawn(analysis_db.clone(), 1),
             analysis_db,
             active_mix_profile,
             show_mix_picker_modal: false,
@@ -945,6 +948,7 @@ impl AppUI {
 
         let was_empty = self.queue.is_empty();
 
+        self.analysis_worker.enqueue(new_tracks.iter().map(|t| t.filepath.clone()));
         for track in new_tracks {
             if let Some(ref ws) = self.web_server {
                 ws.register_stream_file(&track.filepath);
