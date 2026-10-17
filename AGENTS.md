@@ -165,10 +165,11 @@ Execute the full test suite using Cargo with single-threaded test execution (req
 cargo test -- --test-threads=1
 ```
 
-Tests that bind all network interfaces (real SSDP discovery, LAN web server binding) are marked `#[ignore]` so local runs do not trigger macOS firewall prompts. Run them explicitly, and in CI:
+Tests that bind all network interfaces (real SSDP discovery, LAN web server binding) are marked `#[ignore]` so local runs do not trigger macOS firewall prompts. CI runs them on Linux (`.github/workflows/ci.yml`); to run them yourself:
 ```bash
-cargo test -- --test-threads=1 --include-ignored
+cargo test -- --test-threads=1 --ignored --skip test_discover_devices_real
 ```
+(`test_discover_devices_real` scans your LAN for real renderers and asserts nothing; drop the `--skip` to include it.)
 
 To run a specific test:
 ```bash
@@ -176,10 +177,12 @@ cargo test --test test_autopilot test_autopilot_mix_generates_full_queue_when_li
 ```
 
 ### Code Quality & Lints
-Always verify zero compiler and clippy warnings before committing:
+Always verify formatting and zero compiler and clippy warnings (including test code) before committing. CI (`.github/workflows/ci.yml`, Ubuntu + macOS) runs the same checks plus the test suite on every push and pull request to `main`:
 ```bash
-cargo clippy -- -D warnings
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 ```
+Formatting follows `rustfmt.toml`; the one-time bulk reformat commit is listed in `.git-blame-ignore-revs` (`git config blame.ignoreRevsFile .git-blame-ignore-revs`).
 
 ### Release Build
 ```bash
