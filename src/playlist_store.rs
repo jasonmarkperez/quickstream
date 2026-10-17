@@ -42,8 +42,8 @@ impl fmt::Display for StoreError {
     }
 }
 
-/// Outcome of [`PlaylistStore::add`]: tracks added, tracks skipped because their path was
-/// already in the playlist, and the playlist's length afterwards.
+/// Outcome of [`PlaylistStore::add`]: tracks added, tracks skipped (path already in the
+/// playlist, or containing a line break), and the playlist's length afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AddResult {
     pub added: usize,
@@ -210,7 +210,8 @@ impl PlaylistStore {
     }
 
     /// Append `entries` to the playlist named `name`, skipping any whose path is already in it
-    /// (including repeats within `entries`). Writes the file only when something was added.
+    /// (including repeats within `entries`) or contains a line break, which would split its
+    /// M3U8 line. Writes the file only when something was added.
     pub fn add(&mut self, name: &str, entries: Vec<PlaylistEntry>) -> Result<AddResult, StoreError> {
         let (slot, path) = self.locate(name)?;
         let playlist = &mut self.playlists[slot];
@@ -221,6 +222,11 @@ impl PlaylistStore {
             // folder, so store it absolute. `std::path::absolute` never reads the disk.
             if let Ok(abs) = std::path::absolute(&entry.path) {
                 entry.path = abs;
+            }
+            let bytes = entry.path.as_os_str().as_encoded_bytes();
+            if bytes.contains(&b'\n') || bytes.contains(&b'\r') {
+                skipped += 1;
+                continue;
             }
             if present.insert(entry.path.clone()) {
                 playlist.entries.push(entry);

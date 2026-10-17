@@ -336,6 +336,30 @@ fn test_add_stores_relative_paths_as_absolute() {
     assert_eq!(path, &std::env::current_dir().unwrap().join("rel/a.mp3"));
 }
 
+/// A line break in a path would split the M3U8 line and corrupt the file, so such entries
+/// are skipped.
+#[test]
+fn test_add_skips_paths_with_line_breaks() {
+    common::isolate();
+    let dir = scratch("add_newline");
+    let (worker, mut store) = open_store(&dir);
+    store.create("Mix").unwrap();
+    let mut lf = entry("lf");
+    lf.path = PathBuf::from("/music/evil\n/etc/passwd.mp3");
+    let mut cr = entry("cr");
+    cr.path = PathBuf::from("/music/evil\r.mp3");
+    assert_eq!(
+        store.add("Mix", vec![lf, entry("a"), cr]),
+        Ok(AddResult {
+            added: 1,
+            skipped: 2,
+            total: 1
+        })
+    );
+    assert!(worker.flush());
+    assert_eq!(on_disk(&dir, "Mix").entries, vec![entry("a")]);
+}
+
 #[test]
 fn test_remove_takes_out_one_track() {
     common::isolate();
