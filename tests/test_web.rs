@@ -1,14 +1,16 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::path::PathBuf;
 
 use quickstream::web::{
-    NowPlayingState, WebBrowserResponse, WebCommand, WebDeviceItem, WebQueueItem, WebServer,
+    parse_byte_range, ByteRange, NowPlayingState, ServerLimits, StreamServerState,
+    WebBrowserResponse, WebBind, WebCommand, WebDeviceItem, WebQueueItem, WebServer,
+    WebServerHandle,
 };
 
 fn parse_http_response(raw: &[u8]) -> (u16, String, Vec<u8>) {
@@ -762,4 +764,434 @@ fn test_web_server_stream_serves_non_utf8_file_name() {
 
     handle.stop();
     let _ = fs::remove_dir_all(&temp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Request limits, connection caps and HTTP Range handling (issue #22)
+// ---------------------------------------------------------------------------
+
+/// Send raw bytes, then read the whole response.
+fn http_raw(port: u16, request: &[u8]) -> (u16, String, Vec<u8>) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let _ = stream.write_all(request);
+    let mut resp = Vec::new();
+    let _ = stream.read_to_end(&mut resp);
+    parse_http_response(&resp)
+}
+
+fn header_value(headers: &str, name: &str) -> Option<String> {
+    headers.lines().skip(1).find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+    })
+}
+
+fn start_limited(
+    limits: ServerLimits,
+) -> (
+    WebServerHandle,
+    Arc<RwLock<NowPlayingState>>,
+    mpsc::Receiver<WebCommand>,
+) {
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (tx, rx) = mpsc::channel();
+    let handle = WebServer::start_with_options(
+        WebBind::Loopback,
+        0,
+        state.clone(),
+        tx,
+        Arc::new(StreamServerState::new()),
+        limits,
+    )
+    .expect("start web server");
+    (handle, state, rx)
+}
+
+/// Registers a 100-byte file (bytes 0..100) and returns the server and its contents.
+fn start_range_fixture(tag: &str) -> (WebServerHandle, PathBuf, Vec<u8>) {
+    let dir = std::env::temp_dir().join(format!("qs_range_{}_{}", tag, std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("range_song.mp3");
+    let data: Vec<u8> = (0..100).collect();
+    fs::write(&file, &data).unwrap();
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state, tx).expect("start web server");
+    handle.register_stream_file(&file);
+    (handle, dir, data)
+}
+
+fn range_get(port: u16, range: &str) -> (u16, String, Vec<u8>) {
+    let req = format!(
+        "GET /stream/range_song.mp3 HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: {}\r\n\r\n",
+        range
+    );
+    http_raw(port, req.as_bytes())
+}
+
+#[test]
+fn test_parse_byte_range_cases() {
+    use ByteRange::{Full, Partial, Unsatisfiable};
+    let p = |start, end| Partial { start, end };
+
+    assert_eq!(parse_byte_range("bytes=10-24", 100), p(10, 24));
+    assert_eq!(parse_byte_range("bytes=90-", 100), p(90, 99));
+    assert_eq!(parse_byte_range("bytes=50-1000", 100), p(50, 99));
+    assert_eq!(parse_byte_range("Bytes=0-0", 100), p(0, 0));
+    assert_eq!(parse_byte_range("bytes=0-99999999999999999999999", 100), p(0, 99));
+
+    // Suffix ranges: the last N bytes.
+    assert_eq!(parse_byte_range("bytes=-10", 100), p(90, 99));
+    assert_eq!(parse_byte_range("bytes=-500", 100), p(0, 99));
+    assert_eq!(parse_byte_range("bytes=-0", 100), Unsatisfiable);
+
+    // Unsatisfiable ranges.
+    assert_eq!(parse_byte_range("bytes=100-", 100), Unsatisfiable);
+    assert_eq!(parse_byte_range("bytes=99999999999999999999999-", 100), Unsatisfiable);
+    assert_eq!(parse_byte_range("bytes=5-2", 100), Unsatisfiable);
+    assert_eq!(parse_byte_range("bytes=0-", 0), Unsatisfiable);
+    assert_eq!(parse_byte_range("bytes=-5", 0), Unsatisfiable);
+
+    // Multiple ranges: the first satisfiable one is served.
+    assert_eq!(parse_byte_range("bytes=10-19, 50-59", 100), p(10, 19));
+    assert_eq!(parse_byte_range("bytes=200-300,5-9", 100), p(5, 9));
+    assert_eq!(parse_byte_range("bytes=200-300,400-", 100), Unsatisfiable);
+
+    // Invalid syntax or unknown units: the Range header is ignored.
+    for bad in [
+        "bytes=abc-",
+        "bytes=",
+        "bytes=-",
+        "bytes=1-2-3",
+        "bytes=+1-2",
+        "bytes=0-5,x",
+        "items=0-5",
+        "bytes 0-5",
+    ] {
+        assert_eq!(parse_byte_range(bad, 100), Full, "{:?} should be ignored", bad);
+    }
+}
+
+#[test]
+fn test_web_server_stream_suffix_range() {
+    let (handle, dir, data) = start_range_fixture("suffix");
+
+    let (status, headers, body) = range_get(handle.port, "bytes=-10");
+    assert_eq!(status, 206, "headers: {}", headers);
+    assert_eq!(header_value(&headers, "Content-Range").as_deref(), Some("bytes 90-99/100"));
+    assert_eq!(header_value(&headers, "Content-Length").as_deref(), Some("10"));
+    assert_eq!(body, &data[90..]);
+
+    // A suffix longer than the file selects the whole file.
+    let (status, headers, body) = range_get(handle.port, "bytes=-500");
+    assert_eq!(status, 206, "headers: {}", headers);
+    assert_eq!(header_value(&headers, "Content-Range").as_deref(), Some("bytes 0-99/100"));
+    assert_eq!(body, data);
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_web_server_stream_multi_range_serves_first_range() {
+    let (handle, dir, data) = start_range_fixture("multi");
+
+    let (status, headers, body) = range_get(handle.port, "bytes=10-19,50-59");
+    assert_eq!(status, 206, "headers: {}", headers);
+    assert_eq!(header_value(&headers, "Content-Range").as_deref(), Some("bytes 10-19/100"));
+    assert_eq!(header_value(&headers, "Content-Length").as_deref(), Some("10"));
+    assert_eq!(body, &data[10..20]);
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_web_server_stream_invalid_range_serves_full_body() {
+    let (handle, dir, data) = start_range_fixture("invalid");
+
+    for bad in ["bytes=abc-", "bytes=1-2-3", "items=0-5"] {
+        let (status, headers, body) = range_get(handle.port, bad);
+        assert_eq!(status, 200, "{}: headers: {}", bad, headers);
+        assert_eq!(header_value(&headers, "Content-Range"), None);
+        assert_eq!(header_value(&headers, "Content-Length").as_deref(), Some("100"));
+        assert_eq!(body, data);
+    }
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_web_server_stream_416_headers() {
+    let (handle, dir, _data) = start_range_fixture("416");
+
+    for unsatisfiable in ["bytes=100-", "bytes=5-2", "bytes=-0"] {
+        let (status, headers, body) = range_get(handle.port, unsatisfiable);
+        assert_eq!(status, 416, "{}: headers: {}", unsatisfiable, headers);
+        assert_eq!(header_value(&headers, "Content-Range").as_deref(), Some("bytes */100"));
+        assert_eq!(header_value(&headers, "Content-Length").as_deref(), Some("0"));
+        assert_eq!(header_value(&headers, "Connection").as_deref(), Some("close"));
+        assert!(body.is_empty());
+    }
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_web_server_stream_responses_advertise_connection_close() {
+    let (handle, dir, _data) = start_range_fixture("close");
+
+    let (status, headers, _) = http_get(handle.port, "/stream/range_song.mp3");
+    assert_eq!(status, 200);
+    assert_eq!(header_value(&headers, "Connection").as_deref(), Some("close"));
+
+    let (status, headers, _) = range_get(handle.port, "bytes=0-9");
+    assert_eq!(status, 206);
+    assert_eq!(header_value(&headers, "Connection").as_deref(), Some("close"));
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_web_server_rejects_oversized_header_line() {
+    let (handle, _state, _rx) = start_limited(ServerLimits::default());
+
+    let req = format!(
+        "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Big: {}\r\n\r\n",
+        "a".repeat(9000)
+    );
+    let (status, headers, _) = http_raw(handle.port, req.as_bytes());
+    assert_eq!(status, 431, "headers: {}", headers);
+    assert_eq!(header_value(&headers, "Connection").as_deref(), Some("close"));
+
+    // The server keeps working afterwards.
+    let (status, _, _) = http_get(handle.port, "/api/status");
+    assert_eq!(status, 200);
+
+    handle.stop();
+}
+
+#[test]
+fn test_web_server_rejects_oversized_request_line() {
+    let (handle, _state, _rx) = start_limited(ServerLimits::default());
+
+    let req = format!(
+        "GET /api/status?pad={} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        "a".repeat(9000)
+    );
+    let (status, headers, _) = http_raw(handle.port, req.as_bytes());
+    assert_eq!(status, 414, "headers: {}", headers);
+
+    handle.stop();
+}
+
+#[test]
+fn test_web_server_rejects_too_many_headers() {
+    let (handle, _state, _rx) = start_limited(ServerLimits::default());
+
+    let build = |count: usize| {
+        let mut req = String::from("GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+        for i in 1..count {
+            req.push_str(&format!("X-Header-{}: v\r\n", i));
+        }
+        req.push_str("\r\n");
+        req
+    };
+
+    // 100 header fields (Host + 99) are accepted.
+    let (status, _, _) = http_raw(handle.port, build(100).as_bytes());
+    assert_eq!(status, 200);
+
+    // 101 are rejected.
+    let (status, headers, _) = http_raw(handle.port, build(101).as_bytes());
+    assert_eq!(status, 431, "headers: {}", headers);
+
+    handle.stop();
+}
+
+#[test]
+fn test_web_server_rejects_oversized_content_length_before_reading_body() {
+    let (handle, _state, rx) = start_limited(ServerLimits::default());
+
+    for declared in ["18446744073709551615", "99999999999999999999999", "65537"] {
+        // Headers only: a server that tried to read (or allocate) the declared body would hang or
+        // fail instead of answering 413 straight away.
+        let req = format!(
+            "POST /api/action HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            declared
+        );
+        let started = Instant::now();
+        let (status, headers, _) = http_raw(handle.port, req.as_bytes());
+        assert_eq!(status, 413, "Content-Length {}: headers: {}", declared, headers);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+    assert!(rx.try_recv().is_err(), "no command should be dispatched");
+
+    // A body at the limit is still accepted.
+    let body = format!("{{\"action\":\"next\",\"pad\":\"{}\"}}", "a".repeat(64 * 1024 - 40));
+    assert!(body.len() <= 64 * 1024);
+    let (status, _, _) = http_post(handle.port, "/api/action", &body);
+    assert_eq!(status, 200);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), WebCommand::Next);
+
+    // The server is still alive.
+    let (status, _, _) = http_get(handle.port, "/api/status");
+    assert_eq!(status, 200);
+
+    handle.stop();
+}
+
+#[test]
+fn test_web_server_request_head_deadline_is_total_not_per_read() {
+    let limits = ServerLimits {
+        request_timeout: Duration::from_secs(1),
+        ..ServerLimits::default()
+    };
+    let (handle, _state, _rx) = start_limited(limits);
+
+    let mut stream = TcpStream::connect(("127.0.0.1", handle.port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let started = Instant::now();
+    // Drip one header line every 250 ms for 5 s: each read succeeds well within any per-read
+    // timeout, but the head is never finished.
+    let dripper = std::thread::spawn(move || {
+        if writer.write_all(b"GET /api/status HTTP/1.1\r\n").is_err() {
+            return;
+        }
+        for _ in 0..20 {
+            if writer.write_all(b"X-Drip: 1\r\n").is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    });
+
+    let mut resp = Vec::new();
+    let _ = stream.read_to_end(&mut resp);
+    let elapsed = started.elapsed();
+    let (status, headers, _) = parse_http_response(&resp);
+    assert_eq!(status, 408, "headers: {}", headers);
+    assert!(elapsed < Duration::from_secs(4), "took {:?}", elapsed);
+
+    let _ = dripper.join();
+    handle.stop();
+}
+
+#[test]
+fn test_web_server_caps_concurrent_connections() {
+    let limits = ServerLimits {
+        max_connections: 2,
+        ..ServerLimits::default()
+    };
+    let (handle, _state, _rx) = start_limited(limits);
+    let port = handle.port;
+
+    // Two idle connections take both slots (accepted in order, before the third).
+    let idle1 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let idle2 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    let mut third = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    third
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut resp = Vec::new();
+    let _ = third.read_to_end(&mut resp);
+    let (status, headers, _) = parse_http_response(&resp);
+    assert_eq!(status, 503, "headers: {}", headers);
+    assert_eq!(header_value(&headers, "Connection").as_deref(), Some("close"));
+
+    // Closing the idle connections frees their slots.
+    drop(idle1);
+    drop(idle2);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, _, _) = http_get(port, "/api/status");
+        if status == 200 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "slots were not released (last status {})", status);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    handle.stop();
+}
+
+/// Open /stream/continuous.wav and return the status code with the reader positioned after the
+/// response head.
+fn open_continuous(port: u16) -> (u16, BufReader<TcpStream>) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(b"GET /stream/continuous.wav HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    let _ = reader.read_line(&mut status_line);
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) if line.trim().is_empty() => break,
+            Ok(_) => {}
+        }
+    }
+    (status, reader)
+}
+
+#[test]
+fn test_web_server_streams_use_separate_pool_and_release_on_disconnect() {
+    let limits = ServerLimits {
+        max_connections: 1,
+        max_streams: 1,
+        ..ServerLimits::default()
+    };
+    // Empty queue: the continuous stream sends silence until the client goes away.
+    let (handle, _state, _rx) = start_limited(limits);
+    let port = handle.port;
+
+    let (status, mut first) = open_continuous(port);
+    assert_eq!(status, 200);
+    let mut wav_hdr = [0u8; 44];
+    first.read_exact(&mut wav_hdr).unwrap();
+    assert_eq!(&wav_hdr[0..4], b"RIFF");
+
+    // The open stream does not occupy the request pool.
+    let (status, _, _) = http_get(port, "/api/status");
+    assert_eq!(status, 200);
+
+    // The stream pool is full.
+    let (status, _) = open_continuous(port);
+    assert_eq!(status, 503);
+
+    // Once the client disconnects, the silence loop must notice the dead socket and exit,
+    // freeing the stream slot.
+    drop(first);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, conn) = open_continuous(port);
+        drop(conn);
+        if status == 200 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "stream slot was not released (last status {})", status);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    handle.stop();
 }
