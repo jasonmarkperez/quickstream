@@ -1154,9 +1154,13 @@ impl AppUI {
         };
         let mut paths = Vec::new();
         for entry in &playlist.entries {
-            if !ui.exists.contains_key(&entry.path) && ui.checks.in_flight.insert(entry.path.clone()) {
-                paths.push(entry.path.clone());
+            // Called every tick: look up before cloning, so a fully checked playlist allocates
+            // nothing.
+            if ui.exists.contains_key(&entry.path) || ui.checks.in_flight.contains(&entry.path) {
+                continue;
             }
+            ui.checks.in_flight.insert(entry.path.clone());
+            paths.push(entry.path.clone());
         }
         if paths.is_empty() {
             return;
