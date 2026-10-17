@@ -73,72 +73,98 @@ pub struct MusicalKey;
 impl MusicalKey {
     /// Parse raw text tag (from ID3 TKEY, Rekordbox, Traktor, Mixed in Key, or FLAC)
     /// and convert to Camelot notation.
+    ///
+    /// Accepted forms (surrounding whitespace ignored):
+    /// - Camelot: `8A`, `11b`, `08A` (A = minor, B = major).
+    /// - Open Key: `1m`..`12m` (minor), `1d`..`12d` (major); `1m` = A minor = `8A`.
+    /// - Note + optional accidental + optional mode: `C`, `F#`, `Ab`, `B♭`, `A flat`, `F sharp`,
+    ///   followed (optionally after a space, `-` or `_`) by a mode. A single-letter mode is
+    ///   case-sensitive (`m` = minor, `M` = major, so `AbM` is A-flat major); longer modes are
+    ///   case-insensitive (`min`, `minor`, `maj`, `major`). No mode means major.
+    ///
+    /// Anything else (unknown modes, out-of-range numbers, trailing text) yields `None`.
     pub fn parse_to_camelot(raw: &str) -> Option<CamelotKey> {
-        let clean = raw.trim().to_uppercase();
+        let clean = raw.trim();
         if clean.is_empty() {
             return None;
         }
+        Self::parse_numbered(clean).or_else(|| Self::parse_note_and_mode(clean))
+    }
 
-        // 1. Direct Camelot notation: e.g. "8A", "11B", "1A"
-        if let Some(caps) = clean.strip_suffix('A') {
-            if let Ok(num) = caps.parse::<u8>() {
-                return CamelotKey::new(num, true);
-            }
-        } else if let Some(caps) = clean.strip_suffix('B') {
-            if let Ok(num) = caps.parse::<u8>() {
-                return CamelotKey::new(num, false);
-            }
+    /// Camelot (`8A`) or Open Key (`1m` / `1d`) notation: a number followed by one letter.
+    fn parse_numbered(clean: &str) -> Option<CamelotKey> {
+        let split = clean.find(|c: char| !c.is_ascii_digit())?;
+        let (digits, rest) = clean.split_at(split);
+        if digits.is_empty() || rest.chars().count() != 1 {
+            return None;
         }
+        let num: u8 = digits.parse().ok()?;
+        if !(1..=12).contains(&num) {
+            return None;
+        }
+        match rest.to_ascii_lowercase().as_str() {
+            "a" => CamelotKey::new(num, true),
+            "b" => CamelotKey::new(num, false),
+            // Open Key 1 is C major / A minor, which Camelot numbers 8.
+            "m" => CamelotKey::new((num + 6) % 12 + 1, true),
+            "d" => CamelotKey::new((num + 6) % 12 + 1, false),
+            _ => None,
+        }
+    }
 
-        // 2. Standard Musical Key Notation (e.g. "Am", "A minor", "C#m", "Db Maj", "AbM")
-        // Camelot Mapping:
-        // Minor:
-        // Abm/G#m: 1A, Ebm/D#m: 2A, Bbm/A#m: 3A, Fm: 4A, Cm: 5A, Gm: 6A, Dm: 7A, Am: 8A, Em: 9A, Bm: 10A, F#m/Gbm: 11A, C#m/Dbm: 12A
-        // Major:
-        // B: 1B, F#/Gb: 2B, Db/C#: 3B, Ab/G#: 4B, Eb/D#: 5B, Bb/A#: 6B, F: 7B, C: 8B, G: 9B, D: 10B, A: 11B, E: 12B
-        let is_minor = clean.contains("MIN") || clean.contains("M") && !clean.contains("MAJ") || clean.ends_with('M');
-        let note = clean
-            .replace("MINOR", "")
-            .replace("MAJOR", "")
-            .replace("MIN", "")
-            .replace("MAJ", "")
-            .replace('M', "")
-            .trim()
-            .to_string();
-
-        let num = match (note.as_str(), is_minor) {
-            // Minor keys
-            ("AB" | "G#", true) => 1,
-            ("EB" | "D#", true) => 2,
-            ("BB" | "A#", true) => 3,
-            ("F", true) => 4,
-            ("C", true) => 5,
-            ("G", true) => 6,
-            ("D", true) => 7,
-            ("A", true) => 8,
-            ("E", true) => 9,
-            ("B", true) => 10,
-            ("F#" | "GB", true) => 11,
-            ("C#" | "DB", true) => 12,
-
-            // Major keys
-            ("B", false) => 1,
-            ("F#" | "GB", false) => 2,
-            ("DB" | "C#", false) => 3,
-            ("AB" | "G#", false) => 4,
-            ("EB" | "D#", false) => 5,
-            ("BB" | "A#", false) => 6,
-            ("F", false) => 7,
-            ("C", false) => 8,
-            ("G", false) => 9,
-            ("D", false) => 10,
-            ("A", false) => 11,
-            ("E", false) => 12,
-
+    /// Note letter, optional accidental, optional mode suffix.
+    fn parse_note_and_mode(clean: &str) -> Option<CamelotKey> {
+        let mut chars = clean.chars();
+        let letter = chars.next()?.to_ascii_uppercase();
+        let natural: i32 = match letter {
+            'C' => 0,
+            'D' => 2,
+            'E' => 4,
+            'F' => 5,
+            'G' => 7,
+            'A' => 9,
+            'B' => 11,
             _ => return None,
         };
+        let rest = chars.as_str();
 
-        CamelotKey::new(num, is_minor)
+        let (accidental, rest) = Self::split_accidental(rest);
+        let pitch_class = (natural + accidental).rem_euclid(12);
+
+        let mode = rest.trim_start_matches([' ', '-', '_']);
+        let is_minor = match mode {
+            "" | "M" => false,
+            "m" => true,
+            _ => match mode.to_ascii_lowercase().as_str() {
+                "maj" | "major" => false,
+                "min" | "minor" => true,
+                _ => return None,
+            },
+        };
+
+        // Camelot numbers walk the circle of fifths: C major = 8B, G major = 9B, ...
+        // A minor key shares its number with its relative major (3 semitones up).
+        let major_pc = if is_minor { (pitch_class + 3) % 12 } else { pitch_class };
+        let number = ((major_pc * 7) % 12 + 7) % 12 + 1;
+        CamelotKey::new(number as u8, is_minor)
+    }
+
+    /// Split a leading accidental (`#`, `b`, `♯`, `♭`, `sharp`, `flat`) off `rest`, returning its
+    /// semitone offset and the remainder.
+    fn split_accidental(rest: &str) -> (i32, &str) {
+        for (token, offset) in [("#", 1), ("♯", 1), ("b", -1), ("♭", -1)] {
+            if let Some(after) = rest.strip_prefix(token) {
+                return (offset, after);
+            }
+        }
+        let spaced = rest.trim_start_matches([' ', '-', '_']);
+        let lower = spaced.to_ascii_lowercase();
+        for (word, offset) in [("sharp", 1), ("flat", -1)] {
+            if lower.starts_with(word) {
+                return (offset, &spaced[word.len()..]);
+            }
+        }
+        (0, rest)
     }
 }
 
@@ -155,6 +181,95 @@ mod tests {
         assert_eq!(MusicalKey::parse_to_camelot("C"), Some(CamelotKey { number: 8, is_minor: false }));
         assert_eq!(MusicalKey::parse_to_camelot("C Maj"), Some(CamelotKey { number: 8, is_minor: false }));
         assert_eq!(MusicalKey::parse_to_camelot("C#m"), Some(CamelotKey { number: 12, is_minor: true }));
+    }
+
+    fn minor(n: u8) -> Option<CamelotKey> {
+        Some(CamelotKey { number: n, is_minor: true })
+    }
+    fn major(n: u8) -> Option<CamelotKey> {
+        Some(CamelotKey { number: n, is_minor: false })
+    }
+
+    #[test]
+    fn test_key_parsing_table() {
+        let cases: &[(&str, Option<CamelotKey>)] = &[
+            // Camelot (any case, optional zero padding / whitespace)
+            ("8A", minor(8)),
+            ("11B", major(11)),
+            ("1a", minor(1)),
+            ("12b", major(12)),
+            ("08A", minor(8)),
+            (" 5B ", major(5)),
+            // Open Key: 1m = A minor (8A), 1d = C major (8B), 6d = B major (1B), 12m = D minor (7A)
+            ("1m", minor(8)),
+            ("1d", major(8)),
+            ("6d", major(1)),
+            ("12m", minor(7)),
+            ("5M", minor(12)),
+            ("10D", major(5)),
+            // Single-letter mode suffix: lower-case m = minor, upper-case M = major
+            ("Am", minor(8)),
+            ("AbM", major(4)),
+            ("Abm", minor(1)),
+            ("C#m", minor(12)),
+            ("Gm", minor(6)),
+            ("GM", major(9)),
+            ("F#", major(2)),
+            ("C", major(8)),
+            ("E", major(12)),
+            // Spelled-out / abbreviated modes, any case, optional separator
+            ("Ab major", major(4)),
+            ("F# Minor", minor(11)),
+            ("Emaj", major(12)),
+            ("G#min", minor(1)),
+            ("A minor", minor(8)),
+            ("C Maj", major(8)),
+            ("D MINOR", minor(7)),
+            ("Bb-major", major(6)),
+            ("Eb_min", minor(2)),
+            ("db minor", minor(12)),
+            // Unicode and spelled-out accidentals, enharmonics
+            ("B♭m", minor(3)),
+            ("F♯ major", major(2)),
+            ("A flat minor", minor(1)),
+            ("F sharp minor", minor(11)),
+            ("Cb", major(1)),
+            ("E#m", minor(4)),
+            // Garbage
+            ("", None),
+            ("   ", None),
+            ("13A", None),
+            ("0B", None),
+            ("8C", None),
+            ("0m", None),
+            ("H", None),
+            ("Am major", None),
+            ("A mixolydian", None),
+            ("o", None),
+        ];
+        let failures: Vec<String> = cases
+            .iter()
+            .filter_map(|(raw, expected)| {
+                let got = MusicalKey::parse_to_camelot(raw);
+                (got != *expected).then(|| format!("{raw:?}: expected {expected:?}, got {got:?}"))
+            })
+            .collect();
+        assert!(failures.is_empty(), "key parsing mismatches:\n{}", failures.join("\n"));
+    }
+
+    /// Every pitch class in both modes maps to a distinct Camelot slot.
+    #[test]
+    fn test_all_notes_map_to_distinct_camelot_keys() {
+        let notes = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"];
+        let mut seen = std::collections::HashSet::new();
+        for note in notes {
+            for suffix in ["", "m"] {
+                let key = MusicalKey::parse_to_camelot(&format!("{note}{suffix}"))
+                    .unwrap_or_else(|| panic!("{note}{suffix} must parse"));
+                assert!(seen.insert(key), "{note}{suffix} collides at {key}");
+            }
+        }
+        assert_eq!(seen.len(), 24);
     }
 
     #[test]
