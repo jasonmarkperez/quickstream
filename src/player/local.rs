@@ -423,7 +423,7 @@ impl LocalPlayer {
         self.shared_state.is_finished.store(false, Ordering::SeqCst);
     }
 
-    fn play_ffplay(&mut self, filepath: &Path) -> anyhow::Result<()> {
+    fn play_ffplay(&mut self, filepath: &Path, start_seconds: f64) -> anyhow::Result<()> {
         if let Some(mut child) = self.ffplay_child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -434,12 +434,15 @@ impl LocalPlayer {
             .arg("-loglevel")
             .arg("error")
             .arg("-volume")
-            .arg(format!("{}", self.volume))
-            .arg(filepath);
+            .arg(format!("{}", self.volume));
+        if start_seconds > 0.0 {
+            cmd.arg("-ss").arg(format!("{:.3}", start_seconds));
+        }
+        cmd.arg(filepath);
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
         self.ffplay_child = Some(cmd.spawn()?);
         self.start_time = Some(Instant::now());
-        self.accumulated_offset = 0.0;
+        self.accumulated_offset = start_seconds;
 
         // ffplay has no IPC to report duration, so read it from the file's tags/headers.
         // This runs on AsyncPlayer's worker thread, never the UI thread.
@@ -479,12 +482,23 @@ impl Drop for LocalPlayer {
     }
 }
 
-impl AudioPlayer for LocalPlayer {
-    fn play(&mut self, filepath: &Path) -> anyhow::Result<()> {
+impl LocalPlayer {
+    /// Load `filepath` and start playing at `start_seconds`.
+    ///
+    /// The start position is part of the load (mpv's `start` option, ffplay's `-ss`) rather than
+    /// a seek afterwards: on a slow source such as an SMB share, mpv rejects a seek sent before
+    /// the file has finished loading, and playback would begin at 0:00 (issue #44).
+    fn play_from(&mut self, filepath: &Path, start_seconds: f64) -> anyhow::Result<()> {
+        let start_seconds = if start_seconds.is_finite() {
+            start_seconds.max(0.0)
+        } else {
+            0.0
+        };
         let _timer = crate::log_perf!(
             "player",
-            "LocalPlayer::play '{}' via {}",
+            "LocalPlayer::play '{}' at {:.2}s via {}",
             filepath.display(),
+            start_seconds,
             self.backend
         );
         let abs_path = if filepath.is_absolute() {
@@ -496,9 +510,9 @@ impl AudioPlayer for LocalPlayer {
 
         // Duration is streamed asynchronously via IPC ("observe_property", "duration") for mpv
         // and read from metadata for ffplay; clear the previous track's until then.
-        *self.shared_state.position.lock().unwrap() = 0.0;
+        *self.shared_state.position.lock().unwrap() = start_seconds;
         *self.shared_state.duration.lock().unwrap() = 0.0;
-        self.accumulated_offset = 0.0;
+        self.accumulated_offset = start_seconds;
         self.start_time = None;
         self.shared_state.is_finished.store(false, Ordering::SeqCst);
         self.shared_state.is_playing.store(true, Ordering::SeqCst);
@@ -508,6 +522,17 @@ impl AudioPlayer for LocalPlayer {
             let mpv_res = (|| -> anyhow::Result<()> {
                 self.ensure_mpv_daemon()?;
                 let file_str = abs_path.to_string_lossy();
+                // `start` applies to every following load, so it is always set (or cleared).
+                let start = if start_seconds > 0.0 {
+                    format!("{:.3}", start_seconds)
+                } else {
+                    "none".to_string()
+                };
+                let start_cmd = serde_json::json!({
+                    "command": ["set_property", "start", start]
+                })
+                .to_string();
+                self.send_command(&start_cmd)?;
                 let json_cmd = serde_json::json!({
                     "command": ["loadfile", file_str, "replace"]
                 })
@@ -520,12 +545,22 @@ impl AudioPlayer for LocalPlayer {
             if let Err(e) = &mpv_res {
                 // If mpv fails to spawn or connect, seamlessly fall back to ffplay
                 crate::log_warn!("player", "mpv playback error ({:?}), falling back to ffplay", e);
-                return self.play_ffplay(&abs_path);
+                return self.play_ffplay(&abs_path, start_seconds);
             }
             mpv_res
         } else {
-            self.play_ffplay(&abs_path)
+            self.play_ffplay(&abs_path, start_seconds)
         }
+    }
+}
+
+impl AudioPlayer for LocalPlayer {
+    fn play(&mut self, filepath: &Path) -> anyhow::Result<()> {
+        self.play_from(filepath, 0.0)
+    }
+
+    fn play_at(&mut self, filepath: &Path, position_seconds: f64) -> anyhow::Result<()> {
+        self.play_from(filepath, position_seconds)
     }
 
     fn pause(&mut self) -> anyhow::Result<()> {

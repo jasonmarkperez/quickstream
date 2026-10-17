@@ -285,9 +285,12 @@ fn test_requests_are_spaced_by_the_minimum_interval() {
     }
     let reqs = server.requests();
     assert_eq!(reqs.len(), 3);
+    // The client spaces request *starts* by 250ms; the server sees arrival times, which also
+    // include connection setup jitter (233ms gaps seen on a CI runner). Unthrottled requests
+    // arrive ~0ms apart, so 200ms still proves the spacing.
     for pair in reqs.windows(2) {
         let gap = pair[1].at.duration_since(pair[0].at);
-        assert!(gap >= Duration::from_millis(240), "requests only {:?} apart", gap);
+        assert!(gap >= Duration::from_millis(200), "requests only {:?} apart", gap);
     }
 }
 
