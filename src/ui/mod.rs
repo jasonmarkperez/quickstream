@@ -185,6 +185,8 @@ pub struct AppUI {
     pub active_mix_profile: crate::analysis::MixProfile,
     pub show_mix_picker_modal: bool,
     pub mix_picker_cursor: usize,
+    /// Writes bookmarks and settings off the UI thread; flushed and joined on drop.
+    pub persistence: crate::persist::PersistenceWorker,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,7 +197,9 @@ pub enum AutopilotRunMode {
 }
 
 impl AppUI {
-    pub fn new(start_dir: Option<PathBuf>, settings_mgr: SettingsManager) -> Self {
+    pub fn new(start_dir: Option<PathBuf>, mut settings_mgr: SettingsManager) -> Self {
+        let persistence = crate::persist::PersistenceWorker::spawn();
+        settings_mgr.set_persistence(persistence.handle());
         let cwd = start_dir
             .or_else(|| {
                 settings_mgr
@@ -303,6 +307,7 @@ impl AppUI {
             active_mix_profile,
             show_mix_picker_modal: false,
             mix_picker_cursor: 0,
+            persistence,
         };
         app.refresh_browser();
         app.update_web_state();
@@ -314,10 +319,18 @@ impl AppUI {
         crate::persist::load_json_or_backup(&paths::get_bookmarks_path(), "bookmarks").unwrap_or_default()
     }
 
+    /// Queue the bookmarks file write on the persistence worker (never blocks the UI).
     fn save_bookmarks(&self) {
         if let Ok(json) = serde_json::to_string_pretty(&self.bookmarks) {
-            let _ = crate::persist::atomic_write(&paths::get_bookmarks_path(), json.as_bytes());
+            self.persistence.save(paths::get_bookmarks_path(), json.into_bytes());
         }
+    }
+
+    /// Replace the persistence worker (tests use one with an instrumented writer). The old
+    /// worker is flushed and joined first so no queued write is lost.
+    pub fn set_persistence_worker(&mut self, worker: crate::persist::PersistenceWorker) {
+        self.settings_mgr.set_persistence(worker.handle());
+        drop(std::mem::replace(&mut self.persistence, worker));
     }
 
     pub fn format_file_label(
@@ -1339,6 +1352,8 @@ impl AppUI {
         TUI_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
         let res = self.event_loop(&mut terminal);
         SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+        // A bookmark or setting changed right before quitting must reach disk.
+        self.persistence.flush();
         TUI_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
 
         disable_raw_mode()?;

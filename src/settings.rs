@@ -150,6 +150,9 @@ pub const SETTING_DEFINITIONS: &[SettingDefinition] = &[
 pub struct SettingsManager {
     pub path: PathBuf,
     pub settings: Settings,
+    /// When set (the TUI), `save()` queues the write on the persistence worker instead of
+    /// writing on the calling thread.
+    persist: Option<crate::persist::PersistHandle>,
 }
 
 impl Default for SettingsManager {
@@ -168,7 +171,12 @@ impl SettingsManager {
     /// so saving the defaults later doesn't destroy the user's settings.
     pub fn with_path(path: PathBuf) -> Self {
         let settings = crate::persist::load_json_or_backup(&path, "settings").unwrap_or_default();
-        Self { path, settings }
+        Self { path, settings, persist: None }
+    }
+
+    /// Route future `save()` calls through a persistence worker (off the calling thread).
+    pub fn set_persistence(&mut self, handle: crate::persist::PersistHandle) {
+        self.persist = Some(handle);
     }
 
     pub fn load_from(path: &Path) -> Option<Settings> {
@@ -180,10 +188,19 @@ impl SettingsManager {
     }
 
     /// Write the settings to disk atomically (temp file + fsync + rename).
+    ///
+    /// With a persistence worker attached (`set_persistence`) the write is queued and this
+    /// returns `true` once queued; failures are logged by the worker.
     pub fn save(&self) -> bool {
-        match serde_json::to_string_pretty(&self.settings) {
-            Ok(json) => crate::persist::atomic_write(&self.path, json.as_bytes()).is_ok(),
-            Err(_) => false,
+        let Ok(json) = serde_json::to_string_pretty(&self.settings) else {
+            return false;
+        };
+        match &self.persist {
+            Some(handle) => {
+                handle.save(self.path.clone(), json.into_bytes());
+                true
+            }
+            None => crate::persist::atomic_write(&self.path, json.as_bytes()).is_ok(),
         }
     }
 
