@@ -971,7 +971,7 @@ fn handle_client(
     // Route dispatch
     if method == "GET" || method == "HEAD" {
         let is_head = method == "HEAD";
-        if path == "/" || path == "/index.html" {
+        if route == "/" || route == "/index.html" {
             // Serve single-page dashboard
             let body = NOW_PLAYING_HTML.as_bytes();
             let header = format!(

@@ -459,6 +459,18 @@ fn test_dashboard_forbids_framing() {
 }
 
 #[test]
+fn test_loopback_dashboard_ignores_query_strings() {
+    let (handle, _rx) = start(Arc::new(RwLock::new(NowPlayingState::default())));
+    let port = handle.port;
+    for path in ["/?token=bad", "/?foo", "/index.html?x=1", "/#top"] {
+        let (status, _, body) = get(port, path);
+        assert_eq!(status, 200, "{}", path);
+        assert!(String::from_utf8_lossy(&body).contains("<html"), "{}", path);
+    }
+    handle.stop();
+}
+
+#[test]
 fn test_pairing_link_sets_session_cookie_and_redirects() {
     isolate_config();
     let token = quickstream::web_access::web_token();
