@@ -406,9 +406,11 @@ fn test_autopilot_append_mode_does_not_interrupt_playback() {
 
     // Seed existing queue with 2 tracks
     for i in 1..=2 {
-        let mut meta = quickstream::metadata::AudioMetadata::default();
-        meta.title = format!("Existing {}", i);
-        meta.filepath = temp_dir.join(format!("Existing_{}.wav", i));
+        let meta = quickstream::metadata::AudioMetadata {
+            title: format!("Existing {}", i),
+            filepath: temp_dir.join(format!("Existing_{}.wav", i)),
+            ..Default::default()
+        };
         app.queue.add_track(meta);
     }
     app.queue.current_index = 1; // "Existing 2" is playing
@@ -455,9 +457,11 @@ fn test_autopilot_reshuffle_from_next_track_forward() {
 
     // Create 4 initial tracks in queue
     for i in 1..=4 {
-        let mut meta = quickstream::metadata::AudioMetadata::default();
-        meta.title = format!("Original Track {}", i);
-        meta.filepath = temp_dir.join(format!("orig_{}.wav", i));
+        let meta = quickstream::metadata::AudioMetadata {
+            title: format!("Original Track {}", i),
+            filepath: temp_dir.join(format!("orig_{}.wav", i)),
+            ..Default::default()
+        };
         app.queue.add_track(meta);
     }
     app.queue.current_index = 1; // "Original Track 2" is playing
@@ -508,9 +512,11 @@ fn test_web_autopilot_reshuffle_action() {
 
     // Queue 3 songs
     for i in 1..=3 {
-        let mut meta = quickstream::metadata::AudioMetadata::default();
-        meta.title = format!("Song {}", i);
-        meta.filepath = temp_dir.join(format!("song_{}.wav", i));
+        let meta = quickstream::metadata::AudioMetadata {
+            title: format!("Song {}", i),
+            filepath: temp_dir.join(format!("song_{}.wav", i)),
+            ..Default::default()
+        };
         app.queue.add_track(meta);
     }
     app.queue.current_index = 0;

@@ -688,7 +688,7 @@ fn test_filesystem_root_and_home_are_never_allowed_roots() {
         // A root that is a symlink to / grants nothing.
         let link = dir.join("everything");
         std::os::unix::fs::symlink("/", &link).unwrap();
-        assert_eq!(resolve_allowed_path(Path::new("/etc"), &[link.clone()]), None);
+        assert_eq!(resolve_allowed_path(Path::new("/etc"), std::slice::from_ref(&link)), None);
         assert_eq!(resolve_allowed_path(&music, &[link]), None);
     }
     let _ = fs::remove_dir_all(&dir);

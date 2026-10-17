@@ -2,7 +2,7 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::KeyCode;
 use quickstream::metadata::AudioMetadata;
@@ -27,10 +27,10 @@ fn track(n: usize) -> AudioMetadata {
     }
 }
 
-fn app_with_queue(dir: &PathBuf, n: usize) -> AppUI {
+fn app_with_queue(dir: &Path, n: usize) -> AppUI {
     let mut settings_mgr = SettingsManager::new();
     settings_mgr.settings.web_server_enabled = false;
-    let mut app = AppUI::new(Some(dir.clone()), settings_mgr);
+    let mut app = AppUI::new(Some(dir.to_path_buf()), settings_mgr);
     for i in 1..=n {
         app.queue.add_track(track(i));
     }
