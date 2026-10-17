@@ -3129,8 +3129,11 @@ impl AppUI {
     }
 
     /// Folders the web dashboard may browse and act on: the startup home, the bookmarks and the
-    /// folder the browser opened at launch. Folders browsed later in the TUI are not included.
+    /// folder the browser opened at launch. Folders browsed later in the TUI are not included,
+    /// and neither are the filesystem root or the home folder itself (too broad).
     pub fn web_allowed_roots(&self) -> Vec<PathBuf> {
+        static LOGGED_SKIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let home = crate::web_access::home_dir();
         let mut roots: Vec<PathBuf> = Vec::new();
         let candidates = self
             .settings_mgr
@@ -3141,9 +3144,20 @@ impl AppUI {
             .map(PathBuf::from)
             .chain(std::iter::once(self.launch_dir.clone()));
         for root in candidates {
-            if root.is_absolute() && !roots.contains(&root) {
-                roots.push(root);
+            if roots.contains(&root) {
+                continue;
             }
+            if !crate::web_access::is_acceptable_root(&root, home.as_deref()) {
+                if root.is_absolute() && !LOGGED_SKIP.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::log_info!(
+                        "web",
+                        "Not letting the web dashboard reach {}: too broad (use a music folder, bookmark or startup home)",
+                        root.display()
+                    );
+                }
+                continue;
+            }
+            roots.push(root);
         }
         roots
     }

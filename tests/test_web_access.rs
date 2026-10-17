@@ -10,7 +10,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use quickstream::web::{NowPlayingState, WebBrowserResponse, WebCommand, WebServer};
-use quickstream::web_access::{authorize, load_or_create_token, resolve_allowed_path, AuthDecision, AuthHeaders};
+use quickstream::web_access::{
+    authorize, is_acceptable_root, load_or_create_token, resolve_allowed_path, AuthDecision, AuthHeaders,
+};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const PORT: u16 = 8080;
@@ -616,6 +618,52 @@ fn test_app_publishes_allowed_roots_to_web_state() {
     assert!(roots.contains(&home), "{:?}", roots);
     assert!(roots.contains(&bookmark), "{:?}", roots);
     assert!(!roots.contains(&elsewhere), "{:?}", roots);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_filesystem_root_and_home_are_never_allowed_roots() {
+    let dir = temp_dir("broadroots");
+    let home = dir.join("home").join("me");
+    let music = home.join("Music");
+    fs::create_dir_all(&music).unwrap();
+
+    assert!(!is_acceptable_root(Path::new("/"), Some(&home)));
+    assert!(!is_acceptable_root(Path::new("/"), None));
+    assert!(!is_acceptable_root(&home, Some(&home)));
+    assert!(!is_acceptable_root(&home.join("Music").join(".."), Some(&home)));
+    // Folders containing the home folder are broader still.
+    assert!(!is_acceptable_root(&dir.join("home"), Some(&home)));
+    assert!(!is_acceptable_root(Path::new("Music"), Some(&home)));
+    assert!(is_acceptable_root(&music, Some(&home)));
+    assert!(is_acceptable_root(&music, None));
+
+    #[cfg(unix)]
+    {
+        // A root that is a symlink to / grants nothing.
+        let link = dir.join("everything");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        assert_eq!(resolve_allowed_path(Path::new("/etc"), &[link.clone()]), None);
+        assert_eq!(resolve_allowed_path(&music, &[link]), None);
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_app_never_publishes_root_or_home_as_allowed_roots() {
+    let dir = temp_dir("approots_broad");
+    let music = dir.join("Music");
+    fs::create_dir_all(&music).unwrap();
+    let real_home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()).expect("home dir");
+
+    let mut app = web_app(music.clone(), Some(real_home.to_string_lossy().to_string()));
+    // Launched from / with the home folder bookmarked.
+    app.launch_dir = PathBuf::from("/");
+    app.bookmarks = vec!["/".to_string(), real_home.to_string_lossy().to_string(), music.to_string_lossy().to_string()];
+    app.update_web_state();
+
+    let roots = app.web_state.read().unwrap().allowed_roots.clone();
+    assert_eq!(roots, vec![music.clone()]);
     let _ = fs::remove_dir_all(&dir);
 }
 

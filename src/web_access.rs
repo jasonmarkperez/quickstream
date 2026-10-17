@@ -377,16 +377,59 @@ pub fn pairing_url(host: &str, port: u16, token: &str) -> String {
 // Allowed folders
 // ---------------------------------------------------------------------------------------------
 
+/// Whether `root` may be an allowed folder for the web dashboard. The filesystem root, the home
+/// folder `home` and folders containing it are too broad and never accepted, nor are relative
+/// paths.
+///
+/// The check is lexical (no filesystem access, so the UI thread may call it);
+/// [`resolve_allowed_path`] repeats it on the canonicalized roots.
+pub fn is_acceptable_root(root: &Path, home: Option<&Path>) -> bool {
+    if !root.is_absolute() {
+        return false;
+    }
+    let root = normalize_lexically(root);
+    if root.parent().is_none() {
+        return false;
+    }
+    match home {
+        Some(home) => !normalize_lexically(home).starts_with(&root),
+        None => true,
+    }
+}
+
+/// Resolve `.` and `..` components without touching the filesystem.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The current user's home folder.
+pub fn home_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf())
+}
+
 /// Canonicalize `path` and return it if it lies inside one of `roots` (also canonicalized).
-/// Relative paths, missing paths and symlinks leading out of the roots are refused.
+/// Relative paths, missing paths and symlinks leading out of the roots are refused, and so are
+/// roots that resolve to the filesystem root or the home folder (see [`is_acceptable_root`]).
 pub fn resolve_allowed_path(path: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
     if !path.is_absolute() {
         return None;
     }
     let canonical = std::fs::canonicalize(path).ok()?;
+    let home = home_dir().map(|h| std::fs::canonicalize(&h).unwrap_or(h));
     roots
         .iter()
         .filter_map(|r| std::fs::canonicalize(r).ok())
+        .filter(|root| is_acceptable_root(root, home.as_deref()))
         .any(|root| canonical.starts_with(&root))
         .then_some(canonical)
 }
