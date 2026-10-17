@@ -246,7 +246,8 @@ impl StreamServerState {
 
     /// Register a file on disk so that /stream/<filename> resolves to its exact path.
     pub fn register_file(&self, path: &Path) {
-        if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+        // Lossy so names that are not valid UTF-8 match the lossily encoded URLs built by upnp.rs.
+        if let Some(filename) = path.file_name().map(|f| f.to_string_lossy()) {
             let mut reg = self.file_registry.write().unwrap();
             reg.insert(filename.to_string(), path.to_path_buf());
             reg.insert(filename.to_lowercase(), path.to_path_buf());
@@ -931,6 +932,27 @@ pub fn calculate_stream_offset(
     }
 }
 
+/// Resolve a `/stream/<name>` request to a file the player has explicitly exposed.
+///
+/// Only files in the stream registry, or the current now-playing file matched by file
+/// name, are served. Raw filesystem paths are never accepted, so a LAN client cannot
+/// read arbitrary files from disk.
+fn resolve_stream_file(name: &str, stream_state: &StreamServerState, current: Option<&Path>) -> Option<PathBuf> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return None;
+    }
+    // The now-playing file wins over the registry: the registry is keyed by bare file name, so a
+    // later registration of a same-named track from another album would otherwise replace it.
+    let found = current
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|f| f.to_string_lossy().to_lowercase() == name.to_lowercase())
+        })
+        .map(Path::to_path_buf)
+        .or_else(|| stream_state.lookup_file(name))?;
+    found.is_file().then_some(found)
+}
+
 fn serve_audio_stream(
     mut stream: TcpStream,
     path: &str,
@@ -958,7 +980,6 @@ fn serve_audio_stream(
     let raw_encoded = path.strip_prefix("/stream/").unwrap_or("");
     let encoded_path = raw_encoded.split('?').next().unwrap_or(raw_encoded);
     let decoded_path = crate::player::upnp::url_decode(encoded_path);
-    let candidate = PathBuf::from(&decoded_path);
 
     let query_str = path.split_once('?').map(|(_, q)| q);
     let mut offset_seconds: f64 = 0.0;
@@ -979,47 +1000,12 @@ fn serve_audio_stream(
         (s.filepath.clone(), s.duration_seconds)
     };
 
-    let filepath = if candidate.is_absolute() && candidate.exists() && candidate.is_file() {
-        candidate
-    } else if let Some(reg_path) = stream_state.lookup_file(&decoded_path) {
-        if reg_path.exists() && reg_path.is_file() {
-            reg_path
-        } else if let Some(ref p) = current_filepath {
-            if p.exists() && p.is_file() {
-                p.clone()
-            } else {
-                crate::log_warn!(
-                    "web",
-                    "Stream 404: Registered file '{}' missing on disk ({})",
-                    decoded_path,
-                    reg_path.display()
-                );
-                let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-                stream.write_all(not_found)?;
-                stream.flush()?;
-                return Ok(());
-            }
-        } else {
+    let filepath = match resolve_stream_file(&decoded_path, stream_state, current_filepath.as_deref()) {
+        Some(p) => p,
+        None => {
             crate::log_warn!(
                 "web",
-                "Stream 404: Registered file '{}' missing on disk ({})",
-                decoded_path,
-                reg_path.display()
-            );
-            let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-            stream.write_all(not_found)?;
-            stream.flush()?;
-            return Ok(());
-        }
-    } else if candidate.exists() && candidate.is_file() {
-        candidate
-    } else if let Some(ref p) = current_filepath {
-        if p.exists() && p.is_file() {
-            p.clone()
-        } else {
-            crate::log_warn!(
-                "web",
-                "Stream 404: Candidate '{}' not found and current_filepath is invalid",
+                "Stream 404: '{}' is not a registered or now-playing file",
                 decoded_path
             );
             let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
@@ -1027,16 +1013,6 @@ fn serve_audio_stream(
             stream.flush()?;
             return Ok(());
         }
-    } else {
-        crate::log_warn!(
-            "web",
-            "Stream 404: File '{}' not found in registry and no current_filepath",
-            decoded_path
-        );
-        let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-        stream.write_all(not_found)?;
-        stream.flush()?;
-        return Ok(());
     };
 
     let mut file = match std::fs::File::open(&filepath) {
