@@ -54,17 +54,26 @@ const MIGRATIONS: &[&str] = &[
 const _: () = assert!(MIGRATIONS.len() as u32 == CURRENT_SCHEMA_VERSION);
 
 /// Returned when the database on disk was written by a newer quickstream build.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "analysis database {path} has schema version {found}, which is newer than this build supports \
-     (version {supported}); refusing to open it so it is not damaged. Upgrade quickstream, or move \
-     the file aside to rebuild the analysis cache"
-)]
+#[derive(Debug)]
 pub struct SchemaTooNewError {
     pub path: String,
     pub found: u32,
     pub supported: u32,
 }
+
+impl std::fmt::Display for SchemaTooNewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "analysis database {} has schema version {}, which is newer than this build supports \
+             (version {}); refusing to open it so it is not damaged. Upgrade quickstream, or move \
+             the file aside to rebuild the analysis cache",
+            self.path, self.found, self.supported
+        )
+    }
+}
+
+impl std::error::Error for SchemaTooNewError {}
 
 /// Complete audio features and acoustic vector for intelligent mixing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
