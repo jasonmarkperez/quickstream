@@ -531,6 +531,55 @@ impl UPnPClient {
     }
 }
 
+/// Coordinates the background poll thread with player commands.
+///
+/// Every command (play, pause, resume, seek, stop) bumps `epoch` when it starts and
+/// again when it ends, and counts itself in `active_commands` meanwhile. The poll thread
+/// snapshots the epoch before its SOAP calls and applies what it observed only if the
+/// epoch is unchanged and no command is running, checked and written under this lock.
+/// A poll thread from an earlier session, or one whose SOAP call overlapped a command,
+/// therefore cannot write stale state (e.g. `track_finished`) into the current session.
+#[derive(Default)]
+struct PollControl {
+    epoch: u64,
+    active_commands: u32,
+}
+
+fn lock_poll_control(ctl: &Mutex<PollControl>) -> std::sync::MutexGuard<'_, PollControl> {
+    ctl.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// RAII marker for a running player command; see [`PollControl`].
+struct CommandGuard {
+    ctl: Arc<Mutex<PollControl>>,
+}
+
+impl CommandGuard {
+    fn begin(ctl: &Arc<Mutex<PollControl>>) -> Self {
+        {
+            let mut c = lock_poll_control(ctl);
+            c.epoch = c.epoch.wrapping_add(1);
+            c.active_commands += 1;
+        }
+        Self { ctl: ctl.clone() }
+    }
+}
+
+impl Drop for CommandGuard {
+    fn drop(&mut self) {
+        let mut c = lock_poll_control(&self.ctl);
+        c.epoch = c.epoch.wrapping_add(1);
+        c.active_commands = c.active_commands.saturating_sub(1);
+    }
+}
+
+/// What one poll tick learned from the renderer.
+enum PollObservation {
+    /// Continuous (gapless) stream: only the transport state is tracked.
+    Continuous { state: String },
+    Track { rel_sec: f64, dur_sec: f64, state: String },
+}
+
 /// An `AudioPlayer` implementation streaming audio over DLNA/UPnP to remote renderers.
 pub struct UPnPPlayer {
     pub device: DLNADevice,
@@ -547,6 +596,7 @@ pub struct UPnPPlayer {
     current_filepath: Arc<Mutex<Option<PathBuf>>>,
     playback_stream_offset: Arc<Mutex<f64>>,
     last_seek_time: Arc<Mutex<Instant>>,
+    poll_control: Arc<Mutex<PollControl>>,
 }
 
 impl UPnPPlayer {
@@ -576,7 +626,13 @@ impl UPnPPlayer {
             current_filepath: Arc::new(Mutex::new(None)),
             playback_stream_offset: Arc::new(Mutex::new(0.0)),
             last_seek_time: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(10))),
+            poll_control: Arc::new(Mutex::new(PollControl::default())),
         }
+    }
+
+    /// Mark a player command as running until the returned guard is dropped.
+    fn begin_command(&self) -> CommandGuard {
+        CommandGuard::begin(&self.poll_control)
     }
 
     pub fn with_stream_state(mut self, stream_state: Option<Arc<crate::web::StreamServerState>>) -> Self {
@@ -603,6 +659,7 @@ impl UPnPPlayer {
 
         let dev_name = self.device.friendly_name.clone();
         let stream_state = self.stream_state.clone();
+        let poll_control = self.poll_control.clone();
 
         std::thread::spawn(move || {
             let mut consecutive_stopped = 0;
@@ -616,9 +673,43 @@ impl UPnPPlayer {
                     break;
                 }
 
-                if let Some(ref ss) = stream_state {
-                    if ss.continuous.is_active.load(Ordering::SeqCst) {
-                        let state = client.get_transport_info();
+                // Snapshot the command epoch before querying the renderer. Skip the tick
+                // entirely while a command is changing the renderer's state.
+                let epoch = {
+                    let ctl = lock_poll_control(&poll_control);
+                    if ctl.active_commands > 0 {
+                        continue;
+                    }
+                    ctl.epoch
+                };
+                let current_seek_instant = *last_seek_ref.lock().unwrap();
+
+                let continuous = stream_state
+                    .as_ref()
+                    .is_some_and(|ss| ss.continuous.is_active.load(Ordering::SeqCst));
+                let observation = if continuous {
+                    PollObservation::Continuous {
+                        state: client.get_transport_info(),
+                    }
+                } else {
+                    let (rel_sec, dur_sec) = client.get_position_info();
+                    let state = client.get_transport_info();
+                    PollObservation::Track { rel_sec, dur_sec, state }
+                };
+
+                // The SOAP calls above can take seconds. Apply their result only if this
+                // thread still belongs to the current session and no command ran in the
+                // meantime; hold the lock while writing so no command can start mid-write.
+                let ctl = lock_poll_control(&poll_control);
+                if stop_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                if ctl.epoch != epoch || ctl.active_commands > 0 {
+                    continue;
+                }
+
+                let (rel_sec, dur_sec, state) = match observation {
+                    PollObservation::Continuous { state } => {
                         if state == "PLAYING" {
                             consecutive_stopped = 0;
                             is_playing_ref.store(true, Ordering::SeqCst);
@@ -630,10 +721,10 @@ impl UPnPPlayer {
                         }
                         continue;
                     }
-                }
+                    PollObservation::Track { rel_sec, dur_sec, state } => (rel_sec, dur_sec, state),
+                };
 
                 // If user sought, sync last_seek_instant and reset max_observed_pos / total_playing_seconds
-                let current_seek_instant = *last_seek_ref.lock().unwrap();
                 if current_seek_instant != last_seek_instant {
                     last_seek_instant = current_seek_instant;
                     let target_pos = *pos_ref.lock().unwrap();
@@ -643,12 +734,10 @@ impl UPnPPlayer {
 
                 let time_since_seek = current_seek_instant.elapsed();
 
-                let (rel_sec, dur_sec) = client.get_position_info();
                 if dur_sec > 0.0 {
                     *dur_ref.lock().unwrap() = dur_sec;
                 }
 
-                let state = client.get_transport_info();
                 match state.as_str() {
                     "PLAYING" => {
                         consecutive_stopped = 0;
@@ -842,6 +931,7 @@ impl UPnPPlayer {
 
 impl Drop for UPnPPlayer {
     fn drop(&mut self) {
+        let _cmd = self.begin_command();
         self.poll_stop_flag.store(true, Ordering::SeqCst);
         if let Some(ref ss) = self.stream_state {
             ss.close_active_streams();
@@ -867,8 +957,11 @@ impl AudioPlayer for UPnPPlayer {
             position_seconds,
             self.device.friendly_name
         );
+        let _cmd = self.begin_command();
 
-        // 1. Terminate any previous polling thread, close streaming sockets, & stop renderer
+        // 1. Terminate any previous polling thread, close streaming sockets, & stop renderer.
+        // The old thread is not joined (it may be inside a multi-second SOAP call); the
+        // command epoch bumped above makes it drop whatever it observes from now on.
         self.poll_stop_flag.store(true, Ordering::SeqCst);
         if let Some(ref ss) = self.stream_state {
             ss.close_active_streams();
@@ -945,6 +1038,7 @@ impl AudioPlayer for UPnPPlayer {
     }
 
     fn pause(&mut self) -> anyhow::Result<()> {
+        let _cmd = self.begin_command();
         let (rel_sec, _) = self.client.get_position_info();
         if rel_sec > 0.0 {
             let offset = *self.playback_stream_offset.lock().unwrap();
@@ -967,6 +1061,7 @@ impl AudioPlayer for UPnPPlayer {
     }
 
     fn resume(&mut self) -> anyhow::Result<()> {
+        let _cmd = self.begin_command();
         let current_pos = *self.position_seconds.lock().unwrap();
         crate::log_info!("player", "UPnPPlayer::resume at {:.2}s", current_pos);
 
@@ -1013,6 +1108,7 @@ impl AudioPlayer for UPnPPlayer {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        let _cmd = self.begin_command();
         self.poll_stop_flag.store(true, Ordering::SeqCst);
         if let Some(ref ss) = self.stream_state {
             ss.close_active_streams();
@@ -1033,6 +1129,7 @@ impl AudioPlayer for UPnPPlayer {
     }
 
     fn seek_to(&mut self, position_seconds: f64) -> anyhow::Result<()> {
+        let _cmd = self.begin_command();
         if let Some(ref ss) = self.stream_state {
             if ss.continuous.is_active.load(Ordering::SeqCst) {
                 ss.continuous.seek_to(position_seconds);
