@@ -129,8 +129,9 @@ pub fn create_didl_lite_xml(
     )
 }
 
-/// Largest SOAP response accepted from a renderer.
-const MAX_SOAP_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Largest SOAP response accepted from a renderer. Real replies, including
+/// GetPositionInfo with its DIDL-Lite track metadata, are a few KiB.
+pub const MAX_SOAP_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Why a SOAP action failed.
 #[derive(Debug, Clone, PartialEq)]
@@ -299,6 +300,13 @@ impl UPnPClient {
         }
         let url = parse_http_url(control_url)
             .ok_or_else(|| SoapError::InvalidUrl(format!("Invalid control URL: {}", control_url)))?;
+        // Host names would need a DNS lookup that the request deadline cannot bound.
+        if url.host.parse::<std::net::IpAddr>().is_err() {
+            return Err(SoapError::InvalidUrl(format!(
+                "Control URL host is not an IP address: {}",
+                control_url
+            )));
+        }
 
         let mut args_xml = String::new();
         for (k, v) in arguments {
