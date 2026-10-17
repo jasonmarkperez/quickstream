@@ -39,7 +39,11 @@ pub struct LocalPlayer {
 
 impl LocalPlayer {
     pub fn new(backend: &str) -> Self {
-        let sock_name = format!("mpv_{}.sock", std::process::id());
+        // Unique per instance: an old player may still be shutting down on another thread
+        // (and removing its socket) while a new one starts.
+        static NEXT_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let instance = NEXT_INSTANCE.fetch_add(1, Ordering::SeqCst);
+        let sock_name = format!("mpv_{}_{}.sock", std::process::id(), instance);
         let socket_path = PathBuf::from("/tmp").join(sock_name);
 
         Self {

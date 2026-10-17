@@ -1098,3 +1098,35 @@ fn test_upnp_player_play_at_starts_directly_with_pos_offset() {
     let _ = handle.join();
 }
 
+
+#[test]
+fn test_upnp_player_detached_from_stream_state_does_not_close_shared_streams() {
+    use std::sync::atomic::Ordering;
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let device = DLNADevice {
+        udn: "uuid:retired".to_string(),
+        friendly_name: "Retired Renderer".to_string(),
+        model_name: "Test".to_string(),
+        manufacturer: "Test".to_string(),
+        host: "127.0.0.1".to_string(),
+        port,
+        location: format!("http://127.0.0.1:{}/desc.xml", port),
+        av_transport_control_url: format!("http://127.0.0.1:{}/ctrl/AVTransport", port),
+        rendering_control_url: format!("http://127.0.0.1:{}/ctrl/RenderingControl", port),
+    };
+    let shared = std::sync::Arc::new(quickstream::web::StreamServerState::new());
+    // Another renderer is now streaming from the shared server.
+    shared.continuous.is_active.store(true, Ordering::SeqCst);
+
+    let mut old = UPnPPlayer::new(device, 8080).with_stream_state(Some(shared.clone()));
+    old.detach_stream_state();
+    let _ = old.stop();
+    drop(old);
+
+    assert!(
+        shared.continuous.is_active.load(Ordering::SeqCst),
+        "a retired player must not close the streams of the new renderer"
+    );
+}
