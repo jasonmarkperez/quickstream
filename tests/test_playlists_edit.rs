@@ -495,3 +495,69 @@ fn test_help_modal_lists_playlist_editing_keys() {
     drop(app);
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+/// Open the rename prompt on the selected playlist and submit `new` as its name.
+fn rename_selected(app: &mut AppUI, old: &str, new: &str) {
+    press(app, KeyCode::Char('R'), KeyModifiers::SHIFT);
+    for _ in 0..old.chars().count() {
+        press(app, KeyCode::Backspace, KeyModifiers::NONE);
+    }
+    type_text(app, new);
+    press(app, KeyCode::Enter, KeyModifiers::NONE);
+}
+
+fn saved_last_playlist(temp_dir: &std::path::Path) -> Option<String> {
+    SettingsManager::with_path(temp_dir.join("config.json"))
+        .settings
+        .last_playlist
+}
+
+#[test]
+fn test_rename_moves_last_playlist_to_the_new_name() {
+    common::isolate();
+    let (mut app, temp_dir) = app_on_playlists_tab("rename_last");
+    seed(&mut app, "Alpha", &[]);
+    seed(&mut app, "Beta", &[]);
+    app.settings_mgr.settings.last_playlist = Some("alpha".to_string());
+    app.playlists.list_cursor = 0;
+
+    rename_selected(&mut app, "Alpha", "Zed");
+    assert_eq!(app.settings_mgr.settings.last_playlist.as_deref(), Some("Zed"));
+    assert!(app.persistence.flush());
+    assert_eq!(saved_last_playlist(&temp_dir).as_deref(), Some("Zed"));
+
+    // Renaming some other playlist leaves it alone.
+    let beta = app.playlists.store.index_of("Beta").unwrap();
+    app.playlists.list_cursor = beta;
+    rename_selected(&mut app, "Beta", "Gamma");
+    assert_eq!(app.settings_mgr.settings.last_playlist.as_deref(), Some("Zed"));
+
+    drop(app);
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_delete_clears_last_playlist() {
+    common::isolate();
+    let (mut app, temp_dir) = app_on_playlists_tab("delete_last");
+    seed(&mut app, "Alpha", &[]);
+    seed(&mut app, "Beta", &[]);
+    app.settings_mgr.settings.last_playlist = Some("Alpha".to_string());
+    app.settings_mgr.save();
+
+    // Deleting another playlist keeps it.
+    app.playlists.list_cursor = 1;
+    press(&mut app, KeyCode::Char('D'), KeyModifiers::SHIFT);
+    press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+    assert_eq!(app.settings_mgr.settings.last_playlist.as_deref(), Some("Alpha"));
+
+    app.playlists.list_cursor = 0;
+    press(&mut app, KeyCode::Char('D'), KeyModifiers::SHIFT);
+    press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+    assert_eq!(app.settings_mgr.settings.last_playlist, None);
+    assert!(app.persistence.flush());
+    assert_eq!(saved_last_playlist(&temp_dir), None);
+
+    drop(app);
+    let _ = fs::remove_dir_all(&temp_dir);
+}

@@ -606,6 +606,7 @@ impl AppUI {
         }
         match purpose {
             NamePurpose::Rename { old } => {
+                self.follow_last_playlist(&old, Some(&name));
                 self.status_message = format!("Renamed \"{}\" to \"{}\"", old, name);
             }
             NamePurpose::Create | NamePurpose::CreateAndAdd(_) => {
@@ -615,9 +616,25 @@ impl AppUI {
         }
     }
 
+    /// Keep `last_playlist` (the add picker's start row) pointing at a playlist that exists:
+    /// `old` was renamed to `new`, or deleted when `new` is `None`.
+    fn follow_last_playlist(&mut self, old: &str, new: Option<&str>) {
+        let settings = &mut self.settings_mgr.settings;
+        if !settings
+            .last_playlist
+            .as_deref()
+            .is_some_and(|last| crate::playlist::names_equal(last, old))
+        {
+            return;
+        }
+        settings.last_playlist = new.map(str::to_string);
+        self.settings_mgr.save();
+    }
+
     fn delete_playlist(&mut self, name: &str) {
         match self.playlists.store.delete(name) {
             Ok(()) => {
+                self.follow_last_playlist(name, None);
                 // Stay on the same row, or move up to the new last row when the last one went.
                 let len = self.playlists.store.playlists().len();
                 self.playlists.list_cursor = self.playlists.list_cursor.min(len.saturating_sub(1));
