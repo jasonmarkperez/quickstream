@@ -19,8 +19,9 @@ This guide is intended for AI coding agents and automated development tools work
 3. **Zero-Touch Library Invariant**:
    - Quickstream **MUST NEVER** write to, modify, delete, or rename files or directories in the user's music library or network shares (e.g. `/Volumes/Music`).
    - All persistent application data strictly complies with the XDG Base Directory specification:
-     - Configuration: `~/.config/quickstream/config.json`
+     - Configuration: `~/.config/quickstream/config.json` (includes `last_playlist`, the playlist the add picker preselects)
      - Bookmarks: `~/.config/quickstream/bookmarks.json`
+     - Playlists: `~/.config/quickstream/playlists/<name>.m3u8` (`paths::get_playlists_dir()`; extended M3U8, UTF-8, LF, absolute track paths, one file per playlist). Every write, rename and delete goes through `PlaylistStore` and `playlist::playlist_file_path`, which refuses any path whose parent is not the playlists folder. Missing-file checks never prune a playlist, and a file that fails to load is skipped and never rewritten.
      - Track Analysis Database: `~/.cache/quickstream/track_analysis.db` (SQLite)
      - Cache Indexes: `~/.cache/quickstream/music_index.jsonl`
      - Logs: `~/.local/share/quickstream/quickstream.log`
@@ -61,6 +62,7 @@ quickstream/
 │   │
 │   ├── ui/               # Terminal User Interface (Ratatui + Crossterm)
 │   │   ├── mod.rs        # AppUI state machine, 60 FPS render passes, tab switching, hotkey router
+│   │   ├── playlists.rs  # Tab 5 Playlists: PlaylistsUi, name prompt / delete confirm / add picker, L key, play & queue
 │   │   └── search.rs     # SearchModalState, streaming fuzzy search (fuzzy-matcher / SkimMatcherV2)
 │   │
 │   ├── player/           # Audio playback abstraction layer
@@ -78,6 +80,9 @@ quickstream/
 │   │
 │   ├── library.rs        # Recursive walkdir scanner, progressive autopilot streamer, JSONL cache
 │   ├── metadata.rs       # Lofty audio metadata extraction, cover art decoding, path heuristics
+│   ├── playlist.rs       # Pure M3U8 playlist model: parse/write, name validation, safe file paths, queue plan
+│   ├── playlist_store.rs # In-memory PlaylistStore (sorted), write-through to disk via PersistHandle
+│   ├── persist.rs        # Background atomic writer: ordered save / delete / rename (PersistHandle)
 │   ├── queue.rs          # PlaybackQueue, FastRng (SplitMix64 deterministic PRNG), shuffle & loop
 │   ├── web.rs            # Embedded HTTP byte-range server, continuous WAV streaming, REST API, Web UI
 │   ├── web_access.rs     # Web access control: pairing token, Host/Origin/Content-Type checks, allowed folders
@@ -93,17 +98,25 @@ quickstream/
     ├── test_local_player.rs  # mpv / ffplay local audio backend lifecycle
     ├── test_metadata.rs      # Lofty audio header parsing, duration, and path heuristics
     ├── test_now_playing.rs   # Tab 0 Now Playing hero view layout and rendering
+    ├── test_playlists.rs     # M3U8 parse/write round trips, name rules, safe paths, queue planning
+    ├── test_playlist_store.rs # Store create/add/remove/move/rename/delete, case-only rename, load skips
+    ├── test_playlists_ui.rs  # Tab 5 tab switching, two-pane navigation, rendering, modal hook, help
+    ├── test_playlists_edit.rs # Name prompt, create/rename/delete, K/J move, d/x remove
+    ├── test_playlists_add.rs  # L key, add picker, folder adds, last_playlist
+    ├── test_playlists_play.rs # Missing-file checks, Enter replace+play, a append, all-missing
     ├── test_search.rs        # Multi-threaded fuzzy search, scoped scan, and modal navigation
     ├── test_upnp.rs          # UPnP SOAP XML generation, AVTransport state machine, continuous stream
     └── test_web.rs           # Embedded web server, byte ranges, REST API, and command dispatch
 ```
 
+The background writer's delete and rename tests (used by `PlaylistStore`) are in the existing `tests/test_persistence_worker.rs`, which the map above does not list.
+
 ---
 
 ## 3. Terminal UI Architecture & Ratatui Guidelines
 
-### 4-Tab Layout Structure
-- **Header**: Tab bar (`[1] Now Playing` | `[2] Queue & Library` | `[3] Devices` | `[4] Settings`).
+### 5-Tab Layout Structure
+- **Header**: Tab bar (`[1] Now Playing` | `[2] Queue & Library` | `[3] Devices` | `[4] Settings` | `[5] Playlists`).
 - **Main View Area**:
   - **Tab 0 (`[1] Now Playing`)**: Hero view with large typography (Title, Artist, Album), technical codec/format badges, timeline, and upcoming queue preview.
   - **Tab 1 (`[2] Queue & Library`)**: Split-pane layout.
@@ -111,6 +124,10 @@ quickstream/
     - **Right Pane (`queue`)**: `PlaybackQueue` showing queued songs, duration, status badges, and track index. Focus toggled with `h` and `l`.
   - **Tab 2 (`[3] Devices`)**: Discovered DLNA MediaRenderers and `Local Audio` with active output indicator (`●`).
   - **Tab 3 (`[4] Settings`)**: User preferences editor (metadata display, audio backend, seek interval, volume step, queue mode, PCM transcode, web server toggle, startup home directory).
+  - **Tab 4 (`[5] Playlists`)**: Split-pane layout (`src/ui/playlists.rs`, state in `AppUI::playlists: PlaylistsUi`). A startup worker loads the playlists. Until the load finishes, the tab shows `Loading playlists…` and edits are refused with `Playlists are still loading`. Focus toggles with `h` and `l`. `j`/`k`/`Up`/`Down` move with wraparound.
+    - **Left Pane (playlists)**: one row per playlist (name and track count), sorted case-insensitively. `c` create, `R` rename (prompt prefilled with the current name), `D` delete after `Delete "<name>" (<n> tracks)? y/n`, `Enter` focus the tracks pane, `a` append the whole playlist to the queue. Empty state: `No playlists yet. Press c to create one, or L on any track.`
+    - **Right Pane (tracks)**: title `<NAME> (<n> tracks, <total length>)`, with unknown durations left out of the total. Rows read `<n>. <artist> - <title>  <m:ss>`. Missing files show `✗ missing: <artist> - <title>` and `----`. Existence is checked on a worker and cached per path for the session. Rows not yet checked render normally. `Enter` replaces the queue with the playlist and plays from the selected track: it stops any autopilot scan and continuous stream first and skips missing files. If every file is missing, it leaves the queue untouched. `a` appends the whole playlist. `K`/`J` move the selected track up/down (no wraparound; on tab `[2]` these keys page instead). `d`/`x`/`Del` remove it. Empty state: `Empty. Press L on a track in tab 2 to add it.`
+    - Edits save automatically through the background writer (`PersistHandle`). There is no save key.
 - **Persistent Bottom Playback Bar**:
   - Rendered across all tabs.
   - Displays: State badge (`▶`, `⏸`, `⏹`), track title, artist, format badge (`[FLAC] [24b/96k]`), volume/mute, interactive progress bar, elapsed/total time, and active mix profile badge.
@@ -118,23 +135,31 @@ quickstream/
   - **Help Modal (`?`)**: Full keyboard shortcut cheat-sheet.
   - **Fuzzy Search Modal (`f`)**: Streaming fuzzy finder with real-time preview card.
   - **Mix Profile Modal (`M`)**: Interactive autopilot mix profile selector (`[1]` Diverse Shuffle, `[2]` BPM Flow, `[3]` Chill & Ambient, `[4]` Workout, `[5]` Late Night Groove).
-  - Modals intercept keyboard input when active; dismissed with `Esc` or `q`.
+  - **Add-to-Playlist Picker (`L`)**: the header names what is being added (the track title, or `<folder> (folder)`). The rows list the playlists, with `last_playlist` highlighted (or the first row if it no longer exists), then `+ New playlist…`. `j`/`k`/arrows wrap, `Enter` adds, `Esc`/`q` cancel. Results: `Added "<title>" to <name> (<n> tracks)`, `Already in <name>`, `Added <k> to <name>, skipped <m> already in it`.
+  - **Playlist Name Prompt** (`c`, `R`, `+ New playlist…`): every character is text, including `q` and digits. `Backspace` deletes, `Enter` confirms, `Esc` cancels. An invalid or duplicate name (case-insensitive) keeps the prompt open and shows the error, e.g. `Name can't contain /` or `"Road Trip" already exists`.
+  - **Playlist Delete Confirmation (`D`)**: `y` deletes the file. Any other key cancels.
+  - Modals intercept keyboard input when active, before the global hotkeys. Most are dismissed with `Esc` or `q`. The playlist name prompt and the Startup Home Directory editor treat `q` as text and close only with `Esc`/`Enter`. `Ctrl+C` quits from any modal.
 
 ### Key Navigation Invariants
 1. **List Wraparound**:
-   All interactive lists (Queue, FileBrowser, Devices, Search Results, Mix Profiles) wrap around: navigating `Up` at index `0` moves to the last item, and navigating `Down` at the end loops back to `0`.
+   All interactive lists (Queue, FileBrowser, Devices, Search Results, Mix Profiles, Playlists, Playlist Tracks, Add-to-Playlist Picker) wrap around: navigating `Up` at index `0` moves to the last item, and navigating `Down` at the end loops back to `0`. Moving a playlist track with `K`/`J` does not wrap.
 2. **Keybinding Precedence**:
    - Terminal resize events handled first.
-   - Active overlay modal input handled next (dismissal on `Esc`/`q`).
-   - Global playback hotkeys (`Space`, `s`, `R`, `m`, `t`, `+`, `-`, arrows, Shift+arrows) work across all tabs.
+   - Active overlay modal input handled next (see Overlay Modals for dismissal keys).
+   - Global hotkeys in `AppUI::handle_input_key` come next, so tab handlers cannot reuse them: `q`/`Esc`/`Ctrl+C` (quit; while a directory scan is running, `Esc` cancels the scan instead), `?`, `Tab`/`Shift+Tab`, `1`–`5`, `n`, `Space`, `s`, `Left`/`Right`, the seek keys, `+`/`=`/`-`, `v`, `/`, `f`, `z`/`Z`, `p`, `P`, `M`, `L`. Some act only on certain tabs (`v`, `/`, `f`). There is no global `A`, `R`, `m` or `t` binding. `R` is the tab 5 rename key.
    - Tab-specific and pane-specific keys handle item manipulation.
 3. **Key Mappings**:
-   - `Left` / `Right`: Global Previous / Next track.
-   - `Shift+Left` / `Shift+Right`: Global Seek backward / forward by configured interval (default 10s).
-   - `A`: Start / Restart Autopilot mode on current directory.
-   - `M`: Open Mix Profile modal.
+   - `1`–`5` / `Tab` / `Shift+Tab`: Switch tab (cycling covers all 5 tabs). `n`: Toggle Now Playing ↔ Queue & Library.
+   - `Space`: Play / Pause (on `[4] Settings` it cycles the selected value). `s`: Stop.
+   - `Left` / `Right`: Global Previous / Next track (on `[4] Settings` they cycle the selected value).
+   - `Shift`/`Ctrl`/`Alt` + `Left` / `Right`, `[` / `]`, `<` / `>`: Global Seek backward / forward by `seek_step_seconds` (default 10s).
+   - `+` (or `=`) / `-`: Volume up / down by `volume_step`.
+   - `p`: Start Autopilot on the current directory (or the highlighted Music Home).
    - `P`: Reshuffle Autopilot seed from next track forward.
-   - `r`: Start Seed Radio station from selected track.
+   - `M`: Open Mix Profile modal.
+   - `z` / `Z`: Shuffle the queue.
+   - `r` (tab-specific): Seed Radio from the now-playing track on `[1]`; from the selected browser track or queue track on `[2]` (on a folder row it rescans the directory); rescans renderers on `[3]`.
+   - `L`: Add to playlist (opens the Add-to-Playlist Picker). On `[2]` it adds the focused pane's selection. Browser track row: that track. Browser folder row: the audio files directly inside the folder, in name order, not recursive, listed on a worker (`Couldn't read <folder>` on error). `★ Music Homes` or `..` row: status `Select a track or folder`. Queue pane: the selected queue track. On every other tab it adds the now-playing track (`Nothing is playing` when idle). Entries are built from metadata already in memory (queue row, now playing, `MetadataCache`, else the file stem). The share is never read on the UI thread.
 
 ---
 
