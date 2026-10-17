@@ -1,3 +1,5 @@
+mod common;
+
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -29,6 +31,7 @@ fn ensure_test_file() -> PathBuf {
 
 #[test]
 fn test_local_playback_lifecycle() {
+    common::isolate();
     let test_file = ensure_test_file();
     assert!(test_file.exists(), "test file must exist");
 
@@ -101,6 +104,7 @@ fn test_local_playback_lifecycle() {
 
 #[test]
 fn test_ffplay_backend_lifecycle() {
+    common::isolate();
     let test_file = ensure_test_file();
     assert!(test_file.exists(), "test file must exist");
 

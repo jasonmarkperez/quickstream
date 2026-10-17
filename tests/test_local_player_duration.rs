@@ -4,6 +4,8 @@
 //! Every test that plays audio uses silent audio generated into a scratch directory.
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,14 +19,11 @@ fn scratch_root() -> PathBuf {
     std::env::temp_dir().join(format!("qs-dur-{}", std::process::id()))
 }
 
-/// Fresh scratch dir unique to this process and test. Also points the XDG config/cache/data
-/// dirs at it so nothing (e.g. the logger) touches the real user directories.
+/// Fresh scratch dir unique to this process and test. (The XDG dirs are isolated by
+/// `common::isolate()`.)
 fn scratch_dir(name: &str) -> PathBuf {
     let root = scratch_root();
     fs::create_dir_all(&root).unwrap();
-    for var in ["XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"] {
-        std::env::set_var(var, root.join(var.to_lowercase()));
-    }
     let dir = root.join(name);
     fs::create_dir(&dir).expect("scratch dir must not already exist");
     dir
@@ -59,6 +58,7 @@ fn silent_wav(dir: &Path, name: &str, secs: u32) -> PathBuf {
 
 #[test]
 fn test_ffplay_duration_comes_from_metadata_and_bounds_seek() {
+    common::isolate();
     if !have("ffmpeg") || !have("ffplay") {
         eprintln!("skipping: ffmpeg/ffplay not installed");
         return;
@@ -88,6 +88,7 @@ fn test_ffplay_duration_comes_from_metadata_and_bounds_seek() {
 
 #[test]
 fn test_mpv_play_resets_stale_duration() {
+    common::isolate();
     if !have("mpv") || !have("ffmpeg") {
         eprintln!("skipping: mpv/ffmpeg not installed");
         return;

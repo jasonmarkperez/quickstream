@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -41,6 +43,7 @@ fn create_dummy_audio(path: &Path) {
 
 #[test]
 fn test_splitmix64_fast_rng_shuffle() {
+    common::isolate();
     let mut rng = FastRng::with_seed(42);
     let mut numbers: Vec<usize> = (0..50).collect();
     let original = numbers.clone();
@@ -57,6 +60,7 @@ fn test_splitmix64_fast_rng_shuffle() {
 
 #[test]
 fn test_continuous_wav_header_format() {
+    common::isolate();
     let hdr = make_continuous_wav_header();
     assert_eq!(hdr.len(), 44);
     assert_eq!(&hdr[0..4], b"RIFF");
@@ -76,6 +80,7 @@ fn test_continuous_wav_header_format() {
 
 #[test]
 fn test_autopilot_recursive_scan_and_queue() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_autopilot_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -117,6 +122,7 @@ fn test_autopilot_recursive_scan_and_queue() {
 
 #[test]
 fn test_web_autopilot_and_shuffle_actions() {
+    common::isolate();
     // Web commands only reach folders inside the allowed roots.
     let music = std::env::temp_dir().join(format!("qs_web_autopilot_{}", std::process::id()));
     fs::create_dir_all(music.join("jazz")).unwrap();
@@ -173,6 +179,7 @@ fn test_web_autopilot_and_shuffle_actions() {
 
 #[test]
 fn test_continuous_wav_stream_endpoint() {
+    common::isolate();
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
     let (tx, _rx) = mpsc::channel();
     let handle = WebServer::start(0, state.clone(), tx).expect("Failed to start test web server");
@@ -221,6 +228,7 @@ fn test_continuous_wav_stream_endpoint() {
 
 #[test]
 fn test_parse_path_heuristics_title_artist_album() {
+    common::isolate();
     use quickstream::library::LibraryManager;
 
     // 1. Path with track-disc prefix, artist in filename and folder structure
@@ -247,6 +255,7 @@ fn test_parse_path_heuristics_title_artist_album() {
 
 #[test]
 fn test_autopilot_diverse_sampling_across_artists() {
+    common::isolate();
     use quickstream::library::LibraryManager;
 
     let temp_dir = std::env::temp_dir().join(format!("quickstream_diverse_test_{}", std::process::id()));
@@ -284,6 +293,7 @@ fn test_autopilot_diverse_sampling_across_artists() {
 
 #[test]
 fn test_queue_background_metadata_update() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_bg_meta_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -319,6 +329,7 @@ fn test_queue_background_metadata_update() {
 
 #[test]
 fn test_autopilot_progressive_streaming_events() {
+    common::isolate();
     use quickstream::library::{AutopilotEvent, LibraryManager};
     use std::sync::atomic::AtomicBool;
 
@@ -378,6 +389,7 @@ fn test_autopilot_progressive_streaming_events() {
 
 #[test]
 fn test_autopilot_append_mode_does_not_interrupt_playback() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_ap_append_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -426,6 +438,7 @@ fn test_autopilot_append_mode_does_not_interrupt_playback() {
 
 #[test]
 fn test_autopilot_reshuffle_from_next_track_forward() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_ap_reshuffle_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -474,6 +487,7 @@ fn test_autopilot_reshuffle_from_next_track_forward() {
 
 #[test]
 fn test_web_autopilot_reshuffle_action() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_web_ap_reshuffle_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -518,6 +532,7 @@ fn test_web_autopilot_reshuffle_action() {
 
 #[test]
 fn test_autopilot_bpm_flow_and_mood_vibe() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_mix_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -585,6 +600,7 @@ fn test_autopilot_bpm_flow_and_mood_vibe() {
 
 #[test]
 fn test_web_mix_profile_and_seed_radio_commands() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_web_mix_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -627,6 +643,7 @@ fn test_web_mix_profile_and_seed_radio_commands() {
 
 #[test]
 fn test_autopilot_mood_vibe_diverse_artist_sampling_no_single_artist_loop() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_diverse_mood_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -715,6 +732,7 @@ fn test_autopilot_mood_vibe_diverse_artist_sampling_no_single_artist_loop() {
 
 #[test]
 fn test_autopilot_mix_generates_full_queue_when_library_has_sparse_matches() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_sparse_mix_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();

@@ -1,3 +1,5 @@
+mod common;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +15,7 @@ use quickstream::player::AudioPlayer;
 
 #[test]
 fn test_upnp_time_conversions() {
+    common::isolate();
     assert_eq!(format_seconds_to_upnp_time(0.0), "00:00:00");
     assert_eq!(format_seconds_to_upnp_time(65.0), "00:01:05");
     assert_eq!(format_seconds_to_upnp_time(3665.0), "01:01:05");
@@ -26,6 +29,7 @@ fn test_upnp_time_conversions() {
 
 #[test]
 fn test_upnp_xml_escape_and_url_encoding() {
+    common::isolate();
     let unescaped = "<Rock & Roll \"Greatest\" 'Hits'>";
     let escaped = quick_xml_escape(unescaped);
     assert_eq!(
@@ -44,6 +48,7 @@ fn test_upnp_xml_escape_and_url_encoding() {
 
 #[test]
 fn test_didl_lite_metadata_generation() {
+    common::isolate();
     let xml = create_didl_lite_xml(
         "http://192.168.1.50:8080/stream/song.flac",
         "A Nice Song & Melody",
@@ -154,6 +159,7 @@ fn spawn_mock_upnp_renderer() -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<
 
 #[test]
 fn test_upnp_client_soap_methods() {
+    common::isolate();
     let (port, stop_flag, handle) = spawn_mock_upnp_renderer();
 
     let device = DLNADevice {
@@ -211,6 +217,7 @@ fn test_upnp_client_soap_methods() {
 
 #[test]
 fn test_upnp_player_audio_player_trait_lifecycle() {
+    common::isolate();
     let (port, stop_flag, handle) = spawn_mock_upnp_renderer();
 
     let device = DLNADevice {
@@ -273,6 +280,7 @@ fn test_upnp_player_audio_player_trait_lifecycle() {
 
 #[test]
 fn test_upnp_player_seek_mode_not_supported_fallback() {
+    common::isolate();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock renderer");
     let port = listener.local_addr().unwrap().port();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -404,6 +412,7 @@ fn test_upnp_player_seek_mode_not_supported_fallback() {
 
 #[test]
 fn test_upnp_player_pause_resume_after_seek() {
+    common::isolate();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock renderer");
     let port = listener.local_addr().unwrap().port();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -575,6 +584,7 @@ fn test_upnp_player_pause_resume_after_seek() {
 
 #[test]
 fn test_upnp_player_with_stream_server_state_socket_closure_and_registration() {
+    common::isolate();
     let (port, stop_flag, handle) = spawn_mock_upnp_renderer();
 
     let device = DLNADevice {
@@ -626,6 +636,7 @@ fn test_upnp_player_with_stream_server_state_socket_closure_and_registration() {
 
 #[test]
 fn test_upnp_player_auto_advance_when_renderer_resets_rel_time_on_stop() {
+    common::isolate();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock renderer");
     let port = listener.local_addr().unwrap().port();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -770,6 +781,7 @@ fn test_upnp_player_auto_advance_when_renderer_resets_rel_time_on_stop() {
 
 #[test]
 fn test_upnp_player_stopped_early_does_not_auto_advance() {
+    common::isolate();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock renderer");
     let port = listener.local_addr().unwrap().port();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -899,6 +911,7 @@ fn test_upnp_player_stopped_early_does_not_auto_advance() {
 
 #[test]
 fn test_upnp_client_play_retries_on_action_failed() {
+    common::isolate();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock renderer");
     let port = listener.local_addr().unwrap().port();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -1002,6 +1015,7 @@ fn test_upnp_client_play_retries_on_action_failed() {
 
 #[test]
 fn test_upnp_player_play_at_starts_directly_with_pos_offset() {
+    common::isolate();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock renderer");
     let port = listener.local_addr().unwrap().port();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -1101,6 +1115,7 @@ fn test_upnp_player_play_at_starts_directly_with_pos_offset() {
 
 #[test]
 fn test_upnp_player_detached_from_stream_state_does_not_close_shared_streams() {
+    common::isolate();
     use std::sync::atomic::Ordering;
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = closed.local_addr().unwrap().port();

@@ -1,6 +1,8 @@
 //! Logger behaviour: background writer thread, ordering, size-based rotation, non-blocking callers.
 //! Every test uses its own `Logger` instance writing into a temp dir, never the user's real log.
 
+mod common;
+
 use quickstream::logger::{Logger, LoggerConfig};
 use std::fs;
 use std::path::PathBuf;
@@ -19,6 +21,7 @@ fn rotated(path: &std::path::Path, n: usize) -> PathBuf {
 
 #[test]
 fn test_lines_from_multiple_threads_are_all_written_in_per_thread_order() {
+    common::isolate();
     let path = temp_log("order");
     let logger = std::sync::Arc::new(Logger::with_config(path.clone(), LoggerConfig::default()));
 
@@ -53,6 +56,7 @@ fn test_lines_from_multiple_threads_are_all_written_in_per_thread_order() {
 
 #[test]
 fn test_log_file_rotates_at_size_limit_and_keeps_configured_backups() {
+    common::isolate();
     let path = temp_log("rotate");
     let config = LoggerConfig { max_bytes: 1024, max_backups: 2, ..LoggerConfig::default() };
     let logger = Logger::with_config(path.clone(), config);
@@ -87,6 +91,7 @@ fn test_log_file_rotates_at_size_limit_and_keeps_configured_backups() {
 
 #[test]
 fn test_existing_oversized_log_is_rotated_before_appending() {
+    common::isolate();
     let path = temp_log("preexisting");
     fs::write(&path, "x".repeat(2048)).unwrap();
     let logger = Logger::with_config(path.clone(), LoggerConfig { max_bytes: 1024, ..LoggerConfig::default() });
@@ -101,6 +106,7 @@ fn test_existing_oversized_log_is_rotated_before_appending() {
 
 #[test]
 fn test_caller_does_not_block_when_writer_is_slow() {
+    common::isolate();
     let path = temp_log("slow");
     let config = LoggerConfig {
         queue_capacity: 8,
@@ -127,6 +133,7 @@ fn test_caller_does_not_block_when_writer_is_slow() {
 
 #[test]
 fn test_drop_flushes_pending_lines() {
+    common::isolate();
     let path = temp_log("drop");
     {
         let logger = Logger::with_config(
@@ -143,6 +150,7 @@ fn test_drop_flushes_pending_lines() {
 
 #[test]
 fn test_error_lines_reach_disk_without_explicit_flush() {
+    common::isolate();
     let path = temp_log("error");
     let logger = Logger::with_config(path.clone(), LoggerConfig::default());
     logger.log("ERROR", "err", "something broke");

@@ -4,6 +4,8 @@
 //! sources (tags, shared network volumes, SSDP). These tests make sure the
 //! embedded dashboard never turns that data into markup or code.
 
+mod common;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -97,6 +99,7 @@ fn inline_handler_attrs(html: &str) -> Vec<String> {
 
 #[test]
 fn test_dashboard_has_no_inline_event_handlers() {
+    common::isolate();
     let html = fetch_dashboard();
     let handlers = inline_handler_attrs(&html);
     assert!(
@@ -112,6 +115,7 @@ fn test_dashboard_has_no_inline_event_handlers() {
 
 #[test]
 fn test_dashboard_never_builds_html_from_data() {
+    common::isolate();
     let html = fetch_dashboard();
     for sink in ["insertAdjacentHTML", "outerHTML", "document.write"] {
         assert!(!html.contains(sink), "dashboard uses HTML sink {}", sink);
@@ -150,6 +154,7 @@ fn as_filename(name: &str) -> String {
 
 #[test]
 fn test_browser_api_round_trips_hostile_names() {
+    common::isolate();
     let dir = hostile_test_dir("browser");
     let mut expected_dirs = Vec::new();
     let mut expected_files = Vec::new();
@@ -232,6 +237,7 @@ fn hostile_state() -> NowPlayingState {
 
 #[test]
 fn test_status_api_round_trips_hostile_names() {
+    common::isolate();
     let state = Arc::new(RwLock::new(hostile_state()));
     let (tx, _rx) = mpsc::channel();
     let handle = WebServer::start(0, state.clone(), tx).expect("start web server");
@@ -261,6 +267,7 @@ fn dashboard_script(html: &str) -> String {
 
 #[test]
 fn test_dashboard_renders_hostile_names_as_text_in_js() {
+    common::isolate();
     if Command::new("node").arg("--version").output().is_err() {
         eprintln!("SKIPPED: node is not installed; dashboard DOM behavior test not run");
         return;

@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs::{self, File};
 use std::io::Write;
 
@@ -31,6 +33,7 @@ fn create_dummy_wav(path: &std::path::Path) {
 
 #[test]
 fn test_extract_metadata_real_audio() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_meta_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();

@@ -1,5 +1,7 @@
 //! The queue cursor stays inside the queue after removals, clears and reshuffles (issue #16).
 
+mod common;
+
 use std::path::PathBuf;
 
 use crossterm::event::KeyCode;
@@ -39,6 +41,7 @@ fn app_with_queue(dir: &PathBuf, n: usize) -> AppUI {
 
 #[test]
 fn test_removing_last_queue_row_clamps_cursor() {
+    common::isolate();
     let dir = temp_dir("remove_last");
     let mut app = app_with_queue(&dir, 3);
     app.queue_cursor = 2;
@@ -54,6 +57,7 @@ fn test_removing_last_queue_row_clamps_cursor() {
 
 #[test]
 fn test_removing_row_before_current_keeps_current_track() {
+    common::isolate();
     let dir = temp_dir("remove_before");
     let mut app = app_with_queue(&dir, 4);
     app.queue.current_index = 2; // Song 3
@@ -64,6 +68,7 @@ fn test_removing_row_before_current_keeps_current_track() {
 
 #[test]
 fn test_clearing_queue_resets_cursor() {
+    common::isolate();
     let dir = temp_dir("clear");
     let mut app = app_with_queue(&dir, 5);
     app.queue_cursor = 4;
@@ -74,6 +79,7 @@ fn test_clearing_queue_resets_cursor() {
 
 #[test]
 fn test_reshuffle_truncation_clamps_cursor() {
+    common::isolate();
     let dir = temp_dir("reshuffle");
     let mut app = app_with_queue(&dir, 5);
     app.queue.current_index = 1;

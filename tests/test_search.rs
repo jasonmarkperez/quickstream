@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -97,6 +99,7 @@ fn sample_tracks() -> (PathBuf, Vec<AudioMetadata>) {
 
 #[test]
 fn test_fuzzy_search_multi_field_matching() {
+    common::isolate();
     let (root, tracks) = sample_tracks();
     let mut modal = SearchModalState::new(root, tracks);
 
@@ -135,6 +138,7 @@ fn test_fuzzy_search_multi_field_matching() {
 
 #[test]
 fn test_fuzzy_search_query_edits_and_navigation() {
+    common::isolate();
     let (root, tracks) = sample_tracks();
     let mut modal = SearchModalState::new(root, tracks);
 
@@ -169,6 +173,7 @@ fn test_fuzzy_search_query_edits_and_navigation() {
 
 #[test]
 fn test_scoped_directory_scan() {
+    common::isolate();
     let temp_root = std::env::temp_dir().join(format!("quickstream_scan_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_root);
     fs::create_dir_all(&temp_root).unwrap();
@@ -205,6 +210,7 @@ fn test_scoped_directory_scan() {
 
 #[test]
 fn test_multi_token_out_of_order_search() {
+    common::isolate();
     let (root, tracks) = sample_tracks();
     let mut modal = SearchModalState::new(root, tracks);
 
@@ -222,6 +228,7 @@ fn test_multi_token_out_of_order_search() {
 
 #[test]
 fn test_background_streaming_scanner() {
+    common::isolate();
     let root = PathBuf::from("/music");
     let (tx, rx) = std::sync::mpsc::channel();
     let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -286,6 +293,7 @@ fn test_background_streaming_scanner() {
 
 #[test]
 fn test_large_library_search_performance() {
+    common::isolate();
     let root = PathBuf::from("/large_library");
     let mut large_tracks = Vec::with_capacity(20_000);
 
@@ -328,6 +336,7 @@ fn test_large_library_search_performance() {
 
 #[test]
 fn test_flutter_vs_future_sound_of_london() {
+    common::isolate();
     let root = PathBuf::from("/Volumes/Music");
     let tracks = vec![
         AudioMetadata {
@@ -371,6 +380,7 @@ fn test_flutter_vs_future_sound_of_london() {
 
 #[test]
 fn test_search_modal_paging_and_jumping() {
+    common::isolate();
     let root = PathBuf::from("/music");
     let tracks: Vec<AudioMetadata> = (0..30)
         .map(|i| AudioMetadata {
@@ -444,6 +454,7 @@ fn streamed_track(root: &Path, i: usize) -> AudioMetadata {
 
 #[test]
 fn test_streaming_batches_coalesce_filter_updates() {
+    common::isolate();
     let root = PathBuf::from("/music");
     let (tx, rx) = std::sync::mpsc::channel();
     let mut modal = SearchModalState::new_with_scanner(root.clone(), Vec::new(), Some(rx), None);

@@ -1,12 +1,14 @@
 //! Issue #28: bookmark and settings saves run on one persistence worker thread, never on the
 //! UI thread, and queued writes are flushed on shutdown.
 //!
-//! Own test binary: the AppUI tests point the XDG config/cache/data dirs at a temp dir for the
-//! whole process, so nothing here touches the user's real files.
+//! Like every test binary, the XDG config/cache/data dirs point at a temp dir for the whole
+//! process (`common::isolate()`), so nothing here touches the user's real files.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::KeyCode;
@@ -50,21 +52,9 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// Point every XDG dir at a temp root for this process (once) and return the root.
-fn xdg_root() -> &'static PathBuf {
-    static ROOT: OnceLock<PathBuf> = OnceLock::new();
-    ROOT.get_or_init(|| {
-        let root = std::env::temp_dir().join(format!("qs_persist_xdg_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        for var in ["XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"] {
-            std::env::set_var(var, root.join(var.to_lowercase()));
-        }
-        root
-    })
-}
-
 #[test]
 fn test_save_returns_while_writer_is_busy_and_rapid_saves_coalesce() {
+    common::isolate();
     let (writer, log, release) = gated_writer();
     let worker = PersistenceWorker::spawn_with_writer(writer);
     let path = PathBuf::from("/nonexistent/qs/config.json");
@@ -89,6 +79,7 @@ fn test_save_returns_while_writer_is_busy_and_rapid_saves_coalesce() {
 
 #[test]
 fn test_drop_flushes_queued_writes() {
+    common::isolate();
     let dir = scratch("drop");
     let path = dir.join("bookmarks.json");
     let worker = PersistenceWorker::spawn();
@@ -101,6 +92,7 @@ fn test_drop_flushes_queued_writes() {
 
 #[test]
 fn test_handle_outliving_worker_still_writes() {
+    common::isolate();
     let dir = scratch("late");
     let path = dir.join("config.json");
     let worker = PersistenceWorker::spawn();
@@ -113,6 +105,7 @@ fn test_handle_outliving_worker_still_writes() {
 
 #[test]
 fn test_settings_manager_save_goes_through_worker() {
+    common::isolate();
     let dir = scratch("settings");
     let path = dir.join("config.json");
     let (writer, log, release) = gated_writer();
@@ -146,7 +139,7 @@ fn test_app(config: &Path) -> AppUI {
 
 #[test]
 fn test_ui_bookmark_and_setting_saves_do_not_block_the_ui_thread() {
-    let root = xdg_root();
+    let root = common::isolate();
     let config = root.join("ui_gated_config.json");
     let mut app = test_app(&config);
     let (writer, log, release) = gated_writer();
@@ -173,7 +166,7 @@ fn test_ui_bookmark_and_setting_saves_do_not_block_the_ui_thread() {
 
 #[test]
 fn test_ui_change_right_before_quit_is_flushed_on_drop() {
-    let root = xdg_root();
+    let root = common::isolate();
     let config = root.join("ui_flush_config.json");
     let mut app = test_app(&config);
     let before = app.settings_mgr.settings.volume_step;

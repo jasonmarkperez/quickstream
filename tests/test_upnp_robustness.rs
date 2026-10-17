@@ -2,6 +2,8 @@
 //! renderers. Every mock binds 127.0.0.1 and serves each connection on its own thread,
 //! so a deliberately slow reply never blocks the player's other SOAP calls.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -190,6 +192,7 @@ fn wait_for(flag: &AtomicBool, timeout: Duration) -> bool {
 /// "track finished" and flag the *new* track as finished, causing a spurious skip.
 #[test]
 fn test_upnp_stale_poller_cannot_mark_new_track_finished() {
+    common::isolate();
     struct State {
         transport: Mutex<String>,
         rel: Mutex<String>,
@@ -272,6 +275,7 @@ fn test_upnp_stale_poller_cannot_mark_new_track_finished() {
 /// top of the new stream offset and the progress bar jumps away from the seek target.
 #[test]
 fn test_upnp_stale_position_report_is_dropped_after_seek() {
+    common::isolate();
     struct State {
         transport: Mutex<String>,
         slow_gpi_armed: AtomicBool,
@@ -364,6 +368,7 @@ fn client_for(mock: &MockRenderer) -> UPnPClient {
 /// A renderer that reports the numeric code with its own wording must still be retried.
 #[test]
 fn test_upnp_play_retries_on_numeric_code_with_custom_description() {
+    common::isolate();
     let attempts = Arc::new(AtomicUsize::new(0));
     let attempts_h = attempts.clone();
     let mock = spawn_mock(Arc::new(move |action, _body, stream| {
@@ -381,6 +386,7 @@ fn test_upnp_play_retries_on_numeric_code_with_custom_description() {
 /// Renderers that omit errorCode but use the standard description are still retried.
 #[test]
 fn test_upnp_play_retries_on_description_only_fault() {
+    common::isolate();
     let attempts = Arc::new(AtomicUsize::new(0));
     let attempts_h = attempts.clone();
     let mock = spawn_mock(Arc::new(move |action, _body, stream| {
@@ -398,6 +404,7 @@ fn test_upnp_play_retries_on_description_only_fault() {
 /// A non-retryable code must not be retried just because its description mentions a number.
 #[test]
 fn test_upnp_play_does_not_retry_on_unrelated_code() {
+    common::isolate();
     let attempts = Arc::new(AtomicUsize::new(0));
     let attempts_h = attempts.clone();
     let mock = spawn_mock(Arc::new(move |action, _body, stream| {
@@ -416,6 +423,7 @@ fn test_upnp_play_does_not_retry_on_unrelated_code() {
 /// Stop answered with 701 (already stopped) counts as success even with a vendor description.
 #[test]
 fn test_upnp_stop_accepts_numeric_701() {
+    common::isolate();
     let mock = spawn_mock(Arc::new(move |action, _body, stream| {
         if action == "Stop" {
             write_fault(stream, Some(701), Some("Busy"));
@@ -430,6 +438,7 @@ fn test_upnp_stop_accepts_numeric_701() {
 /// HTTP/1.1 chunked replies must be decoded; here the chunk boundary splits the value.
 #[test]
 fn test_upnp_chunked_soap_response_is_decoded() {
+    common::isolate();
     let mock = spawn_mock(Arc::new(move |_action, _body, stream| {
         let body = ok_xml(&transport_info_xml("PLAYING"));
         let split = body.find("PLAYING").unwrap() + 3;
@@ -450,6 +459,7 @@ fn test_upnp_chunked_soap_response_is_decoded() {
 /// A renderer that trickles bytes must not hold a SOAP call past its overall deadline.
 #[test]
 fn test_upnp_soap_call_has_overall_deadline() {
+    common::isolate();
     let mock = spawn_mock(Arc::new(move |_action, _body, stream| {
         let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\n");
         for _ in 0..40 {
@@ -479,6 +489,7 @@ fn test_upnp_soap_call_has_overall_deadline() {
 
 #[test]
 fn test_parse_status_code() {
+    common::isolate();
     assert_eq!(parse_status_code("HTTP/1.1 200 OK"), Some(200));
     assert_eq!(parse_status_code("HTTP/1.0 500 Internal Server Error"), Some(500));
     assert_eq!(parse_status_code("HTTP/1.1 204"), Some(204));
@@ -491,6 +502,7 @@ fn test_parse_status_code() {
 
 #[test]
 fn test_decode_chunked() {
+    common::isolate();
     assert_eq!(
         decode_chunked(b"4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\n\r\n").unwrap(),
         Some(b"Wikipedia".to_vec())
@@ -505,6 +517,7 @@ fn test_decode_chunked() {
 
 #[test]
 fn test_parse_http_response_framing() {
+    common::isolate();
     // Content-Length: complete once the body has arrived, trailing bytes ignored.
     let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloEXTRA";
     let resp = parse_http_response(raw, false).unwrap().unwrap();
@@ -534,6 +547,7 @@ fn test_parse_http_response_framing() {
 
 #[test]
 fn test_parse_http_url() {
+    common::isolate();
     let u = parse_http_url("http://192.168.1.5:8080/ctrl/AVT").unwrap();
     assert_eq!((u.host.as_str(), u.port, u.path.as_str()), ("192.168.1.5", 8080, "/ctrl/AVT"));
     assert_eq!(u.host_port, "192.168.1.5:8080");
@@ -548,6 +562,7 @@ fn test_parse_http_url() {
 
 #[test]
 fn test_parse_soap_fault_and_retry_classification() {
+    common::isolate();
     let body = |inner: &str| format!("<s:Envelope><s:Body><s:Fault><detail><UPnPError>{}</UPnPError></detail></s:Fault></s:Body></s:Envelope>", inner);
 
     let e = parse_soap_fault(500, &body("<errorCode> 701 </errorCode><errorDescription>Busy</errorDescription>"));

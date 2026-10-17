@@ -4,6 +4,8 @@
 //! `SLOW_CACHE_DELAY`, like a cache on a slow disk. Kept in its own test binary because it
 //! points XDG_CACHE_HOME at a temp dir for the whole process.
 
+mod common;
+
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -14,6 +16,7 @@ const SLOW_CACHE_DELAY: Duration = Duration::from_millis(1500);
 
 #[test]
 fn test_open_fuzzy_search_loads_cache_off_ui_thread() {
+    common::isolate();
     let root = std::env::temp_dir().join(format!("qs_search_nb_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let music_dir = root.join("music");

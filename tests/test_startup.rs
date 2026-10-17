@@ -1,9 +1,12 @@
 //! Binary startup: version reporting (issue #25).
 
+mod common;
+
 use std::process::Command;
 
 #[test]
 fn test_startup_log_reports_crate_version() {
+    common::isolate();
     let root = std::env::temp_dir().join(format!("qs_startup_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();

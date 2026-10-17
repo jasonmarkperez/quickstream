@@ -1,6 +1,8 @@
 //! Last.fm enrichment client (#27): no key in source, opt-in only, User-Agent, throttling and
 //! an in-memory cache. Every request here goes to a mock server on 127.0.0.1.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -109,6 +111,7 @@ fn config(server: &MockServer, enabled: bool, key: Option<&str>) -> OnlineConfig
 
 #[test]
 fn test_source_has_no_hardcoded_api_key() {
+    common::isolate();
     let src = include_str!("../src/analysis/online.rs");
     let bytes = src.as_bytes();
     let has_hex_run = bytes
@@ -124,6 +127,7 @@ fn test_source_has_no_hardcoded_api_key() {
 
 #[test]
 fn test_config_from_settings_is_off_by_default_and_reads_key_from_env() {
+    common::isolate();
     std::env::remove_var(API_KEY_ENV);
     let defaults = Settings::default();
     let cfg = OnlineConfig::from_settings(&defaults);
@@ -155,6 +159,7 @@ fn test_config_from_settings_is_off_by_default_and_reads_key_from_env() {
 
 #[test]
 fn test_disabled_setting_makes_no_requests() {
+    common::isolate();
     let server = MockServer::start(vec![TAGS_JSON]);
     let client = OnlineMetadataClient::new(config(&server, false, Some("testkey")));
     assert!(client.fetch_artist_tags("Slowdive").is_empty());
@@ -165,6 +170,7 @@ fn test_disabled_setting_makes_no_requests() {
 
 #[test]
 fn test_missing_or_blank_api_key_makes_no_requests() {
+    common::isolate();
     let server = MockServer::start(vec![TAGS_JSON]);
     for key in [None, Some(""), Some("   ")] {
         let client = OnlineMetadataClient::new(config(&server, true, key));
@@ -181,6 +187,7 @@ fn test_missing_or_blank_api_key_makes_no_requests() {
 
 #[test]
 fn test_fetch_tags_sends_key_and_user_agent_and_parses_response() {
+    common::isolate();
     let server = MockServer::start(vec![TAGS_JSON]);
     let client = OnlineMetadataClient::new(config(&server, true, Some("testkey")));
     let tags = client.fetch_artist_tags("Sigur Rós & Co");
@@ -205,6 +212,7 @@ fn test_fetch_tags_sends_key_and_user_agent_and_parses_response() {
 
 #[test]
 fn test_fetch_similar_artists_parses_response() {
+    common::isolate();
     let server = MockServer::start(vec![SIMILAR_JSON]);
     let client = OnlineMetadataClient::new(config(&server, true, Some("testkey")));
     let similar = client.fetch_similar_artists("Slowdive");
@@ -216,6 +224,7 @@ fn test_fetch_similar_artists_parses_response() {
 
 #[test]
 fn test_results_are_cached_per_artist() {
+    common::isolate();
     let server = MockServer::start(vec![TAGS_JSON]);
     let client = OnlineMetadataClient::new(config(&server, true, Some("testkey")));
     let first = client.fetch_artist_tags("Slowdive");
@@ -230,6 +239,7 @@ fn test_results_are_cached_per_artist() {
 
 #[test]
 fn test_error_responses_are_not_cached() {
+    common::isolate();
     let server = MockServer::start(vec![RATE_LIMITED_JSON, TAGS_JSON]);
     let client = OnlineMetadataClient::new(config(&server, true, Some("testkey")));
     assert!(client.fetch_artist_tags("Slowdive").is_empty());
@@ -239,6 +249,7 @@ fn test_error_responses_are_not_cached() {
 
 #[test]
 fn test_requests_are_spaced_by_the_minimum_interval() {
+    common::isolate();
     let server = MockServer::start(vec![TAGS_JSON]);
     let mut cfg = config(&server, true, Some("testkey"));
     cfg.min_interval = Duration::from_millis(250);
@@ -256,6 +267,7 @@ fn test_requests_are_spaced_by_the_minimum_interval() {
 
 #[test]
 fn test_unreachable_server_returns_empty() {
+    common::isolate();
     // Bind then drop to get a port nothing listens on.
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let client = OnlineMetadataClient::new(OnlineConfig {
@@ -271,6 +283,7 @@ fn test_unreachable_server_returns_empty() {
 
 #[test]
 fn test_blank_artist_makes_no_request() {
+    common::isolate();
     let server = MockServer::start(vec![TAGS_JSON]);
     let client = OnlineMetadataClient::new(config(&server, true, Some("testkey")));
     assert!(client.fetch_artist_tags("   ").is_empty());

@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -65,6 +67,7 @@ fn http_post(port: u16, path: &str, body: &str) -> (u16, String, Vec<u8>) {
 
 #[test]
 fn test_web_server_dashboard_endpoint() {
+    common::isolate();
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
     let (tx, _rx) = mpsc::channel();
     let handle = WebServer::start(0, state, tx).expect("start web server");
@@ -83,6 +86,7 @@ fn test_web_server_dashboard_endpoint() {
 
 #[test]
 fn test_web_server_status_api() {
+    common::isolate();
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
     let (tx, _rx) = mpsc::channel();
     let handle = WebServer::start(0, state.clone(), tx).expect("start web server");
@@ -114,6 +118,7 @@ fn test_web_server_status_api() {
 
 #[test]
 fn test_web_server_cover_placeholder() {
+    common::isolate();
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
     let (tx, _rx) = mpsc::channel();
     let handle = WebServer::start(0, state, tx).expect("start web server");
@@ -130,6 +135,7 @@ fn test_web_server_cover_placeholder() {
 
 #[test]
 fn test_web_server_cover_from_folder() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_web_cover_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).expect("create temp dir");
@@ -162,6 +168,7 @@ fn test_web_server_cover_from_folder() {
 
 #[test]
 fn test_web_server_action_commands() {
+    common::isolate();
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
     let (tx, rx) = mpsc::channel();
     let handle = WebServer::start(0, state, tx).expect("start web server");
@@ -202,6 +209,7 @@ fn test_web_server_action_commands() {
 
 #[test]
 fn test_web_server_audio_streaming_byte_ranges() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("qs_stream_test_{}", std::process::id()));
     let _ = fs::create_dir_all(&temp_dir);
     let test_file = temp_dir.join("test_song.mp3");
@@ -269,6 +277,7 @@ fn test_web_server_audio_streaming_byte_ranges() {
 
 #[test]
 fn test_web_server_audio_streaming_seek_pos_query() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join("test_web_seek_stream");
     let _ = fs::create_dir_all(&temp_dir);
     let test_file = temp_dir.join("test_seek.mp3");
@@ -304,6 +313,7 @@ fn test_web_server_audio_streaming_seek_pos_query() {
 
 #[test]
 fn test_web_server_stream_file_registry() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join("test_web_registry");
     let _ = fs::create_dir_all(&temp_dir);
     let test_file = temp_dir.join("registered_song.mp3");
@@ -338,6 +348,7 @@ fn test_web_server_stream_file_registry() {
 
 #[test]
 fn test_web_server_close_active_streams_terminates_clients() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join("test_web_close_streams");
     let _ = fs::create_dir_all(&temp_dir);
     let test_file = temp_dir.join("large_stream.mp3");
@@ -388,6 +399,7 @@ fn test_web_server_close_active_streams_terminates_clients() {
 
 #[test]
 fn test_web_server_browser_api() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("qs_browser_test_{}", std::process::id()));
     let _ = fs::create_dir_all(&temp_dir);
     // The browser lists canonical paths (macOS: /var -> /private/var).
@@ -462,6 +474,7 @@ fn test_web_server_browser_api() {
 
 #[test]
 fn test_web_server_extended_action_commands() {
+    common::isolate();
     // Path commands only reach files inside the allowed roots and carry the resolved path.
     let music = std::env::temp_dir().join(format!("qs_web_actions_{}", std::process::id()));
     fs::create_dir_all(music.join("album")).unwrap();
@@ -536,6 +549,7 @@ fn test_web_server_extended_action_commands() {
 
 #[test]
 fn test_web_server_status_api_with_queue_and_devices() {
+    common::isolate();
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
     let (tx, _rx) = mpsc::channel();
     let handle = WebServer::start(0, state.clone(), tx).expect("start web server");
@@ -600,6 +614,7 @@ fn test_web_server_status_api_with_queue_and_devices() {
 
 #[test]
 fn test_web_server_defaults_to_loopback_bind() {
+    common::isolate();
     use quickstream::web::WebBind;
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
     let (tx, _rx) = mpsc::channel();
@@ -618,6 +633,7 @@ fn test_web_server_defaults_to_loopback_bind() {
 #[test]
 #[ignore = "binds all network interfaces (macOS firewall prompt); run with --include-ignored"]
 fn test_web_server_stops_when_another_listener_shadows_its_loopback_port() {
+    common::isolate();
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
     let (tx, _rx) = mpsc::channel();
     let handle = WebServer::start_with_bind(quickstream::web::WebBind::Lan, 0, state, tx).expect("start web server");
@@ -639,6 +655,7 @@ fn test_web_server_stops_when_another_listener_shadows_its_loopback_port() {
 
 #[test]
 fn test_web_server_stream_rejects_unregistered_absolute_path() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("qs_stream_secret_{}", std::process::id()));
     let _ = fs::create_dir_all(&temp_dir);
     let secret = temp_dir.join("id_rsa");
@@ -660,6 +677,7 @@ fn test_web_server_stream_rejects_unregistered_absolute_path() {
 
 #[test]
 fn test_web_server_stream_rejects_cwd_relative_path() {
+    common::isolate();
     // cargo runs integration tests with the crate root as cwd, so Cargo.toml exists relative to it.
     assert!(PathBuf::from("Cargo.toml").exists());
 
@@ -678,6 +696,7 @@ fn test_web_server_stream_rejects_cwd_relative_path() {
 
 #[test]
 fn test_web_server_stream_unknown_name_does_not_fall_back_to_current_track() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("qs_stream_nofallback_{}", std::process::id()));
     let _ = fs::create_dir_all(&temp_dir);
     let current = temp_dir.join("now_playing.mp3");
@@ -700,6 +719,7 @@ fn test_web_server_stream_unknown_name_does_not_fall_back_to_current_track() {
 
 #[test]
 fn test_web_server_stream_prefers_now_playing_over_same_name_registration() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("qs_stream_samename_{}", std::process::id()));
     let album_a = temp_dir.join("album_a");
     let album_b = temp_dir.join("album_b");
@@ -728,6 +748,7 @@ fn test_web_server_stream_prefers_now_playing_over_same_name_registration() {
 
 #[test]
 fn test_web_server_stream_serves_registered_file_with_encoded_name() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("qs_stream_encoded_{}", std::process::id()));
     fs::create_dir_all(&temp_dir).unwrap();
     let file = temp_dir.join("Café + Friends (Live).flac");
@@ -749,6 +770,7 @@ fn test_web_server_stream_serves_registered_file_with_encoded_name() {
 
 #[test]
 fn test_web_server_stream_rejects_separator_and_dot_names() {
+    common::isolate();
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
     let (tx, _rx) = mpsc::channel();
     let handle = WebServer::start(0, state, tx).expect("start web server");
@@ -763,6 +785,7 @@ fn test_web_server_stream_rejects_separator_and_dot_names() {
 #[cfg(target_os = "linux")]
 #[test]
 fn test_web_server_stream_serves_non_utf8_file_name() {
+    common::isolate();
     use std::os::unix::ffi::OsStrExt;
     let temp_dir = std::env::temp_dir().join(format!("qs_stream_nonutf8_{}", std::process::id()));
     fs::create_dir_all(&temp_dir).unwrap();
@@ -852,6 +875,7 @@ fn range_get(port: u16, range: &str) -> (u16, String, Vec<u8>) {
 
 #[test]
 fn test_parse_byte_range_cases() {
+    common::isolate();
     use ByteRange::{Full, Partial, Unsatisfiable};
     let p = |start, end| Partial { start, end };
 
@@ -895,6 +919,7 @@ fn test_parse_byte_range_cases() {
 
 #[test]
 fn test_web_server_stream_suffix_range() {
+    common::isolate();
     let (handle, dir, data) = start_range_fixture("suffix");
 
     let (status, headers, body) = range_get(handle.port, "bytes=-10");
@@ -915,6 +940,7 @@ fn test_web_server_stream_suffix_range() {
 
 #[test]
 fn test_web_server_stream_multi_range_serves_first_range() {
+    common::isolate();
     let (handle, dir, data) = start_range_fixture("multi");
 
     let (status, headers, body) = range_get(handle.port, "bytes=10-19,50-59");
@@ -929,6 +955,7 @@ fn test_web_server_stream_multi_range_serves_first_range() {
 
 #[test]
 fn test_web_server_stream_invalid_range_serves_full_body() {
+    common::isolate();
     let (handle, dir, data) = start_range_fixture("invalid");
 
     for bad in ["bytes=abc-", "bytes=1-2-3", "items=0-5"] {
@@ -945,6 +972,7 @@ fn test_web_server_stream_invalid_range_serves_full_body() {
 
 #[test]
 fn test_web_server_stream_416_headers() {
+    common::isolate();
     let (handle, dir, _data) = start_range_fixture("416");
 
     for unsatisfiable in ["bytes=100-", "bytes=5-2", "bytes=-0"] {
@@ -962,6 +990,7 @@ fn test_web_server_stream_416_headers() {
 
 #[test]
 fn test_web_server_stream_responses_advertise_connection_close() {
+    common::isolate();
     let (handle, dir, _data) = start_range_fixture("close");
 
     let (status, headers, _) = http_get(handle.port, "/stream/range_song.mp3");
@@ -978,6 +1007,7 @@ fn test_web_server_stream_responses_advertise_connection_close() {
 
 #[test]
 fn test_web_server_rejects_oversized_header_line() {
+    common::isolate();
     let (handle, _state, _rx) = start_limited(ServerLimits::default());
 
     let req = format!(
@@ -997,6 +1027,7 @@ fn test_web_server_rejects_oversized_header_line() {
 
 #[test]
 fn test_web_server_rejects_oversized_request_line() {
+    common::isolate();
     let (handle, _state, _rx) = start_limited(ServerLimits::default());
 
     let req = format!(
@@ -1011,6 +1042,7 @@ fn test_web_server_rejects_oversized_request_line() {
 
 #[test]
 fn test_web_server_rejects_too_many_headers() {
+    common::isolate();
     let (handle, _state, _rx) = start_limited(ServerLimits::default());
 
     let port = handle.port;
@@ -1036,6 +1068,7 @@ fn test_web_server_rejects_too_many_headers() {
 
 #[test]
 fn test_web_server_rejects_oversized_content_length_before_reading_body() {
+    common::isolate();
     let (handle, _state, rx) = start_limited(ServerLimits::default());
 
     for declared in ["18446744073709551615", "99999999999999999999999", "65537"] {
@@ -1068,6 +1101,7 @@ fn test_web_server_rejects_oversized_content_length_before_reading_body() {
 
 #[test]
 fn test_web_server_request_head_deadline_is_total_not_per_read() {
+    common::isolate();
     let limits = ServerLimits {
         request_timeout: Duration::from_secs(1),
         ..ServerLimits::default()
@@ -1107,6 +1141,7 @@ fn test_web_server_request_head_deadline_is_total_not_per_read() {
 
 #[test]
 fn test_web_server_caps_concurrent_connections() {
+    common::isolate();
     let limits = ServerLimits {
         max_connections: 2,
         ..ServerLimits::default()
@@ -1175,6 +1210,7 @@ fn open_continuous(port: u16, path: &str) -> (u16, BufReader<TcpStream>) {
 
 #[test]
 fn test_web_server_streams_use_separate_pool_and_release_on_disconnect() {
+    common::isolate();
     let limits = ServerLimits {
         max_connections: 1,
         max_streams: 1,

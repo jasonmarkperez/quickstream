@@ -1,6 +1,8 @@
 //! Profile mixes stay bounded on large libraries with few matches (issue #38).
 //!
-//! Own test binary: points XDG_DATA_HOME (log location) at a temp dir for the whole process.
+//! Own test binary: it initializes the process-wide logger in the isolated XDG data dir.
+
+mod common;
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -37,10 +39,9 @@ fn create_silent_wav(path: &Path) {
 /// Chill-matching track at the top level. Built once per process.
 fn sparse_library() -> PathBuf {
     static ONCE: std::sync::Once = std::sync::Once::new();
-    let root = std::env::temp_dir().join(format!("qs_autopilot_budget_{}", std::process::id()));
+    // The isolated root: its `data` dir is XDG_DATA_HOME, so the log lands there.
+    let root = common::isolate().to_path_buf();
     ONCE.call_once(|| {
-        let _ = fs::remove_dir_all(&root);
-        std::env::set_var("XDG_DATA_HOME", root.join("data"));
         quickstream::logger::init();
         let library = root.join("library");
         for folder in 0..520 {
@@ -105,6 +106,7 @@ fn gathered_line(log: &str) -> String {
 
 #[test]
 fn test_sparse_profile_scan_stops_at_folder_limit() {
+    common::isolate();
     let run = run_chill_mix(ProfileScanLimits::default());
     let gathered = gathered_line(&run.log);
     assert!(gathered.contains("folders=500 "), "{}", gathered);
@@ -112,6 +114,7 @@ fn test_sparse_profile_scan_stops_at_folder_limit() {
 
 #[test]
 fn test_profile_scan_stops_at_time_budget() {
+    common::isolate();
     let run = run_chill_mix(ProfileScanLimits {
         time_budget: Duration::ZERO,
         ..ProfileScanLimits::default()
@@ -123,6 +126,7 @@ fn test_profile_scan_stops_at_time_budget() {
 
 #[test]
 fn test_first_match_is_queued_before_gathering_finishes() {
+    common::isolate();
     let run = run_chill_mix(ProfileScanLimits::default());
     let first = run.first_track_at.expect("at least one track");
     assert!(
@@ -135,6 +139,7 @@ fn test_first_match_is_queued_before_gathering_finishes() {
 
 #[test]
 fn test_sequencing_after_queued_track_keeps_artist_spacing() {
+    common::isolate();
     use quickstream::analysis::mixer::DjMixer;
     use quickstream::metadata::AudioMetadata;
     let track = |artist: &str, n: usize| AudioMetadata {
@@ -161,6 +166,7 @@ fn counter(line: &str, name: &str) -> usize {
 
 #[test]
 fn test_profile_scan_reads_few_tags_per_folder() {
+    common::isolate();
     let run = run_chill_mix(ProfileScanLimits::default());
     let gathered = gathered_line(&run.log);
     let folders = counter(&gathered, "folders");

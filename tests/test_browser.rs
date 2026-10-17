@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs::{self, File};
 use std::io::Write;
 
@@ -33,6 +35,7 @@ fn create_dummy_wav(path: &std::path::Path) {
 
 #[test]
 fn test_browser_metadata_view_toggle() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_browser_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -92,6 +95,7 @@ fn test_browser_metadata_view_toggle() {
 
 #[test]
 fn test_browser_non_blocking_navigation_large_directory() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_fast_nav_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -154,6 +158,7 @@ fn test_browser_non_blocking_navigation_large_directory() {
 
 #[test]
 fn test_browser_scrolling_beyond_viewport() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_scroll_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -209,6 +214,7 @@ fn test_browser_scrolling_beyond_viewport() {
 
 #[test]
 fn test_browser_paging_and_jump_shortcuts() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_page_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -321,6 +327,7 @@ fn test_browser_paging_and_jump_shortcuts() {
 
 #[test]
 fn test_browser_navigate_into_folder_resets_cursor_and_offset() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_nav_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -414,6 +421,7 @@ fn test_browser_navigate_into_folder_resets_cursor_and_offset() {
 
 #[test]
 fn test_browser_spotlight_subfolder_jump() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_spotlight_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -492,6 +500,7 @@ fn test_browser_spotlight_subfolder_jump() {
 
 #[test]
 fn test_browser_bookmarks_instant_load_no_stat() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_bookmarks_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -522,6 +531,7 @@ fn test_browser_bookmarks_instant_load_no_stat() {
 
 #[test]
 fn test_browser_async_scanner_nonexistent_directory() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_nonexistent_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -550,6 +560,7 @@ fn test_browser_async_scanner_nonexistent_directory() {
 
 #[test]
 fn test_browser_cancellation_on_navigation() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_cancel_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -579,6 +590,7 @@ fn test_browser_cancellation_on_navigation() {
 
 #[test]
 fn test_browser_cache_instant_back_navigation() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_cache_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -625,6 +637,7 @@ fn test_browser_cache_instant_back_navigation() {
 
 #[test]
 fn test_browser_small_folder_streaming_and_incremental_sorting() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_small_folder_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -677,6 +690,7 @@ fn test_browser_small_folder_streaming_and_incremental_sorting() {
 
 #[test]
 fn test_ui_seek_hotkeys() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_seek_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -743,6 +757,7 @@ fn test_ui_seek_hotkeys() {
 
 #[test]
 fn test_browser_add_track_to_queue_does_not_start_playback() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_add_track_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -802,6 +817,7 @@ fn test_browser_add_track_to_queue_does_not_start_playback() {
 
 #[test]
 fn test_browser_backspace_parent_navigation() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_backspace_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     let sub_dir = temp_dir.join("subfolder");
@@ -841,6 +857,7 @@ fn test_browser_backspace_parent_navigation() {
 
 #[test]
 fn test_help_modal_lifecycle_and_render() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_help_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -904,6 +921,7 @@ fn test_help_modal_lifecycle_and_render() {
 
 #[test]
 fn test_queue_track_skip_debouncing_and_flushing() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_debounce_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -995,6 +1013,7 @@ fn test_queue_track_skip_debouncing_and_flushing() {
 
 #[test]
 fn test_browser_metadata_view_toggle_in_place_and_settings_tab() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_toggle_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -1078,6 +1097,7 @@ fn test_browser_metadata_view_toggle_in_place_and_settings_tab() {
 
 #[test]
 fn test_browser_perf_and_scan_lifecycle_tracking() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_perf_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -1119,6 +1139,7 @@ fn test_browser_perf_and_scan_lifecycle_tracking() {
 
 #[test]
 fn test_queue_rendering_without_file_type_and_file_list_display_swap() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_q_render_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -1175,6 +1196,7 @@ fn test_queue_rendering_without_file_type_and_file_list_display_swap() {
 
 #[test]
 fn test_settings_view_file_actions_disabled_and_home_dir_editing() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_set_edit_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -1272,6 +1294,7 @@ fn test_settings_view_file_actions_disabled_and_home_dir_editing() {
 
 #[test]
 fn test_browser_drops_duplicate_directory_entries_from_os() {
+    common::isolate();
     // Some SMB shares return each directory entry several times (issue #35).
     use quickstream::ui::DirScanEvent;
     let temp_dir = std::env::temp_dir().join(format!("qs_browser_dupes_{}", std::process::id()));

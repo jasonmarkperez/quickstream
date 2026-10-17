@@ -68,6 +68,6 @@ cargo build --release
 
 When contributing:
 - Ensure all tests pass and `cargo clippy` has zero warnings before opening a PR or committing.
-- Add integration tests in `tests/test_<feature>.rs` for any new functionality or bug fixes.
+- Add integration tests in `tests/test_<feature>.rs` for any new functionality or bug fixes. Each test file declares `mod common;` and each test starts with `common::isolate();` so it never touches your real `~/.config`, `~/.cache` or `~/.local/share` quickstream dirs (`tests/test_isolation.rs` enforces this).
 - Mock all network requests and external subprocesses in unit tests where practical.
 - Use Conventional Commits (e.g. `feat:`, `fix:`, `docs:`, `test:`, `refactor:`).

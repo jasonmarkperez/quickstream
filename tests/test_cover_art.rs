@@ -1,6 +1,8 @@
 //! Cover art served by `/api/cover`: only real image types go out as `Content-Type`, whatever
 //! MIME string the audio file's tag carries.
 
+mod common;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -18,15 +20,6 @@ const GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff"
 const WEBP: &[u8] = b"RIFF\x1a\x00\x00\x00WEBPVP8 \x0e\x00\x00\x00";
 const HTML: &[u8] = b"<html><script>alert(document.cookie)</script></html>";
 const SVG: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>";
-
-/// Keep the web token out of the developer's real ~/.config/quickstream.
-fn isolate_config() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let dir = std::env::temp_dir().join(format!("qs_cover_art_cfg_{}", std::process::id()));
-        std::env::set_var("XDG_CONFIG_HOME", dir);
-    });
-}
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("qs_cover_art_{}_{}", name, std::process::id()));
@@ -81,6 +74,7 @@ fn write_wav_with_picture(path: &Path, mime: &str, data: &[u8]) {
 
 #[test]
 fn test_cover_mime_accepts_allowlisted_tag_types() {
+    common::isolate();
     assert_eq!(cover_image_mime(Some("image/jpeg"), JPEG), Some("image/jpeg"));
     assert_eq!(cover_image_mime(Some("image/png"), PNG), Some("image/png"));
     assert_eq!(cover_image_mime(Some("image/webp"), WEBP), Some("image/webp"));
@@ -90,6 +84,7 @@ fn test_cover_mime_accepts_allowlisted_tag_types() {
 
 #[test]
 fn test_cover_mime_rejects_hostile_tag_types_for_non_image_data() {
+    common::isolate();
     assert_eq!(cover_image_mime(Some("text/html"), HTML), None);
     assert_eq!(cover_image_mime(Some("image/png\r\nSet-Cookie: x=1"), HTML), None);
     assert_eq!(cover_image_mime(Some("image/svg+xml"), SVG), None);
@@ -100,6 +95,7 @@ fn test_cover_mime_rejects_hostile_tag_types_for_non_image_data() {
 
 #[test]
 fn test_cover_mime_uses_magic_bytes_when_tag_type_is_missing_or_unknown() {
+    common::isolate();
     assert_eq!(cover_image_mime(None, JPEG), Some("image/jpeg"));
     assert_eq!(cover_image_mime(Some(""), PNG), Some("image/png"));
     assert_eq!(cover_image_mime(Some("text/html"), PNG), Some("image/png"));
@@ -110,6 +106,7 @@ fn test_cover_mime_uses_magic_bytes_when_tag_type_is_missing_or_unknown() {
 
 #[test]
 fn test_cover_mime_trusts_the_image_bytes_over_the_tag() {
+    common::isolate();
     // A PNG labelled as JPEG goes out as PNG.
     assert_eq!(cover_image_mime(Some("image/jpeg"), PNG), Some("image/png"));
 }
@@ -120,6 +117,7 @@ fn test_cover_mime_trusts_the_image_bytes_over_the_tag() {
 
 #[test]
 fn test_embedded_picture_with_hostile_mime_is_not_served() {
+    common::isolate();
     let dir = temp_dir("hostile_embedded");
     for (i, mime) in ["text/html", "image/png\r\nSet-Cookie: x=1", "", "image/svg+xml"].iter().enumerate() {
         let track = dir.join(format!("track{}.wav", i));
@@ -131,6 +129,7 @@ fn test_embedded_picture_with_hostile_mime_is_not_served() {
 
 #[test]
 fn test_embedded_picture_with_hostile_mime_falls_back_to_folder_art() {
+    common::isolate();
     let dir = temp_dir("folder_fallback");
     let track = dir.join("track.wav");
     write_wav_with_picture(&track, "text/html", HTML);
@@ -143,6 +142,7 @@ fn test_embedded_picture_with_hostile_mime_falls_back_to_folder_art() {
 
 #[test]
 fn test_embedded_image_with_hostile_mime_is_served_with_detected_type() {
+    common::isolate();
     let dir = temp_dir("detected");
     let track = dir.join("track.wav");
     write_wav_with_picture(&track, "image/png\r\nSet-Cookie: x=1", PNG);
@@ -184,7 +184,6 @@ fn content_type(headers: &str) -> String {
 }
 
 fn start(filepath: Option<PathBuf>) -> quickstream::web::WebServerHandle {
-    isolate_config();
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
     state.write().unwrap().filepath = filepath;
     let (tx, _rx) = mpsc::channel();
@@ -193,6 +192,7 @@ fn start(filepath: Option<PathBuf>) -> quickstream::web::WebServerHandle {
 
 #[test]
 fn test_api_cover_never_sends_tag_controlled_content_type() {
+    common::isolate();
     let dir = temp_dir("api_hostile");
     for (i, mime) in ["text/html", "image/png\r\nSet-Cookie: x=1", ""].iter().enumerate() {
         let track = dir.join(format!("track{}.wav", i));
@@ -210,6 +210,7 @@ fn test_api_cover_never_sends_tag_controlled_content_type() {
 
 #[test]
 fn test_api_cover_serves_embedded_image_with_nosniff() {
+    common::isolate();
     let dir = temp_dir("api_image");
     let track = dir.join("track.wav");
     write_wav_with_picture(&track, "image/png\r\nSet-Cookie: x=1", PNG);
@@ -226,6 +227,7 @@ fn test_api_cover_serves_embedded_image_with_nosniff() {
 
 #[test]
 fn test_api_cover_placeholder_sends_nosniff() {
+    common::isolate();
     let handle = start(None);
     let (status, headers, _) = get(handle.port, "/api/cover");
     handle.stop();
@@ -236,7 +238,7 @@ fn test_api_cover_placeholder_sends_nosniff() {
 
 #[test]
 fn test_dashboard_and_json_responses_send_nosniff() {
-    isolate_config();
+    common::isolate();
     let dir = temp_dir("json_nosniff");
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
     // /api/browser answers 403 unless there is an allowed folder to list.

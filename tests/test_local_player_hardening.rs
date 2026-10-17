@@ -3,6 +3,8 @@
 //! Every test that plays audio uses silent audio generated into a scratch directory.
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
@@ -12,14 +14,11 @@ use std::process::Command;
 use quickstream::player::local::{create_private_ipc_dir, verify_ipc_socket, LocalPlayer};
 use quickstream::player::AudioPlayer;
 
-/// Fresh scratch dir unique to this process and test. Also points the XDG config/cache/data
-/// dirs at it so nothing (e.g. the logger) touches the real user directories.
+/// Fresh scratch dir unique to this process and test. (The XDG dirs are isolated by
+/// `common::isolate()`.)
 fn scratch_dir(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("qs-hard-{}", std::process::id()));
     fs::create_dir_all(&root).unwrap();
-    for var in ["XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"] {
-        std::env::set_var(var, root.join(var.to_lowercase()));
-    }
     let dir = root.join(name);
     fs::create_dir(&dir).expect("scratch dir must not already exist");
     dir
@@ -64,6 +63,7 @@ fn current_uid() -> u32 {
 
 #[test]
 fn test_private_ipc_dir_is_0700_and_owned_by_current_user() {
+    common::isolate();
     let base = scratch_dir("dir-perms");
     let dir = base.join("ipc");
 
@@ -79,6 +79,7 @@ fn test_private_ipc_dir_is_0700_and_owned_by_current_user() {
 
 #[test]
 fn test_private_ipc_dir_refuses_existing_directory() {
+    common::isolate();
     let base = scratch_dir("dir-exists");
     let dir = base.join("ipc");
     fs::create_dir(&dir).unwrap();
@@ -94,6 +95,7 @@ fn test_private_ipc_dir_refuses_existing_directory() {
 
 #[test]
 fn test_private_ipc_dir_refuses_symlink() {
+    common::isolate();
     let base = scratch_dir("dir-symlink");
     let target = base.join("elsewhere");
     fs::create_dir(&target).unwrap();
@@ -110,6 +112,7 @@ fn test_private_ipc_dir_refuses_symlink() {
 
 #[test]
 fn test_verify_ipc_socket_checks_type_and_owner() {
+    common::isolate();
     let base = scratch_dir("verify-sock");
     let sock = base.join("s.sock");
     let _listener = UnixListener::bind(&sock).unwrap();
@@ -131,6 +134,7 @@ fn test_verify_ipc_socket_checks_type_and_owner() {
 
 #[test]
 fn test_mpv_socket_lives_in_private_runtime_dir_and_is_removed_on_drop() {
+    common::isolate();
     if !have("mpv") || !have("ffmpeg") {
         eprintln!("skipping: mpv/ffmpeg not installed");
         return;
@@ -170,6 +174,7 @@ fn test_mpv_socket_lives_in_private_runtime_dir_and_is_removed_on_drop() {
 
 #[test]
 fn test_mpv_socket_dir_name_is_unpredictable() {
+    common::isolate();
     if !have("mpv") || !have("ffmpeg") {
         eprintln!("skipping: mpv/ffmpeg not installed");
         return;
@@ -203,6 +208,7 @@ fn test_mpv_socket_dir_name_is_unpredictable() {
 
 #[test]
 fn test_failed_mpv_connect_kills_and_reaps_spawned_child() {
+    common::isolate();
     if !have("ffmpeg") || !have("ffplay") {
         eprintln!("skipping: ffmpeg/ffplay not installed");
         return;

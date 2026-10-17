@@ -1,6 +1,8 @@
 //! Integration tests for the background track analysis worker (issue #15) and the
 //! ffmpeg robustness fixes in `BpmAnalyzer` (issue #19).
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -110,6 +112,7 @@ fn snapshot(dir: &Path) -> BTreeMap<PathBuf, (u64, SystemTime)> {
 
 #[test]
 fn test_read_embedded_bpm_reads_id3_tbpm_frame() {
+    common::isolate();
     let music = scratch_dir("tbpm");
     let track = music.join("tagged.wav");
     write_tagged_wav(&track, "128", "Am");
@@ -120,6 +123,7 @@ fn test_read_embedded_bpm_reads_id3_tbpm_frame() {
 
 #[test]
 fn test_acoustic_tempo_on_track_shorter_than_seek_offset() {
+    common::isolate();
     if !ffmpeg_available() {
         eprintln!("ffmpeg not installed; skipping");
         return;
@@ -139,6 +143,7 @@ fn test_acoustic_tempo_on_track_shorter_than_seek_offset() {
 
 #[test]
 fn test_subprocess_timeout_kills_hung_child() {
+    common::isolate();
     let mut cmd = std::process::Command::new("sleep");
     cmd.arg("30");
     let start = Instant::now();
@@ -157,6 +162,7 @@ fn test_subprocess_timeout_kills_hung_child() {
 
 #[test]
 fn test_worker_populates_db_from_embedded_tags() {
+    common::isolate();
     let music = scratch_dir("worker_tags");
     let cache = scratch_dir("worker_tags_db");
     let track = music.join("tagged.wav");
@@ -183,6 +189,7 @@ fn test_worker_populates_db_from_embedded_tags() {
 
 #[test]
 fn test_worker_analyses_untagged_short_track_acoustically() {
+    common::isolate();
     if !ffmpeg_available() {
         eprintln!("ffmpeg not installed; skipping");
         return;
@@ -209,6 +216,7 @@ fn test_worker_analyses_untagged_short_track_acoustically() {
 
 #[test]
 fn test_worker_skips_tracks_already_in_db() {
+    common::isolate();
     let music = scratch_dir("worker_resume");
     let cache = scratch_dir("worker_resume_db");
     let track = music.join("tagged.wav");
@@ -247,6 +255,7 @@ fn test_worker_skips_tracks_already_in_db() {
 
 #[test]
 fn test_worker_never_writes_into_music_library() {
+    common::isolate();
     let music = scratch_dir("worker_zero_touch");
     let cache = scratch_dir("worker_zero_touch_db");
     write_tagged_wav(&music.join("a.wav"), "100", "C");
@@ -267,6 +276,7 @@ fn test_worker_never_writes_into_music_library() {
 
 #[test]
 fn test_worker_shutdown_is_prompt_with_pending_work() {
+    common::isolate();
     let music = scratch_dir("worker_shutdown");
     let cache = scratch_dir("worker_shutdown_db");
     let mut tracks = Vec::new();
@@ -299,12 +309,12 @@ fn test_worker_shutdown_is_prompt_with_pending_work() {
 
 #[test]
 fn test_autopilot_tracks_are_analysed_in_background() {
+    common::isolate();
     use quickstream::settings::SettingsManager;
     use quickstream::ui::AppUI;
 
-    // Redirect the analysis DB / caches away from the real user cache.
-    let cache = scratch_dir("ui_cache");
-    std::env::set_var("XDG_CACHE_HOME", &cache);
+    // `common::isolate()` points XDG_CACHE_HOME (analysis DB, library cache) at a temp dir.
+    let cache = common::isolate().join("cache");
 
     let music = scratch_dir("ui_music");
     let a = music.join("a.wav");
@@ -327,9 +337,7 @@ fn test_autopilot_tracks_are_analysed_in_background() {
 
     let _ = app.player.stop();
     drop(app);
-    std::env::remove_var("XDG_CACHE_HOME");
     let _ = fs::remove_dir_all(&music);
-    let _ = fs::remove_dir_all(&cache);
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +368,7 @@ fn invocations(log: &Path) -> usize {
 
 #[test]
 fn test_worker_does_not_persist_when_ffmpeg_fails() {
+    common::isolate();
     if !ffmpeg_available() {
         eprintln!("ffmpeg not installed; skipping");
         return;
@@ -387,6 +396,7 @@ fn test_worker_does_not_persist_when_ffmpeg_fails() {
 
 #[test]
 fn test_worker_retries_in_later_session_when_ffmpeg_was_missing() {
+    common::isolate();
     let music = scratch_dir("worker_ffmpeg_missing");
     let cache = scratch_dir("worker_ffmpeg_missing_db");
     let track = music.join("untagged_120.wav");
@@ -425,6 +435,7 @@ fn test_worker_retries_in_later_session_when_ffmpeg_was_missing() {
 #[cfg(unix)]
 #[test]
 fn test_worker_does_not_persist_when_ffmpeg_produces_no_audio() {
+    common::isolate();
     let music = scratch_dir("worker_ffmpeg_empty");
     let cache = scratch_dir("worker_ffmpeg_empty_db");
     let track = music.join("untagged.wav");
@@ -453,6 +464,7 @@ fn test_worker_does_not_persist_when_ffmpeg_produces_no_audio() {
 
 #[test]
 fn test_worker_persists_silent_track_without_bpm() {
+    common::isolate();
     if !ffmpeg_available() {
         eprintln!("ffmpeg not installed; skipping");
         return;
@@ -482,6 +494,7 @@ fn test_worker_persists_silent_track_without_bpm() {
 
 #[test]
 fn test_worker_persists_tagged_track_even_when_ffmpeg_missing() {
+    common::isolate();
     let music = scratch_dir("worker_tagged_no_ffmpeg");
     let cache = scratch_dir("worker_tagged_no_ffmpeg_db");
     let track = music.join("tagged.wav");
@@ -508,6 +521,7 @@ fn test_worker_persists_tagged_track_even_when_ffmpeg_missing() {
 #[cfg(unix)]
 #[test]
 fn test_decode_does_not_retry_from_zero_after_ffmpeg_failure() {
+    common::isolate();
     let dir = scratch_dir("decode_no_retry_fail");
     let track = dir.join("track.wav");
     write_wav(&track, &click_track(120.0, 12.0));
@@ -526,6 +540,7 @@ fn test_decode_does_not_retry_from_zero_after_ffmpeg_failure() {
 #[cfg(unix)]
 #[test]
 fn test_decode_does_not_retry_from_zero_after_timeout() {
+    common::isolate();
     let dir = scratch_dir("decode_no_retry_timeout");
     let track = dir.join("track.wav");
     write_wav(&track, &click_track(120.0, 12.0));
@@ -552,6 +567,7 @@ fn test_decode_does_not_retry_from_zero_after_timeout() {
 #[cfg(unix)]
 #[test]
 fn test_decode_retries_from_zero_when_first_decode_is_too_short() {
+    common::isolate();
     let dir = scratch_dir("decode_retry_short");
     let track = dir.join("track.wav");
     write_wav(&track, &click_track(120.0, 12.0));

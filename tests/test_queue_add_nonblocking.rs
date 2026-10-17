@@ -4,6 +4,8 @@
 //! connects, like a slow network share. A helper thread connects as the writer after
 //! `SLOW_FILE_DELAY`, so any synchronous metadata read on the UI thread takes at least that long.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -46,6 +48,7 @@ fn app_with_web_commands() -> (AppUI, mpsc::Sender<WebCommand>) {
 
 #[test]
 fn test_web_add_file_does_not_read_metadata_on_ui_thread() {
+    common::isolate();
     let dir = temp_dir("add_file");
     let slow = make_slow_audio_file(&dir, "slow.mp3");
     let (mut app, tx) = app_with_web_commands();
@@ -62,6 +65,7 @@ fn test_web_add_file_does_not_read_metadata_on_ui_thread() {
 
 #[test]
 fn test_web_add_folder_does_not_block_ui_thread() {
+    common::isolate();
     let dir = temp_dir("add_folder");
     let slow = make_slow_audio_file(&dir, "slow.mp3");
     let (mut app, tx) = app_with_web_commands();

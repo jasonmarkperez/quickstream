@@ -1,6 +1,8 @@
 //! The continuous (gapless) WAV stream is only served during a UPnP continuous session, at a
 //! per-session unguessable path, to the renderer that first connected.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -16,14 +18,6 @@ use quickstream::web::{
     ContinuousAdmission, ContinuousStreamController, NowPlayingState, StreamServerState, WebCommand, WebQueueItem,
     WebServer, WebServerHandle,
 };
-
-fn isolate_config() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let dir = std::env::temp_dir().join(format!("qs_continuous_cfg_{}", std::process::id()));
-        std::env::set_var("XDG_CONFIG_HOME", dir);
-    });
-}
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("qs_continuous_{}_{}", name, std::process::id()));
@@ -65,7 +59,6 @@ fn queue_item(index: usize, path: &Path) -> WebQueueItem {
 }
 
 fn start(state: Arc<RwLock<NowPlayingState>>) -> (WebServerHandle, mpsc::Receiver<WebCommand>) {
-    isolate_config();
     let (tx, rx) = mpsc::channel();
     let handle = WebServer::start(0, state, tx).expect("start web server");
     (handle, rx)
@@ -101,6 +94,7 @@ fn is_session_path(path: &str) -> bool {
 
 #[test]
 fn test_continuous_stream_is_not_served_without_an_armed_session() {
+    common::isolate();
     let dir = temp_dir("unarmed");
     let song = dir.join("a.wav");
     write_wav(&song, 100);
@@ -132,6 +126,7 @@ fn test_continuous_stream_is_not_served_without_an_armed_session() {
 
 #[test]
 fn test_armed_continuous_session_serves_only_its_own_path() {
+    common::isolate();
     let (handle, _rx) = start(Arc::new(RwLock::new(NowPlayingState::default())));
     let port = handle.port;
     let ss = handle.stream_state();
@@ -173,6 +168,7 @@ fn test_armed_continuous_session_serves_only_its_own_path() {
 
 #[test]
 fn test_continuous_session_admits_only_the_first_peer() {
+    common::isolate();
     let c = ContinuousStreamController::new();
     let renderer = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20));
     let other = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 66));
@@ -200,6 +196,7 @@ fn test_continuous_session_admits_only_the_first_peer() {
 
 #[test]
 fn test_armed_continuous_stream_plays_queue_gaplessly_and_shuffles_on_wrap() {
+    common::isolate();
     if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
         eprintln!("ffmpeg not installed; skipping");
         return;
@@ -308,6 +305,7 @@ fn spawn_mock_renderer() -> (u16, Arc<AtomicBool>, Arc<Mutex<String>>, std::thre
 
 #[test]
 fn test_upnp_continuous_play_uses_the_armed_session_path() {
+    common::isolate();
     let (port, stop, uri, mock) = spawn_mock_renderer();
     let device = DLNADevice {
         udn: "uuid:continuous".to_string(),

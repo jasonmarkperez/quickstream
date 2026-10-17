@@ -1,5 +1,7 @@
 //! The UI's metadata cache is shared with background scanners, never deep-copied (issue #4).
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
@@ -50,6 +52,7 @@ fn meta(path: &std::path::Path, title: &str) -> AudioMetadata {
 
 #[test]
 fn test_metadata_cache_clones_share_storage() {
+    common::isolate();
     let a = MetadataCache::default();
     let b = a.clone();
     let path = PathBuf::from("/qs-test-nonexistent/a.mp3");
@@ -62,6 +65,7 @@ fn test_metadata_cache_clones_share_storage() {
 
 #[test]
 fn test_browser_refresh_and_autopilot_share_the_cache() {
+    common::isolate();
     let dir = temp_dir("app");
     write_silent_wav(&dir.join("song.wav"));
     let mut settings_mgr = SettingsManager::new();
@@ -83,6 +87,7 @@ fn test_browser_refresh_and_autopilot_share_the_cache() {
 
 #[test]
 fn test_autopilot_scanner_reads_shared_cache() {
+    common::isolate();
     let dir = temp_dir("scanner");
     let album = dir.join("Artist").join("Album");
     std::fs::create_dir_all(&album).unwrap();

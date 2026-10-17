@@ -188,5 +188,6 @@ cargo build --release
 
 ### Important Rules for Future Agents
 - **No Temporary Root Scripts**: Do not create ad-hoc test scripts (e.g. `test_something.py`, `scratch.rs`, `patch.py`) in the repository root. Always place unit and integration tests inside `tests/` following the `test_*.rs` naming convention.
+- **Test Isolation**: Every integration test file declares `mod common;` and every `#[test]` starts with `common::isolate();` (`tests/common/mod.rs`), which points `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` / `XDG_DATA_HOME` at a per-process temp dir so tests never read or write the real `~/.config`, `~/.cache` or `~/.local/share` quickstream dirs. `tests/test_isolation.rs` fails if a test skips it.
 - **Graceful Resource Cleanup**: All networking threads (`DLNAScanner`), streaming HTTP sockets, Tokio runtimes, and subprocesses (`mpv`, `ffplay`) must terminate cleanly upon shutdown or `ctrlc` signal.
 - **File Modifications**: Use targeted file editing tools (`replace_file_content` or `write_to_file`) rather than shell sed/cat scripts.

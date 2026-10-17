@@ -1,5 +1,7 @@
 //! Background worker threads are tracked, stopped and joined on shutdown (issue #5).
 
+mod common;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -48,6 +50,7 @@ fn app_at(dir: &std::path::Path) -> AppUI {
 
 #[test]
 fn test_shutdown_stops_and_joins_every_worker_kind() {
+    common::isolate();
     let root = library("all");
     let mut app = app_at(&root);
 
@@ -68,6 +71,7 @@ fn test_shutdown_stops_and_joins_every_worker_kind() {
 
 #[test]
 fn test_shutdown_wait_is_bounded_for_stuck_workers() {
+    common::isolate();
     let root = library("stuck");
     let mut app = app_at(&root);
     app.workers.spawn("stuck-test", || std::thread::sleep(Duration::from_secs(10)));
@@ -81,6 +85,7 @@ fn test_shutdown_wait_is_bounded_for_stuck_workers() {
 
 #[test]
 fn test_finished_workers_are_reaped() {
+    common::isolate();
     let root = library("reap");
     let mut app = app_at(&root);
     let _ = app.shutdown_workers(Duration::from_secs(2));

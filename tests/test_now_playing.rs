@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -10,6 +12,7 @@ use quickstream::ui::AppUI;
 
 #[test]
 fn test_now_playing_tab_key_navigation() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_np_keys_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -54,6 +57,7 @@ fn test_now_playing_tab_key_navigation() {
 
 #[test]
 fn test_render_now_playing_tab_empty_and_populated() {
+    common::isolate();
     let temp_dir = std::env::temp_dir().join(format!("quickstream_np_render_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
