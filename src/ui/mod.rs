@@ -3545,13 +3545,15 @@ impl AppUI {
 
     fn render_tabs(&self, f: &mut Frame, area: Rect) {
         let titles = vec![
-            " [1] Now Playing ",
-            " [2] Queue & Library ",
-            " [3] Devices ",
-            " [4] Settings ",
-            " [5] Playlists ",
+            " [1] Now Playing",
+            " [2] Queue & Library",
+            " [3] Devices",
+            " [4] Settings",
+            " [5] Playlists",
         ];
+        // Zero padding keeps all five labels inside a standard 80-column terminal.
         let tabs = Tabs::new(titles)
+            .padding("", "")
             .select(self.active_tab)
             .block(Block::default().borders(Borders::BOTTOM))
             .style(Style::default().fg(Color::DarkGray))

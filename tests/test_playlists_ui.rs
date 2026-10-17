@@ -365,3 +365,27 @@ fn test_help_modal_lists_tab_5_navigation() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_tab_bar_shows_all_five_labels_at_80_columns() {
+    common::isolate();
+    let temp_dir = fresh_dirs("tabbar80");
+    let mut app = new_app(&temp_dir);
+
+    let out = render(&mut app, 80, 30);
+    let first_line = out.lines().next().unwrap_or("").to_string();
+    for label in [
+        "[1] Now Playing",
+        "[2] Queue & Library",
+        "[3] Devices",
+        "[4] Settings",
+        "[5] Playlists",
+    ] {
+        assert!(
+            first_line.contains(label),
+            "missing {label:?} in tab bar: {first_line:?}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
