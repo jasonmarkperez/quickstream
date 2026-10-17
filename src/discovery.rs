@@ -468,115 +468,172 @@ pub fn http_exchange(
     }
 }
 
-/// Robust HTTP GET to download device XML over TcpStream with Content-Length support.
+/// Largest device description accepted from a renderer.
+pub const MAX_DESCRIPTION_BYTES: usize = 256 * 1024;
+/// Overall deadline for fetching one device description.
+pub const DESCRIPTION_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
+/// Device descriptions fetched concurrently during a scan.
+pub const MAX_PARALLEL_DESCRIPTION_FETCHES: usize = 8;
+/// Distinct LOCATION URLs followed per scan; further responders are ignored.
+pub const MAX_LOCATIONS_PER_SCAN: usize = 64;
+
+/// Download a device description with the default deadline and size cap.
 pub fn fetch_xml(url: &str) -> Option<String> {
-    let url_trimmed = url.trim();
-    let without_proto = url_trimmed.strip_prefix("http://")?;
-    let (host_port, path) = if let Some(slash) = without_proto.find('/') {
-        (&without_proto[..slash], &without_proto[slash..])
-    } else {
-        (without_proto, "/")
-    };
+    fetch_xml_with_limits(url, DESCRIPTION_FETCH_TIMEOUT, MAX_DESCRIPTION_BYTES)
+}
 
-    let (host, port) = if let Some(colon) = host_port.find(':') {
-        let h = &host_port[..colon];
-        let p = host_port[colon + 1..].parse::<u16>().ok()?;
-        (h, p)
-    } else {
-        (host_port, 80)
-    };
-
-    let addrs = (host, port).to_socket_addrs().ok()?;
-    let mut stream = None;
-    for addr in addrs {
-        if let Ok(s) = TcpStream::connect_timeout(&addr, Duration::from_millis(1500)) {
-            let _ = s.set_read_timeout(Some(Duration::from_millis(1500)));
-            let _ = s.set_write_timeout(Some(Duration::from_millis(1500)));
-            stream = Some(s);
-            break;
-        }
-    }
-    let mut stream = stream?;
-
+/// Download a device description. The whole request must finish within `timeout` and
+/// the body may not exceed `max_body_bytes`; otherwise `None` is returned.
+pub fn fetch_xml_with_limits(url: &str, timeout: Duration, max_body_bytes: usize) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    let u = parse_http_url(url)?;
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Quickstream/0.2.0 UPnP/1.1\r\nConnection: close\r\n\r\n",
-        path, host_port
+        u.path, u.host_port
     );
-
-    stream.write_all(request.as_bytes()).ok()?;
-
-    let mut buffer = Vec::new();
-    let mut chunk = [0u8; 1024];
-    let mut header_end = None;
-
-    while let Ok(n) = stream.read(&mut chunk) {
-        if n == 0 {
-            break;
+    // Leave room for the status line and headers on top of the body cap.
+    let resp = match http_exchange(&u.host, u.port, request.as_bytes(), deadline, max_body_bytes + 16 * 1024) {
+        Ok(r) => r,
+        Err(e) => {
+            crate::log_info!("discovery", "Device description fetch from {} failed: {}", url, e);
+            return None;
         }
-        buffer.extend_from_slice(&chunk[..n]);
-        if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-            header_end = Some(pos);
-            break;
+    };
+    if !(200..300).contains(&resp.status) || resp.body.is_empty() || resp.body.len() > max_body_bytes {
+        crate::log_info!(
+            "discovery",
+            "Ignoring device description from {} (HTTP {}, {} bytes)",
+            url,
+            resp.status,
+            resp.body.len()
+        );
+        return None;
+    }
+    Some(resp.body_text())
+}
+
+/// Extract the LOCATION URL from an SSDP response, but only if its host is the IP
+/// address the response came from.
+///
+/// Without this check any host on the network (or a spoofed packet) could point
+/// discovery at an arbitrary URL. LOCATION hosts that are names rather than IP
+/// literals are rejected too, since they cannot be checked without a DNS lookup.
+pub fn ssdp_location_for_sender(response: &str, sender: std::net::IpAddr) -> Option<String> {
+    let location = response.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case("location") {
+            Some(value.trim().to_string())
+        } else {
+            None
+        }
+    })?;
+    let url = parse_http_url(&location)?;
+    let host_ip: std::net::IpAddr = url.host.parse().ok()?;
+    if host_ip.to_canonical() == sender.to_canonical() {
+        Some(location)
+    } else {
+        None
+    }
+}
+
+/// Fetches device descriptions on background threads, at most `max_parallel` at once.
+///
+/// Each fetch is bounded by `fetch_timeout`, so a slow device delays only itself.
+pub struct DescriptionFetcher {
+    max_parallel: usize,
+    fetch_timeout: Duration,
+    seen: HashSet<String>,
+    pending: std::collections::VecDeque<(usize, String)>,
+    in_flight: usize,
+    tx: std::sync::mpsc::Sender<(usize, Option<DLNADevice>)>,
+    rx: std::sync::mpsc::Receiver<(usize, Option<DLNADevice>)>,
+    results: Vec<(usize, DLNADevice)>,
+}
+
+impl DescriptionFetcher {
+    pub fn new(max_parallel: usize, fetch_timeout: Duration) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            max_parallel: max_parallel.max(1),
+            fetch_timeout,
+            seen: HashSet::new(),
+            pending: std::collections::VecDeque::new(),
+            in_flight: 0,
+            tx,
+            rx,
+            results: Vec::new(),
         }
     }
 
-    let header_pos = match header_end {
-        Some(p) => p,
-        None => {
-            if let Some(p) = buffer.windows(2).position(|w| w == b"\n\n") {
-                p
-            } else {
-                return if !buffer.is_empty() {
-                    Some(String::from_utf8_lossy(&buffer).to_string())
-                } else {
-                    None
-                };
-            }
+    /// Queue a LOCATION URL. Duplicates and URLs past [`MAX_LOCATIONS_PER_SCAN`] are ignored.
+    pub fn submit(&mut self, url: String) {
+        if self.seen.len() >= MAX_LOCATIONS_PER_SCAN || !self.seen.insert(url.clone()) {
+            return;
         }
-    };
+        let index = self.seen.len() - 1;
+        self.pending.push_back((index, url));
+        self.pump();
+    }
 
-    let header_str = String::from_utf8_lossy(&buffer[..header_pos]);
-    let delimiter_len = if buffer[header_pos..].starts_with(b"\r\n\r\n") { 4 } else { 2 };
-    let body_start = header_pos + delimiter_len;
-
-    // Check Content-Length header
-    let content_length: Option<usize> = header_str.lines().find_map(|line| {
-        if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("content-length") {
-                return v.trim().parse::<usize>().ok();
-            }
+    /// Collect finished fetches and start queued ones. Never blocks.
+    pub fn pump(&mut self) {
+        while let Ok(msg) = self.rx.try_recv() {
+            self.record(msg);
         }
-        None
-    });
+        while self.in_flight < self.max_parallel {
+            let Some((index, url)) = self.pending.pop_front() else {
+                break;
+            };
+            self.in_flight += 1;
+            let tx = self.tx.clone();
+            let timeout = self.fetch_timeout;
+            thread::spawn(move || {
+                let device = fetch_xml_with_limits(&url, timeout, MAX_DESCRIPTION_BYTES)
+                    .and_then(|xml| parse_device_description(&xml, &url));
+                let _ = tx.send((index, device));
+            });
+        }
+    }
 
-    if let Some(cl) = content_length {
-        let needed = cl.saturating_sub(buffer.len() - body_start);
-        let mut read_remaining = 0;
-        while read_remaining < needed {
-            let to_read = (needed - read_remaining).min(chunk.len());
-            match stream.read(&mut chunk[..to_read]) {
-                Ok(0) => break,
-                Ok(n) => {
-                    buffer.extend_from_slice(&chunk[..n]);
-                    read_remaining += n;
-                }
+    fn record(&mut self, (index, device): (usize, Option<DLNADevice>)) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if let Some(dev) = device {
+            self.results.push((index, dev));
+        }
+    }
+
+    /// Wait for queued and running fetches until `deadline`, then return the devices
+    /// found, in the order their LOCATIONs were submitted. Fetches still running at the
+    /// deadline end on their own timeout; their results are discarded.
+    pub fn finish(mut self, deadline: Instant) -> Vec<DLNADevice> {
+        loop {
+            self.pump();
+            if self.in_flight == 0 && self.pending.is_empty() {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match self.rx.recv_timeout(deadline - now) {
+                Ok(msg) => self.record(msg),
                 Err(_) => break,
             }
         }
-    } else {
-        while let Ok(n) = stream.read(&mut chunk) {
-            if n == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&chunk[..n]);
-        }
+        self.results.sort_by_key(|(i, _)| *i);
+        self.results.into_iter().map(|(_, d)| d).collect()
     }
+}
 
-    if buffer.len() > body_start {
-        Some(String::from_utf8_lossy(&buffer[body_start..]).to_string())
-    } else {
-        None
+/// Fetch and parse several device descriptions concurrently (at most `max_parallel`
+/// at a time, each bounded by `fetch_timeout`).
+pub fn fetch_device_descriptions(urls: &[String], max_parallel: usize, fetch_timeout: Duration) -> Vec<DLNADevice> {
+    let mut fetcher = DescriptionFetcher::new(max_parallel, fetch_timeout);
+    for url in urls {
+        fetcher.submit(url.clone());
     }
+    let rounds = urls.len().div_ceil(max_parallel.max(1)).max(1) as u32;
+    fetcher.finish(Instant::now() + fetch_timeout * rounds + Duration::from_millis(250))
 }
 
 /// Parse UPnP Device Description XML and extract device information and service URLs.
@@ -668,7 +725,8 @@ pub fn discover_devices(timeout: Duration) -> Vec<DLNADevice> {
         Err(_) => return Vec::new(),
     };
 
-    let _ = socket.set_read_timeout(Some(Duration::from_millis(400)));
+    // Short read timeout so finished description fetches are collected promptly.
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
     let _ = socket.set_multicast_ttl_v4(2);
 
     for target in &search_targets {
@@ -685,33 +743,31 @@ pub fn discover_devices(timeout: Duration) -> Vec<DLNADevice> {
     }
 
     let start = Instant::now();
-    let mut discovered_locations = HashSet::new();
-    let mut devices = Vec::new();
+    let mut fetcher = DescriptionFetcher::new(MAX_PARALLEL_DESCRIPTION_FETCHES, DESCRIPTION_FETCH_TIMEOUT);
+    let mut rejected = HashSet::new();
     let mut buf = [0u8; 4096];
 
     while start.elapsed() < timeout {
-        if let Ok((len, _)) = socket.recv_from(&mut buf) {
+        if let Ok((len, src)) = socket.recv_from(&mut buf) {
             let resp = String::from_utf8_lossy(&buf[..len]);
-            for line in resp.lines() {
-                if let Some((header_name, header_val)) = line.split_once(':') {
-                    if header_name.trim().eq_ignore_ascii_case("location") {
-                        let url = header_val.trim().to_string();
-                        if !discovered_locations.contains(&url) {
-                            discovered_locations.insert(url.clone());
-                            if let Some(xml) = fetch_xml(&url) {
-                                if let Some(dev) = parse_device_description(&xml, &url) {
-                                    devices.push(dev);
-                                }
-                            }
-                        }
-                        break;
+            match ssdp_location_for_sender(&resp, src.ip()) {
+                Some(url) => fetcher.submit(url),
+                None => {
+                    if rejected.insert(src.ip()) {
+                        crate::log_info!(
+                            "discovery",
+                            "Ignoring SSDP response from {}: no LOCATION on the sender's own IP",
+                            src.ip()
+                        );
                     }
                 }
             }
         }
+        fetcher.pump();
     }
 
-    devices
+    // Descriptions already being fetched get one more fetch timeout to finish.
+    fetcher.finish(Instant::now() + DESCRIPTION_FETCH_TIMEOUT)
 }
 
 /// Asynchronous background device discovery manager.
