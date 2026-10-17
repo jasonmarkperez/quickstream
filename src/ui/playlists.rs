@@ -60,10 +60,7 @@ impl PlaylistChecks {
     fn new() -> Self {
         let (exists_tx, exists_rx) = std::sync::mpsc::channel();
         let (queue_tx, queue_rx) = std::sync::mpsc::channel();
-        let checker: ExistsChecker = std::sync::Arc::new(|path: &std::path::Path| {
-            // Non-audio entries show as missing; plan_queue never queues them either.
-            crate::metadata::is_supported_audio_file(path) && path.exists()
-        });
+        let checker: ExistsChecker = std::sync::Arc::new(playable_audio_file);
         Self {
             checker,
             in_flight: std::collections::HashSet::new(),
@@ -1108,6 +1105,16 @@ impl PlaylistsUi {
     /// is detached by the bounded worker join.
     pub fn stop_checks(&self) {
         self.checks.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether a playlist entry can be queued: the path resolves (through any symlinks) to a regular
+/// file with an audio extension. Checking the resolved path stops a `song.mp3` symlink from
+/// pointing the stream server at some other file. Runs on a worker; it touches the disk.
+pub fn playable_audio_file(path: &std::path::Path) -> bool {
+    match std::fs::canonicalize(path) {
+        Ok(resolved) => resolved.is_file() && crate::metadata::is_supported_audio_file(&resolved),
+        Err(_) => false,
     }
 }
 

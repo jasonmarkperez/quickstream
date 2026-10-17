@@ -532,3 +532,30 @@ fn test_playback_error_is_kept_when_enter_queues_the_playlist() {
     assert!(!app.player.is_playing(), "a failed start must not report playing");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_symlink_to_a_non_audio_file_is_not_queued() {
+    common::isolate();
+    let dir = temp_dir("symlink");
+    let good = dir.join("good.mp3");
+    let secret = dir.join("secret.txt");
+    let link = dir.join("x.mp3");
+    touch(&good);
+    touch(&secret);
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+    write_playlist(vec![entry(&good, "Alpha", "One"), entry(&link, "Eve", "Link")]);
+    let mut app = app_with_playlist(&dir);
+
+    app.active_tab = 4;
+    app.playlists.tracks_focus = false;
+    press(&mut app, crossterm::event::KeyCode::Char('a'));
+    assert!(
+        poll_until(&mut app, |app| app.queue.len() == 1),
+        "status: {}",
+        app.status_message
+    );
+    assert_eq!(queue_paths(&app), vec![good.clone()]);
+    assert_eq!(app.status_message, "Queued 1 tracks from Road Trip, 1 missing");
+    assert!(app.playlists.is_missing(&link));
+    let _ = std::fs::remove_dir_all(&dir);
+}
