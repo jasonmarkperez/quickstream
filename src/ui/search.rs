@@ -11,6 +11,10 @@ use ratatui::widgets::ListState;
 
 use crate::metadata::AudioMetadata;
 
+/// Minimum time between filter passes triggered by streamed scan batches. Each pass scores and
+/// sorts every indexed track, so re-running it for every batch makes typing lag on large libraries.
+const SCAN_FILTER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Precomputed search indexing data for a single track with field boundary isolation.
 #[derive(Clone)]
 pub struct SearchItem {
@@ -43,6 +47,8 @@ pub struct SearchModalState {
     pub stop_flag: Option<Arc<AtomicBool>>,
     pub scan_start: Option<std::time::Instant>,
     pub spinner_frame: usize,
+    last_filter_at: Option<std::time::Instant>,
+    filter_pending: bool,
 }
 
 impl SearchModalState {
@@ -75,12 +81,16 @@ impl SearchModalState {
             stop_flag,
             scan_start,
             spinner_frame: 0,
+            last_filter_at: None,
+            filter_pending: false,
         };
 
         if !tracks.is_empty() {
             state.add_tracks(tracks);
         } else {
             state.apply_filter();
+            // Nothing is shown yet, so the first streamed batch should display immediately.
+            state.last_filter_at = None;
         }
 
         state
@@ -143,7 +153,14 @@ impl SearchModalState {
             self.all_tracks.push(track);
         }
 
-        self.apply_filter();
+        let recently_filtered = self
+            .last_filter_at
+            .is_some_and(|t| t.elapsed() < SCAN_FILTER_INTERVAL);
+        if self.is_scanning && recently_filtered {
+            self.filter_pending = true;
+        } else {
+            self.apply_filter();
+        }
     }
 
     /// Poll any background scanner batches and update progress.
@@ -165,6 +182,13 @@ impl SearchModalState {
 
             if !batches.is_empty() {
                 self.add_tracks(batches);
+            }
+
+            let interval_passed = self
+                .last_filter_at
+                .is_none_or(|t| t.elapsed() >= SCAN_FILTER_INTERVAL);
+            if self.filter_pending && (disconnected || interval_passed) {
+                self.apply_filter();
             }
 
             if disconnected {
@@ -230,6 +254,8 @@ impl SearchModalState {
     }
 
     pub fn apply_filter(&mut self) {
+        self.last_filter_at = Some(std::time::Instant::now());
+        self.filter_pending = false;
         let trimmed = self.query.trim();
         if trimmed.is_empty() {
             // Return all tracks sorted by artist / title / filename

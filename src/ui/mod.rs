@@ -2040,39 +2040,31 @@ impl AppUI {
             self.browser_dir.clone()
         };
 
-        // 1. Immediately pull any cached tracks for target_dir
-        let cached_map = crate::library::LibraryManager::load_cache_map();
-        let initial_tracks: Vec<crate::metadata::AudioMetadata> = cached_map
-            .values()
-            .filter(|t| t.filepath.starts_with(&target_dir))
-            .cloned()
-            .collect();
-
-        for t in &initial_tracks {
-            self.metadata_cache.insert(t.filepath.clone(), t.clone());
-        }
-
-        // 2. Set up background streaming scanner
+        // Background thread: send cached tracks for target_dir first (the cache covers the whole
+        // library and can be large), then stream newly discovered tracks.
         let (tx, rx) = std::sync::mpsc::channel();
         let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_clone = stop_flag.clone();
         let scan_dir = target_dir.clone();
-        let scan_cache = cached_map;
 
         std::thread::spawn(move || {
-            crate::library::LibraryManager::scan_directory_streaming(
-                scan_dir,
-                scan_cache,
-                tx,
-                stop_clone,
-            );
+            let cached_map = crate::library::LibraryManager::load_cache_map();
+            let initial_tracks: Vec<crate::metadata::AudioMetadata> = cached_map
+                .values()
+                .filter(|t| t.filepath.starts_with(&scan_dir))
+                .cloned()
+                .collect();
+            if !initial_tracks.is_empty() && tx.send(initial_tracks).is_err() {
+                return;
+            }
+            crate::library::LibraryManager::scan_directory_streaming(scan_dir, cached_map, tx, stop_clone);
         });
 
         let target_name = target_dir.file_name().unwrap_or_default().to_string_lossy();
         self.status_message = format!("Fuzzy search in {}", target_name);
         let modal = search::SearchModalState::new_with_scanner(
             target_dir,
-            initial_tracks,
+            Vec::new(),
             Some(rx),
             Some(stop_flag),
         );
