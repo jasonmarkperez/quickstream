@@ -769,8 +769,15 @@ pub fn list_folder_audio_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         .filter_map(Result::ok)
         // Skip hidden files, including the "._name" AppleDouble files macOS leaves on network shares.
         .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+        .filter(|entry| crate::metadata::is_supported_audio_file(&entry.path()))
+        // Only files: a folder named `Live.flac` is not a track. A symlink counts when it
+        // resolves to a file.
+        .filter(|entry| match entry.file_type() {
+            Ok(t) if t.is_file() => true,
+            Ok(t) if t.is_symlink() => std::fs::metadata(entry.path()).is_ok_and(|m| m.is_file()),
+            _ => false,
+        })
         .map(|entry| entry.path())
-        .filter(|path| crate::metadata::is_supported_audio_file(path))
         .collect();
     files.sort_by_cached_key(|path| path.file_name().map(|name| name.to_string_lossy().to_lowercase()));
     Ok(files)

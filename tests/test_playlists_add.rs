@@ -188,6 +188,26 @@ fn test_list_folder_audio_files_is_flat_sorted_and_audio_only() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A folder named like a track (`Live.flac`) is not a track; a symlink to a real file is.
+#[test]
+fn test_list_folder_audio_files_skips_directories_with_audio_names() {
+    common::isolate();
+    let dir = scratch_dir("listing_dirs");
+    fs::write(dir.join("01 Real.flac"), b"").unwrap();
+    fs::create_dir_all(dir.join("Live.flac")).unwrap();
+    fs::write(dir.join("Live.flac").join("inner.flac"), b"").unwrap();
+    std::os::unix::fs::symlink(dir.join("01 Real.flac"), dir.join("02 Link.flac")).unwrap();
+    std::os::unix::fs::symlink(dir.join("Live.flac"), dir.join("03 DirLink.flac")).unwrap();
+
+    let files = list_folder_audio_files(&dir).expect("folder is readable");
+    let names: Vec<String> = files
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["01 Real.flac", "02 Link.flac"]);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_add_key_refused_while_loading_and_on_header_rows() {
     common::isolate();
