@@ -1,6 +1,6 @@
 //! Access control for the embedded web server.
 //!
-//! - Network (non-loopback) peers need the session token, sent as the `qs_token` cookie (set by
+//! - Network (non-loopback) peers need the session token, sent as the `qs_token_<port>` cookie (set by
 //!   opening the pairing link `/?token=<token>`) or an `Authorization: Bearer` header. `/stream/*`
 //!   is exempt: DLNA renderers cannot authenticate, and it only serves registered files.
 //! - Loopback peers need no token, but the `Host` header must name the loopback address on every
@@ -16,8 +16,11 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// Name of the session cookie that carries the token.
-pub const TOKEN_COOKIE: &str = "qs_token";
+/// Name of the session cookie that carries the token. Cookies are shared by every port on a
+/// host, so the name includes the server's port.
+pub fn token_cookie_name(port: u16) -> String {
+    format!("qs_token_{}", port)
+}
 
 /// Request headers relevant to authorization, collected while the request is parsed.
 #[derive(Debug, Default, Clone)]
@@ -62,10 +65,11 @@ impl AuthHeaders {
         }
     }
 
-    fn cookie_token(&self) -> Option<&str> {
+    fn cookie_token(&self, port: u16) -> Option<&str> {
+        let name = token_cookie_name(port);
         self.cookie.as_deref()?.split(';').find_map(|pair| {
             let (k, v) = pair.trim().split_once('=')?;
-            (k.trim() == TOKEN_COOKIE).then(|| v.trim())
+            (k.trim() == name).then(|| v.trim())
         })
     }
 
@@ -161,7 +165,7 @@ pub fn authorize(
             }
         }
         let authenticated =
-            token_matches(headers.cookie_token(), token) || token_matches(headers.bearer_token(), token);
+            token_matches(headers.cookie_token(server_port), token) || token_matches(headers.bearer_token(), token);
         if !authenticated {
             return AuthDecision::Unauthorized;
         }
@@ -207,8 +211,14 @@ max-width:32rem;margin:15vh auto;padding:0 1.25rem;line-height:1.5}a{color:#7aa2
 (it ends in <code>/?token=&hellip;</code>). After that, this page opens normally.</p>\
 <p><a href=\"/\">Retry</a></p></body></html>";
 
-/// Write the response for a non-`Allow` decision.
-pub fn write_decision_response(out: &mut impl Write, decision: &AuthDecision, path: &str, token: &str) -> std::io::Result<()> {
+/// Write the response for a non-`Allow` decision. `server_port` names the session cookie.
+pub fn write_decision_response(
+    out: &mut impl Write,
+    decision: &AuthDecision,
+    path: &str,
+    token: &str,
+    server_port: u16,
+) -> std::io::Result<()> {
     let is_api = path_only(path).starts_with("/api/");
     let (status, content_type, body, extra): (&str, &str, String, String) = match decision {
         AuthDecision::Allow => return Ok(()),
@@ -218,7 +228,8 @@ pub fn write_decision_response(out: &mut impl Write, decision: &AuthDecision, pa
             String::new(),
             format!(
                 "Location: /\r\nSet-Cookie: {}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n",
-                TOKEN_COOKIE, token
+                token_cookie_name(server_port),
+                token
             ),
         ),
         AuthDecision::Unauthorized if is_api => (
@@ -279,13 +290,13 @@ pub fn check_request(
     if decision == AuthDecision::Allow {
         return Ok(true);
     }
-    write_decision_response(stream, &decision, path, token)?;
+    write_decision_response(stream, &decision, path, token, port)?;
     Ok(false)
 }
 
 /// Write a JSON 403 for a request naming a path outside the allowed folders.
 pub fn write_path_forbidden(out: &mut impl Write) -> std::io::Result<()> {
-    write_decision_response(out, &AuthDecision::Forbidden("path is outside the allowed folders"), "/api/", "")
+    write_decision_response(out, &AuthDecision::Forbidden("path is outside the allowed folders"), "/api/", "", 0)
 }
 
 // ---------------------------------------------------------------------------------------------

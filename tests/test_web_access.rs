@@ -96,10 +96,22 @@ fn test_remote_token_in_query_of_api_does_not_authorize() {
 
 #[test]
 fn test_remote_cookie_token_is_accepted() {
-    let cookie = format!("Cookie: theme=dark; qs_token={}; other=1", TOKEN);
+    let cookie = format!("Cookie: theme=dark; qs_token_{}={}; other=1", PORT, TOKEN);
     let h = headers(&[&lan_host(), &cookie]);
     assert_eq!(authorize(lan_peer(), PORT, "GET", "/", &h, TOKEN), AuthDecision::Allow);
     assert_eq!(authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN), AuthDecision::Allow);
+}
+
+#[test]
+fn test_session_cookie_is_scoped_to_the_server_port() {
+    // Cookies are shared by every port on a host, so the cookie name carries the port.
+    let unscoped = format!("Cookie: qs_token={}", TOKEN);
+    let other_port = format!("Cookie: qs_token_9999={}", TOKEN);
+    for cookie in [unscoped, other_port] {
+        let h = headers(&[&lan_host(), &cookie]);
+        assert_eq!(authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN), AuthDecision::Unauthorized, "{}", cookie);
+    }
+    assert_eq!(quickstream::web_access::token_cookie_name(8080), "qs_token_8080");
 }
 
 #[test]
@@ -111,12 +123,12 @@ fn test_remote_bearer_token_is_accepted() {
 
 #[test]
 fn test_remote_wrong_cookie_or_bearer_is_unauthorized() {
-    let h = headers(&[&lan_host(), "Cookie: qs_token=ffffffffffffffffffffffffffffffff"]);
+    let h = headers(&[&lan_host(), &format!("Cookie: qs_token_{}=ffffffffffffffffffffffffffffffff", PORT)]);
     assert_eq!(authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN), AuthDecision::Unauthorized);
     let h = headers(&[&lan_host(), "Authorization: Bearer nope"]);
     assert_eq!(authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN), AuthDecision::Unauthorized);
-    // A cookie whose name merely ends in qs_token is not the session cookie.
-    let h = headers(&[&lan_host(), &format!("Cookie: xqs_token={}", TOKEN)]);
+    // A cookie whose name merely ends in the session cookie name is not the session cookie.
+    let h = headers(&[&lan_host(), &format!("Cookie: xqs_token_{}={}", PORT, TOKEN)]);
     assert_eq!(authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN), AuthDecision::Unauthorized);
 }
 
@@ -133,7 +145,7 @@ fn test_remote_stream_requests_need_no_token() {
 
 #[test]
 fn test_remote_post_requires_json_content_type() {
-    let cookie = format!("Cookie: qs_token={}", TOKEN);
+    let cookie = format!("Cookie: qs_token_{}={}", PORT, TOKEN);
     let h = headers(&[&lan_host(), &cookie, "Content-Type: text/plain"]);
     assert!(matches!(authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN), AuthDecision::Forbidden(_)));
     let h = headers(&[&lan_host(), &cookie]);
@@ -144,7 +156,7 @@ fn test_remote_post_requires_json_content_type() {
 
 #[test]
 fn test_remote_post_with_foreign_origin_is_forbidden() {
-    let cookie = format!("Cookie: qs_token={}", TOKEN);
+    let cookie = format!("Cookie: qs_token_{}={}", PORT, TOKEN);
     let h = headers(&[&lan_host(), &cookie, "Content-Type: application/json", "Origin: http://evil.example"]);
     assert!(matches!(authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN), AuthDecision::Forbidden(_)));
     let h = headers(&[&lan_host(), &cookie, "Content-Type: application/json", "Origin: null"]);
@@ -458,7 +470,7 @@ fn test_pairing_link_sets_session_cookie_and_redirects() {
         .lines()
         .find(|l| l.to_lowercase().starts_with("set-cookie:"))
         .expect("Set-Cookie header");
-    assert!(cookie_line.contains(&format!("qs_token={}", token)));
+    assert!(cookie_line.contains(&format!("qs_token_{}={}", handle.port, token)), "{}", cookie_line);
     assert!(cookie_line.contains("HttpOnly"));
     assert!(cookie_line.contains("SameSite=Strict"));
     assert!(cookie_line.contains("Path=/"));
