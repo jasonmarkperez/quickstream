@@ -994,12 +994,14 @@ impl AppUI {
 
     /// Resolve tags for queue tracks that still have placeholder metadata. Each path is read at
     /// most once per session by a persistent pool of 4 workers; results arrive via `metadata_rx`.
+    /// A zero sample rate marks a placeholder that has an artist and duration (a playlist's
+    /// `#EXTINF`) but no album or audio properties yet.
     pub fn start_queue_metadata_fetch(&mut self) {
         let candidates: Vec<PathBuf> = self
             .queue
             .tracks
             .iter()
-            .filter(|t| t.duration_seconds <= 0.0 || t.artist.is_empty())
+            .filter(|t| t.duration_seconds <= 0.0 || t.artist.is_empty() || t.sample_rate_hz == 0)
             .map(|t| t.filepath.clone())
             .collect();
         let new_paths: Vec<PathBuf> = candidates
@@ -1507,6 +1509,7 @@ impl AppUI {
         for stop in stops.into_iter().flatten() {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        self.playlists.stop_checks();
         // Dropping the inbox wakes queue metadata workers blocked waiting for work.
         self.queue_metadata_tx = None;
         if let Some(mut modal) = self.search_modal.take() {
@@ -4721,6 +4724,7 @@ impl AppUI {
             Self::help_key_line("c", "New playlist (tab 5)"),
             Self::help_key_line("R / D", "Rename / Delete playlist"),
             Self::help_key_line("J / K", "Move track down / up"),
+            Self::help_key_line("Enter/a", "Play / queue playlist"),
         ];
         f.render_widget(Paragraph::new(left_lines), cols[0]);
 

@@ -29,6 +29,72 @@ pub enum NamePurpose {
     CreateAndAdd(PendingAdd),
 }
 
+/// Existence test used by the playlist workers. Tests swap in a slow one to stand in for a
+/// hung network share.
+pub type ExistsChecker = std::sync::Arc<dyn Fn(&std::path::Path) -> bool + Send + Sync>;
+
+/// A playlist snapshot whose files were checked on a worker, ready to be queued.
+struct QueueCheckResult {
+    name: String,
+    entries: Vec<crate::playlist::PlaylistEntry>,
+    exists: Vec<bool>,
+    /// Track to play from (`Enter`: replace the queue); `None` appends (`a`).
+    play_from: Option<usize>,
+}
+
+/// Background existence checks for tab 5. Files are only checked on workers: a `stat` on an
+/// unmounted share can hang, and the UI must keep drawing.
+struct PlaylistChecks {
+    checker: ExistsChecker,
+    /// Paths sent to an existence-check worker whose result has not arrived yet.
+    in_flight: std::collections::HashSet<std::path::PathBuf>,
+    exists_tx: std::sync::mpsc::Sender<(std::path::PathBuf, bool)>,
+    exists_rx: std::sync::mpsc::Receiver<(std::path::PathBuf, bool)>,
+    queue_tx: std::sync::mpsc::Sender<QueueCheckResult>,
+    queue_rx: std::sync::mpsc::Receiver<QueueCheckResult>,
+    /// Set on shutdown: workers stop checking and send nothing more.
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PlaylistChecks {
+    fn new() -> Self {
+        let (exists_tx, exists_rx) = std::sync::mpsc::channel();
+        let (queue_tx, queue_rx) = std::sync::mpsc::channel();
+        let checker: ExistsChecker = std::sync::Arc::new(|path: &std::path::Path| path.exists());
+        Self {
+            checker,
+            in_flight: std::collections::HashSet::new(),
+            exists_tx,
+            exists_rx,
+            queue_tx,
+            queue_rx,
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+/// The first two folders of `path` (`/Volumes/Music/...` -> `/Volumes/Music`): the share a
+/// playlist whose files are all missing most likely lives on. Pure: no file system access.
+pub fn mount_hint(path: &std::path::Path) -> String {
+    let mut hint = std::path::PathBuf::new();
+    let mut folders = 0;
+    for component in path.components() {
+        if matches!(component, std::path::Component::Normal(_)) {
+            if folders == 2 {
+                break;
+            }
+            folders += 1;
+        }
+        hint.push(component);
+    }
+    hint.display().to_string()
+}
+
+/// Row text for a playlist entry whose file was not found: `<n>. ✗ missing: <label>  ----`.
+pub fn missing_row_text(index: usize, entry: &crate::playlist::PlaylistEntry) -> String {
+    format!("{}. ✗ missing: {}  ----", index + 1, entry.display_label())
+}
+
 /// Tracks waiting for the user to choose a playlist.
 #[derive(Debug, Clone)]
 pub enum PendingAdd {
@@ -68,6 +134,7 @@ pub struct PlaylistsUi {
     pub modal: Option<PlaylistModal>,
     /// `Path::exists()` results for playlist entries, cached for the session.
     pub exists: HashMap<PathBuf, bool>,
+    checks: PlaylistChecks,
     /// Folder listings for folder adds (`L` on a folder), sent by `playlist-folder` workers.
     folder_tx: mpsc::Sender<FolderListing>,
     folder_rx: mpsc::Receiver<FolderListing>,
@@ -90,6 +157,7 @@ impl PlaylistsUi {
             tracks_focus: false,
             modal: None,
             exists: HashMap::new(),
+            checks: PlaylistChecks::new(),
             folder_tx,
             folder_rx,
             load_rx: None,
@@ -224,6 +292,7 @@ impl AppUI {
         }
         self.playlists.clamp_cursors();
         self.poll_playlist_folder_adds();
+        self.poll_playlist_checks();
     }
 
     /// Keys while a playlist modal is open. Returns true when the app should quit.
@@ -304,6 +373,12 @@ impl AppUI {
         }
         self.playlists.clamp_cursors();
         match (code, modifiers) {
+            (KeyCode::Enter, _) if self.playlists.tracks_focus => {
+                self.queue_selected_playlist(Some(self.playlists.track_cursor));
+            }
+            (KeyCode::Char('a'), KeyModifiers::NONE) => {
+                self.queue_selected_playlist(None);
+            }
             (KeyCode::Char('h'), KeyModifiers::NONE) => self.playlists.tracks_focus = false,
             (KeyCode::Char('l'), KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE)
                 if !self.playlists.tracks_focus && self.playlists.selected_playlist().is_some() =>
@@ -424,7 +499,12 @@ impl AppUI {
                 } else {
                     Style::default().fg(Color::White)
                 };
-                ListItem::new(track_row_label(idx, entry)).style(style)
+                let text = if ui.is_missing(&entry.path) {
+                    missing_row_text(idx, entry)
+                } else {
+                    track_row_label(idx, entry)
+                };
+                ListItem::new(text).style(style)
             })
             .collect();
         ui.tracks_state.select(Some(ui.track_cursor));
@@ -980,5 +1060,184 @@ impl super::AppUI {
         let mut state = ListState::default();
         state.select(Some(cursor));
         f.render_stateful_widget(list, chunks[1], &mut state);
+    }
+}
+
+impl PlaylistsUi {
+    /// Replace the existence test (tests use a blocking one to stand in for a hung share).
+    #[doc(hidden)]
+    pub fn set_exists_checker(&mut self, checker: ExistsChecker) {
+        self.checks.checker = checker;
+    }
+
+    /// Whether a check this session found `path` missing. Paths not checked yet are not missing.
+    pub fn is_missing(&self, path: &std::path::Path) -> bool {
+        self.exists.get(path) == Some(&false)
+    }
+
+    /// Number of paths whose existence check is still running.
+    pub fn checks_in_flight(&self) -> usize {
+        self.checks.in_flight.len()
+    }
+
+    /// Tell playlist workers to stop checking (shutdown). A check already stuck in a hung `stat`
+    /// is detached by the bounded worker join.
+    pub fn stop_checks(&self) {
+        self.checks.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl AppUI {
+    /// Check, on a worker, the entries of the playlist shown in the tracks pane that were not
+    /// checked this session and are not being checked now. Called on every poll; never stats on
+    /// the UI thread.
+    pub fn request_playlist_exists_checks(&mut self) {
+        if self.active_tab != 4 {
+            return;
+        }
+        let ui = &mut self.playlists;
+        let Some(playlist) = ui.store.playlists().get(ui.list_cursor) else {
+            return;
+        };
+        let mut paths = Vec::new();
+        for entry in &playlist.entries {
+            if !ui.exists.contains_key(&entry.path) && ui.checks.in_flight.insert(entry.path.clone()) {
+                paths.push(entry.path.clone());
+            }
+        }
+        if paths.is_empty() {
+            return;
+        }
+        let checker = ui.checks.checker.clone();
+        let tx = ui.checks.exists_tx.clone();
+        let stop = ui.checks.stop.clone();
+        // Results are sent one by one, so rows turn into `✗ missing` as each check finishes.
+        self.workers.spawn("playlist-exists", move || {
+            for path in paths {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let exists = checker(path.as_path());
+                if tx.send((path, exists)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Apply finished existence checks, then start checks for anything newly shown.
+    fn poll_playlist_checks(&mut self) {
+        while let Ok((path, exists)) = self.playlists.checks.exists_rx.try_recv() {
+            self.playlists.checks.in_flight.remove(&path);
+            self.playlists.exists.insert(path, exists);
+        }
+        while let Ok(result) = self.playlists.checks.queue_rx.try_recv() {
+            self.apply_playlist_queue(result);
+        }
+        self.request_playlist_exists_checks();
+    }
+
+    /// `Enter` in the tracks pane (`play_from` = selected track) or `a` (`None`): check the
+    /// selected playlist's files on a worker, then replace the queue and play, or append.
+    pub fn queue_selected_playlist(&mut self, play_from: Option<usize>) {
+        if !self.playlists.store.is_loaded() {
+            self.status_message = crate::playlist_store::StoreError::NotLoaded.to_string();
+            return;
+        }
+        let Some(playlist) = self.playlists.store.playlists().get(self.playlists.list_cursor) else {
+            self.status_message = "No playlist selected".to_string();
+            return;
+        };
+        if playlist.entries.is_empty() {
+            self.status_message = format!("{} is empty", playlist.name);
+            return;
+        }
+        let name = playlist.name.clone();
+        let entries = playlist.entries.clone();
+        self.status_message = format!("Checking {} tracks in {}…", entries.len(), name);
+        let checker = self.playlists.checks.checker.clone();
+        let tx = self.playlists.checks.queue_tx.clone();
+        let stop = self.playlists.checks.stop.clone();
+        self.workers.spawn("playlist-queue", move || {
+            let mut exists = Vec::with_capacity(entries.len());
+            for entry in &entries {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                exists.push(checker(entry.path.as_path()));
+            }
+            let _ = tx.send(QueueCheckResult {
+                name,
+                entries,
+                exists,
+                play_from,
+            });
+        });
+    }
+
+    /// Queue the files of a checked playlist that exist. Replace (`play_from` set) only clears
+    /// the queue once something can be queued, so an all-missing playlist leaves it as it was.
+    fn apply_playlist_queue(&mut self, result: QueueCheckResult) {
+        // Fresh results update the session cache; they never change the playlist or its file.
+        for (entry, exists) in result.entries.iter().zip(&result.exists) {
+            self.playlists.exists.insert(entry.path.clone(), *exists);
+        }
+        let cached = |path: &std::path::Path| self.metadata_cache.get(path);
+        let crate::playlist::QueuePlan {
+            tracks,
+            start_index,
+            missing,
+        } = crate::playlist::plan_queue(&result.entries, &result.exists, result.play_from, &cached);
+        if tracks.is_empty() {
+            let hint = result.entries.first().map(|e| mount_hint(&e.path)).unwrap_or_default();
+            self.status_message = format!(
+                "None of {}'s {} tracks found. Is {} mounted?",
+                result.name,
+                result.entries.len(),
+                hint
+            );
+            return;
+        }
+        let queued = tracks.len();
+        // enqueue_tracks starts the background tag fetch that fills in placeholder entries.
+        match (result.play_from, start_index) {
+            (Some(_), Some(start)) => {
+                self.clear_queue_for_playlist();
+                self.enqueue_tracks(tracks);
+                self.queue.current_index = start;
+                self.queue_cursor = start;
+                self.play_current_track();
+            }
+            _ => {
+                self.enqueue_tracks(tracks);
+            }
+        }
+        // Set after play_current_track, which clears the status on success.
+        self.status_message = if missing == 0 {
+            format!("Queued {} tracks from {}", queued, result.name)
+        } else {
+            format!("Queued {} tracks from {}, {} missing", queued, result.name, missing)
+        };
+        self.update_web_state();
+    }
+
+    /// Before a playlist replaces the queue: stop any autopilot scan, end any continuous DLNA
+    /// stream the way autopilot does before its own fresh start, stop playback, empty the queue.
+    fn clear_queue_for_playlist(&mut self) {
+        if let Some(stop) = self.autopilot_scan_stop.take() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.autopilot_rx = None;
+        self.is_autopilot_scanning = false;
+        // The queue is now the playlist, not an autopilot mix (web dashboard badge).
+        self.autopilot_dir = None;
+        if let Some(ref ws) = self.web_server {
+            ws.close_active_streams();
+            *ws.stream_state().continuous.current_track_index.lock().unwrap() = 0;
+            *ws.stream_state().continuous.current_position.lock().unwrap() = 0.0;
+        }
+        let _ = self.player.stop();
+        self.queue.clear();
+        self.queue_cursor = 0;
     }
 }
