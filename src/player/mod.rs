@@ -2,6 +2,7 @@
 
 pub mod local;
 pub mod upnp;
+pub mod worker;
 
 use std::path::Path;
 
@@ -30,4 +31,11 @@ pub trait AudioPlayer: Send + Sync {
         false
     }
     fn reset_finished(&mut self) {}
+    /// Stop using the web server's shared stream state. Called before a player is retired so its
+    /// delayed stop/drop cannot close streams that now belong to the next renderer.
+    fn detach_stream_state(&mut self) {}
+    /// Return and clear the most recent asynchronous command error, if any.
+    fn take_error(&mut self) -> Option<String> {
+        None
+    }
 }

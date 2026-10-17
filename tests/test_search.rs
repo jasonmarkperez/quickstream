@@ -424,3 +424,52 @@ fn test_search_modal_paging_and_jumping() {
 
 
 
+
+fn streamed_track(root: &Path, i: usize) -> AudioMetadata {
+    AudioMetadata {
+        filepath: root.join(format!("track{}.flac", i)),
+        filename: format!("track{}.flac", i),
+        title: format!("Track {}", i),
+        artist: "Artist".to_string(),
+        album: "Album".to_string(),
+        genre: "Rock".to_string(),
+        format_name: "FLAC".to_string(),
+        duration_seconds: 180.0,
+        file_size: 1000,
+        bitrate_kbps: 900,
+        sample_rate_hz: 44100,
+        channels: 2,
+    }
+}
+
+#[test]
+fn test_streaming_batches_coalesce_filter_updates() {
+    let root = PathBuf::from("/music");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut modal = SearchModalState::new_with_scanner(root.clone(), Vec::new(), Some(rx), None);
+
+    tx.send(vec![streamed_track(&root, 1)]).unwrap();
+    modal.poll_background_scan();
+    assert_eq!(modal.filtered.len(), 1, "first batch is shown immediately");
+
+    // A batch arriving right after a filter pass is indexed but not re-filtered yet.
+    tx.send(vec![streamed_track(&root, 2)]).unwrap();
+    modal.poll_background_scan();
+    assert_eq!(modal.all_tracks.len(), 2);
+    assert_eq!(modal.filtered.len(), 1);
+
+    // Once the coalescing interval passes, the next poll applies the filter.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    modal.poll_background_scan();
+    assert_eq!(modal.filtered.len(), 2);
+
+    // Scan completion applies the filter immediately.
+    tx.send(vec![streamed_track(&root, 3)]).unwrap();
+    drop(tx);
+    modal.poll_background_scan();
+    assert_eq!(modal.filtered.len(), 3);
+
+    // Typing always filters immediately.
+    modal.append_char('3');
+    assert_eq!(modal.filtered.len(), 1);
+}

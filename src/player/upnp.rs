@@ -851,6 +851,10 @@ impl Drop for UPnPPlayer {
 }
 
 impl AudioPlayer for UPnPPlayer {
+    fn detach_stream_state(&mut self) {
+        self.stream_state = None;
+    }
+
     fn play(&mut self, filepath: &Path) -> anyhow::Result<()> {
         self.play_at(filepath, 0.0)
     }

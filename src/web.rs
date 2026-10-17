@@ -246,7 +246,8 @@ impl StreamServerState {
 
     /// Register a file on disk so that /stream/<filename> resolves to its exact path.
     pub fn register_file(&self, path: &Path) {
-        if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+        // Lossy so names that are not valid UTF-8 match the lossily encoded URLs built by upnp.rs.
+        if let Some(filename) = path.file_name().map(|f| f.to_string_lossy()) {
             let mut reg = self.file_registry.write().unwrap();
             reg.insert(filename.to_string(), path.to_path_buf());
             reg.insert(filename.to_lowercase(), path.to_path_buf());
@@ -310,9 +311,21 @@ impl Drop for SocketGuard {
     }
 }
 
+/// Network interfaces the web server listens on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebBind {
+    /// 127.0.0.1 only: reachable from this computer.
+    Loopback,
+    /// All interfaces: reachable from other devices on the network. Needed while a DLNA
+    /// renderer streams from this server.
+    Lan,
+}
+
 /// Handle to the background web server process.
 pub struct WebServerHandle {
     pub port: u16,
+    /// Interfaces the server actually bound to.
+    pub bind: WebBind,
     stop_flag: Arc<AtomicBool>,
     stream_state: Arc<StreamServerState>,
     join_handle: Option<std::thread::JoinHandle<()>>,
@@ -334,7 +347,6 @@ impl WebServerHandle {
     pub fn stop(mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         self.stream_state.close_active_streams();
-        let _ = TcpStream::connect(format!("127.0.0.1:{}", self.port));
         if let Some(h) = self.join_handle.take() {
             let _ = h.join();
         }
@@ -345,8 +357,6 @@ impl Drop for WebServerHandle {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         self.stream_state.close_active_streams();
-        // Ping socket to unblock accept()
-        let _ = TcpStream::connect(format!("127.0.0.1:{}", self.port));
         if let Some(h) = self.join_handle.take() {
             let _ = h.join();
         }
@@ -356,17 +366,28 @@ impl Drop for WebServerHandle {
 pub struct WebServer;
 
 impl WebServer {
-    /// Start the local web server on the requested port (or fallback to an available port).
+    /// Start the local web server on loopback on the requested port (or fallback to an available port).
     pub fn start(
         port: u16,
         state: Arc<RwLock<NowPlayingState>>,
         cmd_tx: mpsc::Sender<WebCommand>,
     ) -> anyhow::Result<WebServerHandle> {
-        Self::start_with_stream_state(port, state, cmd_tx, Arc::new(StreamServerState::new()))
+        Self::start_with_bind(WebBind::Loopback, port, state, cmd_tx)
+    }
+
+    /// Start the local web server on the given interfaces.
+    pub fn start_with_bind(
+        bind: WebBind,
+        port: u16,
+        state: Arc<RwLock<NowPlayingState>>,
+        cmd_tx: mpsc::Sender<WebCommand>,
+    ) -> anyhow::Result<WebServerHandle> {
+        Self::start_with_stream_state(bind, port, state, cmd_tx, Arc::new(StreamServerState::new()))
     }
 
     /// Start the local web server sharing an existing StreamServerState.
     pub fn start_with_stream_state(
+        bind: WebBind,
         port: u16,
         state: Arc<RwLock<NowPlayingState>>,
         cmd_tx: mpsc::Sender<WebCommand>,
@@ -374,22 +395,31 @@ impl WebServer {
     ) -> anyhow::Result<WebServerHandle> {
         let candidate_ports = [port, 8080, 8090, 8091, 0];
         let mut listener_opt = None;
+        // Never fall back to the other interface: if another app holds *:port, binding
+        // 127.0.0.1:port still succeeds on macOS, and renderers' LAN requests would reach
+        // that other app. Move to the next candidate port instead.
+        let host = match bind {
+            WebBind::Lan => "0.0.0.0",
+            WebBind::Loopback => "127.0.0.1",
+        };
         for &p in &candidate_ports {
-            if let Ok(l) = TcpListener::bind(format!("0.0.0.0:{}", p)) {
-                listener_opt = Some(l);
-                break;
-            }
-            if let Ok(l) = TcpListener::bind(format!("127.0.0.1:{}", p)) {
+            if let Ok(l) = TcpListener::bind(format!("{}:{}", host, p)) {
                 listener_opt = Some(l);
                 break;
             }
         }
         let listener = listener_opt.ok_or_else(|| anyhow::anyhow!("Failed to bind web server to any port"))?;
+        let actual_bind = bind;
         let actual_port = listener.local_addr()?.port();
+        crate::log_info!("web", "Web server listening on {}", listener.local_addr()?);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_thread = stop_flag.clone();
         let stream_state_thread = stream_state.clone();
 
+        // Non-blocking accept so the loop sees the stop flag within one poll interval. A wake-up
+        // connection to 127.0.0.1:port is not reliable: another listener bound to 127.0.0.1 on
+        // the same port (allowed next to a 0.0.0.0 bind) would receive it instead.
+        listener.set_nonblocking(true)?;
         let join_handle = std::thread::Builder::new()
             .name("QuickstreamWebServer".to_string())
             .spawn(move || {
@@ -399,6 +429,8 @@ impl WebServer {
                             if stop_flag_thread.load(Ordering::SeqCst) {
                                 break;
                             }
+                            // Accepted sockets inherit O_NONBLOCK on macOS/BSD.
+                            let _ = stream.set_nonblocking(false);
                             let state_clone = state.clone();
                             let cmd_tx_clone = cmd_tx.clone();
                             let stream_state_clone = stream_state_thread.clone();
@@ -415,6 +447,7 @@ impl WebServer {
 
         Ok(WebServerHandle {
             port: actual_port,
+            bind: actual_bind,
             stop_flag,
             stream_state,
             join_handle: Some(join_handle),
@@ -934,6 +967,27 @@ pub fn calculate_stream_offset(
     }
 }
 
+/// Resolve a `/stream/<name>` request to a file the player has explicitly exposed.
+///
+/// Only files in the stream registry, or the current now-playing file matched by file
+/// name, are served. Raw filesystem paths are never accepted, so a LAN client cannot
+/// read arbitrary files from disk.
+fn resolve_stream_file(name: &str, stream_state: &StreamServerState, current: Option<&Path>) -> Option<PathBuf> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return None;
+    }
+    // The now-playing file wins over the registry: the registry is keyed by bare file name, so a
+    // later registration of a same-named track from another album would otherwise replace it.
+    let found = current
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|f| f.to_string_lossy().to_lowercase() == name.to_lowercase())
+        })
+        .map(Path::to_path_buf)
+        .or_else(|| stream_state.lookup_file(name))?;
+    found.is_file().then_some(found)
+}
+
 fn serve_audio_stream(
     mut stream: TcpStream,
     path: &str,
@@ -961,7 +1015,6 @@ fn serve_audio_stream(
     let raw_encoded = path.strip_prefix("/stream/").unwrap_or("");
     let encoded_path = raw_encoded.split('?').next().unwrap_or(raw_encoded);
     let decoded_path = crate::player::upnp::url_decode(encoded_path);
-    let candidate = PathBuf::from(&decoded_path);
 
     let query_str = path.split_once('?').map(|(_, q)| q);
     let mut offset_seconds: f64 = 0.0;
@@ -982,47 +1035,12 @@ fn serve_audio_stream(
         (s.filepath.clone(), s.duration_seconds)
     };
 
-    let filepath = if candidate.is_absolute() && candidate.exists() && candidate.is_file() {
-        candidate
-    } else if let Some(reg_path) = stream_state.lookup_file(&decoded_path) {
-        if reg_path.exists() && reg_path.is_file() {
-            reg_path
-        } else if let Some(ref p) = current_filepath {
-            if p.exists() && p.is_file() {
-                p.clone()
-            } else {
-                crate::log_warn!(
-                    "web",
-                    "Stream 404: Registered file '{}' missing on disk ({})",
-                    decoded_path,
-                    reg_path.display()
-                );
-                let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-                stream.write_all(not_found)?;
-                stream.flush()?;
-                return Ok(());
-            }
-        } else {
+    let filepath = match resolve_stream_file(&decoded_path, stream_state, current_filepath.as_deref()) {
+        Some(p) => p,
+        None => {
             crate::log_warn!(
                 "web",
-                "Stream 404: Registered file '{}' missing on disk ({})",
-                decoded_path,
-                reg_path.display()
-            );
-            let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-            stream.write_all(not_found)?;
-            stream.flush()?;
-            return Ok(());
-        }
-    } else if candidate.exists() && candidate.is_file() {
-        candidate
-    } else if let Some(ref p) = current_filepath {
-        if p.exists() && p.is_file() {
-            p.clone()
-        } else {
-            crate::log_warn!(
-                "web",
-                "Stream 404: Candidate '{}' not found and current_filepath is invalid",
+                "Stream 404: '{}' is not a registered or now-playing file",
                 decoded_path
             );
             let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
@@ -1030,16 +1048,6 @@ fn serve_audio_stream(
             stream.flush()?;
             return Ok(());
         }
-    } else {
-        crate::log_warn!(
-            "web",
-            "Stream 404: File '{}' not found in registry and no current_filepath",
-            decoded_path
-        );
-        let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-        stream.write_all(not_found)?;
-        stream.flush()?;
-        return Ok(());
     };
 
     let mut file = match std::fs::File::open(&filepath) {
