@@ -312,24 +312,6 @@ impl AppUI {
             self.player.stop()?;
             return Ok(true);
         }
-        if matches!(self.playlists.modal, Some(PlaylistModal::AddPicker { .. })) {
-            self.handle_add_picker_key(key);
-            return Ok(false);
-        }
-        // Enter in a prompt opened from "+ New playlist…" creates the playlist and adds to it;
-        // typing, Backspace and Esc stay with the shared name prompt handling below.
-        if key.code == KeyCode::Enter
-            && matches!(
-                self.playlists.modal,
-                Some(PlaylistModal::NamePrompt {
-                    purpose: NamePurpose::CreateAndAdd(_),
-                    ..
-                })
-            )
-        {
-            self.confirm_create_and_add();
-            return Ok(false);
-        }
         let Some(modal) = self.playlists.modal.take() else {
             return Ok(false);
         };
@@ -369,9 +351,8 @@ impl AppUI {
                 }
             }
             modal @ PlaylistModal::AddPicker { .. } => {
-                if key.code != KeyCode::Esc {
-                    self.playlists.modal = Some(modal);
-                }
+                self.playlists.modal = Some(modal);
+                self.handle_add_picker_key(key);
             }
         }
         Ok(false)
@@ -523,10 +504,6 @@ impl AppUI {
     }
 
     pub(super) fn render_playlist_modal(&self, f: &mut Frame) {
-        if let Some(PlaylistModal::AddPicker { pending, cursor }) = &self.playlists.modal {
-            self.render_add_picker(f, pending, *cursor);
-            return;
-        }
         match &self.playlists.modal {
             Some(PlaylistModal::NamePrompt { purpose, input, error }) => {
                 render_name_prompt(f, purpose, input, error.as_deref())
@@ -590,8 +567,9 @@ impl AppUI {
         self.playlists.modal = Some(PlaylistModal::ConfirmDelete { name, count });
     }
 
-    /// Apply a confirmed name prompt. An invalid or duplicate name puts the prompt back with
-    /// the error so the user can fix it.
+    /// Apply a confirmed name prompt: rename, create, or (from the add picker's
+    /// "+ New playlist…") create and then add. An invalid or duplicate name puts the prompt back
+    /// with the error so the user can fix it.
     fn submit_name_prompt(&mut self, purpose: NamePurpose, input: String) {
         let result = match &purpose {
             NamePurpose::Rename { old } => self.playlists.store.rename(old, &input),
@@ -621,9 +599,13 @@ impl AppUI {
                     format!("Renamed \"{}\" to \"{}\"", old, name)
                 };
             }
-            NamePurpose::Create | NamePurpose::CreateAndAdd(_) => {
+            NamePurpose::Create => {
                 self.playlists.track_cursor = 0;
                 self.status_message = format!("Created \"{}\"", name);
+            }
+            NamePurpose::CreateAndAdd(pending) => {
+                self.playlists.track_cursor = 0;
+                self.apply_pending_add(&name, pending);
             }
         }
     }
@@ -946,39 +928,6 @@ impl super::AppUI {
                     purpose: NamePurpose::CreateAndAdd(pending),
                     input: String::new(),
                     error: None,
-                });
-            }
-        }
-    }
-
-    /// Enter in the name prompt opened from "+ New playlist…": create the playlist, then add.
-    fn confirm_create_and_add(&mut self) {
-        let (pending, input) = match self.playlists.modal.take() {
-            Some(PlaylistModal::NamePrompt {
-                purpose: NamePurpose::CreateAndAdd(pending),
-                input,
-                ..
-            }) => (pending, input),
-            other => {
-                self.playlists.modal = other;
-                return;
-            }
-        };
-        match self.playlists.store.create(&input) {
-            Ok(name) => {
-                // Tab 5's list cursor follows the new playlist to its sorted position.
-                if let Some(index) = self.playlists.store.index_of(&name) {
-                    self.playlists.list_cursor = index;
-                    self.playlists.track_cursor = 0;
-                }
-                self.apply_pending_add(&name, pending);
-            }
-            // Invalid or duplicate name: keep the prompt open with the error.
-            Err(e) => {
-                self.playlists.modal = Some(PlaylistModal::NamePrompt {
-                    purpose: NamePurpose::CreateAndAdd(pending),
-                    input,
-                    error: Some(e.to_string()),
                 });
             }
         }
