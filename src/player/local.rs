@@ -1,14 +1,15 @@
 //! High-performance, glitch-free audio playback using an async mpv JSON IPC client with ffplay fallback.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::AudioPlayer;
 
@@ -21,11 +22,136 @@ struct SharedState {
     is_finished: AtomicBool,
 }
 
+/// File name of the mpv IPC socket inside the player's private directory.
+const IPC_SOCKET_NAME: &str = "mpv.sock";
+/// Random bytes in the private directory name (hex encoded, so twice as many chars).
+const IPC_DIR_RANDOM_BYTES: usize = 8;
+/// `sockaddr_un.sun_path` is 104 bytes on macOS and 108 on Linux (including the NUL).
+const MAX_SOCKET_PATH_LEN: usize = 100;
+
+fn current_uid() -> u32 {
+    // SAFETY: getuid() has no preconditions and cannot fail.
+    unsafe { libc::getuid() }
+}
+
+fn permission_error(msg: String) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, msg)
+}
+
+/// Create `path` as a brand-new directory with mode 0700, owned by the current user.
+///
+/// Refuses (returns an error) if anything already exists at `path`, including a symlink:
+/// `mkdir(2)` never follows a symlink in the final component, and an existing entry is
+/// never adopted or re-permissioned.
+pub fn create_private_ipc_dir(path: &Path) -> io::Result<()> {
+    fs::DirBuilder::new().mode(0o700).create(path)?;
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.file_type().is_dir() || meta.uid() != current_uid() {
+        return Err(permission_error(format!("{:?} is not a directory owned by the current user", path)));
+    }
+    // The umask can only clear bits; make sure the owner still has full access.
+    if meta.mode() & 0o777 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Check that `path` is a unix socket (not a symlink or other file) owned by the current user.
+pub fn verify_ipc_socket(path: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.file_type().is_socket() {
+        return Err(permission_error(format!("{:?} is not a unix socket", path)));
+    }
+    if meta.uid() != current_uid() {
+        return Err(permission_error(format!(
+            "{:?} is owned by uid {}, expected {}",
+            path,
+            meta.uid(),
+            current_uid()
+        )));
+    }
+    Ok(())
+}
+
+fn random_hex(n_bytes: usize) -> String {
+    let mut buf = vec![0u8; n_bytes];
+    let from_os = fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).is_ok();
+    if !from_os {
+        // RandomState is seeded from the OS RNG; mix in time and a counter per chunk.
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        for chunk in buf.chunks_mut(8) {
+            let mut h = RandomState::new().build_hasher();
+            h.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+            h.write_u128(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+            let bytes = h.finish().to_ne_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+    }
+    buf.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Candidate parent directories for the private IPC directory, in order of preference.
+fn ipc_base_dirs() -> Vec<PathBuf> {
+    let mut bases = Vec::new();
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let runtime = PathBuf::from(runtime);
+        if runtime.is_absolute() {
+            bases.push(runtime);
+        }
+    }
+    bases.push(std::env::temp_dir());
+    bases.push(PathBuf::from("/tmp"));
+    bases
+}
+
+/// A base is unusable if it is missing or if other users could rename entries in it
+/// (world-writable without the sticky bit).
+fn usable_ipc_base(base: &Path) -> bool {
+    match fs::metadata(base) {
+        Ok(meta) => meta.is_dir() && !(meta.mode() & 0o002 != 0 && meta.mode() & 0o1000 == 0),
+        Err(_) => false,
+    }
+}
+
+/// Create a fresh private directory (mode 0700, unpredictable name) to hold the mpv socket.
+fn create_ipc_dir() -> io::Result<PathBuf> {
+    let name_len = "qs-".len() + IPC_DIR_RANDOM_BYTES * 2;
+    let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no usable directory for the mpv IPC socket");
+    for base in ipc_base_dirs() {
+        let path_len = base.as_os_str().len() + 1 + name_len + 1 + IPC_SOCKET_NAME.len();
+        if path_len > MAX_SOCKET_PATH_LEN || !usable_ipc_base(&base) {
+            continue;
+        }
+        for _ in 0..8 {
+            let dir = base.join(format!("qs-{}", random_hex(IPC_DIR_RANDOM_BYTES)));
+            match create_private_ipc_dir(&dir) {
+                Ok(()) => return Ok(dir),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last_err = e,
+                Err(e) => {
+                    last_err = e;
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 pub struct LocalPlayer {
     backend: String,
+    mpv_binary: PathBuf,
     mpv_child: Option<Child>,
     ipc_writer: Option<UnixStream>,
-    socket_path: PathBuf,
+    /// Private 0700 directory holding the IPC socket; created on first mpv start.
+    ipc_dir: Option<PathBuf>,
+    socket_path: Option<PathBuf>,
     current_file: Option<PathBuf>,
     volume: u8,
     shared_state: Arc<SharedState>,
@@ -39,18 +165,25 @@ pub struct LocalPlayer {
 
 impl LocalPlayer {
     pub fn new(backend: &str) -> Self {
-        // Unique per instance: an old player may still be shutting down on another thread
-        // (and removing its socket) while a new one starts.
-        static NEXT_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let instance = NEXT_INSTANCE.fetch_add(1, Ordering::SeqCst);
-        let sock_name = format!("mpv_{}_{}.sock", std::process::id(), instance);
-        let socket_path = PathBuf::from("/tmp").join(sock_name);
+        Self::with_mpv_binary(backend, "mpv")
+    }
 
+    /// Path of the mpv IPC socket, once mpv has been started.
+    pub fn ipc_socket_path(&self) -> Option<&Path> {
+        self.socket_path.as_deref()
+    }
+
+    /// Like [`LocalPlayer::new`], but launches `mpv_binary` instead of `mpv` from `PATH`.
+    pub fn with_mpv_binary(backend: &str, mpv_binary: impl Into<PathBuf>) -> Self {
         Self {
             backend: backend.to_string(),
+            mpv_binary: mpv_binary.into(),
             mpv_child: None,
             ipc_writer: None,
-            socket_path,
+            // Each instance gets its own directory, so an old player still shutting down on
+            // another thread never removes a new player's socket.
+            ipc_dir: None,
+            socket_path: None,
             current_file: None,
             volume: 50,
             shared_state: Arc::new(SharedState::default()),
@@ -78,19 +211,19 @@ impl LocalPlayer {
         self.reader_thread = None;
         self.ipc_writer = None;
 
-        if self.socket_path.exists() {
-            let _ = fs::remove_file(&self.socket_path);
-        }
-        if let Some(parent) = self.socket_path.parent() {
-            let _ = fs::create_dir_all(parent);
+        // Never let a previous mpv outlive its handle: stop and reap it before respawning.
+        if let Some(mut old) = self.mpv_child.take() {
+            kill_and_reap(&mut old);
         }
 
+        let socket_path = self.prepare_ipc_socket_path()?;
+
         // Spawn mpv in headless idle mode with IPC socket server
-        let mut cmd = Command::new("mpv");
+        let mut cmd = Command::new(&self.mpv_binary);
         cmd.arg("--no-video")
             .arg("--idle")
             .arg("--gapless-audio=yes")
-            .arg(format!("--input-ipc-server={}", self.socket_path.display()))
+            .arg(format!("--input-ipc-server={}", socket_path.display()))
             .arg(format!("--volume={}", self.volume))
             .arg("--audio-display=no")
             .arg("--terminal=no")
@@ -98,25 +231,17 @@ impl LocalPlayer {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-        let child = cmd.spawn()?;
-        self.mpv_child = Some(child);
+        let mut child = cmd.spawn()?;
 
-        // Connect to socket with retry loop (up to 3s)
-        let mut writer_stream = None;
-        for _ in 0..60 {
-            thread::sleep(Duration::from_millis(50));
-            if self.socket_path.exists() {
-                if let Ok(s) = UnixStream::connect(&self.socket_path) {
-                    writer_stream = Some(s);
-                    break;
-                }
+        let mut writer = match Self::connect_ipc(&socket_path, &mut child) {
+            Ok(w) => w,
+            Err(e) => {
+                kill_and_reap(&mut child);
+                let _ = fs::remove_file(&socket_path);
+                return Err(e);
             }
-        }
-
-        let mut writer = match writer_stream {
-            Some(w) => w,
-            None => anyhow::bail!("Failed to connect to mpv IPC socket at {:?}", self.socket_path),
         };
+        self.mpv_child = Some(child);
 
         let reader_stream = writer.try_clone()?;
         let _ = reader_stream.set_read_timeout(Some(Duration::from_millis(400)));
@@ -213,6 +338,54 @@ impl LocalPlayer {
         Ok(())
     }
 
+    /// Ensure the private IPC directory exists and return a socket path inside it, with any
+    /// socket left over from a previous mpv in this directory removed.
+    fn prepare_ipc_socket_path(&mut self) -> anyhow::Result<PathBuf> {
+        let dir = match &self.ipc_dir {
+            Some(dir) => {
+                let meta = fs::symlink_metadata(dir)?;
+                if !meta.file_type().is_dir() || meta.uid() != current_uid() || meta.mode() & 0o077 != 0 {
+                    anyhow::bail!("mpv IPC directory {:?} is no longer private", dir);
+                }
+                dir.clone()
+            }
+            None => {
+                let dir = create_ipc_dir()?;
+                self.ipc_dir = Some(dir.clone());
+                dir
+            }
+        };
+        let socket_path = dir.join(IPC_SOCKET_NAME);
+        match fs::remove_file(&socket_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        self.socket_path = Some(socket_path.clone());
+        Ok(socket_path)
+    }
+
+    /// Wait (up to 3s) for `child` to create its IPC socket, verify it, and connect.
+    fn connect_ipc(socket_path: &Path, child: &mut Child) -> anyhow::Result<UnixStream> {
+        for _ in 0..60 {
+            thread::sleep(Duration::from_millis(50));
+            if let Ok(Some(status)) = child.try_wait() {
+                anyhow::bail!("mpv exited before opening its IPC socket ({})", status);
+            }
+            match fs::symlink_metadata(socket_path) {
+                Ok(_) => {
+                    verify_ipc_socket(socket_path)?;
+                    if let Ok(stream) = UnixStream::connect(socket_path) {
+                        return Ok(stream);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        anyhow::bail!("Failed to connect to mpv IPC socket at {:?}", socket_path)
+    }
+
     fn send_command(&mut self, json_str: &str) -> anyhow::Result<()> {
         if let Some(stream) = self.ipc_writer.as_mut() {
             stream.write_all(json_str.as_bytes())?;
@@ -273,8 +446,12 @@ impl Drop for LocalPlayer {
             let _ = child.kill();
             let _ = child.wait();
         }
-        if self.socket_path.exists() {
-            let _ = fs::remove_file(&self.socket_path);
+        if let Some(socket_path) = self.socket_path.take() {
+            let _ = fs::remove_file(socket_path);
+        }
+        if let Some(dir) = self.ipc_dir.take() {
+            // remove_dir (not remove_dir_all): only ever deletes our own, now empty, directory.
+            let _ = fs::remove_dir(dir);
         }
     }
 }
