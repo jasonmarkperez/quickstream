@@ -10,6 +10,9 @@ use quickstream::player::AudioPlayer;
 /// 90s of silence (mp3, like the library), so the test never makes audible noise.
 fn silent_track() -> Option<PathBuf> {
     let path = std::env::temp_dir().join("quickstream_test_silence_90s.mp3");
+    // Written under a temporary name and renamed, so an interrupted run never leaves a
+    // truncated file that later runs would reuse.
+    let partial = std::env::temp_dir().join(format!("quickstream_test_silence_90s.{}.mp3", std::process::id()));
     if !path.exists() {
         let status = std::process::Command::new("ffmpeg")
             .args([
@@ -23,12 +26,14 @@ fn silent_track() -> Option<PathBuf> {
                 "-t",
                 "90",
             ])
-            .arg(&path)
+            .arg(&partial)
             .status()
             .ok()?;
         if !status.success() {
+            let _ = std::fs::remove_file(&partial);
             return None;
         }
+        std::fs::rename(&partial, &path).ok()?;
     }
     Some(path)
 }
@@ -49,7 +54,7 @@ fn slow_http_server(file: PathBuf, delay: Duration) -> String {
             std::thread::spawn(move || {
                 let _ = stream.set_nonblocking(false);
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut range_start = 0u64;
+                let mut range_start: Option<u64> = None;
                 let mut line = String::new();
                 while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
                     let l = line.trim().to_ascii_lowercase();
@@ -57,22 +62,35 @@ fn slow_http_server(file: PathBuf, delay: Duration) -> String {
                         break;
                     }
                     if let Some(v) = l.strip_prefix("range: bytes=") {
-                        range_start = v.split('-').next().and_then(|n| n.parse().ok()).unwrap_or(0);
+                        range_start = v.split('-').next().and_then(|n| n.parse().ok());
                     }
                     line.clear();
                 }
                 std::thread::sleep(delay);
                 let data = std::fs::read(&file).unwrap();
                 let total = data.len() as u64;
-                let start = range_start.min(total);
-                let body = &data[start as usize..];
-                let head = format!(
-                    "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mpeg\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    start,
-                    total.saturating_sub(1),
-                    total,
-                    body.len()
-                );
+                let head = match range_start {
+                    Some(start) if start >= total => format!(
+                        "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        total
+                    ),
+                    Some(start) => format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mpeg\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        start,
+                        total - 1,
+                        total,
+                        total - start
+                    ),
+                    None => format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        total
+                    ),
+                };
+                let body = match range_start {
+                    Some(start) if start >= total => &data[..0],
+                    Some(start) => &data[start as usize..],
+                    None => &data[..],
+                };
                 let mut out = stream;
                 let _ = out.write_all(head.as_bytes());
                 let _ = out.write_all(body);
@@ -82,14 +100,17 @@ fn slow_http_server(file: PathBuf, delay: Duration) -> String {
     format!("http://127.0.0.1:{}/track.mp3", port)
 }
 
-fn wait_for_position(player: &LocalPlayer, min: f64) -> f64 {
-    let deadline = Instant::now() + Duration::from_secs(4);
-    let mut pos = player.position_seconds();
-    while pos < min && Instant::now() < deadline {
+/// Position as reported by mpv itself. `play_at` sets the position optimistically, so wait until
+/// mpv has loaded the file (it reports a duration) and has played for a moment; otherwise the
+/// optimistic value would be read back and the test could not tell where mpv really started.
+fn mpv_reported_position(player: &LocalPlayer) -> f64 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while player.duration_seconds() <= 0.0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
-        pos = player.position_seconds();
     }
-    pos
+    assert!(player.duration_seconds() > 0.0, "mpv never reported a duration");
+    std::thread::sleep(Duration::from_millis(1200));
+    player.position_seconds()
 }
 
 #[test]
@@ -106,7 +127,7 @@ fn test_mpv_play_at_starts_at_requested_position() {
 
     let mut player = LocalPlayer::new("mpv");
     player.play_at(&track, 42.0).expect("play_at");
-    let pos = wait_for_position(&player, 41.0);
+    let pos = mpv_reported_position(&player);
     assert!(
         (41.0..50.0).contains(&pos),
         "mpv started at {:.2}s instead of ~42s",
@@ -137,7 +158,7 @@ fn test_mpv_play_at_on_slow_source_starts_at_requested_position() {
 
     let mut player = LocalPlayer::new("mpv");
     player.play_at(std::path::Path::new(&url), 42.0).expect("play_at");
-    let pos = wait_for_position(&player, 41.0);
+    let pos = mpv_reported_position(&player);
     assert!(
         (41.0..50.0).contains(&pos),
         "mpv started at {:.2}s instead of ~42s",
@@ -169,18 +190,18 @@ fn test_ffplay_play_at_reports_requested_position() {
 }
 
 /// A stand-in mpv that creates the IPC socket, records every JSON command it receives to
-/// `log`, and replies success. Lets the test see exactly what LocalPlayer asks mpv to do.
-fn recording_fake_mpv(dir: &std::path::Path, log: &std::path::Path) -> PathBuf {
+/// `commands.log` next to itself, and replies success. Lets the test see exactly what
+/// LocalPlayer asks mpv to do.
+fn recording_fake_mpv(dir: &std::path::Path) -> PathBuf {
     let script = dir.join("fake-mpv");
-    let body = format!(
-        r#"#!/usr/bin/env python3
+    let body = r#"#!/usr/bin/env python3
 # (no extra shebang arguments: Linux passes "python3 -I" to env as one word)
 import json, os, socket, sys
 sock = next(a.split("=", 1)[1] for a in sys.argv if a.startswith("--input-ipc-server="))
 srv = socket.socket(socket.AF_UNIX)
 srv.bind(sock)
 srv.listen(4)
-log = open({log:?}, "a", buffering=1)
+log = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "commands.log"), "a", buffering=1)
 while True:
     conn, _ = srv.accept()
     buf = b""
@@ -195,13 +216,11 @@ while True:
                 continue
             log.write(line.decode() + "\n")
             req = json.loads(line)
-            reply = {{"error": "success"}}
+            reply = {"error": "success"}
             if "request_id" in req:
                 reply["request_id"] = req["request_id"]
             conn.sendall((json.dumps(reply) + "\n").encode())
-"#,
-        log = log.to_string_lossy()
-    );
+"#;
     std::fs::write(&script, body).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -239,7 +258,7 @@ fn test_mpv_play_at_loads_file_with_start_position() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let log = dir.join("commands.log");
-    let fake = recording_fake_mpv(&dir, &log);
+    let fake = recording_fake_mpv(&dir);
     let track = dir.join("track.mp3");
     std::fs::write(&track, b"not audio").unwrap();
 
