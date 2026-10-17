@@ -160,6 +160,11 @@ Execute the full test suite using Cargo with single-threaded test execution (req
 cargo test -- --test-threads=1
 ```
 
+Tests that bind all network interfaces (real SSDP discovery, LAN web server binding) are marked `#[ignore]` so local runs do not trigger macOS firewall prompts. Run them explicitly, and in CI:
+```bash
+cargo test -- --test-threads=1 --include-ignored
+```
+
 To run a specific test:
 ```bash
 cargo test --test test_autopilot test_autopilot_mix_generates_full_queue_when_library_has_sparse_matches

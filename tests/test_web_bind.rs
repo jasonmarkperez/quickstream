@@ -41,12 +41,14 @@ fn test_web_remote_binds_loopback_by_default() {
 }
 
 #[test]
+#[ignore = "binds all network interfaces (macOS firewall prompt); run with --include-ignored"]
 fn test_web_remote_binds_lan_when_setting_enabled() {
     let app = app(true, true);
     assert_eq!(app.web_server.as_ref().expect("server running").bind, WebBind::Lan);
 }
 
 #[test]
+#[ignore = "binds all network interfaces (macOS firewall prompt); run with --include-ignored"]
 fn test_dlna_renderer_switches_server_to_lan_and_back() {
     let mut app = app(true, false);
     app.switch_to_upnp_player(fake_renderer());
@@ -57,6 +59,7 @@ fn test_dlna_renderer_switches_server_to_lan_and_back() {
 }
 
 #[test]
+#[ignore = "binds all network interfaces (macOS firewall prompt); run with --include-ignored"]
 fn test_lan_request_never_falls_back_to_loopback_on_busy_port() {
     use std::sync::{mpsc, Arc, RwLock};
     use quickstream::web::{NowPlayingState, WebServer};
