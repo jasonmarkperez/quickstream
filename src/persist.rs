@@ -212,7 +212,7 @@ impl PersistHandle {
     /// replaces how saves are written.
     pub fn rename(&self, from: PathBuf, to: PathBuf) {
         if let Err(mpsc::SendError(Msg::Rename(from, to))) = self.tx.send(Msg::Rename(from, to)) {
-            rename_logged(&from, &to);
+            let _ = rename_logged(&from, &to);
         }
     }
 
@@ -324,14 +324,22 @@ fn delete_logged(path: &Path) {
     }
 }
 
-fn rename_logged(from: &Path, to: &Path) {
+/// Move `from` to `to` and log a failure. Returns false when the rename failed for any reason
+/// other than `from` being gone: the old file is still there, so writing `to` would leave two.
+fn rename_logged(from: &Path, to: &Path) -> bool {
     match fs::rename(from, to) {
-        Ok(()) => sync_parent_dir(to),
-        Err(e) => crate::logger::log_raw(
-            "WARN",
-            "persist",
-            &format!("failed to rename '{}' to '{}': {}", from.display(), to.display(), e),
-        ),
+        Ok(()) => {
+            sync_parent_dir(to);
+            true
+        }
+        Err(e) => {
+            crate::logger::log_raw(
+                "WARN",
+                "persist",
+                &format!("failed to rename '{}' to '{}': {}", from.display(), to.display(), e),
+            );
+            e.kind() == io::ErrorKind::NotFound
+        }
     }
 }
 
@@ -342,12 +350,29 @@ enum Op {
     Rename(PathBuf, PathBuf),
 }
 
-impl Op {
-    fn apply(&self, writer: &Writer) {
-        match self {
-            Op::Write(path, bytes) => write_logged(writer, path, bytes),
+/// Apply `ops` in order. A save to the target of a rename that failed earlier in the batch is
+/// skipped: the old file is still on disk, and writing the new name would leave both.
+fn apply_ops(ops: &[Op], writer: &Writer) {
+    let mut failed_targets: Vec<&Path> = Vec::new();
+    for op in ops {
+        match op {
+            Op::Write(path, bytes) => {
+                if failed_targets.contains(&path.as_path()) {
+                    crate::logger::log_raw(
+                        "WARN",
+                        "persist",
+                        &format!("not writing '{}': renaming onto it failed", path.display()),
+                    );
+                } else {
+                    write_logged(writer, path, bytes);
+                }
+            }
             Op::Delete(path) => delete_logged(path),
-            Op::Rename(from, to) => rename_logged(from, to),
+            Op::Rename(from, to) => {
+                if !rename_logged(from, to) {
+                    failed_targets.push(to);
+                }
+            }
         }
     }
 }
@@ -415,9 +440,7 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, writer: &Writer) {
         while let Ok(msg) = rx.try_recv() {
             batch.absorb(msg);
         }
-        for op in &batch.ops {
-            op.apply(writer);
-        }
+        apply_ops(&batch.ops, writer);
         for ack in batch.acks {
             let _ = ack.send(());
         }

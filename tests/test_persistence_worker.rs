@@ -6,6 +6,7 @@
 
 mod common;
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -395,5 +396,60 @@ fn test_delete_and_rename_after_shutdown_run_on_the_calling_thread() {
     handle.delete(gone.clone());
     assert_eq!(names_in(&dir), vec!["b.m3u8".to_string()]);
     assert_eq!(std::fs::read(&b).unwrap(), b"a");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A playlist rename sends rename(old, new) then save(new). When the rename fails for a reason
+/// other than the old file being gone, the save must not create the new file next to the old
+/// one, or both load as playlists on the next start.
+#[test]
+fn test_save_after_a_failed_rename_does_not_create_the_target() {
+    common::isolate();
+    let dir = scratch("failed_rename");
+    let locked = dir.join("locked");
+    let open = dir.join("open");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::create_dir_all(&open).unwrap();
+    let old = locked.join("Old.m3u8");
+    let new = open.join("New.m3u8");
+    std::fs::write(&old, b"#EXTM3U\n#PLAYLIST:Old\n").unwrap();
+    // Read-only folder: its entries can't be removed, so the rename fails with EACCES.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(locked.join("probe"), b"").is_ok() {
+        // Running as root: permissions don't apply, nothing to test.
+        let _ = std::fs::remove_file(locked.join("probe"));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let worker = PersistenceWorker::spawn();
+
+    worker.rename(old.clone(), new.clone());
+    worker.save(new.clone(), b"#EXTM3U\n#PLAYLIST:New\n".to_vec());
+    assert!(worker.flush());
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        !new.exists(),
+        "the save after a failed rename created a second playlist"
+    );
+    assert_eq!(std::fs::read(&old).unwrap(), b"#EXTM3U\n#PLAYLIST:Old\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A rename whose source is already gone changes nothing on disk, so the save still writes.
+#[test]
+fn test_save_after_a_rename_of_a_missing_file_still_writes() {
+    common::isolate();
+    let dir = scratch("missing_rename");
+    let old = dir.join("Old.m3u8");
+    let new = dir.join("New.m3u8");
+    let worker = PersistenceWorker::spawn();
+
+    worker.rename(old.clone(), new.clone());
+    worker.save(new.clone(), b"#EXTM3U\n".to_vec());
+    assert!(worker.flush());
+    assert_eq!(std::fs::read(&new).unwrap(), b"#EXTM3U\n");
+    assert_eq!(names_in(&dir), vec!["New.m3u8".to_string()]);
     let _ = std::fs::remove_dir_all(&dir);
 }
