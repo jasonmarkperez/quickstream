@@ -1,7 +1,45 @@
 //! BPM detection and acoustic energy analysis using embedded tags or ffmpeg DSP.
 
-use std::path::Path;
-use std::process::Command;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+/// Hard limit for a single ffmpeg decode (a stalled network share must never hang a worker).
+pub const FFMPEG_TIMEOUT: Duration = Duration::from_secs(20);
+/// Preferred seek offset into the track for tempo analysis (skips intros).
+const ACOUSTIC_SEEK_SECS: u32 = 30;
+/// Length of the decoded analysis slice.
+const ACOUSTIC_SLICE_SECS: u32 = 20;
+const ANALYSIS_SAMPLE_RATE: u32 = 11025;
+/// Minimum decoded audio needed for a usable analysis.
+const MIN_SLICE_SECS: u32 = 3;
+
+/// How acoustic analysis invokes ffmpeg (binary and per-call timeout).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FfmpegConfig {
+    /// ffmpeg executable; a bare name is resolved via `PATH`.
+    pub binary: PathBuf,
+    /// Hard limit for a single decode.
+    pub timeout: Duration,
+}
+
+impl Default for FfmpegConfig {
+    fn default() -> Self {
+        Self {
+            binary: PathBuf::from("ffmpeg"),
+            timeout: FFMPEG_TIMEOUT,
+        }
+    }
+}
+
+/// Tempo and energy derived from a single decoded slice.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AcousticAnalysis {
+    pub bpm: Option<f64>,
+    pub energy: Option<f64>,
+}
 
 /// Detect BPM and acoustic energy for an audio track.
 pub struct BpmAnalyzer;
@@ -18,72 +56,193 @@ impl BpmAnalyzer {
         Self::analyze_acoustic_tempo(path)
     }
 
-    /// Read embedded TBPM / BPM tag via lofty.
+    /// Read embedded BPM tag via lofty (ID3 `TBPM`, MP4 `tmpo` / iTunes BPM, Vorbis `BPM`).
     pub fn read_embedded_bpm(path: &Path) -> Option<f64> {
+        use lofty::config::ParseOptions;
         use lofty::prelude::*;
         use lofty::probe::Probe;
+
+        let tagged_file = Probe::open(path)
+            .ok()?
+            .options(ParseOptions::new().read_cover_art(false))
+            .read()
+            .ok()?;
+        tagged_file.tags().iter().find_map(Self::bpm_from_tag)
+    }
+
+    /// Extract a plausible BPM value from a single lofty tag.
+    /// ID3v2 `TBPM` and MP4 `tmpo` map to `ItemKey::IntegerBpm`; others map to `ItemKey::Bpm`.
+    pub fn bpm_from_tag(tag: &lofty::tag::Tag) -> Option<f64> {
         use lofty::tag::ItemKey;
 
-        let tagged_file = Probe::open(path).ok()?.read().ok()?;
-        let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag())?;
-
-        // 1. ItemKey::Bpm
-        if let Some(val) = tag.get_string(ItemKey::Bpm) {
-            if let Ok(bpm) = val.trim().parse::<f64>() {
-                if bpm > 30.0 && bpm < 300.0 {
-                    return Some(bpm);
-                }
-            }
-        }
-
-        // 2. Fallback to custom "TBPM" or "BPM" tag item
-        for item in tag.items() {
-            let key = item.key();
-            if key == ItemKey::Bpm {
-                if let Some(val) = item.value().text() {
-                    if let Ok(bpm) = val.trim().parse::<f64>() {
-                        if bpm > 30.0 && bpm < 300.0 {
-                            return Some(bpm);
-                        }
-                    }
-                }
-            }
-        }
-
-        None
+        [ItemKey::Bpm, ItemKey::IntegerBpm].into_iter().find_map(|key| {
+            let bpm = tag.get_string(key)?.trim().parse::<f64>().ok()?;
+            (bpm > 30.0 && bpm < 300.0).then_some(bpm)
+        })
     }
 
     /// Perform acoustic onset autocorrelation on a 20-second mono 11.025kHz slice.
     pub fn analyze_acoustic_tempo(path: &Path) -> Option<f64> {
-        // Extract 20 seconds from the middle of the track at 11,025 Hz mono 16-bit LE
-        let output = Command::new("ffmpeg")
+        let samples = Self::decode_pcm_slice(path, ACOUSTIC_SEEK_SECS, ACOUSTIC_SLICE_SECS, ANALYSIS_SAMPLE_RATE, None)?;
+        Self::compute_bpm_from_samples(&samples, ANALYSIS_SAMPLE_RATE as f32)
+    }
+
+    /// Decode one slice and derive both tempo and energy from it (single ffmpeg call).
+    /// `cancel` aborts the ffmpeg subprocess early (e.g. on application shutdown).
+    ///
+    /// Returns `None` if the decode failed (ffmpeg missing, error exit, timeout, cancelled) or
+    /// produced no audio. A successful decode in which no tempo is found (e.g. silence, or a clip
+    /// too short for tempo analysis) is a real result: `Some` with `bpm: None`.
+    pub fn analyze_acoustic(path: &Path, cancel: Option<&AtomicBool>) -> Option<AcousticAnalysis> {
+        Self::analyze_acoustic_with(&FfmpegConfig::default(), path, cancel)
+    }
+
+    /// [`Self::analyze_acoustic`] using an explicit ffmpeg binary and timeout.
+    pub fn analyze_acoustic_with(
+        ffmpeg: &FfmpegConfig,
+        path: &Path,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<AcousticAnalysis> {
+        let samples = Self::decode_slice_unfiltered(
+            ffmpeg,
+            path,
+            ACOUSTIC_SEEK_SECS,
+            ACOUSTIC_SLICE_SECS,
+            ANALYSIS_SAMPLE_RATE,
+            cancel,
+        )
+        .filter(|s| !s.is_empty())?;
+        let long_enough = samples.len() >= (ANALYSIS_SAMPLE_RATE * MIN_SLICE_SECS) as usize;
+        Some(AcousticAnalysis {
+            bpm: if long_enough {
+                Self::compute_bpm_from_samples(&samples, ANALYSIS_SAMPLE_RATE as f32)
+            } else {
+                None
+            },
+            energy: Self::energy_from_samples(&samples),
+        })
+    }
+
+    /// Decode `duration_secs` of mono PCM starting at `offset_secs`.
+    /// If the track is shorter than the seek offset (too little audio returned), retry from 0.
+    /// Returns `None` if decoding failed or yielded less than the minimum usable audio.
+    pub fn decode_pcm_slice(
+        path: &Path,
+        offset_secs: u32,
+        duration_secs: u32,
+        sample_rate: u32,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<Vec<f32>> {
+        Self::decode_pcm_slice_with(&FfmpegConfig::default(), path, offset_secs, duration_secs, sample_rate, cancel)
+    }
+
+    /// [`Self::decode_pcm_slice`] using an explicit ffmpeg binary and timeout.
+    pub fn decode_pcm_slice_with(
+        ffmpeg: &FfmpegConfig,
+        path: &Path,
+        offset_secs: u32,
+        duration_secs: u32,
+        sample_rate: u32,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<Vec<f32>> {
+        let min_samples = (sample_rate * MIN_SLICE_SECS) as usize;
+        Self::decode_slice_unfiltered(ffmpeg, path, offset_secs, duration_secs, sample_rate, cancel)
+            .filter(|s| s.len() >= min_samples)
+    }
+
+    /// Decode a slice, retrying from offset 0 only when the first decode *succeeded* but returned
+    /// too little audio (track shorter than the seek offset). A failed or timed-out first decode is
+    /// not retried, so a stalled file costs at most one timeout.
+    /// Returns `None` only if a decode failed; the returned samples may be short or empty.
+    fn decode_slice_unfiltered(
+        ffmpeg: &FfmpegConfig,
+        path: &Path,
+        offset_secs: u32,
+        duration_secs: u32,
+        sample_rate: u32,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<Vec<f32>> {
+        let min_samples = (sample_rate * MIN_SLICE_SECS) as usize;
+        let first = Self::decode_pcm_at(ffmpeg, path, offset_secs, duration_secs, sample_rate, cancel)?;
+        if first.len() >= min_samples || offset_secs == 0 || cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Some(first);
+        }
+        Self::decode_pcm_at(ffmpeg, path, 0, duration_secs, sample_rate, cancel)
+    }
+
+    fn decode_pcm_at(
+        ffmpeg: &FfmpegConfig,
+        path: &Path,
+        offset_secs: u32,
+        duration_secs: u32,
+        sample_rate: u32,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<Vec<f32>> {
+        let mut cmd = Command::new(&ffmpeg.binary);
+        cmd.args(["-nostdin", "-ss", &offset_secs.to_string(), "-t", &duration_secs.to_string(), "-i"])
+            .arg(path)
             .args([
-                "-ss", "30",
-                "-t", "20",
-                "-i", path.to_str()?,
                 "-vn",
                 "-sn",
-                "-ar", "11025",
+                "-ar", &sample_rate.to_string(),
                 "-ac", "1",
                 "-f", "s16le",
                 "-loglevel", "error",
                 "-",
-            ])
-            .output()
+            ]);
+        let pcm_bytes = Self::run_with_timeout(cmd, ffmpeg.timeout, cancel)?;
+        Some(
+            pcm_bytes
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+                .collect(),
+        )
+    }
+
+    /// Run a subprocess capturing stdout, killing it if it exceeds `timeout`
+    /// or if `cancel` is raised. Returns `None` on failure, timeout or cancellation.
+    pub fn run_with_timeout(mut cmd: Command, timeout: Duration, cancel: Option<&AtomicBool>) -> Option<Vec<u8>> {
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
             .ok()?;
 
-        if !output.status.success() || output.stdout.len() < 22050 * 2 {
-            return None;
-        }
+        // Drain stdout on a helper thread so a full pipe buffer can never stall the child.
+        let mut stdout = child.stdout.take()?;
+        let reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            buf
+        });
 
-        let pcm_bytes = output.stdout;
-        let mut samples = Vec::with_capacity(pcm_bytes.len() / 2);
-        for chunk in pcm_bytes.chunks_exact(2) {
-            let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0;
-            samples.push(sample);
-        }
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {
+                    let cancelled = cancel.is_some_and(|c| c.load(Ordering::Relaxed));
+                    if cancelled || Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break None;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+            }
+        };
 
-        Self::compute_bpm_from_samples(&samples, 11025.0)
+        let output = reader.join().ok()?;
+        match status {
+            Some(s) if s.success() => Some(output),
+            _ => None,
+        }
     }
 
     /// Autocorrelate energy envelope across 60–180 BPM range.
@@ -146,41 +305,20 @@ impl BpmAnalyzer {
 
     /// Calculate RMS energy score (0.0 to 1.0).
     pub fn calculate_energy(path: &Path) -> Option<f64> {
-        let output = Command::new("ffmpeg")
-            .args([
-                "-ss", "20",
-                "-t", "10",
-                "-i", path.to_str()?,
-                "-vn",
-                "-ar", "8000",
-                "-ac", "1",
-                "-f", "s16le",
-                "-loglevel", "error",
-                "-",
-            ])
-            .output()
-            .ok()?;
+        let samples = Self::decode_pcm_slice(path, 20, 10, 8000, None)?;
+        Self::energy_from_samples(&samples)
+    }
 
-        if !output.status.success() || output.stdout.is_empty() {
+    /// Normalised RMS energy score (0.0 to 1.0) for a block of samples.
+    pub fn energy_from_samples(samples: &[f32]) -> Option<f64> {
+        if samples.is_empty() {
             return None;
         }
-
-        let mut sum_sq = 0.0f64;
-        let mut count = 0;
-        for chunk in output.stdout.chunks_exact(2) {
-            let s = i16::from_le_bytes([chunk[0], chunk[1]]) as f64 / 32768.0;
-            sum_sq += s * s;
-            count += 1;
-        }
-
-        if count > 0 {
-            let rms = (sum_sq / count as f64).sqrt();
-            // Scale RMS (typically 0.05 to 0.40) to normalized 0.0 - 1.0 energy score
-            let energy = (rms * 3.0).clamp(0.0, 1.0);
-            Some((energy * 100.0).round() / 100.0)
-        } else {
-            None
-        }
+        let sum_sq: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        let rms = (sum_sq / samples.len() as f64).sqrt();
+        // Scale RMS (typically 0.05 to 0.40) to normalized 0.0 - 1.0 energy score
+        let energy = (rms * 3.0).clamp(0.0, 1.0);
+        Some((energy * 100.0).round() / 100.0)
     }
 }
 

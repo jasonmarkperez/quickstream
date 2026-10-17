@@ -12,17 +12,25 @@ fn closed_port() -> u16 {
 }
 
 fn fake_renderer() -> DLNADevice {
-    let port = closed_port();
+    renderer_at("127.0.0.1", closed_port())
+}
+
+/// A renderer elsewhere on the network (TEST-NET-1, never routed).
+fn network_renderer() -> DLNADevice {
+    renderer_at("192.0.2.10", 1400)
+}
+
+fn renderer_at(host: &str, port: u16) -> DLNADevice {
     DLNADevice {
         udn: "uuid:bind-test".to_string(),
         friendly_name: "Bind Test Renderer".to_string(),
         model_name: "Test".to_string(),
         manufacturer: "Test".to_string(),
-        host: "127.0.0.1".to_string(),
+        host: host.to_string(),
         port,
-        location: format!("http://127.0.0.1:{}/desc.xml", port),
-        av_transport_control_url: format!("http://127.0.0.1:{}/ctrl/AVTransport", port),
-        rendering_control_url: format!("http://127.0.0.1:{}/ctrl/RenderingControl", port),
+        location: format!("http://{}:{}/desc.xml", host, port),
+        av_transport_control_url: format!("http://{}:{}/ctrl/AVTransport", host, port),
+        rendering_control_url: format!("http://{}:{}/ctrl/RenderingControl", host, port),
     }
 }
 
@@ -51,7 +59,7 @@ fn test_web_remote_binds_lan_when_setting_enabled() {
 #[ignore = "binds all network interfaces (macOS firewall prompt); run with --include-ignored"]
 fn test_dlna_renderer_switches_server_to_lan_and_back() {
     let mut app = app(true, false);
-    app.switch_to_upnp_player(fake_renderer());
+    app.switch_to_upnp_player(network_renderer());
     assert_eq!(app.web_server.as_ref().unwrap().bind, WebBind::Lan);
 
     app.switch_to_local_player();
@@ -91,4 +99,12 @@ fn test_creating_app_does_not_start_network_discovery() {
     // Discovery runs on a background thread for ~2.5s once started.
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert!(!app.device_manager.is_scanning(), "discovery must start from run(), not AppUI::new");
+}
+
+#[test]
+fn test_renderer_on_this_computer_keeps_server_on_loopback() {
+    // A renderer at 127.0.0.1 reaches the stream over loopback; no network exposure needed.
+    let mut app = app(true, false);
+    app.switch_to_upnp_player(fake_renderer());
+    assert_eq!(app.web_server.as_ref().unwrap().bind, WebBind::Loopback);
 }

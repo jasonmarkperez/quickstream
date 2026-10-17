@@ -7,10 +7,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 static LOG_FILE: OnceLock<Mutex<File>> = OnceLock::new();
-static LOCAL_LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-/// Initialize application logging to `~/.cache/quickstream/quickstream.log` and optionally `./quickstream.log`.
+/// Initialize application logging to `~/.local/share/quickstream/quickstream.log`.
 pub fn init() -> PathBuf {
     let log_path = crate::paths::get_log_path();
     if let Some(parent) = log_path.parent() {
@@ -21,11 +20,6 @@ pub fn init() -> PathBuf {
         let _ = LOG_FILE.set(Mutex::new(file));
     }
     let _ = LOG_PATH.set(log_path.clone());
-
-    // Also attempt to log to local directory if writable
-    let local_path = PathBuf::from("quickstream.log");
-    let local_file = OpenOptions::new().create(true).append(true).open(&local_path).ok();
-    let _ = LOCAL_LOG_FILE.set(Mutex::new(local_file));
 
     log_raw("INFO", "logger", &format!("Logging initialized at {}", log_path.display()));
     log_path
@@ -45,15 +39,6 @@ pub fn log_raw(level: &str, module: &str, message: &str) {
         if let Ok(mut file) = mutex.lock() {
             let _ = file.write_all(line.as_bytes());
             let _ = file.flush();
-        }
-    }
-
-    if let Some(mutex) = LOCAL_LOG_FILE.get() {
-        if let Ok(mut opt) = mutex.lock() {
-            if let Some(ref mut file) = *opt {
-                let _ = file.write_all(line.as_bytes());
-                let _ = file.flush();
-            }
         }
     }
 }
@@ -144,5 +129,16 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         assert!(content.contains("[INFO ] [test] Hello test log"));
         assert!(content.contains("[PERF ] [test] test_operation -> elapsed:"));
+    }
+
+    #[test]
+    fn test_logger_does_not_write_to_working_directory() {
+        init();
+        let marker = format!("cwd-log-marker-{}", std::process::id());
+        log_raw("INFO", "test", &marker);
+
+        let cwd_log = std::env::current_dir().unwrap().join("quickstream.log");
+        let content = std::fs::read_to_string(&cwd_log).unwrap_or_default();
+        assert!(!content.contains(&marker), "logger wrote to {}", cwd_log.display());
     }
 }

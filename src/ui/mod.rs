@@ -20,6 +20,7 @@ use crate::discovery::DeviceManager;
 use crate::metadata::is_supported_audio_file;
 use crate::paths;
 use crate::player::local::LocalPlayer;
+use crate::player::worker::AsyncPlayer;
 use crate::player::AudioPlayer;
 use crate::queue::PlaybackQueue;
 use crate::settings::{SettingsManager, SETTING_DEFINITIONS};
@@ -52,6 +53,71 @@ pub enum DirScanEvent {
     },
 }
 
+/// Create a local (mpv/ffplay) player that runs on its own worker thread.
+fn spawn_local_player(backend: &str, initial_volume: u8) -> Box<dyn AudioPlayer> {
+    let backend = backend.to_string();
+    Box::new(AsyncPlayer::spawn(move || Box::new(LocalPlayer::new(&backend)), initial_volume))
+}
+
+/// Start 4 threads that read tags for paths sent to the returned inbox and report results on
+/// `metadata_tx`. The threads exit once the inbox sender is dropped.
+fn spawn_queue_metadata_workers(
+    metadata_tx: std::sync::mpsc::Sender<crate::metadata::AudioMetadata>,
+) -> std::sync::mpsc::Sender<PathBuf> {
+    let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+    let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+    for _ in 0..4 {
+        let rx = rx.clone();
+        let metadata_tx = metadata_tx.clone();
+        std::thread::spawn(move || loop {
+            let path = match rx.lock() {
+                Ok(guard) => match guard.recv() {
+                    Ok(p) => p,
+                    Err(_) => break,
+                },
+                Err(_) => break,
+            };
+            if let Ok(meta) = crate::metadata::extract_metadata(&path) {
+                crate::library::LibraryManager::append_to_cache(&meta);
+                if metadata_tx.send(meta).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    tx
+}
+
+/// Drop a replaced player on a background thread so its shutdown (killing mpv, sending Stop to a
+/// renderer) never blocks the UI.
+fn retire_player(player: Box<dyn AudioPlayer>) {
+    std::thread::spawn(move || drop(player));
+}
+
+static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TUI_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask the running TUI to exit cleanly on its next tick. Safe to call from a signal handler thread.
+pub fn request_shutdown() {
+    SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Reset a pending shutdown request.
+pub fn clear_shutdown_request() {
+    SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether the TUI event loop has exited and the app is releasing resources (players, mpv).
+pub fn is_shutting_down() -> bool {
+    SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether the interactive TUI event loop is currently running.
+pub fn is_tui_active() -> bool {
+    TUI_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub struct AppUI {
     pub active_tab: usize,
     pub queue_focus: bool, // false = browser, true = queue
@@ -80,8 +146,13 @@ pub struct AppUI {
     pub metadata_cache: std::collections::HashMap<PathBuf, crate::metadata::AudioMetadata>,
     pub metadata_tx: std::sync::mpsc::Sender<crate::metadata::AudioMetadata>,
     pub metadata_rx: std::sync::mpsc::Receiver<crate::metadata::AudioMetadata>,
+    pub queue_add_tx: std::sync::mpsc::Sender<Vec<crate::metadata::AudioMetadata>>,
+    pub queue_add_rx: std::sync::mpsc::Receiver<Vec<crate::metadata::AudioMetadata>>,
     pub metadata_worker_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    pub queue_metadata_worker_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Inbox of the queue metadata worker pool (spawned on first use; workers exit when dropped).
+    pub queue_metadata_tx: Option<std::sync::mpsc::Sender<PathBuf>>,
+    /// Paths already sent to the queue metadata workers this session.
+    pub queue_metadata_attempted: std::collections::HashSet<PathBuf>,
     pub browser_state: ListState,
     pub queue_state: ListState,
     pub devices_state: ListState,
@@ -106,6 +177,8 @@ pub struct AppUI {
     pub autopilot_run_mode: AutopilotRunMode,
     pub autopilot_added_count: usize,
     pub analysis_db: crate::analysis::AnalysisDatabase,
+    /// Background BPM/key/energy analysis of discovered tracks (stops and joins on drop).
+    pub analysis_worker: crate::analysis::worker::AnalysisWorker,
     pub active_mix_profile: crate::analysis::MixProfile,
     pub show_mix_picker_modal: bool,
     pub mix_picker_cursor: usize,
@@ -158,6 +231,7 @@ impl AppUI {
         };
 
         let (metadata_tx, metadata_rx) = std::sync::mpsc::channel();
+        let (queue_add_tx, queue_add_rx) = std::sync::mpsc::channel();
         let metadata_cache = crate::library::LibraryManager::load_cache_map();
         let (dir_scan_tx, dir_scan_rx) = std::sync::mpsc::channel();
         let analysis_db = crate::analysis::AnalysisDatabase::open_default()
@@ -186,14 +260,17 @@ impl AppUI {
             show_help_modal: false,
             status_message: "Welcome to Quickstream (Rust)".to_string(),
             queue: PlaybackQueue::new(),
-            player: Box::new(LocalPlayer::new(&backend)),
+            player: spawn_local_player(&backend, 50),
             device_manager,
             settings_mgr,
             metadata_cache,
             metadata_tx,
             metadata_rx,
+            queue_add_tx,
+            queue_add_rx,
             metadata_worker_stop: None,
-            queue_metadata_worker_stop: None,
+            queue_metadata_tx: None,
+            queue_metadata_attempted: std::collections::HashSet::new(),
             browser_state: ListState::default(),
             queue_state: ListState::default(),
             devices_state: ListState::default(),
@@ -217,6 +294,7 @@ impl AppUI {
             is_autopilot_scanning: false,
             autopilot_run_mode: AutopilotRunMode::Fresh,
             autopilot_added_count: 0,
+            analysis_worker: crate::analysis::worker::AnalysisWorker::spawn(analysis_db.clone(), 1),
             analysis_db,
             active_mix_profile,
             show_mix_picker_modal: false,
@@ -807,60 +885,66 @@ impl AppUI {
         });
     }
 
+    /// Resolve tags for queue tracks that still have placeholder metadata. Each path is read at
+    /// most once per session by a persistent pool of 4 workers; results arrive via `metadata_rx`.
     pub fn start_queue_metadata_fetch(&mut self) {
-        let paths_to_fetch: Vec<PathBuf> = self
+        let candidates: Vec<PathBuf> = self
             .queue
             .tracks
             .iter()
             .filter(|t| t.duration_seconds <= 0.0 || t.artist.is_empty())
             .map(|t| t.filepath.clone())
             .collect();
-
-        if paths_to_fetch.is_empty() {
+        let new_paths: Vec<PathBuf> = candidates
+            .into_iter()
+            .filter(|p| self.queue_metadata_attempted.insert(p.clone()))
+            .collect();
+        if new_paths.is_empty() {
             return;
         }
 
-        if let Some(stop) = self.queue_metadata_worker_stop.take() {
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.queue_metadata_worker_stop = Some(stop.clone());
-        let tx = self.metadata_tx.clone();
-
-        // 4 parallel worker threads to resolve tags and duration concurrently
-        let queue = std::sync::Arc::new(std::sync::Mutex::new(paths_to_fetch));
-        for _ in 0..4 {
-            let q = queue.clone();
-            let tx = tx.clone();
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                loop {
-                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
-                    }
-                    let path = {
-                        let mut guard = match q.lock() {
-                            Ok(g) => g,
-                            Err(_) => break,
-                        };
-                        guard.pop()
-                    };
-                    let path = match path {
-                        Some(p) => p,
-                        None => break,
-                    };
-                    if let Ok(meta) = crate::metadata::extract_metadata(&path) {
-                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                            break;
-                        }
-                        crate::library::LibraryManager::append_to_cache(&meta);
-                        let _ = tx.send(meta);
-                    }
-                }
-            });
+        let metadata_tx = self.metadata_tx.clone();
+        let tx = self
+            .queue_metadata_tx
+            .get_or_insert_with(|| spawn_queue_metadata_workers(metadata_tx));
+        for path in new_paths {
+            let _ = tx.send(path);
         }
     }
+
+    pub fn poll_pending_queue_adds(&mut self) {
+        while let Ok(tracks) = self.queue_add_rx.try_recv() {
+            let tracks: Vec<_> = tracks
+                .into_iter()
+                .map(|t| self.metadata_cache.get(&t.filepath).cloned().unwrap_or(t))
+                .collect();
+            let added = self.enqueue_tracks(tracks);
+            self.status_message = format!("Added {} tracks (web)", added);
+            self.update_web_state();
+        }
+    }
+
+    /// Cached metadata for `path`, or a path-derived placeholder. Never reads the audio file.
+    fn quick_metadata(&self, path: &std::path::Path) -> crate::metadata::AudioMetadata {
+        self.metadata_cache
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| crate::metadata::fallback_metadata(path))
+    }
+
+    /// Append tracks to the queue and resolve missing tags on background workers.
+    fn enqueue_tracks(&mut self, tracks: Vec<crate::metadata::AudioMetadata>) -> usize {
+        let added = tracks.len();
+        for meta in tracks {
+            self.register_stream_file(&meta.filepath);
+            self.queue.add_track(meta);
+        }
+        if added > 0 {
+            self.start_queue_metadata_fetch();
+        }
+        added
+    }
+
 
     pub fn poll_background_metadata(&mut self) {
         let mut queue_updated = false;
@@ -952,6 +1036,7 @@ impl AppUI {
 
         let was_empty = self.queue.is_empty();
 
+        self.analysis_worker.enqueue(new_tracks.iter().map(|t| t.filepath.clone()));
         for track in new_tracks {
             if let Some(ref ws) = self.web_server {
                 ws.register_stream_file(&track.filepath);
@@ -1229,6 +1314,16 @@ impl AppUI {
         }
     }
 
+    /// Stop playback and return true if a shutdown was requested (e.g. by SIGINT/SIGTERM/SIGHUP).
+    pub fn poll_shutdown_request(&mut self) -> bool {
+        if !SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        crate::log_info!("ui", "Shutdown requested by signal, stopping playback");
+        let _ = self.player.stop();
+        true
+    }
+
     pub fn run(&mut self) -> anyhow::Result<()> {
         self.device_manager.start_background_scan();
         enable_raw_mode()?;
@@ -1237,7 +1332,10 @@ impl AppUI {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
+        TUI_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
         let res = self.event_loop(&mut terminal);
+        SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+        TUI_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
 
         disable_raw_mode()?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -1248,6 +1346,14 @@ impl AppUI {
 
     fn event_loop<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> anyhow::Result<()> {
         loop {
+            if self.poll_shutdown_request() {
+                return Ok(());
+            }
+
+            if let Some(err) = self.player.take_error() {
+                self.status_message = format!("Playback error: {}", err);
+            }
+
             // Check if active track finished and auto-advance queue
             if self.player.is_track_finished() {
                 self.player.reset_finished();
@@ -1276,6 +1382,7 @@ impl AppUI {
 
             // Poll background metadata extraction
             self.poll_background_metadata();
+            self.poll_pending_queue_adds();
 
             // Poll progressive background autopilot discovery
             self.poll_background_autopilot();
@@ -1402,22 +1509,10 @@ impl AppUI {
                                     if is_dir {
                                         self.navigate_browser(path);
                                     } else {
-                                        let meta_opt = self.metadata_cache.get(&path).cloned()
-                                            .or_else(|| {
-                                                if let Ok(m) = crate::metadata::extract_metadata(&path) {
-                                                    self.metadata_cache.insert(path.clone(), m.clone());
-                                                    Some(m)
-                                                } else {
-                                                    None
-                                                }
-                                            })
-                                            .or_else(|| Some(crate::metadata::fallback_metadata(&path)));
-                                        if let Some(meta) = meta_opt {
-                                            let title = meta.display_title().to_string();
-                                            self.register_stream_file(&meta.filepath);
-                                            self.queue.add_track(meta);
-                                            self.status_message = format!("Added to queue: {}", title);
-                                        }
+                                        let meta = self.quick_metadata(&path);
+                                        let title = meta.display_title().to_string();
+                                        self.enqueue_tracks(vec![meta]);
+                                        self.status_message = format!("Added to queue: {}", title);
                                     }
                                 }
                             }
@@ -1968,39 +2063,31 @@ impl AppUI {
             self.browser_dir.clone()
         };
 
-        // 1. Immediately pull any cached tracks for target_dir
-        let cached_map = crate::library::LibraryManager::load_cache_map();
-        let initial_tracks: Vec<crate::metadata::AudioMetadata> = cached_map
-            .values()
-            .filter(|t| t.filepath.starts_with(&target_dir))
-            .cloned()
-            .collect();
-
-        for t in &initial_tracks {
-            self.metadata_cache.insert(t.filepath.clone(), t.clone());
-        }
-
-        // 2. Set up background streaming scanner
+        // Background thread: send cached tracks for target_dir first (the cache covers the whole
+        // library and can be large), then stream newly discovered tracks.
         let (tx, rx) = std::sync::mpsc::channel();
         let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_clone = stop_flag.clone();
         let scan_dir = target_dir.clone();
-        let scan_cache = cached_map;
 
         std::thread::spawn(move || {
-            crate::library::LibraryManager::scan_directory_streaming(
-                scan_dir,
-                scan_cache,
-                tx,
-                stop_clone,
-            );
+            let cached_map = crate::library::LibraryManager::load_cache_map();
+            let initial_tracks: Vec<crate::metadata::AudioMetadata> = cached_map
+                .values()
+                .filter(|t| t.filepath.starts_with(&scan_dir))
+                .cloned()
+                .collect();
+            if !initial_tracks.is_empty() && tx.send(initial_tracks).is_err() {
+                return;
+            }
+            crate::library::LibraryManager::scan_directory_streaming(scan_dir, cached_map, tx, stop_clone);
         });
 
         let target_name = target_dir.file_name().unwrap_or_default().to_string_lossy();
         self.status_message = format!("Fuzzy search in {}", target_name);
         let modal = search::SearchModalState::new_with_scanner(
             target_dir,
-            initial_tracks,
+            Vec::new(),
             Some(rx),
             Some(stop_flag),
         );
@@ -2113,22 +2200,10 @@ impl AppUI {
                             if is_dir {
                                 self.navigate_browser(path);
                             } else {
-                                let meta_opt = self.metadata_cache.get(&path).cloned()
-                                    .or_else(|| {
-                                        if let Ok(m) = crate::metadata::extract_metadata(&path) {
-                                            self.metadata_cache.insert(path.clone(), m.clone());
-                                            Some(m)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .or_else(|| Some(crate::metadata::fallback_metadata(&path)));
-                                if let Some(meta) = meta_opt {
-                                    let title = meta.display_title().to_string();
-                                    self.register_stream_file(&meta.filepath);
-                                    self.queue.add_track(meta);
-                                    self.status_message = format!("Added to queue: {}", title);
-                                }
+                                let meta = self.quick_metadata(&path);
+                                let title = meta.display_title().to_string();
+                                self.enqueue_tracks(vec![meta]);
+                                self.status_message = format!("Added to queue: {}", title);
                             }
                         }
                     }
@@ -2142,26 +2217,13 @@ impl AppUI {
                         }
                     }
                     (KeyCode::Char('a'), KeyModifiers::NONE) if !self.in_bookmarks_view => {
-                        let mut added = 0;
-                        for (_, path, is_dir) in &self.browser_entries {
-                            if !is_dir {
-                                let meta_opt = self.metadata_cache.get(path).cloned()
-                                    .or_else(|| {
-                                        if let Ok(m) = crate::metadata::extract_metadata(path) {
-                                            self.metadata_cache.insert(path.clone(), m.clone());
-                                            Some(m)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .or_else(|| Some(crate::metadata::fallback_metadata(path)));
-                                if let Some(meta) = meta_opt {
-                                    self.register_stream_file(&meta.filepath);
-                                    self.queue.add_track(meta);
-                                    added += 1;
-                                }
-                            }
-                        }
+                        let tracks: Vec<_> = self
+                            .browser_entries
+                            .iter()
+                            .filter(|(_, _, is_dir)| !is_dir)
+                            .map(|(_, path, _)| self.quick_metadata(path))
+                            .collect();
+                        let added = self.enqueue_tracks(tracks);
                         self.status_message = format!("Added {} tracks", added);
                     }
                     (KeyCode::Char('b'), KeyModifiers::NONE) => {
@@ -2401,7 +2463,10 @@ impl AppUI {
         } else if self.settings_cursor == 1 {
             let backend = self.settings_mgr.settings.player_backend.clone();
             if self.device_manager.get_active_device().is_none() {
-                self.player = Box::new(LocalPlayer::new(&backend));
+                let volume = self.player.volume();
+                let mut new_player = spawn_local_player(&backend, volume);
+                let _ = new_player.set_volume(volume);
+                retire_player(std::mem::replace(&mut self.player, new_player));
             }
         } else if self.settings_cursor == 6 || SETTING_DEFINITIONS[self.settings_cursor].key == "web_server_lan" {
             self.sync_web_server();
@@ -2428,13 +2493,7 @@ impl AppUI {
         if let Some(track) = self.queue.current_track() {
             let path = track.filepath.clone();
             if track.duration_seconds <= 0.0 || track.artist.is_empty() {
-                if let Ok(meta) = crate::metadata::extract_metadata(&path) {
-                    crate::library::LibraryManager::append_to_cache(&meta);
-                    self.metadata_cache.insert(path.clone(), meta.clone());
-                    if let Some(cur) = self.queue.current_track_mut() {
-                        *cur = meta;
-                    }
-                }
+                self.start_queue_metadata_fetch();
             }
             if let Some(ref ws) = self.web_server {
                 ws.close_active_streams();
@@ -2474,13 +2533,7 @@ impl AppUI {
         if let Some(track) = self.queue.next_track(&mode) {
             let path = track.filepath.clone();
             if track.duration_seconds <= 0.0 || track.artist.is_empty() {
-                if let Ok(meta) = crate::metadata::extract_metadata(&path) {
-                    crate::library::LibraryManager::append_to_cache(&meta);
-                    self.metadata_cache.insert(path.clone(), meta.clone());
-                    if let Some(cur) = self.queue.current_track_mut() {
-                        *cur = meta;
-                    }
-                }
+                self.start_queue_metadata_fetch();
             }
             if let Some(ref ws) = self.web_server {
                 ws.close_active_streams();
@@ -2523,13 +2576,7 @@ impl AppUI {
         if let Some(track) = self.queue.prev_track() {
             let path = track.filepath.clone();
             if track.duration_seconds <= 0.0 || track.artist.is_empty() {
-                if let Ok(meta) = crate::metadata::extract_metadata(&path) {
-                    crate::library::LibraryManager::append_to_cache(&meta);
-                    self.metadata_cache.insert(path.clone(), meta.clone());
-                    if let Some(cur) = self.queue.current_track_mut() {
-                        *cur = meta;
-                    }
-                }
+                self.start_queue_metadata_fetch();
             }
             if let Some(ref ws) = self.web_server {
                 ws.close_active_streams();
@@ -2691,7 +2738,17 @@ impl AppUI {
     /// Interfaces the web server must listen on right now: the LAN while a DLNA renderer is
     /// active or the user enabled LAN access, otherwise loopback only.
     pub fn required_web_bind(&self) -> crate::web::WebBind {
-        if self.settings_mgr.settings.web_server_lan || self.device_manager.get_active_device().is_some() {
+        let device = self.device_manager.get_active_device();
+        self.web_bind_for_renderer(device.as_ref())
+    }
+
+    /// Interfaces needed while `renderer` (if any) streams from this server. A renderer on this
+    /// computer (loopback address) reaches the server over loopback.
+    fn web_bind_for_renderer(&self, renderer: Option<&crate::discovery::DLNADevice>) -> crate::web::WebBind {
+        let remote_renderer = renderer.is_some_and(|d| {
+            d.host != "localhost" && !d.host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        });
+        if self.settings_mgr.settings.web_server_lan || remote_renderer {
             crate::web::WebBind::Lan
         } else {
             crate::web::WebBind::Loopback
@@ -2751,6 +2808,7 @@ impl AppUI {
         let vol = self.player.volume();
         let current_track = self.queue.current_track().cloned();
 
+        self.player.detach_stream_state();
         let _ = self.player.stop();
         if let Some(ref ws) = self.web_server {
             ws.close_active_streams();
@@ -2758,7 +2816,7 @@ impl AppUI {
         self.device_manager.set_active_device(None);
 
         let backend = self.settings_mgr.settings.player_backend.clone();
-        let mut new_player = LocalPlayer::new(&backend);
+        let mut new_player = spawn_local_player(&backend, vol);
         let _ = new_player.set_volume(vol);
 
         if let Some(track) = current_track {
@@ -2772,21 +2830,29 @@ impl AppUI {
             }
         }
 
-        self.player = Box::new(new_player);
+        retire_player(std::mem::replace(&mut self.player, new_player));
         self.status_message = "Active output: Local Audio".to_string();
         self.sync_web_server();
         self.update_web_state();
     }
 
     pub fn switch_to_upnp_player(&mut self, dev: crate::discovery::DLNADevice) {
+        // Re-selecting the active renderer is a no-op: a new player would queue Play while the
+        // old player's delayed Stop could still reach the same device.
+        if self.device_manager.get_active_device().is_some_and(|d| d.udn == dev.udn) {
+            self.status_message = format!("Active output: {}", dev.friendly_name);
+            return;
+        }
+        let bind = self.web_bind_for_renderer(Some(&dev));
         let port = self
-            .ensure_web_server_bound(crate::web::WebBind::Lan)
+            .ensure_web_server_bound(bind)
             .unwrap_or(self.settings_mgr.settings.web_server_port);
         let was_playing = self.player.is_playing();
         let was_paused = self.player.is_paused();
         let pos = self.player.position_seconds();
         let current_track = self.queue.current_track().cloned();
 
+        self.player.detach_stream_state();
         let _ = self.player.stop();
         if let Some(ref ws) = self.web_server {
             ws.close_active_streams();
@@ -2797,12 +2863,20 @@ impl AppUI {
         self.device_manager.set_active_device(Some(dev.clone()));
 
         let stream_state = self.web_server.as_ref().map(|ws| ws.stream_state());
-        let mut upnp_player = crate::player::upnp::UPnPPlayer::new(dev.clone(), port)
-            .with_stream_state(stream_state);
+        let worker_dev = dev.clone();
+        // Built on the worker thread: UPnPPlayer::new queries the renderer's volume over the network.
         // Do NOT overwrite the remote hardware volume with local software volume!
         // The UPnP device preserves its own hardware volume setting.
+        let mut upnp_player: Box<dyn AudioPlayer> = Box::new(AsyncPlayer::spawn(
+            move || {
+                Box::new(crate::player::upnp::UPnPPlayer::new(worker_dev, port).with_stream_state(stream_state))
+            },
+            // The renderer's volume is unknown until UPnPPlayer::new has queried it. Report 0 rather
+            // than the local volume so a volume key in that window cannot jump the speaker.
+            0,
+        ));
 
-        let mut status = format!("Active output: {}", dev.friendly_name);
+        let status = format!("Active output: {}", dev.friendly_name);
         if let Some(track) = current_track {
             if was_playing || was_paused {
                 if let Some(ref ws) = self.web_server {
@@ -2811,20 +2885,13 @@ impl AppUI {
                 if let Ok(mut s) = self.web_state.write() {
                     s.filepath = Some(track.filepath.clone());
                 }
-                match upnp_player.play_at(&track.filepath, pos) {
-                    Ok(_) => {
-                        if was_paused {
-                            let _ = upnp_player.pause();
-                        }
-                    }
-                    Err(e) => {
-                        status = format!("Connected to {}, but play failed: {}", dev.friendly_name, e);
-                    }
+                if upnp_player.play_at(&track.filepath, pos).is_ok() && was_paused {
+                    let _ = upnp_player.pause();
                 }
             }
         }
 
-        self.player = Box::new(upnp_player);
+        retire_player(std::mem::replace(&mut self.player, upnp_player));
         self.status_message = status;
         self.update_web_state();
     }
@@ -2948,27 +3015,17 @@ impl AppUI {
                 }
                 crate::web::WebCommand::AddFile(path) => {
                     if path.exists() && crate::metadata::is_supported_audio_file(&path) {
-                        let meta_opt = self.metadata_cache.get(&path).cloned()
-                            .or_else(|| {
-                                if let Ok(m) = crate::metadata::extract_metadata(&path) {
-                                    self.metadata_cache.insert(path.clone(), m.clone());
-                                    Some(m)
-                                } else {
-                                    None
-                                }
-                            })
-                            .or_else(|| Some(crate::metadata::fallback_metadata(&path)));
-                        if let Some(meta) = meta_opt {
-                            let title = meta.display_title().to_string();
-                            self.register_stream_file(&meta.filepath);
-                            self.queue.add_track(meta);
-                            self.status_message = format!("Added to queue (web): {}", title);
-                            self.update_web_state();
-                        }
+                        let meta = self.quick_metadata(&path);
+                        let title = meta.display_title().to_string();
+                        self.enqueue_tracks(vec![meta]);
+                        self.status_message = format!("Added to queue (web): {}", title);
+                        self.update_web_state();
                     }
                 }
                 crate::web::WebCommand::AddFolder(path) => {
-                    if path.is_dir() {
+                    // Listing a folder on a network share can be slow: do it off the UI thread.
+                    let tx = self.queue_add_tx.clone();
+                    std::thread::spawn(move || {
                         if let Ok(entries) = std::fs::read_dir(&path) {
                             let mut files: Vec<std::path::PathBuf> = entries
                                 .filter_map(|e| e.ok())
@@ -2976,28 +3033,10 @@ impl AppUI {
                                 .filter(|p| crate::metadata::is_supported_audio_file(p))
                                 .collect();
                             files.sort();
-                            let mut added = 0;
-                            for file_path in files {
-                                let meta_opt = self.metadata_cache.get(&file_path).cloned()
-                                    .or_else(|| {
-                                        if let Ok(m) = crate::metadata::extract_metadata(&file_path) {
-                                            self.metadata_cache.insert(file_path.clone(), m.clone());
-                                            Some(m)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .or_else(|| Some(crate::metadata::fallback_metadata(&file_path)));
-                                if let Some(meta) = meta_opt {
-                                    self.register_stream_file(&meta.filepath);
-                                    self.queue.add_track(meta);
-                                    added += 1;
-                                }
-                            }
-                            self.status_message = format!("Added {} tracks (web)", added);
-                            self.update_web_state();
+                            let tracks = files.iter().map(|p| crate::metadata::fallback_metadata(p)).collect();
+                            let _ = tx.send(tracks);
                         }
-                    }
+                    });
                 }
                 crate::web::WebCommand::SelectDevice(id) => {
                     let devices = self.device_manager.get_devices();

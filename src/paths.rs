@@ -105,7 +105,7 @@ pub fn get_music_index_path() -> PathBuf {
 
 /// Get path to the application log file (quickstream.log).
 pub fn get_log_path() -> PathBuf {
-    get_cache_dir().join("quickstream.log")
+    get_data_dir().join("quickstream.log")
 }
 
 #[cfg(test)]
@@ -128,5 +128,6 @@ mod tests {
     fn test_log_path_resolution() {
         let path = get_log_path();
         assert!(path.ends_with("quickstream.log"));
+        assert_eq!(path.parent(), Some(get_data_dir().as_path()));
     }
 }

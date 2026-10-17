@@ -5,6 +5,7 @@ pub mod harmonic;
 pub mod bpm;
 pub mod mixer;
 pub mod online;
+pub mod worker;
 
 pub use db::{AnalysisDatabase, TrackFeatures};
 pub use harmonic::{CamelotKey, MusicalKey};
