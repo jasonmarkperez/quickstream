@@ -607,7 +607,11 @@ impl AppUI {
         match purpose {
             NamePurpose::Rename { old } => {
                 self.follow_last_playlist(&old, Some(&name));
-                self.status_message = format!("Renamed \"{}\" to \"{}\"", old, name);
+                self.status_message = if old == name {
+                    "Name unchanged".to_string()
+                } else {
+                    format!("Renamed \"{}\" to \"{}\"", old, name)
+                };
             }
             NamePurpose::Create | NamePurpose::CreateAndAdd(_) => {
                 self.playlists.track_cursor = 0;

@@ -277,6 +277,11 @@ impl PlaylistStore {
         {
             return Err(StoreError::Name(NameError::Duplicate(other.name.clone())));
         }
+        // Naming a playlist what it is already called changes nothing, so no reserved name or
+        // file system quirk can make it fail.
+        if self.playlists[slot].name == new_name {
+            return Ok(new_name);
+        }
         // A case-only rename keeps the playlist's own file, so only a different name can land
         // on a skipped file.
         if !names_equal(&self.playlists[slot].name, &new_name) {
@@ -288,9 +293,6 @@ impl PlaylistStore {
             return Err(StoreError::Name(NameError::Duplicate(r.clone())));
         }
         let new_path = self.file_for(&new_name)?;
-        if self.playlists[slot].name == new_name {
-            return Ok(new_name);
-        }
         self.playlists[slot].name = new_name.clone();
         let bytes = self.playlists[slot].to_m3u8().into_bytes();
         sort_by_name(&mut self.playlists);

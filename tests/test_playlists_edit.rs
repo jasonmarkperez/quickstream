@@ -561,3 +561,22 @@ fn test_delete_clears_last_playlist() {
     drop(app);
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_rename_to_the_same_name_says_name_unchanged() {
+    common::isolate();
+    let (mut app, temp_dir) = app_on_playlists_tab("rename_same");
+    seed(&mut app, "Alpha", &[]);
+    app.playlists.list_cursor = 0;
+
+    // Enter on the prefilled name submits it unchanged.
+    press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT);
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+    assert!(app.playlists.modal.is_none());
+    assert_eq!(app.status_message, "Name unchanged");
+    assert_eq!(playlist_names(&app), vec!["Alpha"]);
+
+    drop(app);
+    let _ = fs::remove_dir_all(&temp_dir);
+}

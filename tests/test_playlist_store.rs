@@ -625,3 +625,18 @@ fn test_unreadable_file_is_skipped_and_never_rewritten() {
     assert_eq!(fs::read_to_string(&locked).unwrap(), text);
     assert_eq!(file_names(&dir), vec!["Fresh.m3u8", "Locked.m3u8"]);
 }
+
+#[test]
+fn test_rename_to_the_unchanged_name_is_ok_even_when_that_name_is_reserved() {
+    common::isolate();
+    let dir = scratch("rename_unchanged_reserved");
+    let (worker, mut store) = open_store(&dir);
+    store.create("Mix").unwrap();
+    assert!(worker.flush());
+    // A skipped file with the same bytes (a case-sensitive disk) must not turn a no-op into an error.
+    store.reserve_names(vec!["Mix".to_string()]);
+
+    assert_eq!(store.rename("Mix", "Mix"), Ok("Mix".to_string()));
+    assert!(worker.flush());
+    assert_eq!(file_names(&dir), vec!["Mix.m3u8"]);
+}
