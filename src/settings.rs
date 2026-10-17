@@ -27,6 +27,10 @@ pub struct Settings {
     pub default_mix_profile: String,
     #[serde(default)]
     pub online_enrichment: bool,
+    /// Let other devices on the network reach the web remote. DLNA renderers get LAN access
+    /// while active regardless of this setting.
+    #[serde(default)]
+    pub web_server_lan: bool,
 }
 
 fn default_web_port() -> u16 {
@@ -57,6 +61,7 @@ impl Default for Settings {
             gapless_autopilot: true,
             default_mix_profile: "diverse".to_string(),
             online_enrichment: false,
+            web_server_lan: false,
         }
     }
 }
@@ -134,6 +139,11 @@ pub const SETTING_DEFINITIONS: &[SettingDefinition] = &[
         key: "online_enrichment",
         label: "Online Tag Enrichment",
         description: "Fetch community genre tags and similarity graphs from Last.fm (cached locally, library read-only).",
+    },
+    SettingDefinition {
+        key: "web_server_lan",
+        label: "Web Remote Access",
+        description: "Allow phones and other devices on your network to open the web remote. DLNA speakers always get network access while active.",
     },
 ];
 
@@ -308,6 +318,10 @@ impl SettingsManager {
                 // online_enrichment
                 self.settings.online_enrichment = !self.settings.online_enrichment;
             }
+            11 => {
+                // web_server_lan
+                self.settings.web_server_lan = !self.settings.web_server_lan;
+            }
             _ => {}
         }
         self.save();
@@ -327,8 +341,12 @@ impl SettingsManager {
             }.to_string(),
             5 => if self.settings.force_transcode { "Force 16-bit PCM WAV" } else { "Direct Stream (Auto)" }.to_string(),
             6 => if self.settings.web_server_enabled {
-                let ip = crate::discovery::get_local_ip_for_target("8.8.8.8", 80);
-                if ip != "127.0.0.1" {
+                let ip = if self.settings.web_server_lan {
+                    crate::discovery::get_local_ip_for_target("8.8.8.8", 80)
+                } else {
+                    "127.0.0.1".to_string()
+                };
+                if ip != "127.0.0.1" || !self.settings.web_server_lan {
                     format!("Enabled (http://{}:{})", ip, self.settings.web_server_port)
                 } else {
                     format!("Enabled (Port {})", self.settings.web_server_port)
@@ -362,6 +380,7 @@ impl SettingsManager {
                 other => other,
             }.to_string(),
             10 => if self.settings.online_enrichment { "Enabled (Last.fm Cache)" } else { "Disabled (Local Analysis Only)" }.to_string(),
+            11 => if self.settings.web_server_lan { "Any device on your network" } else { "This computer only" }.to_string(),
             _ => String::new(),
         }
     }
@@ -403,6 +422,27 @@ mod tests {
         assert_eq!(loaded.home_dir, Some("/custom/home".to_string()));
         assert!(!loaded.gapless_autopilot);
 
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_web_server_lan_defaults_off_and_toggles() {
+        assert!(!Settings::default().web_server_lan);
+        let legacy: Settings = serde_json::from_str(
+            r#"{"metadata_view":true,"default_device":"local-audio","seek_step_seconds":10.0,"volume_step":5,"queue_mode":"loop","force_transcode":false,"player_backend":"mpv"}"#,
+        )
+        .unwrap();
+        assert!(!legacy.web_server_lan, "configs saved before this setting existed stay loopback-only");
+
+        let temp_dir = env::temp_dir().join(format!("quickstream_test_lan_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let mut mgr = SettingsManager::with_path(temp_dir.join("test_config.json"));
+        let idx = SETTING_DEFINITIONS.iter().position(|d| d.key == "web_server_lan").expect("setting row");
+        mgr.cycle_setting(idx, true);
+        assert!(mgr.settings.web_server_lan);
+        assert!(mgr.get_display_value(idx).contains("network"));
+        mgr.cycle_setting(idx, true);
+        assert!(!mgr.settings.web_server_lan);
         let _ = fs::remove_dir_all(&temp_dir);
     }
 

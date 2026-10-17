@@ -311,9 +311,21 @@ impl Drop for SocketGuard {
     }
 }
 
+/// Network interfaces the web server listens on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebBind {
+    /// 127.0.0.1 only: reachable from this computer.
+    Loopback,
+    /// All interfaces: reachable from other devices on the network. Needed while a DLNA
+    /// renderer streams from this server.
+    Lan,
+}
+
 /// Handle to the background web server process.
 pub struct WebServerHandle {
     pub port: u16,
+    /// Interfaces the server actually bound to.
+    pub bind: WebBind,
     stop_flag: Arc<AtomicBool>,
     stream_state: Arc<StreamServerState>,
     join_handle: Option<std::thread::JoinHandle<()>>,
@@ -354,17 +366,28 @@ impl Drop for WebServerHandle {
 pub struct WebServer;
 
 impl WebServer {
-    /// Start the local web server on the requested port (or fallback to an available port).
+    /// Start the local web server on loopback on the requested port (or fallback to an available port).
     pub fn start(
         port: u16,
         state: Arc<RwLock<NowPlayingState>>,
         cmd_tx: mpsc::Sender<WebCommand>,
     ) -> anyhow::Result<WebServerHandle> {
-        Self::start_with_stream_state(port, state, cmd_tx, Arc::new(StreamServerState::new()))
+        Self::start_with_bind(WebBind::Loopback, port, state, cmd_tx)
+    }
+
+    /// Start the local web server on the given interfaces.
+    pub fn start_with_bind(
+        bind: WebBind,
+        port: u16,
+        state: Arc<RwLock<NowPlayingState>>,
+        cmd_tx: mpsc::Sender<WebCommand>,
+    ) -> anyhow::Result<WebServerHandle> {
+        Self::start_with_stream_state(bind, port, state, cmd_tx, Arc::new(StreamServerState::new()))
     }
 
     /// Start the local web server sharing an existing StreamServerState.
     pub fn start_with_stream_state(
+        bind: WebBind,
         port: u16,
         state: Arc<RwLock<NowPlayingState>>,
         cmd_tx: mpsc::Sender<WebCommand>,
@@ -372,18 +395,23 @@ impl WebServer {
     ) -> anyhow::Result<WebServerHandle> {
         let candidate_ports = [port, 8080, 8090, 8091, 0];
         let mut listener_opt = None;
+        // Never fall back to the other interface: if another app holds *:port, binding
+        // 127.0.0.1:port still succeeds on macOS, and renderers' LAN requests would reach
+        // that other app. Move to the next candidate port instead.
+        let host = match bind {
+            WebBind::Lan => "0.0.0.0",
+            WebBind::Loopback => "127.0.0.1",
+        };
         for &p in &candidate_ports {
-            if let Ok(l) = TcpListener::bind(format!("0.0.0.0:{}", p)) {
-                listener_opt = Some(l);
-                break;
-            }
-            if let Ok(l) = TcpListener::bind(format!("127.0.0.1:{}", p)) {
+            if let Ok(l) = TcpListener::bind(format!("{}:{}", host, p)) {
                 listener_opt = Some(l);
                 break;
             }
         }
         let listener = listener_opt.ok_or_else(|| anyhow::anyhow!("Failed to bind web server to any port"))?;
+        let actual_bind = bind;
         let actual_port = listener.local_addr()?.port();
+        crate::log_info!("web", "Web server listening on {}", listener.local_addr()?);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_thread = stop_flag.clone();
         let stream_state_thread = stream_state.clone();
@@ -419,6 +447,7 @@ impl WebServer {
 
         Ok(WebServerHandle {
             port: actual_port,
+            bind: actual_bind,
             stop_flag,
             stream_state,
             join_handle: Some(join_handle),

@@ -205,13 +205,20 @@ impl AppUI {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         let backend = settings_mgr.settings.player_backend.clone();
         let bookmarks = Self::load_bookmarks();
+        // Discovery starts in run(): SSDP opens a socket on all interfaces, which tests that
+        // only construct the app should not do (macOS firewall prompts).
         let device_manager = DeviceManager::new();
-        device_manager.start_background_scan();
 
         let web_state = std::sync::Arc::new(std::sync::RwLock::new(crate::web::NowPlayingState::default()));
         let (web_server, web_cmd_rx) = if settings_mgr.settings.web_server_enabled {
             let (tx, rx) = std::sync::mpsc::channel();
-            match crate::web::WebServer::start(
+            let bind = if settings_mgr.settings.web_server_lan {
+                crate::web::WebBind::Lan
+            } else {
+                crate::web::WebBind::Loopback
+            };
+            match crate::web::WebServer::start_with_bind(
+                bind,
                 settings_mgr.settings.web_server_port,
                 web_state.clone(),
                 tx,
@@ -1318,6 +1325,7 @@ impl AppUI {
     }
 
     pub fn run(&mut self) -> anyhow::Result<()> {
+        self.device_manager.start_background_scan();
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
@@ -2460,7 +2468,7 @@ impl AppUI {
                 let _ = new_player.set_volume(volume);
                 retire_player(std::mem::replace(&mut self.player, new_player));
             }
-        } else if self.settings_cursor == 6 {
+        } else if self.settings_cursor == 6 || SETTING_DEFINITIONS[self.settings_cursor].key == "web_server_lan" {
             self.sync_web_server();
         } else if self.settings_cursor == 7 {
             self.update_web_state();
@@ -2727,13 +2735,49 @@ impl AppUI {
         self.queue.current_track().map(|t| t.filepath.clone())
     }
 
-    pub fn ensure_web_server_started(&mut self) -> u16 {
-        if let Some(ref handle) = self.web_server {
-            return handle.port;
+    /// Interfaces the web server must listen on right now: the LAN while a DLNA renderer is
+    /// active or the user enabled LAN access, otherwise loopback only.
+    pub fn required_web_bind(&self) -> crate::web::WebBind {
+        let device = self.device_manager.get_active_device();
+        self.web_bind_for_renderer(device.as_ref())
+    }
+
+    /// Interfaces needed while `renderer` (if any) streams from this server. A renderer on this
+    /// computer (loopback address) reaches the server over loopback.
+    fn web_bind_for_renderer(&self, renderer: Option<&crate::discovery::DLNADevice>) -> crate::web::WebBind {
+        let remote_renderer = renderer.is_some_and(|d| {
+            d.host != "localhost" && !d.host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        });
+        if self.settings_mgr.settings.web_server_lan || remote_renderer {
+            crate::web::WebBind::Lan
+        } else {
+            crate::web::WebBind::Loopback
         }
+    }
+
+    pub fn ensure_web_server_started(&mut self) -> u16 {
+        let bind = self.required_web_bind();
+        self.ensure_web_server_bound(bind).unwrap_or(self.settings_mgr.settings.web_server_port)
+    }
+
+    /// Make sure the web server is running on `bind`, restarting it if it is bound differently.
+    fn ensure_web_server_bound(&mut self, bind: crate::web::WebBind) -> anyhow::Result<u16> {
+        if let Some(ref handle) = self.web_server {
+            if handle.bind == bind {
+                return Ok(handle.port);
+            }
+        }
+        // Reuse the running server's port so open web remotes reconnect to the same address.
+        let port = match self.web_server.take() {
+            Some(old) => {
+                let port = old.port;
+                old.stop();
+                port
+            }
+            None => self.settings_mgr.settings.web_server_port,
+        };
         let (tx, rx) = std::sync::mpsc::channel();
-        let port = self.settings_mgr.settings.web_server_port;
-        match crate::web::WebServer::start(port, self.web_state.clone(), tx) {
+        match crate::web::WebServer::start_with_bind(bind, port, self.web_state.clone(), tx) {
             Ok(handle) => {
                 let actual_port = handle.port;
                 for track in &self.queue.tracks {
@@ -2741,11 +2785,12 @@ impl AppUI {
                 }
                 self.web_server = Some(handle);
                 self.web_cmd_rx = Some(rx);
-                actual_port
+                Ok(actual_port)
             }
             Err(e) => {
                 crate::log_info!("ui", "Failed to start streaming server: {}", e);
-                port
+                self.web_cmd_rx = None;
+                Err(e)
             }
         }
     }
@@ -2798,7 +2843,10 @@ impl AppUI {
             self.status_message = format!("Active output: {}", dev.friendly_name);
             return;
         }
-        let port = self.ensure_web_server_started();
+        let bind = self.web_bind_for_renderer(Some(&dev));
+        let port = self
+            .ensure_web_server_bound(bind)
+            .unwrap_or(self.settings_mgr.settings.web_server_port);
         let was_playing = self.player.is_playing();
         let was_paused = self.player.is_paused();
         let pos = self.player.position_seconds();
@@ -2853,24 +2901,20 @@ impl AppUI {
             || self.device_manager.get_active_device().is_some();
 
         if needs_server {
-            if self.web_server.is_none() {
-                let (tx, rx) = std::sync::mpsc::channel();
-                match crate::web::WebServer::start(
-                    self.settings_mgr.settings.web_server_port,
-                    self.web_state.clone(),
-                    tx,
-                ) {
-                    Ok(handle) => {
-                        self.status_message = format!("Started server on port {}", handle.port);
-                        for track in &self.queue.tracks {
-                            handle.register_stream_file(&track.filepath);
-                        }
-                        self.web_server = Some(handle);
-                        self.web_cmd_rx = Some(rx);
+            let bind = self.required_web_bind();
+            let was_running = self.web_server.is_some();
+            let already_bound = self.web_server.as_ref().is_some_and(|h| h.bind == bind);
+            if !already_bound {
+                match self.ensure_web_server_bound(bind) {
+                    // A rebind (e.g. after switching output) keeps the caller's status message.
+                    Ok(port) if !was_running => {
+                        self.status_message = format!("Started server on port {}", port);
                     }
+                    Ok(_) => {}
                     Err(e) => {
                         self.status_message = format!("Failed to start server: {}", e);
-                        if self.settings_mgr.settings.web_server_enabled {
+                        // Only a failed cold start turns the setting off; a failed rebind may be transient.
+                        if !was_running && self.settings_mgr.settings.web_server_enabled {
                             self.settings_mgr.settings.web_server_enabled = false;
                             self.settings_mgr.save();
                         }

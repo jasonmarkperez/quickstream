@@ -579,10 +579,28 @@ fn test_web_server_status_api_with_queue_and_devices() {
 }
 
 #[test]
-fn test_web_server_stops_when_another_listener_shadows_its_loopback_port() {
+fn test_web_server_defaults_to_loopback_bind() {
+    use quickstream::web::WebBind;
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
     let (tx, _rx) = mpsc::channel();
     let handle = WebServer::start(0, state, tx).expect("start web server");
+    assert_eq!(handle.bind, WebBind::Loopback);
+
+    // Not reachable on the machine's network address.
+    let lan_ip = quickstream::discovery::get_local_ip_for_target("8.8.8.8", 80);
+    if lan_ip != "127.0.0.1" {
+        let addr: std::net::SocketAddr = format!("{}:{}", lan_ip, handle.port).parse().unwrap();
+        assert!(TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_err());
+    }
+    handle.stop();
+}
+
+#[test]
+#[ignore = "binds all network interfaces (macOS firewall prompt); run with --include-ignored"]
+fn test_web_server_stops_when_another_listener_shadows_its_loopback_port() {
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start_with_bind(quickstream::web::WebBind::Lan, 0, state, tx).expect("start web server");
     // Another server in the process (or another app) holds 127.0.0.1 on the same port, so a
     // wake-up connection to 127.0.0.1:port reaches it instead of this server.
     let shadow = std::net::TcpListener::bind(("127.0.0.1", handle.port)).expect("shadow listener");
