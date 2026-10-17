@@ -173,7 +173,8 @@ fn test_ffplay_play_at_reports_requested_position() {
 fn recording_fake_mpv(dir: &std::path::Path, log: &std::path::Path) -> PathBuf {
     let script = dir.join("fake-mpv");
     let body = format!(
-        r#"#!/usr/bin/env python3 -I
+        r#"#!/usr/bin/env python3
+# (no extra shebang arguments: Linux passes "python3 -I" to env as one word)
 import json, os, socket, sys
 sock = next(a.split("=", 1)[1] for a in sys.argv if a.startswith("--input-ipc-server="))
 srv = socket.socket(socket.AF_UNIX)
