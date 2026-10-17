@@ -316,17 +316,17 @@ Quickstream provides a versatile command-line interface:
 Usage: quickstream [OPTIONS] [PATHS]...
 
 Arguments:
-  [PATHS]...  Audio files or directories to load on startup
+  [PATHS]...  Audio files or directories to load
 
 Options:
-      --info <INFO>          Inspect audio metadata tags and exit
-  -s, --search               Launch directly into Skim interactive fuzzy finder mode
-      --scan                 Scan local network for DLNA / UPnP MediaRenderers
-      --web                  Launch local Now Playing web server (HTTP metadata, cover art & remote control)
-      --web-port <WEB_PORT>  Port for Now Playing web server (default: 8080)
-      --set-home <SET_HOME>  Set persistent startup home directory and exit (use "default" or "none" to clear)
-  -h, --help                 Print help
-  -V, --version              Print version
+      --info <INFO>              Inspect audio metadata tags and exit
+      --scan                     Scan local network for DLNA / UPnP MediaRenderers
+      --web                      Launch local Now Playing web server (HTTP metadata, cover art & remote control)
+      --web-port <WEB_PORT>      Port for Now Playing web server (default: 8080)
+      --set-home <SET_HOME>      Set persistent startup home directory and exit (use "default" or "none" to clear)
+  -a, --autopilot [<AUTOPILOT>]  Autopilot mode: recursively discover all audio tracks, build random queue, and start playing immediately
+  -h, --help                     Print help
+  -V, --version                  Print version
 ```
 
 ### Command Examples
@@ -379,9 +379,6 @@ quickstream --info "01 - Starlight.flac"
 # Sample Rate: 44100 Hz
 # Channels:    2
 # Size:        29.40 MB
-
-# 10. Launch directly into Skim interactive fuzzy finder mode
-quickstream -s ~/Music
 ```
 
 ---

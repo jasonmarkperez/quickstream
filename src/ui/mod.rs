@@ -1,4 +1,4 @@
-//! Interactive Terminal User Interface (Ratatui + Crossterm + Skim integration).
+//! Interactive Terminal User Interface (Ratatui + Crossterm).
 
 use std::io;
 use std::path::{Path, PathBuf};
