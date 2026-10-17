@@ -164,6 +164,18 @@ impl DjMixer {
         features_db: &AnalysisDatabase,
         target_limit: usize,
     ) -> Vec<AudioMetadata> {
+        Self::sequence_mix_after(None, candidates, features_db, target_limit)
+    }
+
+    /// Sequence `candidates` to follow `already_queued` (a track already sent to the queue), so
+    /// artist/album spacing and BPM/key transitions account for it. The returned list does not
+    /// include `already_queued`.
+    pub fn sequence_mix_after(
+        already_queued: Option<&AudioMetadata>,
+        candidates: Vec<AudioMetadata>,
+        features_db: &AnalysisDatabase,
+        target_limit: usize,
+    ) -> Vec<AudioMetadata> {
         if candidates.is_empty() {
             return Vec::new();
         }
@@ -184,8 +196,18 @@ impl DjMixer {
         let mut sequenced: Vec<AudioMetadata> = Vec::new();
         let mut recent_artists: Vec<String> = Vec::new();
         let mut recent_albums: Vec<String> = Vec::new();
+        if let Some(first) = already_queued {
+            if !first.artist.is_empty() {
+                recent_artists.push(first.artist.clone());
+            }
+            if !first.album.is_empty() {
+                recent_albums.push(first.album.clone());
+            }
+            sequenced.push(first.clone());
+        }
+        let skip = sequenced.len();
 
-        while !track_items.is_empty() && sequenced.len() < target_limit {
+        while !track_items.is_empty() && sequenced.len() - skip < target_limit {
             let last_bpm = sequenced
                 .last()
                 .and_then(|m| features_db.get_track(&m.filepath))
@@ -278,7 +300,7 @@ impl DjMixer {
             sequenced.push(chosen_meta);
         }
 
-        sequenced
+        sequenced.split_off(skip)
     }
 }
 
