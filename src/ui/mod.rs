@@ -138,7 +138,13 @@ impl AppUI {
         let web_state = std::sync::Arc::new(std::sync::RwLock::new(crate::web::NowPlayingState::default()));
         let (web_server, web_cmd_rx) = if settings_mgr.settings.web_server_enabled {
             let (tx, rx) = std::sync::mpsc::channel();
-            match crate::web::WebServer::start(
+            let bind = if settings_mgr.settings.web_server_lan {
+                crate::web::WebBind::Lan
+            } else {
+                crate::web::WebBind::Loopback
+            };
+            match crate::web::WebServer::start_with_bind(
+                bind,
                 settings_mgr.settings.web_server_port,
                 web_state.clone(),
                 tx,
@@ -2395,7 +2401,7 @@ impl AppUI {
             if self.device_manager.get_active_device().is_none() {
                 self.player = Box::new(LocalPlayer::new(&backend));
             }
-        } else if self.settings_cursor == 6 {
+        } else if self.settings_cursor == 6 || SETTING_DEFINITIONS[self.settings_cursor].key == "web_server_lan" {
             self.sync_web_server();
         } else if self.settings_cursor == 7 {
             self.update_web_state();
@@ -2680,13 +2686,39 @@ impl AppUI {
         self.queue.current_track().map(|t| t.filepath.clone())
     }
 
-    pub fn ensure_web_server_started(&mut self) -> u16 {
-        if let Some(ref handle) = self.web_server {
-            return handle.port;
+    /// Interfaces the web server must listen on right now: the LAN while a DLNA renderer is
+    /// active or the user enabled LAN access, otherwise loopback only.
+    pub fn required_web_bind(&self) -> crate::web::WebBind {
+        if self.settings_mgr.settings.web_server_lan || self.device_manager.get_active_device().is_some() {
+            crate::web::WebBind::Lan
+        } else {
+            crate::web::WebBind::Loopback
         }
+    }
+
+    pub fn ensure_web_server_started(&mut self) -> u16 {
+        let bind = self.required_web_bind();
+        self.ensure_web_server_bound(bind).unwrap_or(self.settings_mgr.settings.web_server_port)
+    }
+
+    /// Make sure the web server is running on `bind`, restarting it if it is bound differently.
+    fn ensure_web_server_bound(&mut self, bind: crate::web::WebBind) -> anyhow::Result<u16> {
+        if let Some(ref handle) = self.web_server {
+            if handle.bind == bind {
+                return Ok(handle.port);
+            }
+        }
+        // Reuse the running server's port so open web remotes reconnect to the same address.
+        let port = match self.web_server.take() {
+            Some(old) => {
+                let port = old.port;
+                old.stop();
+                port
+            }
+            None => self.settings_mgr.settings.web_server_port,
+        };
         let (tx, rx) = std::sync::mpsc::channel();
-        let port = self.settings_mgr.settings.web_server_port;
-        match crate::web::WebServer::start(port, self.web_state.clone(), tx) {
+        match crate::web::WebServer::start_with_bind(bind, port, self.web_state.clone(), tx) {
             Ok(handle) => {
                 let actual_port = handle.port;
                 for track in &self.queue.tracks {
@@ -2694,11 +2726,12 @@ impl AppUI {
                 }
                 self.web_server = Some(handle);
                 self.web_cmd_rx = Some(rx);
-                actual_port
+                Ok(actual_port)
             }
             Err(e) => {
                 crate::log_info!("ui", "Failed to start streaming server: {}", e);
-                port
+                self.web_cmd_rx = None;
+                Err(e)
             }
         }
     }
@@ -2744,7 +2777,9 @@ impl AppUI {
     }
 
     pub fn switch_to_upnp_player(&mut self, dev: crate::discovery::DLNADevice) {
-        let port = self.ensure_web_server_started();
+        let port = self
+            .ensure_web_server_bound(crate::web::WebBind::Lan)
+            .unwrap_or(self.settings_mgr.settings.web_server_port);
         let was_playing = self.player.is_playing();
         let was_paused = self.player.is_paused();
         let pos = self.player.position_seconds();
@@ -2797,20 +2832,12 @@ impl AppUI {
             || self.device_manager.get_active_device().is_some();
 
         if needs_server {
-            if self.web_server.is_none() {
-                let (tx, rx) = std::sync::mpsc::channel();
-                match crate::web::WebServer::start(
-                    self.settings_mgr.settings.web_server_port,
-                    self.web_state.clone(),
-                    tx,
-                ) {
-                    Ok(handle) => {
-                        self.status_message = format!("Started server on port {}", handle.port);
-                        for track in &self.queue.tracks {
-                            handle.register_stream_file(&track.filepath);
-                        }
-                        self.web_server = Some(handle);
-                        self.web_cmd_rx = Some(rx);
+            let bind = self.required_web_bind();
+            let already_running = self.web_server.as_ref().is_some_and(|h| h.bind == bind);
+            if !already_running {
+                match self.ensure_web_server_bound(bind) {
+                    Ok(port) => {
+                        self.status_message = format!("Started server on port {}", port);
                     }
                     Err(e) => {
                         self.status_message = format!("Failed to start server: {}", e);

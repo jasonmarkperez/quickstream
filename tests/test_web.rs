@@ -577,3 +577,20 @@ fn test_web_server_status_api_with_queue_and_devices() {
 
     handle.stop();
 }
+
+#[test]
+fn test_web_server_defaults_to_loopback_bind() {
+    use quickstream::web::WebBind;
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state, tx).expect("start web server");
+    assert_eq!(handle.bind, WebBind::Loopback);
+
+    // Not reachable on the machine's network address.
+    let lan_ip = quickstream::discovery::get_local_ip_for_target("8.8.8.8", 80);
+    if lan_ip != "127.0.0.1" {
+        let addr: std::net::SocketAddr = format!("{}:{}", lan_ip, handle.port).parse().unwrap();
+        assert!(TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_err());
+    }
+    handle.stop();
+}
