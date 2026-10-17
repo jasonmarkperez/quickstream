@@ -75,7 +75,12 @@ fn spawn_mock_upnp_renderer() -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<
         while !stop_flag_thread.load(Ordering::SeqCst) {
             listener.set_nonblocking(true).expect("set nonblocking");
             let stream_opt = match listener.accept() {
-                Ok((s, _)) => Some(s),
+                Ok((s, _)) => {
+                    // On macOS/BSD an accepted socket inherits the listener's non-blocking
+                    // mode; reads must wait for the client's request instead of failing.
+                    s.set_nonblocking(false).expect("set blocking");
+                    Some(s)
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(15));
                     continue;
@@ -285,7 +290,12 @@ fn test_upnp_player_seek_mode_not_supported_fallback() {
         while !stop_flag_thread.load(Ordering::SeqCst) {
             listener.set_nonblocking(true).expect("set nonblocking");
             let stream_opt = match listener.accept() {
-                Ok((s, _)) => Some(s),
+                Ok((s, _)) => {
+                    // On macOS/BSD an accepted socket inherits the listener's non-blocking
+                    // mode; reads must wait for the client's request instead of failing.
+                    s.set_nonblocking(false).expect("set blocking");
+                    Some(s)
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(15));
                     continue;
@@ -425,7 +435,12 @@ fn test_upnp_player_pause_resume_after_seek() {
         while !stop_flag_thread.load(Ordering::SeqCst) {
             listener.set_nonblocking(true).expect("set nonblocking");
             let stream_opt = match listener.accept() {
-                Ok((s, _)) => Some(s),
+                Ok((s, _)) => {
+                    // On macOS/BSD an accepted socket inherits the listener's non-blocking
+                    // mode; reads must wait for the client's request instead of failing.
+                    s.set_nonblocking(false).expect("set blocking");
+                    Some(s)
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(15));
                     continue;
@@ -649,7 +664,12 @@ fn test_upnp_player_auto_advance_when_renderer_resets_rel_time_on_stop() {
         while !stop_flag_thread.load(Ordering::SeqCst) {
             listener.set_nonblocking(true).expect("set nonblocking");
             let stream_opt = match listener.accept() {
-                Ok((s, _)) => Some(s),
+                Ok((s, _)) => {
+                    // On macOS/BSD an accepted socket inherits the listener's non-blocking
+                    // mode; reads must wait for the client's request instead of failing.
+                    s.set_nonblocking(false).expect("set blocking");
+                    Some(s)
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(15));
                     continue;
@@ -797,7 +817,12 @@ fn test_upnp_player_stopped_early_does_not_auto_advance() {
         while !stop_flag_thread.load(Ordering::SeqCst) {
             listener.set_nonblocking(true).expect("set nonblocking");
             let stream_opt = match listener.accept() {
-                Ok((s, _)) => Some(s),
+                Ok((s, _)) => {
+                    // On macOS/BSD an accepted socket inherits the listener's non-blocking
+                    // mode; reads must wait for the client's request instead of failing.
+                    s.set_nonblocking(false).expect("set blocking");
+                    Some(s)
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(15));
                     continue;
@@ -925,7 +950,12 @@ fn test_upnp_client_play_retries_on_action_failed() {
         while !stop_flag_thread.load(Ordering::SeqCst) {
             listener.set_nonblocking(true).expect("set nonblocking");
             let stream_opt = match listener.accept() {
-                Ok((s, _)) => Some(s),
+                Ok((s, _)) => {
+                    // On macOS/BSD an accepted socket inherits the listener's non-blocking
+                    // mode; reads must wait for the client's request instead of failing.
+                    s.set_nonblocking(false).expect("set blocking");
+                    Some(s)
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(15));
                     continue;
@@ -1036,7 +1066,12 @@ fn test_upnp_player_play_at_starts_directly_with_pos_offset() {
         while !stop_flag_thread.load(Ordering::SeqCst) {
             listener.set_nonblocking(true).expect("set nonblocking");
             let stream_opt = match listener.accept() {
-                Ok((s, _)) => Some(s),
+                Ok((s, _)) => {
+                    // On macOS/BSD an accepted socket inherits the listener's non-blocking
+                    // mode; reads must wait for the client's request instead of failing.
+                    s.set_nonblocking(false).expect("set blocking");
+                    Some(s)
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(15));
                     continue;
