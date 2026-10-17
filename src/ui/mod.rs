@@ -13,8 +13,10 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 pub mod search;
+pub mod workers;
 
 use self::search::SearchModalState;
+use self::workers::WorkerRegistry;
 use crate::discovery::DeviceManager;
 use crate::metadata::is_supported_audio_file;
 use crate::paths;
@@ -61,16 +63,20 @@ fn spawn_local_player(backend: &str, initial_volume: u8) -> Box<dyn AudioPlayer>
 }
 
 /// Start 4 threads that read tags for paths sent to the returned inbox and report results on
-/// `metadata_tx`. The threads exit once the inbox sender is dropped.
+/// `metadata_tx`. The threads exit once the inbox sender is dropped or `stop` is set (paths still
+/// queued in the inbox are then skipped).
 fn spawn_queue_metadata_workers(
+    workers: &mut WorkerRegistry,
     metadata_tx: std::sync::mpsc::Sender<crate::metadata::AudioMetadata>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::sync::mpsc::Sender<PathBuf> {
     let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
     let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
     for _ in 0..4 {
         let rx = rx.clone();
         let metadata_tx = metadata_tx.clone();
-        std::thread::spawn(move || loop {
+        let stop = stop.clone();
+        workers.spawn("queue-metadata", move || loop {
             let path = match rx.lock() {
                 Ok(guard) => match guard.recv() {
                     Ok(p) => p,
@@ -78,6 +84,9 @@ fn spawn_queue_metadata_workers(
                 },
                 Err(_) => break,
             };
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
             if let Ok(meta) = crate::metadata::extract_metadata(&path) {
                 crate::library::LibraryManager::append_to_cache(&meta);
                 if metadata_tx.send(meta).is_err() {
@@ -89,11 +98,8 @@ fn spawn_queue_metadata_workers(
     tx
 }
 
-/// Drop a replaced player on a background thread so its shutdown (killing mpv, sending Stop to a
-/// renderer) never blocks the UI.
-fn retire_player(player: Box<dyn AudioPlayer>) {
-    std::thread::spawn(move || drop(player));
-}
+/// How long quitting waits in total for background workers to finish before detaching them.
+pub const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TUI_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -117,6 +123,75 @@ pub fn is_shutting_down() -> bool {
 /// Whether the interactive TUI event loop is currently running.
 pub fn is_tui_active() -> bool {
     TUI_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Thread that put the terminal in raw mode / the alternate screen, while it is still set up.
+static TERMINAL_OWNER: std::sync::Mutex<Option<std::thread::ThreadId>> = std::sync::Mutex::new(None);
+
+fn terminal_owner() -> std::sync::MutexGuard<'static, Option<std::thread::ThreadId>> {
+    TERMINAL_OWNER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Leave the alternate screen, disable raw mode and show the cursor, if the TUI set the terminal
+/// up and has not restored it yet. Returns whether anything was restored. Safe to call from any
+/// thread, repeatedly, and from a panic hook.
+pub fn restore_terminal() -> bool {
+    if terminal_owner().take().is_none() {
+        return false;
+    }
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+    true
+}
+
+/// Restore the terminal only if the current thread is the one running the TUI. A panic on a
+/// worker thread must not tear the screen out from under a TUI that keeps running.
+fn restore_terminal_if_owner() -> bool {
+    let owns_terminal = *terminal_owner() == Some(std::thread::current().id());
+    owns_terminal && restore_terminal()
+}
+
+/// Panic hook body: log the panic, call `restore`, then run `prev` (normally the default hook),
+/// so the panic message prints on the normal screen instead of the discarded alternate screen.
+pub fn terminal_panic_hook<R, P>(restore: R, prev: P) -> impl Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static
+where
+    R: Fn() + Send + Sync + 'static,
+    P: Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static,
+{
+    move |info| {
+        crate::log_error!("panic", "{}", info);
+        restore();
+        prev(info);
+    }
+}
+
+/// Install a process-wide panic hook that restores the terminal before the previous hook prints
+/// the panic message (issue #9). Call once, early in `main`.
+pub fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(terminal_panic_hook(
+        || {
+            restore_terminal_if_owner();
+        },
+        prev,
+    )));
+}
+
+/// Restores the terminal when `AppUI::run` returns, errors out or unwinds.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn claim() -> Self {
+        *terminal_owner() = Some(std::thread::current().id());
+        TerminalGuard
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        TUI_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+        restore_terminal();
+    }
 }
 
 pub struct AppUI {
@@ -144,7 +219,8 @@ pub struct AppUI {
     pub player: Box<dyn AudioPlayer>,
     pub device_manager: DeviceManager,
     pub settings_mgr: SettingsManager,
-    pub metadata_cache: std::collections::HashMap<PathBuf, crate::metadata::AudioMetadata>,
+    /// Shared with background scanners; clone the handle, never the map (issue #4).
+    pub metadata_cache: crate::library::MetadataCache,
     pub metadata_tx: std::sync::mpsc::Sender<crate::metadata::AudioMetadata>,
     pub metadata_rx: std::sync::mpsc::Receiver<crate::metadata::AudioMetadata>,
     pub queue_add_tx: std::sync::mpsc::Sender<Vec<crate::metadata::AudioMetadata>>,
@@ -152,8 +228,12 @@ pub struct AppUI {
     pub metadata_worker_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Inbox of the queue metadata worker pool (spawned on first use; workers exit when dropped).
     pub queue_metadata_tx: Option<std::sync::mpsc::Sender<PathBuf>>,
+    /// Tells the queue metadata pool to stop reading tags (set on shutdown).
+    pub queue_metadata_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Paths already sent to the queue metadata workers this session.
     pub queue_metadata_attempted: std::collections::HashSet<PathBuf>,
+    /// Handles of background worker threads, joined (with a bounded wait) on shutdown.
+    pub workers: WorkerRegistry,
     pub browser_state: ListState,
     pub queue_state: ListState,
     pub devices_state: ListState,
@@ -187,6 +267,15 @@ pub struct AppUI {
     pub mix_picker_cursor: usize,
     /// Writes bookmarks and settings off the UI thread; flushed and joined on drop.
     pub persistence: crate::persist::PersistenceWorker,
+}
+
+impl Drop for AppUI {
+    /// Runs after the TUI has exited (and the terminal is restored): stop and join background
+    /// workers with a bounded wait so quitting stays fast. The player, web server and analysis
+    /// worker fields then shut down in their own `Drop` impls.
+    fn drop(&mut self) {
+        self.shutdown_workers(WORKER_SHUTDOWN_TIMEOUT);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,7 +328,7 @@ impl AppUI {
 
         let (metadata_tx, metadata_rx) = std::sync::mpsc::channel();
         let (queue_add_tx, queue_add_rx) = std::sync::mpsc::channel();
-        let metadata_cache = crate::library::LibraryManager::load_cache_map();
+        let metadata_cache = crate::library::MetadataCache::from(crate::library::LibraryManager::load_cache_map());
         let (dir_scan_tx, dir_scan_rx) = std::sync::mpsc::channel();
         let analysis_db = crate::analysis::AnalysisDatabase::open_default()
             .unwrap_or_else(|_| crate::analysis::AnalysisDatabase::open_in_memory().unwrap());
@@ -278,7 +367,9 @@ impl AppUI {
             queue_add_rx,
             metadata_worker_stop: None,
             queue_metadata_tx: None,
+            queue_metadata_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             queue_metadata_attempted: std::collections::HashSet::new(),
+            workers: WorkerRegistry::new(),
             browser_state: ListState::default(),
             queue_state: ListState::default(),
             devices_state: ListState::default(),
@@ -336,7 +427,7 @@ impl AppUI {
     pub fn format_file_label(
         path: &Path,
         metadata_view: bool,
-        cache: &std::collections::HashMap<PathBuf, crate::metadata::AudioMetadata>,
+        cache: &crate::library::MetadataCache,
     ) -> String {
         if metadata_view {
             if let Some(m) = cache.get(path) {
@@ -355,7 +446,7 @@ impl AppUI {
             for (label, path, is_dir) in &mut self.browser_entries {
                 if !*is_dir {
                     *label = Self::format_file_label(path, metadata_view, &self.metadata_cache);
-                    if metadata_view && !self.metadata_cache.contains_key(path) {
+                    if metadata_view && !self.metadata_cache.contains(path) {
                         unfetched.push(path.clone());
                     }
                 }
@@ -544,9 +635,9 @@ impl AppUI {
         self.dir_scan_stop = Some(stop_flag.clone());
         let tx = self.dir_scan_tx.clone();
         let metadata_view = self.settings_mgr.settings.metadata_view;
-        let cached_map = self.metadata_cache.clone();
+        let cached_map = self.metadata_cache.clone(); // shared handle, not a copy
 
-        std::thread::spawn(move || {
+        self.workers.spawn("dir-scan", move || {
             let thread_start = std::time::Instant::now();
             match std::fs::read_dir(&scan_dir) {
                 Ok(entries) => {
@@ -574,7 +665,7 @@ impl AppUI {
                         // Optimization: Check supported audio file by extension first to avoid expensive stat calls
                         if is_supported_audio_file(&path) {
                             let label = Self::format_file_label(&path, metadata_view, &cached_map);
-                            if metadata_view && !cached_map.contains_key(&path) {
+                            if metadata_view && !cached_map.contains(&path) {
                                 batch_unfetched.push(path.clone());
                             }
                             batch_files.push((label, path, false));
@@ -870,7 +961,7 @@ impl AppUI {
         self.metadata_worker_stop = Some(stop.clone());
         let tx = self.metadata_tx.clone();
 
-        std::thread::spawn(move || {
+        self.workers.spawn("browser-metadata", move || {
             let fetch_start = std::time::Instant::now();
             let mut extracted = 0;
             for path in paths {
@@ -921,9 +1012,10 @@ impl AppUI {
         }
 
         let metadata_tx = self.metadata_tx.clone();
+        let (workers, stop) = (&mut self.workers, self.queue_metadata_stop.clone());
         let tx = self
             .queue_metadata_tx
-            .get_or_insert_with(|| spawn_queue_metadata_workers(metadata_tx));
+            .get_or_insert_with(|| spawn_queue_metadata_workers(workers, metadata_tx, stop));
         for path in new_paths {
             let _ = tx.send(path);
         }
@@ -933,7 +1025,7 @@ impl AppUI {
         while let Ok(tracks) = self.queue_add_rx.try_recv() {
             let tracks: Vec<_> = tracks
                 .into_iter()
-                .map(|t| self.metadata_cache.get(&t.filepath).cloned().unwrap_or(t))
+                .map(|t| self.metadata_cache.get(&t.filepath).unwrap_or(t))
                 .collect();
             let added = self.enqueue_tracks(tracks);
             self.status_message = format!("Added {} tracks (web)", added);
@@ -945,7 +1037,6 @@ impl AppUI {
     fn quick_metadata(&self, path: &std::path::Path) -> crate::metadata::AudioMetadata {
         self.metadata_cache
             .get(path)
-            .cloned()
             .unwrap_or_else(|| crate::metadata::fallback_metadata(path))
     }
 
@@ -962,12 +1053,32 @@ impl AppUI {
         added
     }
 
+    /// Keep the queue cursor on a real row after the queue shrinks.
+    pub fn clamp_queue_cursor(&mut self) {
+        self.queue_cursor = self.queue_cursor.min(self.queue.len().saturating_sub(1));
+    }
+
+    /// Remove a queue row (TUI `d` or the web dashboard). Removing the track that is playing or
+    /// paused moves playback on to the track that took its place; emptying the queue stops it.
+    pub fn remove_queue_track(&mut self, index: usize) -> Option<crate::metadata::AudioMetadata> {
+        let removed = self.queue.remove(index)?;
+        self.clamp_queue_cursor();
+        if removed.was_current {
+            if self.queue.is_empty() {
+                let _ = self.player.stop();
+            } else if self.player.is_playing() || self.player.is_paused() {
+                self.play_current_track();
+            }
+        }
+        Some(removed.track)
+    }
+
 
     pub fn poll_background_metadata(&mut self) {
         let mut queue_updated = false;
         while let Ok(meta) = self.metadata_rx.try_recv() {
             let path = meta.filepath.clone();
-            self.metadata_cache.insert(path.clone(), meta.clone());
+            self.metadata_cache.insert(meta.clone());
 
             // 1. Update matching tracks in queue
             for track in &mut self.queue.tracks {
@@ -1125,6 +1236,10 @@ impl AppUI {
         }
     }
 
+    /// Test helper: block, polling autopilot results, until the scan finishes or `timeout`
+    /// passes. It sleeps on the calling thread, so never call it from the TUI event loop. Public
+    /// only because integration tests in `tests/` drive `AppUI` directly.
+    #[doc(hidden)]
     pub fn wait_for_autopilot_scan(&mut self, timeout: std::time::Duration) {
         let start = std::time::Instant::now();
         while self.is_autopilot_scanning && start.elapsed() < timeout {
@@ -1331,6 +1446,50 @@ impl AppUI {
         }
     }
 
+    /// Drop a replaced player on a worker thread so its shutdown (killing mpv, sending Stop to a
+    /// renderer) never blocks the UI. Shutdown waits for it, so mpv is gone before the process exits.
+    fn retire_player(&mut self, player: Box<dyn AudioPlayer>) {
+        self.workers.spawn("retire-player", move || drop(player));
+    }
+
+    /// Number of background worker threads still running.
+    pub fn live_worker_count(&mut self) -> usize {
+        self.workers.live_count()
+    }
+
+    /// Signal every background worker to stop (directory scan, tag readers, queue metadata pool,
+    /// search scanner, autopilot scanner), then join them, waiting at most `timeout` in total.
+    /// Workers still running at the deadline are detached. Returns how many were left running.
+    /// Called when the app is dropped; safe to call more than once.
+    pub fn shutdown_workers(&mut self, timeout: Duration) -> usize {
+        let stops = [
+            self.dir_scan_stop.take(),
+            self.metadata_worker_stop.take(),
+            self.autopilot_scan_stop.take(),
+            Some(self.queue_metadata_stop.clone()),
+        ];
+        for stop in stops.into_iter().flatten() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Dropping the inbox wakes queue metadata workers blocked waiting for work.
+        self.queue_metadata_tx = None;
+        if let Some(mut modal) = self.search_modal.take() {
+            modal.close();
+        }
+        self.autopilot_rx = None;
+        self.is_autopilot_scanning = false;
+
+        let start = Instant::now();
+        let left = self.workers.join_all(timeout);
+        crate::log_info!(
+            "ui",
+            "Background workers stopped in {:.2?} ({} detached)",
+            start.elapsed(),
+            left
+        );
+        left
+    }
+
     /// Stop playback and return true if a shutdown was requested (e.g. by SIGINT/SIGTERM/SIGHUP).
     pub fn poll_shutdown_request(&mut self) -> bool {
         if !SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1344,6 +1503,8 @@ impl AppUI {
     pub fn run(&mut self) -> anyhow::Result<()> {
         self.device_manager.start_background_scan();
         enable_raw_mode()?;
+        // From here on the terminal is restored on every exit path, including `?` and panics.
+        let guard = TerminalGuard::claim();
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
         let backend = CrosstermBackend::new(stdout);
@@ -1354,11 +1515,7 @@ impl AppUI {
         SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
         // A bookmark or setting changed right before quitting must reach disk.
         self.persistence.flush();
-        TUI_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-
-        disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-        terminal.show_cursor()?;
+        drop(guard);
 
         res
     }
@@ -2089,7 +2246,10 @@ impl AppUI {
         let stop_clone = stop_flag.clone();
         let scan_dir = target_dir.clone();
 
-        std::thread::spawn(move || {
+        if let Some(mut previous) = self.search_modal.take() {
+            previous.close();
+        }
+        self.workers.spawn("search-scan", move || {
             let cached_map = crate::library::LibraryManager::load_cache_map();
             let initial_tracks: Vec<crate::metadata::AudioMetadata> = cached_map
                 .values()
@@ -2262,7 +2422,7 @@ impl AppUI {
                     | (KeyCode::Char('x'), KeyModifiers::NONE)
                     | (KeyCode::Delete, _) => {
                         if self.queue_focus {
-                            if let Some(removed) = self.queue.remove_track(self.queue_cursor) {
+                            if let Some(removed) = self.remove_queue_track(self.queue_cursor) {
                                 self.status_message = format!("Removed {}", removed.display_title());
                             }
                         } else if self.in_bookmarks_view && self.browser_cursor > 0 {
@@ -2277,6 +2437,7 @@ impl AppUI {
                     }
                     (KeyCode::Char('c'), KeyModifiers::NONE) if self.queue_focus => {
                         self.queue.clear();
+                        self.clamp_queue_cursor();
                         self.status_message = "Cleared queue".to_string();
                     }
                     (KeyCode::Char('r'), KeyModifiers::NONE) if !self.queue_focus => {
@@ -2485,7 +2646,8 @@ impl AppUI {
                 let volume = self.player.volume();
                 let mut new_player = spawn_local_player(&backend, volume);
                 let _ = new_player.set_volume(volume);
-                retire_player(std::mem::replace(&mut self.player, new_player));
+                let old = std::mem::replace(&mut self.player, new_player);
+                self.retire_player(old);
             }
         } else if self.settings_cursor == 6 || SETTING_DEFINITIONS[self.settings_cursor].key == "web_server_lan" {
             self.sync_web_server();
@@ -2667,6 +2829,7 @@ impl AppUI {
                 if self.queue.current_index < self.queue.len() {
                     self.queue.tracks.truncate(self.queue.current_index + 1);
                 }
+                self.clamp_queue_cursor();
                 self.status_message = format!("🎲 Autopilot: Reshuffling mix from next track forward (from '{}')...", dir_display);
             }
         }
@@ -2682,7 +2845,7 @@ impl AppUI {
             Vec::new()
         };
 
-        let cache = self.metadata_cache.clone();
+        let cache = self.metadata_cache.clone(); // shared handle, not a copy
         let (tx, rx) = std::sync::mpsc::channel();
         self.autopilot_rx = Some(rx);
 
@@ -2690,7 +2853,7 @@ impl AppUI {
         let scan_dir = dir.clone();
         let profile = self.active_mix_profile.clone();
         let db = self.analysis_db.clone();
-        std::thread::spawn(move || {
+        self.workers.spawn("autopilot", move || {
             crate::library::LibraryManager::scan_directory_autopilot_with_profile(
                 scan_dir,
                 known_subdirs,
@@ -2849,7 +3012,8 @@ impl AppUI {
             }
         }
 
-        retire_player(std::mem::replace(&mut self.player, new_player));
+        let old = std::mem::replace(&mut self.player, new_player);
+        self.retire_player(old);
         self.status_message = "Active output: Local Audio".to_string();
         self.sync_web_server();
         self.update_web_state();
@@ -2910,7 +3074,8 @@ impl AppUI {
             }
         }
 
-        retire_player(std::mem::replace(&mut self.player, upnp_player));
+        let old = std::mem::replace(&mut self.player, upnp_player);
+        self.retire_player(old);
         self.status_message = status;
         self.update_web_state();
     }
@@ -3010,26 +3175,14 @@ impl AppUI {
                     }
                 }
                 crate::web::WebCommand::RemoveIndex(idx) => {
-                    if idx < self.queue.len() {
-                        let was_current = idx == self.queue.current_index;
-                        self.queue.remove_track(idx);
-                        if self.queue_cursor >= self.queue.len() && !self.queue.is_empty() {
-                            self.queue_cursor = self.queue.len() - 1;
-                        }
-                        if was_current {
-                            if !self.queue.is_empty() {
-                                self.play_current_track();
-                            } else {
-                                let _ = self.player.stop();
-                            }
-                        }
+                    if self.remove_queue_track(idx).is_some() {
                         self.update_web_state();
                     }
                 }
                 crate::web::WebCommand::ClearQueue => {
                     let _ = self.player.stop();
                     self.queue.clear();
-                    self.queue_cursor = 0;
+                    self.clamp_queue_cursor();
                     self.update_web_state();
                 }
                 crate::web::WebCommand::AddFile(path) => {
@@ -3044,7 +3197,7 @@ impl AppUI {
                 crate::web::WebCommand::AddFolder(path) => {
                     // Listing a folder on a network share can be slow: do it off the UI thread.
                     let tx = self.queue_add_tx.clone();
-                    std::thread::spawn(move || {
+                    self.workers.spawn("add-folder", move || {
                         if let Ok(entries) = std::fs::read_dir(&path) {
                             let mut files: Vec<std::path::PathBuf> = entries
                                 .filter_map(|e| e.ok())
@@ -4657,4 +4810,26 @@ fn format_time(seconds: f64) -> String {
     let mins = total / 60;
     let secs = total % 60;
     format!("{:02}:{:02}", mins, secs)
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+
+    #[test]
+    fn test_terminal_restore_only_from_owner_thread() {
+        let guard = TerminalGuard::claim();
+
+        // A panic on a worker thread must leave the TUI's terminal alone.
+        let restored_elsewhere = std::thread::spawn(restore_terminal_if_owner).join().unwrap();
+        assert!(!restored_elsewhere);
+        assert!(terminal_owner().is_some());
+
+        // The UI thread itself restores once; later calls (e.g. the guard's drop) are no-ops.
+        assert!(restore_terminal_if_owner());
+        assert!(terminal_owner().is_none());
+        assert!(!restore_terminal());
+        drop(guard);
+        assert!(!restore_terminal());
+    }
 }

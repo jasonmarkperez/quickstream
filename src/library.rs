@@ -22,6 +22,53 @@ pub enum AutopilotEvent {
     Finished(usize),
 }
 
+/// In-memory metadata index keyed by file path, shared between the UI and background scanners.
+/// Clones share one map, so handing it to a worker costs a reference count instead of a copy of
+/// the whole library (issue #4). Lookups take a read lock only for the duration of the call.
+#[derive(Debug, Clone, Default)]
+pub struct MetadataCache(Arc<std::sync::RwLock<HashMap<PathBuf, AudioMetadata>>>);
+
+impl MetadataCache {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<PathBuf, AudioMetadata>> {
+        self.0.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn get(&self, path: &Path) -> Option<AudioMetadata> {
+        self.read().get(path).cloned()
+    }
+
+    pub fn contains(&self, path: &Path) -> bool {
+        self.read().contains_key(path)
+    }
+
+    /// Insert or replace the entry for `meta.filepath`.
+    pub fn insert(&self, meta: AudioMetadata) {
+        self.0
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(meta.filepath.clone(), meta);
+    }
+
+    pub fn len(&self) -> usize {
+        self.read().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.read().is_empty()
+    }
+
+    /// Whether both handles refer to the same underlying map.
+    pub fn shares_storage_with(&self, other: &MetadataCache) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl From<HashMap<PathBuf, AudioMetadata>> for MetadataCache {
+    fn from(map: HashMap<PathBuf, AudioMetadata>) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(map)))
+    }
+}
+
 /// A track item formatted for Skim fuzzy searching with a rich metadata preview window.
 pub struct SkimTrackItem {
     pub metadata: AudioMetadata,
@@ -503,7 +550,7 @@ impl LibraryManager {
         Self::scan_directory_autopilot_with_profile(
             dir,
             known_subdirs,
-            cache,
+            cache.into(),
             crate::analysis::MixProfile::DiverseShuffle,
             db,
             tx,
@@ -515,7 +562,7 @@ impl LibraryManager {
     pub fn scan_directory_autopilot_with_profile(
         dir: PathBuf,
         known_subdirs: Vec<PathBuf>,
-        cache: HashMap<PathBuf, AudioMetadata>,
+        cache: MetadataCache,
         profile: crate::analysis::MixProfile,
         db: crate::analysis::AnalysisDatabase,
         tx: Sender<AutopilotEvent>,
@@ -538,7 +585,7 @@ impl LibraryManager {
     pub fn scan_directory_autopilot_with_profile_limits(
         dir: PathBuf,
         known_subdirs: Vec<PathBuf>,
-        cache: HashMap<PathBuf, AudioMetadata>,
+        cache: MetadataCache,
         profile: crate::analysis::MixProfile,
         db: crate::analysis::AnalysisDatabase,
         tx: Sender<AutopilotEvent>,
@@ -556,7 +603,7 @@ impl LibraryManager {
             if let Some(cached) = cache.get(path) {
                 if cached.file_size == file_len && !cached.title.is_empty() {
                     MixScanStats::count(&stats.cache_hits);
-                    let mut meta = cached.clone();
+                    let mut meta = cached;
                     if meta.genre.is_empty() {
                         if let Some(feat) = db.get_track(path) {
                             if !feat.genre.is_empty() {
