@@ -20,6 +20,7 @@ use crate::discovery::DeviceManager;
 use crate::metadata::is_supported_audio_file;
 use crate::paths;
 use crate::player::local::LocalPlayer;
+use crate::player::worker::AsyncPlayer;
 use crate::player::AudioPlayer;
 use crate::queue::PlaybackQueue;
 use crate::settings::{SettingsManager, SETTING_DEFINITIONS};
@@ -50,6 +51,18 @@ pub enum DirScanEvent {
         dir: PathBuf,
         message: String,
     },
+}
+
+/// Create a local (mpv/ffplay) player that runs on its own worker thread.
+fn spawn_local_player(backend: &str, initial_volume: u8) -> Box<dyn AudioPlayer> {
+    let backend = backend.to_string();
+    Box::new(AsyncPlayer::spawn(move || Box::new(LocalPlayer::new(&backend)), initial_volume))
+}
+
+/// Drop a replaced player on a background thread so its shutdown (killing mpv, sending Stop to a
+/// renderer) never blocks the UI.
+fn retire_player(player: Box<dyn AudioPlayer>) {
+    std::thread::spawn(move || drop(player));
 }
 
 static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -197,7 +210,7 @@ impl AppUI {
             show_help_modal: false,
             status_message: "Welcome to Quickstream (Rust)".to_string(),
             queue: PlaybackQueue::new(),
-            player: Box::new(LocalPlayer::new(&backend)),
+            player: spawn_local_player(&backend, 50),
             device_manager,
             settings_mgr,
             metadata_cache,
@@ -1272,6 +1285,10 @@ impl AppUI {
         loop {
             if self.poll_shutdown_request() {
                 return Ok(());
+            }
+
+            if let Some(err) = self.player.take_error() {
+                self.status_message = format!("Playback error: {}", err);
             }
 
             // Check if active track finished and auto-advance queue
@@ -2427,7 +2444,9 @@ impl AppUI {
         } else if self.settings_cursor == 1 {
             let backend = self.settings_mgr.settings.player_backend.clone();
             if self.device_manager.get_active_device().is_none() {
-                self.player = Box::new(LocalPlayer::new(&backend));
+                let volume = self.player.volume();
+                let old = std::mem::replace(&mut self.player, spawn_local_player(&backend, volume));
+                retire_player(old);
             }
         } else if self.settings_cursor == 6 {
             self.sync_web_server();
@@ -2757,7 +2776,7 @@ impl AppUI {
         self.device_manager.set_active_device(None);
 
         let backend = self.settings_mgr.settings.player_backend.clone();
-        let mut new_player = LocalPlayer::new(&backend);
+        let mut new_player = spawn_local_player(&backend, vol);
         let _ = new_player.set_volume(vol);
 
         if let Some(track) = current_track {
@@ -2771,7 +2790,7 @@ impl AppUI {
             }
         }
 
-        self.player = Box::new(new_player);
+        retire_player(std::mem::replace(&mut self.player, new_player));
         self.status_message = "Active output: Local Audio".to_string();
         self.sync_web_server();
         self.update_web_state();
@@ -2794,12 +2813,18 @@ impl AppUI {
         self.device_manager.set_active_device(Some(dev.clone()));
 
         let stream_state = self.web_server.as_ref().map(|ws| ws.stream_state());
-        let mut upnp_player = crate::player::upnp::UPnPPlayer::new(dev.clone(), port)
-            .with_stream_state(stream_state);
+        let worker_dev = dev.clone();
+        // Built on the worker thread: UPnPPlayer::new queries the renderer's volume over the network.
         // Do NOT overwrite the remote hardware volume with local software volume!
         // The UPnP device preserves its own hardware volume setting.
+        let mut upnp_player: Box<dyn AudioPlayer> = Box::new(AsyncPlayer::spawn(
+            move || {
+                Box::new(crate::player::upnp::UPnPPlayer::new(worker_dev, port).with_stream_state(stream_state))
+            },
+            self.player.volume(),
+        ));
 
-        let mut status = format!("Active output: {}", dev.friendly_name);
+        let status = format!("Active output: {}", dev.friendly_name);
         if let Some(track) = current_track {
             if was_playing || was_paused {
                 if let Some(ref ws) = self.web_server {
@@ -2808,20 +2833,13 @@ impl AppUI {
                 if let Ok(mut s) = self.web_state.write() {
                     s.filepath = Some(track.filepath.clone());
                 }
-                match upnp_player.play_at(&track.filepath, pos) {
-                    Ok(_) => {
-                        if was_paused {
-                            let _ = upnp_player.pause();
-                        }
-                    }
-                    Err(e) => {
-                        status = format!("Connected to {}, but play failed: {}", dev.friendly_name, e);
-                    }
+                if upnp_player.play_at(&track.filepath, pos).is_ok() && was_paused {
+                    let _ = upnp_player.pause();
                 }
             }
         }
 
-        self.player = Box::new(upnp_player);
+        retire_player(std::mem::replace(&mut self.player, upnp_player));
         self.status_message = status;
         self.update_web_state();
     }
