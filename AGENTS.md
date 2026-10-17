@@ -142,7 +142,8 @@ quickstream/
    - In large libraries, the scanner shuffles top-level subdirectories and samples evenly across artist folders rather than greedily consuming all tracks from the first alphabetical folder.
    - Even when an artist directory has 500 tracks, it contributes only a small quota to the candidate pool, guaranteeing diverse representation across 50–100 distinct artists.
 2. **Targeted Match Gathering & Supplementation**:
-   - When filtering by mood, tempo, or seed similarity, the scanner continues searching until at least 80 matching candidates are found (or 500 folders scanned).
+   - When filtering by mood, tempo, or seed similarity, the scanner continues searching until at least 80 matching candidates are found, 500 folders are scanned, or 20 seconds have passed (`ProfileScanLimits`), whichever comes first. At least one folder is always scanned.
+   - The first matching track is sent to the queue immediately so playback starts while gathering continues; the rest of the mix is sequenced to follow it (`DjMixer::sequence_mix_after`).
    - If a library has fewer matching tracks than the queue limit (60) but contains other songs (`total_candidates > 10`), Quickstream places all matches at the top of the mix and supplements remaining slots with diverse candidates from other artists so the queue is never truncated.
 3. **DJ Sequencing (`DjMixer::sequence_mix`)**:
    - **Artist Separation**: Minimum 8-track cooldown before repeating the same real artist (penalized at `-50,000`).
