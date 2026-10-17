@@ -148,9 +148,10 @@ quickstream/
    - The first matching track is sent to the queue immediately so playback starts while gathering continues; the rest of the mix is sequenced to follow it (`DjMixer::sequence_mix_after`).
    - If a library has fewer matching tracks than the queue limit (60) but contains other songs (`total_candidates > 10`), Quickstream places all matches at the top of the mix and supplements remaining slots with diverse candidates from other artists so the queue is never truncated.
 3. **DJ Sequencing (`DjMixer::sequence_mix`)**:
-   - **Artist Separation**: Minimum 8-track cooldown before repeating the same real artist (penalized at `-50,000`).
-   - **Generic Artists**: "Various Artists", "Unknown Artist", and untagged tracks are exempt from single-artist duplication penalties.
-   - **Album Separation**: Minimum 12-track cooldown before repeating the same album.
+   - **Artist Separation** (`ARTIST_COOLDOWN = 8`): after a real artist plays, the next 8 tracks must be by other artists (a repeat is at least 9 queue positions later). Hard rule: a cooldown-violating candidate is only chosen when no candidate satisfies it, and then the one whose artist played longest ago.
+   - **Generic Artists**: "Various Artists", "Unknown Artist", and untagged tracks are exempt from the artist cooldown.
+   - **Album Separation** (`ALBUM_COOLDOWN = 12`): after an album plays, the next 12 tracks must be from other albums; hard in the same way, ranked after the artist rule. Untagged albums are exempt.
+   - **Position-based distances**: cooldowns count queue positions, so untagged/generic tracks still count as tracks between repeats; the already-queued track passed to `DjMixer::sequence_mix_after` is position 0.
    - **Camelot Harmonic Flow**: Key transitions scored by harmonic compatibility (exact match, relative major/minor, ±1 energy boost).
    - **BPM Gradient**: Tracks sequenced with smooth tempo progression.
 

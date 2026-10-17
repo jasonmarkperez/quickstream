@@ -1,11 +1,17 @@
 //! Intelligent Mix Engine: sequences tracks into cohesive mixes using tempo, harmonic keys, and mood.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::metadata::AudioMetadata;
 use super::db::{AnalysisDatabase, TrackFeatures};
 use super::harmonic::{CamelotKey, MusicalKey};
+
+/// After a real artist plays, this many following tracks must be by other artists.
+pub const ARTIST_COOLDOWN: usize = 8;
+/// After an album plays, this many following tracks must be from other albums.
+pub const ALBUM_COOLDOWN: usize = 12;
 
 /// Camelot key stored in a track's features, if any.
 fn camelot_of(feat: Option<&TrackFeatures>) -> Option<CamelotKey> {
@@ -186,129 +192,135 @@ impl DjMixer {
             return Vec::new();
         }
 
-        // 1. Gather TrackFeatures for each candidate (or synthesize defaults)
-        // Each candidate's features (and parsed Camelot key) are looked up exactly once.
-        let mut track_items: Vec<(AudioMetadata, Option<TrackFeatures>, Option<CamelotKey>)> = candidates
+        // 1. Look up each candidate's features (and parse its Camelot key) exactly once.
+        let mut pool: Vec<Candidate> = candidates
             .into_iter()
             .map(|meta| {
                 let feat = features_db.get_track(&meta.filepath);
-                let camelot = camelot_of(feat.as_ref());
-                (meta, feat, camelot)
+                Candidate {
+                    artist_key: artist_key(&meta.artist),
+                    album_key: album_key(&meta.album),
+                    bpm: feat.as_ref().and_then(|f| f.bpm),
+                    camelot: camelot_of(feat.as_ref()),
+                    meta,
+                }
             })
             .collect();
 
-        // 2. Greedy sequencing with DJ rules:
-        // - Avoid same artist within 8 tracks
-        // - Avoid same album within 12 tracks
-        // - Minimize |BPM_{i} - BPM_{i-1}|
-        let mut sequenced: Vec<AudioMetadata> = Vec::new();
-        let mut recent_artists: Vec<String> = Vec::new();
-        let mut recent_albums: Vec<String> = Vec::new();
-        if let Some(first) = already_queued {
-            if !first.artist.is_empty() {
-                recent_artists.push(first.artist.clone());
-            }
-            if !first.album.is_empty() {
-                recent_albums.push(first.album.clone());
-            }
-            sequenced.push(first.clone());
-        }
-        let skip = sequenced.len();
-
+        // 2. Greedy sequencing. Cooldowns are tracked by queue position (every track, tagged or
+        //    not, occupies a position; the already-queued track is position 0).
+        //    Selection order for each slot:
+        //    a. artist cooldown (hard): a candidate whose real artist played within the last
+        //       ARTIST_COOLDOWN positions is only chosen if no candidate satisfies the rule, and
+        //       then the one whose artist played longest ago;
+        //    b. album cooldown (hard, after the artist rule), same scheme with ALBUM_COOLDOWN;
+        //    c. transition score: BPM continuity + Camelot compatibility with the previous track.
+        //    Ties keep candidate order.
+        let mut position = 0usize;
+        let mut last_artist_pos: HashMap<String, usize> = HashMap::new();
+        let mut last_album_pos: HashMap<String, usize> = HashMap::new();
         // Features of the most recently sequenced track, carried forward from the chosen
         // candidate instead of being re-queried from SQLite on every iteration.
         let mut last_bpm: Option<f64> = None;
         let mut last_camelot: Option<CamelotKey> = None;
+
         if let Some(first) = already_queued {
+            if let Some(k) = artist_key(&first.artist) {
+                last_artist_pos.insert(k, position);
+            }
+            if let Some(k) = album_key(&first.album) {
+                last_album_pos.insert(k, position);
+            }
             let feat = features_db.get_track(&first.filepath);
             last_bpm = feat.as_ref().and_then(|f| f.bpm);
             last_camelot = camelot_of(feat.as_ref());
+            position += 1;
         }
 
-        while !track_items.is_empty() && sequenced.len() - skip < target_limit {
-            let mut best_idx = 0;
-            let mut best_score = i64::MIN;
+        let mut sequenced: Vec<AudioMetadata> = Vec::with_capacity(target_limit.min(pool.len()));
+        while !pool.is_empty() && sequenced.len() < target_limit {
+            let shortfall = |key: &Option<String>, last: &HashMap<String, usize>, cooldown: usize| -> usize {
+                key.as_ref()
+                    .and_then(|k| last.get(k))
+                    .map(|&prev| (cooldown + 1).saturating_sub(position - prev))
+                    .unwrap_or(0)
+            };
 
-            for (idx, (meta, feat, cur_camelot)) in track_items.iter().enumerate() {
-                let mut score: i64 = 100;
+            let best_idx = pool
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, c)| {
+                    (
+                        shortfall(&c.artist_key, &last_artist_pos, ARTIST_COOLDOWN),
+                        shortfall(&c.album_key, &last_album_pos, ALBUM_COOLDOWN),
+                        std::cmp::Reverse(transition_score(c, last_bpm, last_camelot)),
+                    )
+                })
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
 
-                let is_generic_artist = |a: &str| -> bool {
-                    let lower = a.trim().to_lowercase();
-                    lower.is_empty()
-                        || lower == "various artists"
-                        || lower == "various"
-                        || lower == "unknown artist"
-                        || lower == "unknown"
-                };
-
-                // Strongly penalize back-to-back identical artist (unless generic / various)
-                if let Some(last) = sequenced.last() {
-                    if !is_generic_artist(&meta.artist)
-                        && !is_generic_artist(&last.artist)
-                        && meta.artist.eq_ignore_ascii_case(&last.artist)
-                    {
-                        score -= 50_000;
-                    }
-                }
-
-                // Penalize repeating recent artists heavily to enforce diversity
-                if !is_generic_artist(&meta.artist) {
-                    if let Some(pos) = recent_artists.iter().rposition(|a| a.eq_ignore_ascii_case(&meta.artist)) {
-                        let distance = recent_artists.len() - pos;
-                        if distance < 8 {
-                            score -= (8 - distance as i64) * 2000;
-                        }
-                    }
-                }
-
-                // Penalize repeating recent albums
-                if !meta.album.is_empty() {
-                    if let Some(pos) = recent_albums.iter().rposition(|a| a == &meta.album) {
-                        let distance = recent_albums.len() - pos;
-                        if distance < 12 {
-                            score -= (12 - distance as i64) * 500;
-                        }
-                    }
-                }
-
-                // Score BPM continuity
-                if let (Some(cur_bpm), Some(prev_bpm)) = (feat.as_ref().and_then(|f| f.bpm), last_bpm) {
-                    let diff = (cur_bpm - prev_bpm).abs();
-                    if diff <= 4.0 {
-                        score += 50; // Smooth blend
-                    } else if diff <= 8.0 {
-                        score += 20;
-                    } else {
-                        score -= (diff as i64) * 3;
-                    }
-                }
-
-                // Score harmonic key compatibility
-                if let (Some(cur_cam), Some(prev_cam)) = (cur_camelot, last_camelot) {
-                    let harm_score = prev_cam.compatibility_score(cur_cam);
-                    score += harm_score as i64 / 2;
-                }
-
-                if score > best_score {
-                    best_score = score;
-                    best_idx = idx;
-                }
+            let chosen = pool.remove(best_idx);
+            if let Some(k) = chosen.artist_key {
+                last_artist_pos.insert(k, position);
             }
-
-            let (chosen_meta, chosen_feat, chosen_camelot) = track_items.remove(best_idx);
-            last_bpm = chosen_feat.as_ref().and_then(|f| f.bpm);
-            last_camelot = chosen_camelot;
-            if !chosen_meta.artist.is_empty() {
-                recent_artists.push(chosen_meta.artist.clone());
+            if let Some(k) = chosen.album_key {
+                last_album_pos.insert(k, position);
             }
-            if !chosen_meta.album.is_empty() {
-                recent_albums.push(chosen_meta.album.clone());
-            }
-            sequenced.push(chosen_meta);
+            last_bpm = chosen.bpm;
+            last_camelot = chosen.camelot;
+            position += 1;
+            sequenced.push(chosen.meta);
         }
 
-        sequenced.split_off(skip)
+        sequenced
     }
+}
+
+/// A candidate track with everything the sequencer needs precomputed.
+struct Candidate {
+    meta: AudioMetadata,
+    artist_key: Option<String>,
+    album_key: Option<String>,
+    bpm: Option<f64>,
+    camelot: Option<CamelotKey>,
+}
+
+/// Artists exempt from the artist cooldown (compilations and untagged tracks).
+fn is_generic_artist(artist: &str) -> bool {
+    matches!(
+        artist.trim().to_lowercase().as_str(),
+        "" | "various artists" | "various" | "unknown artist" | "unknown"
+    )
+}
+
+/// Normalized artist identity for cooldown tracking; `None` for generic / untagged artists.
+fn artist_key(artist: &str) -> Option<String> {
+    (!is_generic_artist(artist)).then(|| artist.trim().to_lowercase())
+}
+
+/// Normalized album identity for cooldown tracking; `None` for untagged albums.
+fn album_key(album: &str) -> Option<String> {
+    let key = album.trim().to_lowercase();
+    (!key.is_empty() && key != "unknown album").then_some(key)
+}
+
+/// Transition quality from the previous track: BPM continuity plus Camelot compatibility.
+fn transition_score(c: &Candidate, last_bpm: Option<f64>, last_camelot: Option<CamelotKey>) -> i64 {
+    let mut score: i64 = 100;
+    if let (Some(cur_bpm), Some(prev_bpm)) = (c.bpm, last_bpm) {
+        let diff = (cur_bpm - prev_bpm).abs();
+        if diff <= 4.0 {
+            score += 50; // Smooth blend
+        } else if diff <= 8.0 {
+            score += 20;
+        } else {
+            score -= (diff as i64) * 3;
+        }
+    }
+    if let (Some(cur_cam), Some(prev_cam)) = (c.camelot, last_camelot) {
+        score += prev_cam.compatibility_score(&cur_cam) as i64 / 2;
+    }
+    score
 }
 
 #[cfg(test)]
