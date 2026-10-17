@@ -111,6 +111,8 @@ pub struct AppUI {
     pub metadata_cache: std::collections::HashMap<PathBuf, crate::metadata::AudioMetadata>,
     pub metadata_tx: std::sync::mpsc::Sender<crate::metadata::AudioMetadata>,
     pub metadata_rx: std::sync::mpsc::Receiver<crate::metadata::AudioMetadata>,
+    pub queue_add_tx: std::sync::mpsc::Sender<Vec<crate::metadata::AudioMetadata>>,
+    pub queue_add_rx: std::sync::mpsc::Receiver<Vec<crate::metadata::AudioMetadata>>,
     pub metadata_worker_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub queue_metadata_worker_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub browser_state: ListState,
@@ -182,6 +184,7 @@ impl AppUI {
         };
 
         let (metadata_tx, metadata_rx) = std::sync::mpsc::channel();
+        let (queue_add_tx, queue_add_rx) = std::sync::mpsc::channel();
         let metadata_cache = crate::library::LibraryManager::load_cache_map();
         let (dir_scan_tx, dir_scan_rx) = std::sync::mpsc::channel();
         let analysis_db = crate::analysis::AnalysisDatabase::open_default()
@@ -216,6 +219,8 @@ impl AppUI {
             metadata_cache,
             metadata_tx,
             metadata_rx,
+            queue_add_tx,
+            queue_add_rx,
             metadata_worker_stop: None,
             queue_metadata_worker_stop: None,
             browser_state: ListState::default(),
@@ -886,6 +891,41 @@ impl AppUI {
         }
     }
 
+    /// Add tracks listed by background folder scans (see `WebCommand::AddFolder`) to the queue.
+    pub fn poll_pending_queue_adds(&mut self) {
+        while let Ok(tracks) = self.queue_add_rx.try_recv() {
+            let tracks: Vec<_> = tracks
+                .into_iter()
+                .map(|t| self.metadata_cache.get(&t.filepath).cloned().unwrap_or(t))
+                .collect();
+            let added = self.enqueue_tracks(tracks);
+            self.status_message = format!("Added {} tracks (web)", added);
+            self.update_web_state();
+        }
+    }
+
+    /// Cached metadata for `path`, or a path-derived placeholder. Never reads the audio file.
+    fn quick_metadata(&self, path: &std::path::Path) -> crate::metadata::AudioMetadata {
+        self.metadata_cache
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| crate::metadata::fallback_metadata(path))
+    }
+
+    /// Append tracks to the queue and resolve missing tags on background workers.
+    fn enqueue_tracks(&mut self, tracks: Vec<crate::metadata::AudioMetadata>) -> usize {
+        let added = tracks.len();
+        for meta in tracks {
+            self.register_stream_file(&meta.filepath);
+            self.queue.add_track(meta);
+        }
+        if added > 0 {
+            self.start_queue_metadata_fetch();
+        }
+        added
+    }
+
+
     pub fn poll_background_metadata(&mut self) {
         let mut queue_updated = false;
         while let Ok(meta) = self.metadata_rx.try_recv() {
@@ -1319,6 +1359,7 @@ impl AppUI {
 
             // Poll background metadata extraction
             self.poll_background_metadata();
+            self.poll_pending_queue_adds();
 
             // Poll progressive background autopilot discovery
             self.poll_background_autopilot();
@@ -1445,22 +1486,10 @@ impl AppUI {
                                     if is_dir {
                                         self.navigate_browser(path);
                                     } else {
-                                        let meta_opt = self.metadata_cache.get(&path).cloned()
-                                            .or_else(|| {
-                                                if let Ok(m) = crate::metadata::extract_metadata(&path) {
-                                                    self.metadata_cache.insert(path.clone(), m.clone());
-                                                    Some(m)
-                                                } else {
-                                                    None
-                                                }
-                                            })
-                                            .or_else(|| Some(crate::metadata::fallback_metadata(&path)));
-                                        if let Some(meta) = meta_opt {
-                                            let title = meta.display_title().to_string();
-                                            self.register_stream_file(&meta.filepath);
-                                            self.queue.add_track(meta);
-                                            self.status_message = format!("Added to queue: {}", title);
-                                        }
+                                        let meta = self.quick_metadata(&path);
+                                        let title = meta.display_title().to_string();
+                                        self.enqueue_tracks(vec![meta]);
+                                        self.status_message = format!("Added to queue: {}", title);
                                     }
                                 }
                             }
@@ -2156,22 +2185,10 @@ impl AppUI {
                             if is_dir {
                                 self.navigate_browser(path);
                             } else {
-                                let meta_opt = self.metadata_cache.get(&path).cloned()
-                                    .or_else(|| {
-                                        if let Ok(m) = crate::metadata::extract_metadata(&path) {
-                                            self.metadata_cache.insert(path.clone(), m.clone());
-                                            Some(m)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .or_else(|| Some(crate::metadata::fallback_metadata(&path)));
-                                if let Some(meta) = meta_opt {
-                                    let title = meta.display_title().to_string();
-                                    self.register_stream_file(&meta.filepath);
-                                    self.queue.add_track(meta);
-                                    self.status_message = format!("Added to queue: {}", title);
-                                }
+                                let meta = self.quick_metadata(&path);
+                                let title = meta.display_title().to_string();
+                                self.enqueue_tracks(vec![meta]);
+                                self.status_message = format!("Added to queue: {}", title);
                             }
                         }
                     }
@@ -2185,26 +2202,13 @@ impl AppUI {
                         }
                     }
                     (KeyCode::Char('a'), KeyModifiers::NONE) if !self.in_bookmarks_view => {
-                        let mut added = 0;
-                        for (_, path, is_dir) in &self.browser_entries {
-                            if !is_dir {
-                                let meta_opt = self.metadata_cache.get(path).cloned()
-                                    .or_else(|| {
-                                        if let Ok(m) = crate::metadata::extract_metadata(path) {
-                                            self.metadata_cache.insert(path.clone(), m.clone());
-                                            Some(m)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .or_else(|| Some(crate::metadata::fallback_metadata(path)));
-                                if let Some(meta) = meta_opt {
-                                    self.register_stream_file(&meta.filepath);
-                                    self.queue.add_track(meta);
-                                    added += 1;
-                                }
-                            }
-                        }
+                        let tracks: Vec<_> = self
+                            .browser_entries
+                            .iter()
+                            .filter(|(_, _, is_dir)| !is_dir)
+                            .map(|(_, path, _)| self.quick_metadata(path))
+                            .collect();
+                        let added = self.enqueue_tracks(tracks);
                         self.status_message = format!("Added {} tracks", added);
                     }
                     (KeyCode::Char('b'), KeyModifiers::NONE) => {
@@ -2473,13 +2477,7 @@ impl AppUI {
         if let Some(track) = self.queue.current_track() {
             let path = track.filepath.clone();
             if track.duration_seconds <= 0.0 || track.artist.is_empty() {
-                if let Ok(meta) = crate::metadata::extract_metadata(&path) {
-                    crate::library::LibraryManager::append_to_cache(&meta);
-                    self.metadata_cache.insert(path.clone(), meta.clone());
-                    if let Some(cur) = self.queue.current_track_mut() {
-                        *cur = meta;
-                    }
-                }
+                self.start_queue_metadata_fetch();
             }
             if let Some(ref ws) = self.web_server {
                 ws.close_active_streams();
@@ -2519,13 +2517,7 @@ impl AppUI {
         if let Some(track) = self.queue.next_track(&mode) {
             let path = track.filepath.clone();
             if track.duration_seconds <= 0.0 || track.artist.is_empty() {
-                if let Ok(meta) = crate::metadata::extract_metadata(&path) {
-                    crate::library::LibraryManager::append_to_cache(&meta);
-                    self.metadata_cache.insert(path.clone(), meta.clone());
-                    if let Some(cur) = self.queue.current_track_mut() {
-                        *cur = meta;
-                    }
-                }
+                self.start_queue_metadata_fetch();
             }
             if let Some(ref ws) = self.web_server {
                 ws.close_active_streams();
@@ -2568,13 +2560,7 @@ impl AppUI {
         if let Some(track) = self.queue.prev_track() {
             let path = track.filepath.clone();
             if track.duration_seconds <= 0.0 || track.artist.is_empty() {
-                if let Ok(meta) = crate::metadata::extract_metadata(&path) {
-                    crate::library::LibraryManager::append_to_cache(&meta);
-                    self.metadata_cache.insert(path.clone(), meta.clone());
-                    if let Some(cur) = self.queue.current_track_mut() {
-                        *cur = meta;
-                    }
-                }
+                self.start_queue_metadata_fetch();
             }
             if let Some(ref ws) = self.web_server {
                 ws.close_active_streams();
@@ -2967,27 +2953,17 @@ impl AppUI {
                 }
                 crate::web::WebCommand::AddFile(path) => {
                     if path.exists() && crate::metadata::is_supported_audio_file(&path) {
-                        let meta_opt = self.metadata_cache.get(&path).cloned()
-                            .or_else(|| {
-                                if let Ok(m) = crate::metadata::extract_metadata(&path) {
-                                    self.metadata_cache.insert(path.clone(), m.clone());
-                                    Some(m)
-                                } else {
-                                    None
-                                }
-                            })
-                            .or_else(|| Some(crate::metadata::fallback_metadata(&path)));
-                        if let Some(meta) = meta_opt {
-                            let title = meta.display_title().to_string();
-                            self.register_stream_file(&meta.filepath);
-                            self.queue.add_track(meta);
-                            self.status_message = format!("Added to queue (web): {}", title);
-                            self.update_web_state();
-                        }
+                        let meta = self.quick_metadata(&path);
+                        let title = meta.display_title().to_string();
+                        self.enqueue_tracks(vec![meta]);
+                        self.status_message = format!("Added to queue (web): {}", title);
+                        self.update_web_state();
                     }
                 }
                 crate::web::WebCommand::AddFolder(path) => {
-                    if path.is_dir() {
+                    // Listing a folder on a network share can be slow: do it off the UI thread.
+                    let tx = self.queue_add_tx.clone();
+                    std::thread::spawn(move || {
                         if let Ok(entries) = std::fs::read_dir(&path) {
                             let mut files: Vec<std::path::PathBuf> = entries
                                 .filter_map(|e| e.ok())
@@ -2995,28 +2971,10 @@ impl AppUI {
                                 .filter(|p| crate::metadata::is_supported_audio_file(p))
                                 .collect();
                             files.sort();
-                            let mut added = 0;
-                            for file_path in files {
-                                let meta_opt = self.metadata_cache.get(&file_path).cloned()
-                                    .or_else(|| {
-                                        if let Ok(m) = crate::metadata::extract_metadata(&file_path) {
-                                            self.metadata_cache.insert(file_path.clone(), m.clone());
-                                            Some(m)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .or_else(|| Some(crate::metadata::fallback_metadata(&file_path)));
-                                if let Some(meta) = meta_opt {
-                                    self.register_stream_file(&meta.filepath);
-                                    self.queue.add_track(meta);
-                                    added += 1;
-                                }
-                            }
-                            self.status_message = format!("Added {} tracks (web)", added);
-                            self.update_web_state();
+                            let tracks = files.iter().map(|p| crate::metadata::fallback_metadata(p)).collect();
+                            let _ = tx.send(tracks);
                         }
-                    }
+                    });
                 }
                 crate::web::WebCommand::SelectDevice(id) => {
                     let devices = self.device_manager.get_devices();
