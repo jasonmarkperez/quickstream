@@ -30,3 +30,11 @@ Finding 1 (tab bar clipped at 80 columns) was already resolved in b38bc2e: rende
 Covering test: test_tab_bar_shows_all_five_labels_at_80_columns (80x30 render asserts all five labels, including '[5] Playlists').
 Command: cargo test --test test_playlists_ui -- --test-threads=1; cargo fmt --check; cargo clippy --all-targets -- -D warnings.
 Output: 9 passed, fmt clean, clippy clean.
+
+## Fix round 4
+
+Finding 1 (tab bar clipped at 80 columns): the code fix has been in place since b38bc2e. render_tabs (src/ui/mod.rs:3546) calls `.padding("", "")` and gives each title one leading space. That is 75 title columns plus 4 dividers, 79 in total. The finding cites the original 50689f2 diff, which used the default padding. No code change was needed this round. To make the evidence stronger, the covering test now renders at 80x30 with each of the five tabs selected, prints the tab bar row, and asserts that all five labels appear on it.
+Rendered row at 80 columns (the same for every selected tab): " [1] Now Playing│ [2] Queue & Library│ [3] Devices│ [4] Settings│ [5] Playlists "
+Covering test: test_tab_bar_shows_all_five_labels_at_80_columns (tests/test_playlists_ui.rs).
+Command: cargo test --test test_playlists_ui -- --test-threads=1 [--nocapture test_tab_bar]; cargo fmt --check; cargo clippy --all-targets -- -D warnings.
+Output: 9 passed, 0 failed; fmt clean; clippy clean (no warnings).
