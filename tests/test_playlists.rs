@@ -483,3 +483,24 @@ fn test_plan_queue_prefers_cached_metadata() {
     assert_eq!(plan.tracks[1].bitrate_kbps, 900);
     assert_eq!(plan.tracks[0], placeholder_metadata(&four_entries()[0]));
 }
+
+#[test]
+fn test_plan_queue_skips_non_audio_entries_as_missing() {
+    common::isolate();
+    let entries = vec![
+        entry("/Music/a.flac", 10, "A", "a"),
+        entry("/Users/x/.ssh/id_rsa", -1, "", "id_rsa"),
+        entry("/Music/notes.txt", -1, "", "notes"),
+        entry("/Music/b.mp3", 10, "B", "b"),
+    ];
+    // Every file "exists": the extension alone must keep non-audio files out of the queue.
+    let plan = plan_queue(&entries, &[true; 4], Some(1), &no_cache);
+    let paths: Vec<_> = plan.tracks.iter().map(|t| t.filepath.clone()).collect();
+    assert_eq!(
+        paths,
+        vec![PathBuf::from("/Music/a.flac"), PathBuf::from("/Music/b.mp3")]
+    );
+    assert_eq!(plan.missing, 2);
+    // The selected non-audio entry falls through to the next playable one.
+    assert_eq!(plan.start_index, Some(1));
+}

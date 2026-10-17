@@ -310,7 +310,9 @@ pub fn plan_queue(
     // exists, otherwise of the next existing entry after it.
     let mut kept_before_selected = 0;
     for (i, entry) in entries.iter().enumerate() {
-        if !exists.get(i).copied().unwrap_or(false) {
+        // A playlist file can list any path. Only audio files may reach the queue, because queued
+        // tracks are served over HTTP. The extension check does not touch the disk.
+        if !exists.get(i).copied().unwrap_or(false) || !crate::metadata::is_supported_audio_file(&entry.path) {
             continue;
         }
         if selected.is_some_and(|s| i < s) {

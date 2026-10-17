@@ -60,7 +60,10 @@ impl PlaylistChecks {
     fn new() -> Self {
         let (exists_tx, exists_rx) = std::sync::mpsc::channel();
         let (queue_tx, queue_rx) = std::sync::mpsc::channel();
-        let checker: ExistsChecker = std::sync::Arc::new(|path: &std::path::Path| path.exists());
+        let checker: ExistsChecker = std::sync::Arc::new(|path: &std::path::Path| {
+            // Non-audio entries show as missing; plan_queue never queues them either.
+            crate::metadata::is_supported_audio_file(path) && path.exists()
+        });
         Self {
             checker,
             in_flight: std::collections::HashSet::new(),
