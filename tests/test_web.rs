@@ -638,3 +638,89 @@ fn test_web_server_stream_unknown_name_does_not_fall_back_to_current_track() {
     handle.stop();
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_web_server_stream_prefers_now_playing_over_same_name_registration() {
+    let temp_dir = std::env::temp_dir().join(format!("qs_stream_samename_{}", std::process::id()));
+    let album_a = temp_dir.join("album_a");
+    let album_b = temp_dir.join("album_b");
+    fs::create_dir_all(&album_a).unwrap();
+    fs::create_dir_all(&album_b).unwrap();
+    let playing = album_a.join("01 Intro.mp3");
+    let other = album_b.join("01 Intro.mp3");
+    fs::write(&playing, vec![0xAA; 32]).unwrap();
+    fs::write(&other, vec![0xBB; 64]).unwrap();
+
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    state.write().unwrap().filepath = Some(playing.clone());
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state, tx).expect("start web server");
+    handle.register_stream_file(&playing);
+    // A later registration (e.g. autopilot queueing another album) reuses the same file name.
+    handle.register_stream_file(&other);
+
+    let (status, _, body) = http_get(handle.port, "/stream/01%20Intro.mp3");
+    assert_eq!(status, 200);
+    assert_eq!(body, vec![0xAA; 32], "must serve the now-playing file, not the other album's");
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_web_server_stream_serves_registered_file_with_encoded_name() {
+    let temp_dir = std::env::temp_dir().join(format!("qs_stream_encoded_{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).unwrap();
+    let file = temp_dir.join("Café + Friends (Live).flac");
+    fs::write(&file, vec![0x42; 16]).unwrap();
+
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state, tx).expect("start web server");
+    handle.register_stream_file(&file);
+
+    let encoded = quickstream::player::upnp::url_encode("Café + Friends (Live).flac");
+    let (status, _, body) = http_get(handle.port, &format!("/stream/{}", encoded));
+    assert_eq!(status, 200);
+    assert_eq!(body, vec![0x42; 16]);
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_web_server_stream_rejects_separator_and_dot_names() {
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state, tx).expect("start web server");
+    for path in ["/stream/", "/stream/..", "/stream/%2E%2E", "/stream/..%5CCargo.toml", "/stream/%5Cetc%5Cpasswd"] {
+        let (status, _, _) = http_get(handle.port, path);
+        assert_eq!(status, 404, "{} must be rejected", path);
+    }
+    handle.stop();
+}
+
+/// Linux allows file names that are not valid UTF-8; DLNA URLs carry them lossily encoded.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_web_server_stream_serves_non_utf8_file_name() {
+    use std::os::unix::ffi::OsStrExt;
+    let temp_dir = std::env::temp_dir().join(format!("qs_stream_nonutf8_{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).unwrap();
+    let name = std::ffi::OsStr::from_bytes(b"caf\xe9.mp3");
+    let file = temp_dir.join(name);
+    fs::write(&file, vec![0x33; 8]).unwrap();
+
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state, tx).expect("start web server");
+    handle.register_stream_file(&file);
+
+    let encoded = quickstream::player::upnp::url_encode(&name.to_string_lossy());
+    let (status, _, body) = http_get(handle.port, &format!("/stream/{}", encoded));
+    assert_eq!(status, 200);
+    assert_eq!(body, vec![0x33; 8]);
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&temp_dir);
+}

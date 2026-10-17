@@ -246,7 +246,8 @@ impl StreamServerState {
 
     /// Register a file on disk so that /stream/<filename> resolves to its exact path.
     pub fn register_file(&self, path: &Path) {
-        if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+        // Lossy so names that are not valid UTF-8 match the lossily encoded URLs built by upnp.rs.
+        if let Some(filename) = path.file_name().map(|f| f.to_string_lossy()) {
             let mut reg = self.file_registry.write().unwrap();
             reg.insert(filename.to_string(), path.to_path_buf());
             reg.insert(filename.to_lowercase(), path.to_path_buf());
@@ -940,15 +941,15 @@ fn resolve_stream_file(name: &str, stream_state: &StreamServerState, current: Op
     if name.is_empty() || name.contains('/') || name.contains('\\') {
         return None;
     }
-    let found = stream_state.lookup_file(name).or_else(|| {
-        current
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|f| f.to_str())
-                    .is_some_and(|f| f.eq_ignore_ascii_case(name))
-            })
-            .map(Path::to_path_buf)
-    })?;
+    // The now-playing file wins over the registry: the registry is keyed by bare file name, so a
+    // later registration of a same-named track from another album would otherwise replace it.
+    let found = current
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|f| f.to_string_lossy().to_lowercase() == name.to_lowercase())
+        })
+        .map(Path::to_path_buf)
+        .or_else(|| stream_state.lookup_file(name))?;
     found.is_file().then_some(found)
 }
 
