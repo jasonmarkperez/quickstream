@@ -306,47 +306,98 @@ pub fn decode_chunked(data: &[u8]) -> Result<Option<Vec<u8>>, String> {
     }
 }
 
+/// Largest header section accepted, counting any interim (1xx) responses before the
+/// final one. Real renderers send well under 4 KiB.
+pub const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+/// Interim (1xx) responses skipped before the final response; more is an error.
+pub const MAX_INTERIM_RESPONSES: usize = 8;
+
+/// Find the end of the header block starting at `start`: returns the offset of the
+/// blank-line delimiter and its length. Only the first [`MAX_HTTP_HEADER_BYTES`] of
+/// `buf` are searched, so a delimiter beyond the cap is never found.
+fn find_header_end(buf: &[u8], start: usize) -> Option<(usize, usize)> {
+    let limit = buf.len().min(MAX_HTTP_HEADER_BYTES);
+    if start >= limit {
+        return None;
+    }
+    let window = &buf[start..limit];
+    let crlf = window.windows(4).position(|w| w == b"\r\n\r\n").map(|p| (p, 4));
+    let lf = window.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2));
+    let (pos, len) = match (crlf, lf) {
+        (Some(a), Some(b)) => if a.0 <= b.0 { a } else { b },
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => return None,
+    };
+    Some((start + pos, len))
+}
+
 /// Try to parse a complete HTTP response from `buf`.
 ///
 /// Returns `Ok(None)` while more data is needed. With `eof = true` the peer has closed
 /// the connection, so whatever has arrived is final. A body shorter than its
 /// Content-Length is accepted at EOF because some renderers send a wrong length.
+///
+/// Up to [`MAX_INTERIM_RESPONSES`] interim 1xx responses are skipped, and the header
+/// section (interim responses included) may not exceed [`MAX_HTTP_HEADER_BYTES`].
 pub fn parse_http_response(buf: &[u8], eof: bool) -> Result<Option<HttpResponse>, HttpError> {
-    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| (p, 4));
-    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2));
-    let (header_end, delim_len) = match (crlf, lf) {
-        (Some(a), Some(b)) => if a.0 <= b.0 { a } else { b },
-        (Some(a), None) => a,
-        (None, Some(b)) => b,
-        (None, None) => {
-            return if eof {
-                Err(HttpError::Malformed(if buf.is_empty() {
-                    "empty response".to_string()
+    let mut start = 0;
+    let mut interim = 0;
+    let (status, headers, body_start) = loop {
+        let (header_end, delim_len) = match find_header_end(buf, start) {
+            Some(found) => found,
+            None => {
+                if buf.len() >= MAX_HTTP_HEADER_BYTES {
+                    return Err(HttpError::Malformed(format!(
+                        "header section larger than {} bytes",
+                        MAX_HTTP_HEADER_BYTES
+                    )));
+                }
+                return if eof {
+                    Err(HttpError::Malformed(if buf.len() == start {
+                        "empty response".to_string()
+                    } else {
+                        "no end of headers".to_string()
+                    }))
                 } else {
-                    "no end of headers".to_string()
-                }))
-            } else {
-                Ok(None)
-            };
+                    Ok(None)
+                };
+            }
+        };
+        let body_start = header_end + delim_len;
+        if body_start > MAX_HTTP_HEADER_BYTES {
+            return Err(HttpError::Malformed(format!(
+                "header section larger than {} bytes",
+                MAX_HTTP_HEADER_BYTES
+            )));
         }
+
+        let head = String::from_utf8_lossy(&buf[start..header_end]);
+        let mut lines = head.lines();
+        let status_line = lines.next().unwrap_or("");
+        let status = parse_status_code(status_line)
+            .ok_or_else(|| HttpError::Malformed(format!("bad status line '{}'", status_line)))?;
+
+        // Skip interim 1xx responses (e.g. "100 Continue").
+        if (100..200).contains(&status) {
+            interim += 1;
+            if interim > MAX_INTERIM_RESPONSES {
+                return Err(HttpError::Malformed(format!(
+                    "more than {} interim responses",
+                    MAX_INTERIM_RESPONSES
+                )));
+            }
+            start = body_start;
+            continue;
+        }
+
+        let headers: Vec<(String, String)> = lines
+            .filter_map(|l| l.split_once(':'))
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .collect();
+        break (status, headers, body_start);
     };
-
-    let head = String::from_utf8_lossy(&buf[..header_end]);
-    let mut lines = head.lines();
-    let status_line = lines.next().unwrap_or("");
-    let status = parse_status_code(status_line)
-        .ok_or_else(|| HttpError::Malformed(format!("bad status line '{}'", status_line)))?;
-    let headers: Vec<(String, String)> = lines
-        .filter_map(|l| l.split_once(':'))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        .collect();
-    let body_start = header_end + delim_len;
     let body = &buf[body_start..];
-
-    // Skip interim 1xx responses (e.g. "100 Continue").
-    if (100..200).contains(&status) {
-        return parse_http_response(body, eof);
-    }
 
     let header = |name: &str| {
         headers
