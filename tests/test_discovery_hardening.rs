@@ -9,9 +9,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use quickstream::discovery::{
-    fetch_xml, parse_http_response, DescriptionFetcher, FetchJob, FetchScheduler, HttpError,
-    DESCRIPTION_FETCH_TIMEOUT, MAX_PARALLEL_DESCRIPTION_FETCHES,
+    extract_xml_tag, fetch_xml, parse_device_description, parse_http_response, DLNADevice,
+    DescriptionFetcher, FetchJob, FetchScheduler, HttpError, DESCRIPTION_FETCH_TIMEOUT,
+    MAX_PARALLEL_DESCRIPTION_FETCHES,
 };
+use quickstream::player::upnp::{SoapError, UPnPClient, AV_TRANSPORT_SERVICE};
 
 type Responder = Arc<dyn Fn(&mut TcpStream) + Send + Sync>;
 
@@ -195,6 +197,124 @@ fn test_fetch_xml_gives_up_early_without_first_byte() {
     assert!(fetch_xml(&server.url()).is_none());
     let elapsed = start.elapsed();
     assert!(elapsed < Duration::from_millis(1800), "took {:?}", elapsed);
+}
+
+// ---------------------------------------------------------------------------
+// XML tag extraction cost and behaviour
+// ---------------------------------------------------------------------------
+
+/// Run `f` on a helper thread and fail if it does not finish within `limit`.
+fn finishes_within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(limit)
+        .unwrap_or_else(|_| panic!("did not finish within {:?}", limit))
+}
+
+fn repeat_to(parts: &[&str], target_len: usize) -> String {
+    let mut s = String::with_capacity(target_len + 64);
+    while s.len() < target_len {
+        for p in parts {
+            s.push_str(p);
+        }
+    }
+    s
+}
+
+/// Hostile bodies (many namespaced opening tags followed by many unrelated closing
+/// tags) must be scanned in roughly linear time.
+#[test]
+fn test_extract_xml_tag_is_linear_on_hostile_input() {
+    let half = 128 * 1024;
+    let mut xml = repeat_to(&["<u:friendlyName>"], half);
+    xml.push_str(&repeat_to(&["</a>"], half));
+    let start = Instant::now();
+    let res = finishes_within(Duration::from_secs(2), move || extract_xml_tag(&xml, "friendlyName"));
+    assert_eq!(res, None);
+    assert!(start.elapsed() < Duration::from_millis(500), "took {:?}", start.elapsed());
+
+    // Unterminated closing tags after a matching opening tag.
+    let mut xml = String::from("<u:CurrentVolume>");
+    xml.push_str(&repeat_to(&["</"], 256 * 1024));
+    let res = finishes_within(Duration::from_secs(2), move || extract_xml_tag(&xml, "CurrentVolume"));
+    assert_eq!(res, None);
+
+    // A full device description padded to the size cap parses quickly too.
+    let mut xml = repeat_to(&["<u:modelName>", "</x>", "<y:z a=\"1\">"], 250 * 1024);
+    xml.push_str(&renderer_xml("Padded"));
+    let dev = finishes_within(Duration::from_secs(2), move || {
+        parse_device_description(&xml, "http://10.0.0.5:49152/desc.xml")
+    });
+    assert_eq!(dev.map(|d| d.friendly_name), Some("Padded".to_string()));
+}
+
+#[test]
+fn test_extract_xml_tag_behaviour() {
+    let x = |xml: &str, tag: &str| extract_xml_tag(xml, tag);
+    assert_eq!(x("<a><b> hi </b></a>", "b").as_deref(), Some("hi"));
+    assert_eq!(x("<u:b xmlns:u=\"urn:x\">v</u:b>", "b").as_deref(), Some("v"));
+    assert_eq!(x("<b attr=\"1\">v</b>", "b").as_deref(), Some("v"));
+    assert_eq!(x("<u:b>v</b>", "b").as_deref(), Some("v"));
+    assert_eq!(x("<b>v</u:b >", "b").as_deref(), Some("v"));
+    // The plain form wins over an earlier namespaced one.
+    assert_eq!(x("<u:b>first</u:b><b>second</b>", "b").as_deref(), Some("second"));
+    // Content up to the first matching close, other tags included.
+    assert_eq!(x("<u:b><i>x</i>y</u:b>", "b").as_deref(), Some("<i>x</i>y"));
+    // A stray '<' in the content does not hide the closing tag.
+    assert_eq!(x("<u:b>1 < 2</u:b>", "b").as_deref(), Some("1 < 2"));
+    // Similar names, self-closing tags, closing tags without an opening one.
+    assert_eq!(x("<bb>v</bb>", "b"), None);
+    assert_eq!(x("<u:bb>v</u:bb>", "b"), None);
+    assert_eq!(x("<b/>", "b"), None);
+    assert_eq!(x("v</b>", "b"), None);
+    assert_eq!(x("<u:b>unterminated", "b"), None);
+    assert_eq!(x("", "b"), None);
+    // Multi-byte text around the tags.
+    assert_eq!(x("<é><u:b>ünï</u:b>", "b").as_deref(), Some("ünï"));
+}
+
+/// SOAP responses are capped at a realistic size.
+#[test]
+fn test_soap_response_size_is_capped() {
+    let server = spawn_server(Arc::new(|s: &mut TcpStream| {
+        let filler = "x".repeat(200 * 1024);
+        let body = format!(
+            "<s:Envelope><s:Body><u:GetTransportInfoResponse><CurrentTransportState>PLAYING</CurrentTransportState><Pad>{}</Pad></u:GetTransportInfoResponse></s:Body></s:Envelope>",
+            filler
+        );
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = s.write_all(resp.as_bytes());
+    }));
+    let device = DLNADevice {
+        friendly_name: "Big".to_string(),
+        location: server.url(),
+        host: "127.0.0.1".to_string(),
+        port: server.port,
+        manufacturer: String::new(),
+        model_name: String::new(),
+        av_transport_control_url: format!("http://127.0.0.1:{}/ctrl", server.port),
+        rendering_control_url: String::new(),
+        udn: String::new(),
+    };
+    let client = UPnPClient::new(device);
+    let res = client.call_action(
+        &client.device.av_transport_control_url,
+        AV_TRANSPORT_SERVICE,
+        "GetTransportInfo",
+        &[("InstanceID", "0")],
+        Duration::from_secs(3),
+    );
+    assert!(
+        matches!(res, Err(SoapError::Transport(HttpError::TooLarge(_)))),
+        "got {:?}",
+        res.map(|b| b.len())
+    );
 }
 
 fn drain(s: &mut FetchScheduler) -> Vec<FetchJob> {

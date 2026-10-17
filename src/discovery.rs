@@ -83,45 +83,46 @@ pub fn extract_xml_tag(xml: &str, tag_name: &str) -> Option<String> {
         }
     }
 
-    // Try tag with namespace (e.g. <u:tag> or <ns:tag>) or attributes (<tag attr="x">)
-    let search_open = "<";
+    // Try tag with namespace (e.g. <u:tag> or <ns:tag>) or attributes (<tag attr="x">).
+    // One forward pass over the `<...>` regions: find the first matching opening tag,
+    // then the first matching closing tag after it. Every byte is looked at a bounded
+    // number of times, so hostile input cannot make this quadratic.
+    fn local_name(name: &str) -> &str {
+        match name.find(':') {
+            Some(colon) => &name[colon + 1..],
+            None => name,
+        }
+    }
+    let mut content_start: Option<usize> = None;
     let mut cursor = 0;
-    while let Some(open_idx) = xml[cursor..].find(search_open) {
-        let abs_open = cursor + open_idx;
-        let tag_close_idx = match xml[abs_open..].find('>') {
-            Some(idx) => abs_open + idx,
+    while let Some(rel) = xml[cursor..].find('<') {
+        let mut open = cursor + rel;
+        let close = match xml[open + 1..].find('>') {
+            Some(i) => open + 1 + i,
             None => break,
         };
-        let tag_header = &xml[abs_open + 1..tag_close_idx];
-        let tag_name_part = tag_header.split_whitespace().next().unwrap_or("");
-        let base_name = if let Some(colon) = tag_name_part.find(':') {
-            &tag_name_part[colon + 1..]
-        } else {
-            tag_name_part
-        };
-
-        if base_name == tag_name {
-            // Found opening tag, find corresponding closing tag
-            let content_start = tag_close_idx + 1;
-            let close_search = "</";
-            let mut search_cursor = content_start;
-            while let Some(close_idx) = xml[search_cursor..].find(close_search) {
-                let abs_close = search_cursor + close_idx;
-                if let Some(end_tag_bracket) = xml[abs_close..].find('>') {
-                    let end_header = &xml[abs_close + 2..abs_close + end_tag_bracket];
-                    let end_base = if let Some(colon) = end_header.find(':') {
-                        &end_header[colon + 1..]
-                    } else {
-                        end_header
-                    };
-                    if end_base.trim() == tag_name {
-                        return Some(xml[content_start..abs_close].trim().to_string());
+        match content_start {
+            None => {
+                let header = &xml[open + 1..close];
+                let name = header.split_whitespace().next().unwrap_or("");
+                if local_name(name) == tag_name {
+                    content_start = Some(close + 1);
+                }
+            }
+            Some(start) => {
+                // A stray '<' in the content must not hide the closing tag: the tag
+                // ending at `close` starts at the last '<' before it.
+                if let Some(inner) = xml[open + 1..close].rfind('<') {
+                    open = open + 1 + inner;
+                }
+                if let Some(end_header) = xml[open + 1..close].strip_prefix('/') {
+                    if local_name(end_header).trim() == tag_name {
+                        return Some(xml[start..open].trim().to_string());
                     }
                 }
-                search_cursor = abs_close + 2;
             }
         }
-        cursor = tag_close_idx + 1;
+        cursor = close + 1;
     }
 
     None

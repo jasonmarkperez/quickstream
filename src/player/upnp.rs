@@ -129,8 +129,9 @@ pub fn create_didl_lite_xml(
     )
 }
 
-/// Largest SOAP response accepted from a renderer.
-const MAX_SOAP_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Largest SOAP response accepted from a renderer. Real replies, including
+/// GetPositionInfo with its DIDL-Lite track metadata, are a few KiB.
+pub const MAX_SOAP_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Why a SOAP action failed.
 #[derive(Debug, Clone, PartialEq)]
