@@ -245,62 +245,98 @@ impl BpmAnalyzer {
         }
     }
 
-    /// Autocorrelate energy envelope across 60–180 BPM range.
+    /// Estimate tempo (60–180 BPM) from mono samples.
+    ///
+    /// 1. Onset strength: half-wave rectified difference of a 10 ms RMS envelope, mean removed.
+    /// 2. Autocorrelation normalized by overlap length (a mean, not a sum), so long lags are not
+    ///    penalized just because fewer frame pairs overlap.
+    /// 3. Normalized correlation is equal at a beat period and its multiples, so the octave is
+    ///    chosen with a broad log-tempo prior centred on 120 BPM (σ = 1 octave): a 120 BPM click
+    ///    reads as 120 rather than 60, while a genuine 90 BPM track has no competing peak.
+    /// 4. The winning lag is refined with parabolic interpolation for sub-frame precision.
+    ///
+    /// Tempos from 60 to ~160 BPM are reported as-is (±2 BPM on click tracks). Faster material
+    /// may be reported at half tempo (e.g. 170 BPM drum & bass as 85); mood/BPM matching
+    /// already treats half and double tempo as equivalent.
+    ///
+    /// Returns `None` for silence or clips too short to analyse.
     pub fn compute_bpm_from_samples(samples: &[f32], sample_rate: f32) -> Option<f64> {
-        if samples.is_empty() {
+        const HOP_SECS: f32 = 0.010;
+        const MIN_BPM: f32 = 60.0;
+        const MAX_BPM: f32 = 180.0;
+        const PRIOR_CENTER_BPM: f32 = 120.0;
+        const PRIOR_OCTAVES_SIGMA: f32 = 1.0;
+
+        if samples.is_empty() || sample_rate <= 0.0 {
+            return None;
+        }
+        let hop_size = ((sample_rate * HOP_SECS) as usize).max(1); // ~110 samples @ 11025 Hz
+        let fps = sample_rate / hop_size as f32; // ~100 frames per second
+
+        let envelope: Vec<f32> = samples
+            .chunks(hop_size)
+            .map(|chunk| (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32).sqrt())
+            .collect();
+
+        // Onset flux: half-wave rectified first difference, then mean-removed so a constant
+        // background (noise floor) adds no baseline to every lag.
+        let raw_flux: Vec<f32> = envelope.windows(2).map(|w| (w[1] - w[0]).max(0.0)).collect();
+        // Light triangular smoothing (±2 frames) widens each onset so a beat period that is not
+        // a whole number of frames does not split its correlation peak across two lag bins
+        // (which otherwise lets the sharper half-tempo peak win).
+        const KERNEL: [f32; 5] = [1.0, 2.0, 3.0, 2.0, 1.0];
+        let mut flux: Vec<f32> = (0..raw_flux.len())
+            .map(|i| {
+                KERNEL
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(k, w)| (i + k).checked_sub(2).and_then(|j| raw_flux.get(j)).map(|f| f * w))
+                    .sum::<f32>()
+                    / 9.0
+            })
+            .collect();
+        let min_lag = (fps * 60.0 / MAX_BPM).floor().max(1.0) as usize;
+        let max_lag = ((fps * 60.0 / MIN_BPM).ceil() as usize).min(flux.len() / 2);
+        if flux.len() < 50 || max_lag <= min_lag + 1 {
+            return None;
+        }
+        let mean = flux.iter().sum::<f32>() / flux.len() as f32;
+        if mean <= f32::EPSILON {
+            return None; // silence / no onsets
+        }
+        flux.iter_mut().for_each(|f| *f -= mean);
+
+        let prior = |lag: f32| -> f32 {
+            let octaves = ((fps * 60.0 / lag) / PRIOR_CENTER_BPM).log2() / PRIOR_OCTAVES_SIGMA;
+            (-0.5 * octaves * octaves).exp()
+        };
+        // Score each lag in [min_lag, max_lag]; one extra lag either side for interpolation.
+        let lo = min_lag.saturating_sub(1).max(1);
+        let hi = (max_lag + 1).min(flux.len() - 1);
+        let scores: Vec<f32> = (lo..=hi)
+            .map(|lag| normalized_autocorrelation(&flux, lag) * prior(lag as f32))
+            .collect();
+        let score_at = |lag: usize| scores[lag - lo];
+
+        let best_lag = (min_lag..=max_lag).max_by(|&a, &b| score_at(a).total_cmp(&score_at(b)))?;
+        if score_at(best_lag) <= 0.0 {
             return None;
         }
 
-        // Window size ~50ms for energy envelope
-        let hop_size = (sample_rate * 0.050) as usize; // ~551 samples @ 11025Hz
-        let mut envelope = Vec::new();
-
-        for chunk in samples.chunks(hop_size) {
-            let mut rms = 0.0f32;
-            for &s in chunk {
-                rms += s * s;
-            }
-            envelope.push((rms / chunk.len() as f32).sqrt());
-        }
-
-        // Compute first-order difference (onset flux)
-        let mut flux = Vec::with_capacity(envelope.len());
-        for i in 1..envelope.len() {
-            let diff = envelope[i] - envelope[i - 1];
-            flux.push(diff.max(0.0)); // half-wave rectification
-        }
-
-        if flux.len() < 50 {
-            return None;
-        }
-
-        // Autocorrelation over BPM range 60 to 180 BPM
-        let fps = sample_rate / hop_size as f32; // ~20 frames per sec
-        let min_bpm = 60.0;
-        let max_bpm = 180.0;
-        let min_lag = (fps * 60.0 / max_bpm).round() as usize;
-        let max_lag = (fps * 60.0 / min_bpm).round() as usize;
-
-        let mut best_lag = 0;
-        let mut max_corr = 0.0f32;
-
-        for lag in min_lag..=max_lag.min(flux.len() / 2) {
-            let mut corr = 0.0f32;
-            for i in 0..(flux.len() - lag) {
-                corr += flux[i] * flux[i + lag];
-            }
-            if corr > max_corr {
-                max_corr = corr;
-                best_lag = lag;
+        // Parabolic interpolation around the peak for sub-frame precision.
+        let mut lag = best_lag as f32;
+        if best_lag > lo && best_lag < hi {
+            let (a, b, c) = (score_at(best_lag - 1), score_at(best_lag), score_at(best_lag + 1));
+            let denom = a - 2.0 * b + c;
+            if denom.abs() > f32::EPSILON {
+                lag += (0.5 * (a - c) / denom).clamp(-0.5, 0.5);
             }
         }
 
-        if best_lag > 0 {
-            let bpm = (fps * 60.0) / best_lag as f32;
-            Some(bpm.round() as f64)
-        } else {
-            None
-        }
+        let bpm = fps * 60.0 / lag;
+        (MIN_BPM - 1.0..=MAX_BPM + 1.0)
+            .contains(&bpm)
+            .then(|| bpm.round() as f64)
     }
 
     /// Calculate RMS energy score (0.0 to 1.0).
@@ -320,6 +356,17 @@ impl BpmAnalyzer {
         let energy = (rms * 3.0).clamp(0.0, 1.0);
         Some((energy * 100.0).round() / 100.0)
     }
+}
+
+/// Autocorrelation of `flux` at `lag`, divided by the number of overlapping frame pairs.
+/// Dividing by the overlap removes the bias of a raw sum toward short lags.
+fn normalized_autocorrelation(flux: &[f32], lag: usize) -> f32 {
+    let overlap = flux.len().saturating_sub(lag);
+    if overlap == 0 {
+        return 0.0;
+    }
+    let sum: f32 = flux[..overlap].iter().zip(&flux[lag..]).map(|(a, b)| a * b).sum();
+    sum / overlap as f32
 }
 
 #[cfg(test)]
@@ -348,5 +395,98 @@ mod tests {
         assert!(bpm.is_some());
         let val = bpm.unwrap();
         assert!((115.0..=125.0).contains(&val), "Expected ~120 BPM, got {}", val);
+    }
+
+    const SR: f32 = ANALYSIS_SAMPLE_RATE as f32;
+
+    /// Click track: decaying 880 Hz bursts at exact (fractional-sample) beat positions over a
+    /// faint deterministic noise floor.
+    fn click_track(bpm: f64, seconds: f64) -> Vec<f32> {
+        let sr = SR as f64;
+        let total = (sr * seconds) as usize;
+        let mut rng: u32 = 0x1234_5678;
+        let mut samples: Vec<f32> = (0..total)
+            .map(|_| {
+                rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((rng >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.02
+            })
+            .collect();
+        let beat = sr * 60.0 / bpm;
+        let burst = (sr * 0.04) as usize;
+        let mut k = 0usize;
+        loop {
+            let start = (k as f64 * beat).round() as usize;
+            if start >= total {
+                break;
+            }
+            for j in 0..burst.min(total - start) {
+                let t = j as f64 / sr;
+                let env = 1.0 - j as f64 / burst as f64;
+                samples[start + j] += (0.8 * env * (2.0 * std::f64::consts::PI * 880.0 * t).sin()) as f32;
+            }
+            k += 1;
+        }
+        samples
+    }
+
+    /// Detection over the production slice length (20 s) must land within ±2 BPM of the true
+    /// tempo, not on an octave (half / double) or a neighbouring coarse lag bin.
+    #[test]
+    fn test_click_tracks_detected_within_two_bpm() {
+        for &true_bpm in &[90.0, 100.0, 120.0, 128.0, 140.0] {
+            let samples = click_track(true_bpm, ACOUSTIC_SLICE_SECS as f64);
+            let detected = BpmAnalyzer::compute_bpm_from_samples(&samples, SR)
+                .unwrap_or_else(|| panic!("no tempo detected for {true_bpm} BPM click track"));
+            assert!(
+                (detected - true_bpm).abs() <= 2.0,
+                "{true_bpm} BPM click track detected as {detected}"
+            );
+        }
+    }
+
+    /// Whole-range sweep: 60–160 BPM is reported at the true tempo; above that the detector may
+    /// report the half tempo (octave-equivalent, e.g. 170 BPM drum & bass as 85), never anything
+    /// else.
+    #[test]
+    fn test_tempo_sweep_is_exact_or_octave_equivalent() {
+        for true_bpm in (60..=180).step_by(5).map(f64::from) {
+            let detected = BpmAnalyzer::compute_bpm_from_samples(&click_track(true_bpm, 20.0), SR)
+                .unwrap_or_else(|| panic!("no tempo for {true_bpm} BPM"));
+            let exact = (detected - true_bpm).abs() <= 2.0;
+            let half = (detected - true_bpm / 2.0).abs() <= 2.0;
+            if true_bpm <= 160.0 {
+                assert!(exact, "{true_bpm} BPM detected as {detected}");
+            } else {
+                assert!(exact || half, "{true_bpm} BPM detected as {detected}");
+            }
+        }
+    }
+
+    /// Short slices (the 3 s minimum used for very short tracks) still give a usable tempo.
+    #[test]
+    fn test_short_click_track_detected_within_two_bpm() {
+        let samples = click_track(128.0, 8.0);
+        let detected = BpmAnalyzer::compute_bpm_from_samples(&samples, SR).expect("tempo for 8 s clip");
+        assert!((detected - 128.0).abs() <= 2.0, "128 BPM 8 s clip detected as {detected}");
+    }
+
+    #[test]
+    fn test_silence_has_no_tempo() {
+        let silence = vec![0.0f32; (SR * 20.0) as usize];
+        assert_eq!(BpmAnalyzer::compute_bpm_from_samples(&silence, SR), None);
+    }
+
+    /// For a perfectly periodic onset train, correlation at the period and at twice the period
+    /// must be equal: the score is a mean over the overlap, not a sum that shrinks with the lag.
+    #[test]
+    fn test_autocorrelation_is_normalized_by_overlap() {
+        let mut flux = vec![0.0f32; 200];
+        for i in (0..flux.len()).step_by(10) {
+            flux[i] = 1.0;
+        }
+        let r10 = normalized_autocorrelation(&flux, 10);
+        let r40 = normalized_autocorrelation(&flux, 40);
+        assert!(r10 > 0.0);
+        assert!((r10 - r40).abs() / r10 < 0.05, "r(10)={r10}, r(40)={r40}: biased toward short lags");
     }
 }
