@@ -6,6 +6,7 @@ pub mod library;
 pub mod logger;
 pub mod metadata;
 pub mod paths;
+pub mod persist;
 pub mod player;
 pub mod queue;
 pub mod settings;

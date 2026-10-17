@@ -1,6 +1,5 @@
 //! Interactive Terminal User Interface (Ratatui + Crossterm + Skim integration).
 
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -186,6 +185,8 @@ pub struct AppUI {
     pub active_mix_profile: crate::analysis::MixProfile,
     pub show_mix_picker_modal: bool,
     pub mix_picker_cursor: usize,
+    /// Writes bookmarks and settings off the UI thread; flushed and joined on drop.
+    pub persistence: crate::persist::PersistenceWorker,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,7 +197,9 @@ pub enum AutopilotRunMode {
 }
 
 impl AppUI {
-    pub fn new(start_dir: Option<PathBuf>, settings_mgr: SettingsManager) -> Self {
+    pub fn new(start_dir: Option<PathBuf>, mut settings_mgr: SettingsManager) -> Self {
+        let persistence = crate::persist::PersistenceWorker::spawn();
+        settings_mgr.set_persistence(persistence.handle());
         let cwd = start_dir
             .or_else(|| {
                 settings_mgr
@@ -304,6 +307,7 @@ impl AppUI {
             active_mix_profile,
             show_mix_picker_modal: false,
             mix_picker_cursor: 0,
+            persistence,
         };
         app.refresh_browser();
         app.update_web_state();
@@ -311,25 +315,22 @@ impl AppUI {
     }
 
     fn load_bookmarks() -> Vec<String> {
-        let path = paths::get_bookmarks_path();
-        if path.exists() {
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(list) = serde_json::from_str::<Vec<String>>(&content) {
-                    return list;
-                }
-            }
-        }
-        Vec::new()
+        // A corrupt file is backed up to bookmarks.json.bak before we start from an empty list.
+        crate::persist::load_json_or_backup(&paths::get_bookmarks_path(), "bookmarks").unwrap_or_default()
     }
 
+    /// Queue the bookmarks file write on the persistence worker (never blocks the UI).
     fn save_bookmarks(&self) {
-        let path = paths::get_bookmarks_path();
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
         if let Ok(json) = serde_json::to_string_pretty(&self.bookmarks) {
-            let _ = fs::write(path, json);
+            self.persistence.save(paths::get_bookmarks_path(), json.into_bytes());
         }
+    }
+
+    /// Replace the persistence worker (tests use one with an instrumented writer). The old
+    /// worker is flushed and joined first so no queued write is lost.
+    pub fn set_persistence_worker(&mut self, worker: crate::persist::PersistenceWorker) {
+        self.settings_mgr.set_persistence(worker.handle());
+        drop(std::mem::replace(&mut self.persistence, worker));
     }
 
     pub fn format_file_label(
@@ -1351,6 +1352,8 @@ impl AppUI {
         TUI_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
         let res = self.event_loop(&mut terminal);
         SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+        // A bookmark or setting changed right before quitting must reach disk.
+        self.persistence.flush();
         TUI_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
 
         disable_raw_mode()?;
