@@ -1,10 +1,12 @@
 //! Library directory indexing (walkdir), JSONL caching, and Skim fuzzy search integration.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -71,6 +73,52 @@ impl SeenPaths {
     pub fn first_visit(&mut self, path: &Path) -> bool {
         self.0.insert(path.to_path_buf())
     }
+}
+
+/// Counters and timings for one autopilot mix build, written to the log as `[autopilot]` PERF
+/// lines so slow mixes show where the time goes (folder walks vs tag reads vs matching).
+#[derive(Default)]
+struct MixScanStats {
+    folders: Cell<usize>,
+    files: Cell<usize>,
+    walk: Cell<Duration>,
+    metadata: Cell<Duration>,
+    cache_hits: Cell<usize>,
+    db_hits: Cell<usize>,
+    tag_reads: Cell<usize>,
+    tag_read_time: Cell<Duration>,
+    fallbacks: Cell<usize>,
+    matching: Cell<Duration>,
+}
+
+impl MixScanStats {
+    fn count(cell: &Cell<usize>) {
+        cell.set(cell.get() + 1);
+    }
+
+    fn time(cell: &Cell<Duration>, since: Instant) {
+        cell.set(cell.get() + since.elapsed());
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "folders={} files={} walk={:.2?} metadata={:.2?} (cache_hits={} db_hits={} tag_reads={} in {:.2?} fallbacks={}) matching={:.2?}",
+            self.folders.get(),
+            self.files.get(),
+            self.walk.get(),
+            self.metadata.get(),
+            self.cache_hits.get(),
+            self.db_hits.get(),
+            self.tag_reads.get(),
+            self.tag_read_time.get(),
+            self.fallbacks.get(),
+            self.matching.get(),
+        )
+    }
+}
+
+fn log_autopilot(message: String) {
+    crate::logger::log_raw("PERF", "autopilot", &message);
 }
 
 #[derive(Default)]
@@ -409,10 +457,12 @@ impl LibraryManager {
         let mut total_sent = 0;
         let mut rng = crate::queue::FastRng::new();
 
-        let make_metadata = |path: &Path| -> AudioMetadata {
+        let stats = MixScanStats::default();
+        let make_metadata_untimed = |path: &Path| -> AudioMetadata {
             let file_len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             if let Some(cached) = cache.get(path) {
                 if cached.file_size == file_len && !cached.title.is_empty() {
+                    MixScanStats::count(&stats.cache_hits);
                     let mut meta = cached.clone();
                     if meta.genre.is_empty() {
                         if let Some(feat) = db.get_track(path) {
@@ -425,6 +475,7 @@ impl LibraryManager {
                 }
             }
             if let Some(feat) = db.get_track(path) {
+                MixScanStats::count(&stats.db_hits);
                 let (title, artist, album) = Self::parse_path_heuristics(path);
                 return AudioMetadata {
                     filepath: path.to_path_buf(),
@@ -440,9 +491,14 @@ impl LibraryManager {
                     ..Default::default()
                 };
             }
-            if let Ok(meta) = crate::metadata::extract_metadata(path) {
+            MixScanStats::count(&stats.tag_reads);
+            let read_start = Instant::now();
+            let extracted = crate::metadata::extract_metadata(path);
+            MixScanStats::time(&stats.tag_read_time, read_start);
+            if let Ok(meta) = extracted {
                 return meta;
             }
+            MixScanStats::count(&stats.fallbacks);
             let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("track");
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase();
             let (title, artist, album) = Self::parse_path_heuristics(path);
@@ -459,8 +515,15 @@ impl LibraryManager {
                 ..Default::default()
             }
         };
+        let make_metadata = |path: &Path| -> AudioMetadata {
+            let start = Instant::now();
+            let meta = make_metadata_untimed(path);
+            MixScanStats::time(&stats.metadata, start);
+            meta
+        };
 
         // 1. Determine subdirectories and immediate files in dir
+        let listing_start = Instant::now();
         let (mut subdirs, mut immediate_files) = if known_subdirs.len() >= target_limit {
             (known_subdirs, Vec::new())
         } else {
@@ -507,6 +570,15 @@ impl LibraryManager {
             (found_subdirs, found_files)
         };
 
+        log_autopilot(format!(
+            "mix start profile=\"{}\" dir='{}' subdirs={} immediate_files={} listing={:.2?}",
+            profile.name(),
+            dir.display(),
+            subdirs.len(),
+            immediate_files.len(),
+            listing_start.elapsed()
+        ));
+
         // Shuffle subdirectories for fair and diverse library sampling
         rng.shuffle(&mut subdirs);
 
@@ -516,7 +588,7 @@ impl LibraryManager {
             let mut matched_candidates: Vec<AudioMetadata> = Vec::new();
             let mut all_candidates: Vec<AudioMetadata> = Vec::new();
 
-            let is_match = |meta: &AudioMetadata| -> bool {
+            let is_match_untimed = |meta: &AudioMetadata| -> bool {
                 match &profile {
                     crate::analysis::MixProfile::BpmFlow { target_bpm, tolerance } => {
                         let min_bpm = target_bpm * (1.0 - tolerance);
@@ -554,6 +626,13 @@ impl LibraryManager {
                     _ => true,
                 }
             };
+            let is_match = |meta: &AudioMetadata| -> bool {
+                let start = Instant::now();
+                let matched = is_match_untimed(meta);
+                MixScanStats::time(&stats.matching, start);
+                matched
+            };
+            let mut last_progress = Instant::now();
 
             if !subdirs.is_empty() {
                 let per_subdir = if subdirs.len() >= 60 {
@@ -588,6 +667,20 @@ impl LibraryManager {
                         break;
                     }
 
+                    if idx > 0 && (idx % 50 == 0 || last_progress.elapsed() >= Duration::from_secs(10)) {
+                        last_progress = Instant::now();
+                        log_autopilot(format!(
+                            "mix progress folders={}/{} files={} matched={} candidates={} elapsed={:.2?}",
+                            idx,
+                            subdirs.len(),
+                            stats.files.get(),
+                            matched_candidates.len(),
+                            all_candidates.len(),
+                            scan_start.elapsed()
+                        ));
+                    }
+
+                    let walk_start = Instant::now();
                     let mut folder_tracks = Vec::new();
                     let mut seen = SeenPaths::default();
                     for entry in WalkDir::new(subdir)
@@ -611,6 +704,9 @@ impl LibraryManager {
                             }
                         }
                     }
+                    MixScanStats::time(&stats.walk, walk_start);
+                    MixScanStats::count(&stats.folders);
+                    stats.files.set(stats.files.get() + folder_tracks.len());
 
                     if !folder_tracks.is_empty() {
                         rng.shuffle(&mut folder_tracks);
@@ -656,6 +752,7 @@ impl LibraryManager {
                         }
                     }
                 }
+                stats.files.set(stats.files.get() + all_files.len().min(200));
                 rng.shuffle(&mut all_files);
                 for p in all_files.into_iter().take(200) {
                     let meta = make_metadata(&p);
@@ -665,6 +762,14 @@ impl LibraryManager {
                     all_candidates.push(meta);
                 }
             }
+
+            log_autopilot(format!(
+                "candidates gathered {} matched={} candidates={} elapsed={:.2?}",
+                stats.summary(),
+                matched_candidates.len(),
+                all_candidates.len(),
+                scan_start.elapsed()
+            ));
 
             if matched_candidates.is_empty() && all_candidates.is_empty() {
                 let _ = tx.send(AutopilotEvent::Finished(0));
@@ -698,7 +803,15 @@ impl LibraryManager {
                 all_candidates
             };
 
+            let candidate_count = filtered.len();
+            let sequence_start = Instant::now();
             let sequenced = crate::analysis::mixer::DjMixer::sequence_mix(filtered, &db, target_limit);
+            log_autopilot(format!(
+                "sequenced {} tracks from candidates={} in {:.2?}",
+                sequenced.len(),
+                candidate_count,
+                sequence_start.elapsed()
+            ));
 
             for track in sequenced {
                 if stop_flag.load(Ordering::Relaxed) {
@@ -710,6 +823,12 @@ impl LibraryManager {
             }
 
             if !stop_flag.load(Ordering::Relaxed) {
+                log_autopilot(format!(
+                    "mix complete profile=\"{}\" sent={} total={:.2?}",
+                    profile.name(),
+                    total_sent,
+                    scan_start.elapsed()
+                ));
                 let _ = tx.send(AutopilotEvent::Finished(total_sent));
             }
             return;
