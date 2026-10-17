@@ -4705,7 +4705,8 @@ impl AppUI {
             return;
         }
 
-        // Left Column: Playback & Navigation (concise to guarantee <= 34 chars)
+        // Left Column: Playback & Navigation. Both columns must fit the 19 rows an 80x24
+        // terminal leaves for the key list, and each description fits in 29 columns there.
         let left_lines = vec![
             Self::help_section_header("PLAYBACK & AUDIO"),
             Self::help_key_line("Space", "Play / Pause"),
@@ -4716,21 +4717,16 @@ impl AppUI {
             Line::from(""),
             Self::help_section_header("NAVIGATION & TABS"),
             Self::help_key_line("n", "Toggle Now Playing ↔ Queue"),
-            Self::help_key_line("1 - 5", "Switch tab (Now/Queue/Dev/Set/PL)"),
-            Self::help_key_line("h / l", "Focus Browser ↔ Queue"),
+            Self::help_key_line("1 - 5", "Tab: Now/Queue/Dev/Set/PL"),
+            Self::help_key_line("h / l", "Focus panes (tabs 2 & 5)"),
             Self::help_key_line("j / k", "Move Up / Down (wraps)"),
-            Self::help_key_line("J / K", "Page Down / Up"),
+            Self::help_key_line("J / K", "Page (2) / Move track (5)"),
             Self::help_key_line("g / G", "Jump to Start / End"),
             Self::help_key_line("Bksp", "Go up to parent dir"),
             Self::help_key_line("~", "Jump to startup home dir"),
-            Line::from(""),
             Self::help_section_header("PLAYLISTS (TAB 5)"),
-            Self::help_key_line("h / l", "Focus Playlists ↔ Tracks"),
-            Self::help_key_line("Enter", "Open playlist's tracks"),
-            Self::help_key_line("c", "New playlist (tab 5)"),
-            Self::help_key_line("R / D", "Rename / Delete playlist"),
-            Self::help_key_line("J / K", "Move track down / up"),
-            Self::help_key_line("Enter/a", "Play / queue playlist"),
+            Self::help_key_line("c / R / D", "New / Rename / Delete"),
+            Self::help_key_line("Enter/a", "Open/Play / Queue playlist"),
         ];
         f.render_widget(Paragraph::new(left_lines), cols[0]);
 

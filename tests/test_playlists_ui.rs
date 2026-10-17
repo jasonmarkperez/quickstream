@@ -357,11 +357,38 @@ fn test_help_modal_lists_tab_5_navigation() {
     let view = render(&mut app, 100, 40);
     assert!(view.contains("1 - 5"), "{}", view);
     assert!(view.contains("PLAYLISTS (TAB 5)"), "{}", view);
-    assert!(view.contains("Focus Playlists"), "{}", view);
-    assert!(view.contains("Open playlist's tracks"), "{}", view);
+    assert!(view.contains("Focus panes (tabs 2 & 5)"), "{}", view);
+    assert!(view.contains("Open/Play / Queue playlist"), "{}", view);
 
     // The 20-row terminal the existing help test uses still renders without panicking.
     render(&mut app, 70, 20);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_help_modal_fits_tab_5_keys_at_80x24() {
+    common::isolate();
+    let temp_dir = fresh_dirs("help80x24");
+    let mut app = new_app(&temp_dir);
+    press(&mut app, KeyCode::Char('?'));
+    assert!(app.show_help_modal);
+
+    // The standard 80x24 terminal shows every line of both columns, unclipped.
+    let view = render(&mut app, 80, 24);
+    for text in [
+        "PLAYLISTS (TAB 5)",
+        "R / D",
+        "Enter/a",
+        "New / Rename / Delete",
+        "Open/Play / Queue playlist",
+        "Focus panes (tabs 2 & 5)",
+        "Page (2) / Move track (5)",
+        "Tab: Now/Queue/Dev/Set/PL",
+        "Full library fuzzy search",
+    ] {
+        assert!(view.contains(text), "80x24 help should show {:?}:\n{}", text, view);
+    }
 
     let _ = fs::remove_dir_all(&temp_dir);
 }

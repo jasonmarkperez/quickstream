@@ -495,7 +495,7 @@ fn test_help_modal_lists_playlist_play_and_queue_keys() {
     let mut app = AppUI::new(Some(dir.clone()), SettingsManager::with_path(dir.join("config.json")));
     app.show_help_modal = true;
     let view = render(&mut app, 120, 40);
-    assert!(view.contains("Play / queue playlist"), "{}", view);
+    assert!(view.contains("Open/Play / Queue playlist"), "{}", view);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
