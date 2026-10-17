@@ -5,12 +5,16 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use quickstream::discovery::DLNADevice;
-use quickstream::player::upnp::UPnPPlayer;
+use quickstream::discovery::{
+    decode_chunked, parse_http_response, parse_http_url, parse_status_code, DLNADevice, HttpError,
+};
+use quickstream::player::upnp::{
+    parse_soap_fault, SoapError, UPnPClient, UPnPPlayer, AV_TRANSPORT_SERVICE,
+};
 use quickstream::player::AudioPlayer;
 
 type Handler = Arc<dyn Fn(&str, &str, &mut TcpStream) + Send + Sync>;
@@ -330,4 +334,243 @@ fn test_upnp_stale_position_report_is_dropped_after_seek() {
 
     let _ = player.stop();
     let _ = std::fs::remove_file(track);
+}
+
+// ---------------------------------------------------------------------------
+// #12: SOAP error handling and HTTP response parsing
+// ---------------------------------------------------------------------------
+
+fn write_fault(stream: &mut TcpStream, code: Option<u32>, description: Option<&str>) {
+    let code_xml = code.map(|c| format!("<errorCode>{}</errorCode>", c)).unwrap_or_default();
+    let desc_xml = description
+        .map(|d| format!("<errorDescription>{}</errorDescription>", d))
+        .unwrap_or_default();
+    let body = format!(
+        r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0">{}{}</UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
+        code_xml, desc_xml
+    );
+    let resp = format!(
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/xml; charset=\"utf-8\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(resp.as_bytes());
+}
+
+fn client_for(mock: &MockRenderer) -> UPnPClient {
+    UPnPClient::new(mock.device("soap-client"))
+}
+
+/// A renderer that reports the numeric code with its own wording must still be retried.
+#[test]
+fn test_upnp_play_retries_on_numeric_code_with_custom_description() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_h = attempts.clone();
+    let mock = spawn_mock(Arc::new(move |action, _body, stream| {
+        if action == "Play" && attempts_h.fetch_add(1, Ordering::SeqCst) < 2 {
+            write_fault(stream, Some(705), Some("Locked"));
+        } else {
+            write_ok(stream, "<u:PlayResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>");
+        }
+    }));
+    let client = client_for(&mock);
+    assert!(client.play("1"), "Play must retry on errorCode 705 regardless of its description");
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+}
+
+/// Renderers that omit errorCode but use the standard description are still retried.
+#[test]
+fn test_upnp_play_retries_on_description_only_fault() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_h = attempts.clone();
+    let mock = spawn_mock(Arc::new(move |action, _body, stream| {
+        if action == "Play" && attempts_h.fetch_add(1, Ordering::SeqCst) < 1 {
+            write_fault(stream, None, Some("Transition not available"));
+        } else {
+            write_ok(stream, "<u:PlayResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>");
+        }
+    }));
+    let client = client_for(&mock);
+    assert!(client.play("1"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+/// A non-retryable code must not be retried just because its description mentions a number.
+#[test]
+fn test_upnp_play_does_not_retry_on_unrelated_code() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_h = attempts.clone();
+    let mock = spawn_mock(Arc::new(move |action, _body, stream| {
+        if action == "Play" {
+            attempts_h.fetch_add(1, Ordering::SeqCst);
+            write_fault(stream, Some(714), Some("Illegal MIME-type (error 501 in decoder)"));
+        } else {
+            write_ok(stream, "<u:OkResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>");
+        }
+    }));
+    let client = client_for(&mock);
+    assert!(!client.play("1"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "714 is not transient and must not be retried");
+}
+
+/// Stop answered with 701 (already stopped) counts as success even with a vendor description.
+#[test]
+fn test_upnp_stop_accepts_numeric_701() {
+    let mock = spawn_mock(Arc::new(move |action, _body, stream| {
+        if action == "Stop" {
+            write_fault(stream, Some(701), Some("Busy"));
+        } else {
+            write_ok(stream, "<u:OkResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>");
+        }
+    }));
+    let client = client_for(&mock);
+    assert!(client.stop(), "701 on Stop means the renderer is already stopped");
+}
+
+/// HTTP/1.1 chunked replies must be decoded; here the chunk boundary splits the value.
+#[test]
+fn test_upnp_chunked_soap_response_is_decoded() {
+    let mock = spawn_mock(Arc::new(move |_action, _body, stream| {
+        let body = ok_xml(&transport_info_xml("PLAYING"));
+        let split = body.find("PLAYING").unwrap() + 3;
+        let (a, b) = body.split_at(split);
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+            a.len(),
+            a,
+            b.len(),
+            b
+        );
+        let _ = stream.write_all(resp.as_bytes());
+    }));
+    let client = client_for(&mock);
+    assert_eq!(client.get_transport_info(), "PLAYING");
+}
+
+/// A renderer that trickles bytes must not hold a SOAP call past its overall deadline.
+#[test]
+fn test_upnp_soap_call_has_overall_deadline() {
+    let mock = spawn_mock(Arc::new(move |_action, _body, stream| {
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\n");
+        for _ in 0..40 {
+            if stream.write_all(b"X").is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }));
+    let client = client_for(&mock);
+    let start = Instant::now();
+    let res = client.send_soap_action_with_timeout(
+        &mock.device("x").av_transport_control_url,
+        AV_TRANSPORT_SERVICE,
+        "GetTransportInfo",
+        &[("InstanceID", "0")],
+        Duration::from_millis(800),
+    );
+    let elapsed = start.elapsed();
+    assert!(res.is_none());
+    assert!(elapsed < Duration::from_millis(2000), "SOAP call took {:?}", elapsed);
+    assert!(matches!(
+        *client.last_fault.lock().unwrap(),
+        Some(SoapError::Transport(HttpError::DeadlineExceeded))
+    ));
+}
+
+#[test]
+fn test_parse_status_code() {
+    assert_eq!(parse_status_code("HTTP/1.1 200 OK"), Some(200));
+    assert_eq!(parse_status_code("HTTP/1.0 500 Internal Server Error"), Some(500));
+    assert_eq!(parse_status_code("HTTP/1.1 204"), Some(204));
+    // The old `contains("200")` check accepted these.
+    assert_eq!(parse_status_code("HTTP/1.1 500 Error 200"), Some(500));
+    assert_eq!(parse_status_code("HTTP/1.1 2000 Weird"), None);
+    assert_eq!(parse_status_code("ICY 200 OK"), None);
+    assert_eq!(parse_status_code(""), None);
+}
+
+#[test]
+fn test_decode_chunked() {
+    assert_eq!(
+        decode_chunked(b"4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\n\r\n").unwrap(),
+        Some(b"Wikipedia".to_vec())
+    );
+    // Incomplete input asks for more data.
+    assert_eq!(decode_chunked(b"4\r\nWi").unwrap(), None);
+    assert_eq!(decode_chunked(b"4\r\nWiki\r\n").unwrap(), None);
+    // Invalid framing is an error.
+    assert!(decode_chunked(b"zz\r\nWiki\r\n0\r\n\r\n").is_err());
+    assert!(decode_chunked(b"2\r\nWiki\r\n0\r\n\r\n").is_err());
+}
+
+#[test]
+fn test_parse_http_response_framing() {
+    // Content-Length: complete once the body has arrived, trailing bytes ignored.
+    let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloEXTRA";
+    let resp = parse_http_response(raw, false).unwrap().unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, b"hello");
+
+    // Short body: wait for more unless the peer closed (lenient at EOF).
+    let short = b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\nhello";
+    assert!(parse_http_response(short, false).unwrap().is_none());
+    assert_eq!(parse_http_response(short, true).unwrap().unwrap().body, b"hello");
+
+    // Chunked.
+    let chunked = b"HTTP/1.1 500 Internal Server Error\r\ntransfer-encoding: Chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
+    let resp = parse_http_response(chunked, false).unwrap().unwrap();
+    assert_eq!(resp.status, 500);
+    assert_eq!(resp.body, b"abc");
+    assert!(parse_http_response(&chunked[..chunked.len() - 7], true).is_err());
+
+    // Interim 100 Continue is skipped.
+    let cont = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    assert_eq!(parse_http_response(cont, false).unwrap().unwrap().body, b"ok");
+
+    // Garbage.
+    assert!(parse_http_response(b"garbage\r\n\r\n", true).is_err());
+    assert!(parse_http_response(b"", true).is_err());
+}
+
+#[test]
+fn test_parse_http_url() {
+    let u = parse_http_url("http://192.168.1.5:8080/ctrl/AVT").unwrap();
+    assert_eq!((u.host.as_str(), u.port, u.path.as_str()), ("192.168.1.5", 8080, "/ctrl/AVT"));
+    assert_eq!(u.host_port, "192.168.1.5:8080");
+    let u = parse_http_url("HTTP://renderer.local").unwrap();
+    assert_eq!((u.host.as_str(), u.port, u.path.as_str()), ("renderer.local", 80, "/"));
+    let u = parse_http_url("http://[fe80::1]:49152/desc.xml").unwrap();
+    assert_eq!((u.host.as_str(), u.port), ("fe80::1", 49152));
+    assert!(parse_http_url("https://192.168.1.5/").is_none());
+    assert!(parse_http_url("http://192.168.1.5:notaport/").is_none());
+    assert!(parse_http_url("http://user@192.168.1.5/").is_none());
+}
+
+#[test]
+fn test_parse_soap_fault_and_retry_classification() {
+    let body = |inner: &str| format!("<s:Envelope><s:Body><s:Fault><detail><UPnPError>{}</UPnPError></detail></s:Fault></s:Body></s:Envelope>", inner);
+
+    let e = parse_soap_fault(500, &body("<errorCode> 701 </errorCode><errorDescription>Busy</errorDescription>"));
+    assert_eq!(e.upnp_code(), Some(701));
+    assert!(e.is_transition_unavailable());
+    assert!(e.is_transient());
+    assert_eq!(e.to_string(), "UPnP error 701: Busy");
+
+    let e = parse_soap_fault(500, &body("<errorDescription>Transport locked</errorDescription>"));
+    assert_eq!(e.upnp_code(), None);
+    assert!(e.is_transient());
+    assert!(!e.is_transition_unavailable());
+
+    // The numeric code wins over a description that happens to mention another code.
+    let e = parse_soap_fault(500, &body("<errorCode>402</errorCode><errorDescription>Invalid Args (701)</errorDescription>"));
+    assert!(!e.is_transient());
+    assert!(!e.is_transition_unavailable());
+
+    let e = parse_soap_fault(503, "Service Unavailable");
+    assert_eq!(e.upnp_code(), None);
+    assert!(!e.is_transient());
+    assert_eq!(e.to_string(), "HTTP 503");
+
+    assert!(SoapError::Transport(HttpError::DeadlineExceeded).is_transient());
+    assert!(!SoapError::Transport(HttpError::Connect("refused".into())).is_transient());
 }

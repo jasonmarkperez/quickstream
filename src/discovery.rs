@@ -127,6 +127,347 @@ pub fn extract_xml_tag(xml: &str, tag_name: &str) -> Option<String> {
     None
 }
 
+/// Parsed `http://` URL.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HttpUrl {
+    /// Host without brackets (an IPv6 literal is returned bare).
+    pub host: String,
+    pub port: u16,
+    /// Authority as written in the URL, used for the `Host:` header.
+    pub host_port: String,
+    pub path: String,
+}
+
+/// Parse an `http://host[:port][/path]` URL. Returns `None` for other schemes or bad ports.
+pub fn parse_http_url(url: &str) -> Option<HttpUrl> {
+    let trimmed = url.trim();
+    let scheme_end = trimmed.find("://")?;
+    if !trimmed[..scheme_end].eq_ignore_ascii_case("http") {
+        return None;
+    }
+    let without_proto = &trimmed[scheme_end + 3..];
+    let (host_port, path) = match without_proto.find('/') {
+        Some(slash) => (&without_proto[..slash], &without_proto[slash..]),
+        None => (without_proto, "/"),
+    };
+    if host_port.is_empty() || host_port.contains('@') {
+        return None;
+    }
+    let (host, port_str) = if let Some(rest) = host_port.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let after = &rest[close + 1..];
+        let port = match after.strip_prefix(':') {
+            Some(p) => Some(p),
+            None if after.is_empty() => None,
+            None => return None,
+        };
+        (&rest[..close], port)
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (host_port, None),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let port = match port_str {
+        Some(p) => p.parse::<u16>().ok()?,
+        None => 80,
+    };
+    Some(HttpUrl {
+        host: host.to_string(),
+        port,
+        host_port: host_port.to_string(),
+        path: path.to_string(),
+    })
+}
+
+/// HTTP response returned by [`http_exchange`], with any chunked framing removed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl HttpResponse {
+    /// First header value with the given (case-insensitive) name.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    pub fn body_text(&self) -> String {
+        String::from_utf8_lossy(&self.body).to_string()
+    }
+}
+
+/// Transport-level failure of an HTTP exchange.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HttpError {
+    Resolve(String),
+    Connect(String),
+    Io { kind: std::io::ErrorKind, message: String },
+    /// The overall deadline passed before a complete response arrived.
+    DeadlineExceeded,
+    /// The response grew past the byte limit.
+    TooLarge(usize),
+    Malformed(String),
+}
+
+impl HttpError {
+    /// Errors worth retrying: timeouts and dropped connections, not refusals or bad replies.
+    pub fn is_transient(&self) -> bool {
+        use std::io::ErrorKind;
+        match self {
+            HttpError::DeadlineExceeded => true,
+            HttpError::Io { kind, .. } => matches!(
+                kind,
+                ErrorKind::TimedOut
+                    | ErrorKind::WouldBlock
+                    | ErrorKind::Interrupted
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+            ),
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HttpError::Resolve(m) => write!(f, "address resolution failed: {}", m),
+            HttpError::Connect(m) => write!(f, "connection failed: {}", m),
+            HttpError::Io { message, .. } => write!(f, "I/O error: {}", message),
+            HttpError::DeadlineExceeded => write!(f, "request timeout (deadline exceeded)"),
+            HttpError::TooLarge(limit) => write!(f, "response larger than {} bytes", limit),
+            HttpError::Malformed(m) => write!(f, "malformed HTTP response: {}", m),
+        }
+    }
+}
+
+/// Parse the numeric status code from an HTTP status line such as `HTTP/1.1 200 OK`.
+pub fn parse_status_code(status_line: &str) -> Option<u16> {
+    let mut parts = status_line.split_whitespace();
+    let version = parts.next()?;
+    if !version.starts_with("HTTP/") {
+        return None;
+    }
+    let code = parts.next()?;
+    if code.len() != 3 || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    code.parse().ok()
+}
+
+/// Decode an HTTP/1.1 chunked body.
+///
+/// Returns `Ok(Some(body))` once the terminating zero-size chunk has been read,
+/// `Ok(None)` if more data is needed, and `Err` if the framing is invalid.
+pub fn decode_chunked(data: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    loop {
+        let line_end = match data[pos..].iter().position(|&b| b == b'\n') {
+            Some(i) => pos + i,
+            None => return Ok(None),
+        };
+        let line = String::from_utf8_lossy(&data[pos..line_end]);
+        let size_str = line.trim_end_matches('\r').split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_str, 16)
+            .map_err(|_| format!("invalid chunk size '{}'", size_str))?;
+        pos = line_end + 1;
+        if size == 0 {
+            // Trailers (if any) carry nothing we need.
+            return Ok(Some(out));
+        }
+        let chunk_end = pos.checked_add(size).ok_or("chunk size overflow")?;
+        if data.len() < chunk_end {
+            return Ok(None);
+        }
+        out.extend_from_slice(&data[pos..chunk_end]);
+        pos = chunk_end;
+        // Each chunk's data is followed by CRLF (tolerate a bare LF).
+        if data[pos..].starts_with(b"\r\n") {
+            pos += 2;
+        } else if data[pos..].starts_with(b"\n") {
+            pos += 1;
+        } else if data.len() - pos < 2 {
+            return Ok(None);
+        } else {
+            return Err("missing CRLF after chunk data".to_string());
+        }
+    }
+}
+
+/// Try to parse a complete HTTP response from `buf`.
+///
+/// Returns `Ok(None)` while more data is needed. With `eof = true` the peer has closed
+/// the connection, so whatever has arrived is final. A body shorter than its
+/// Content-Length is accepted at EOF because some renderers send a wrong length.
+pub fn parse_http_response(buf: &[u8], eof: bool) -> Result<Option<HttpResponse>, HttpError> {
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| (p, 4));
+    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2));
+    let (header_end, delim_len) = match (crlf, lf) {
+        (Some(a), Some(b)) => if a.0 <= b.0 { a } else { b },
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => {
+            return if eof {
+                Err(HttpError::Malformed(if buf.is_empty() {
+                    "empty response".to_string()
+                } else {
+                    "no end of headers".to_string()
+                }))
+            } else {
+                Ok(None)
+            };
+        }
+    };
+
+    let head = String::from_utf8_lossy(&buf[..header_end]);
+    let mut lines = head.lines();
+    let status_line = lines.next().unwrap_or("");
+    let status = parse_status_code(status_line)
+        .ok_or_else(|| HttpError::Malformed(format!("bad status line '{}'", status_line)))?;
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect();
+    let body_start = header_end + delim_len;
+    let body = &buf[body_start..];
+
+    // Skip interim 1xx responses (e.g. "100 Continue").
+    if (100..200).contains(&status) {
+        return parse_http_response(body, eof);
+    }
+
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    let chunked = header("transfer-encoding")
+        .map(|v| v.to_ascii_lowercase().contains("chunked"))
+        .unwrap_or(false);
+
+    let body = if status == 204 || status == 304 {
+        Vec::new()
+    } else if chunked {
+        match decode_chunked(body) {
+            Ok(Some(decoded)) => decoded,
+            Ok(None) if eof => return Err(HttpError::Malformed("truncated chunked body".to_string())),
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(HttpError::Malformed(e)),
+        }
+    } else if let Some(cl) = header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+        if body.len() >= cl {
+            body[..cl].to_vec()
+        } else if eof {
+            body.to_vec()
+        } else {
+            return Ok(None);
+        }
+    } else if eof {
+        body.to_vec()
+    } else {
+        return Ok(None);
+    };
+
+    Ok(Some(HttpResponse { status, headers, body }))
+}
+
+fn remaining_until(deadline: Instant) -> Result<Duration, HttpError> {
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(HttpError::DeadlineExceeded);
+    }
+    Ok((deadline - now).max(Duration::from_millis(1)))
+}
+
+/// Send a raw HTTP/1.x request to `host:port` and read the response.
+///
+/// The whole exchange (resolve, connect, write, read) must finish by `deadline`, and the
+/// raw response may not exceed `max_bytes`; a peer that trickles bytes or never closes
+/// the connection cannot hold the caller past the deadline or grow memory without bound.
+pub fn http_exchange(
+    host: &str,
+    port: u16,
+    request: &[u8],
+    deadline: Instant,
+    max_bytes: usize,
+) -> Result<HttpResponse, HttpError> {
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| HttpError::Resolve(format!("{}:{}: {}", host, port, e)))?;
+
+    let mut stream = None;
+    let mut last_err = String::from("no addresses");
+    for addr in addrs {
+        let timeout = remaining_until(deadline)?;
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    let mut stream = stream.ok_or_else(|| HttpError::Connect(format!("{}:{}: {}", host, port, last_err)))?;
+
+    let io_err = |e: std::io::Error| {
+        if Instant::now() >= deadline {
+            HttpError::DeadlineExceeded
+        } else {
+            HttpError::Io {
+                kind: e.kind(),
+                message: e.to_string(),
+            }
+        }
+    };
+
+    let _ = stream.set_write_timeout(Some(remaining_until(deadline)?));
+    stream.write_all(request).map_err(io_err)?;
+    let _ = stream.flush();
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        if let Some(resp) = parse_http_response(&buf, false)? {
+            return Ok(resp);
+        }
+        let _ = stream.set_read_timeout(Some(remaining_until(deadline)?));
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                return parse_http_response(&buf, true)?
+                    .ok_or_else(|| HttpError::Malformed("incomplete response".to_string()));
+            }
+            Ok(n) => {
+                if buf.len() + n > max_bytes {
+                    return Err(HttpError::TooLarge(max_bytes));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(HttpError::DeadlineExceeded);
+                }
+            }
+            Err(e) => return Err(io_err(e)),
+        }
+    }
+}
+
 /// Robust HTTP GET to download device XML over TcpStream with Content-Length support.
 pub fn fetch_xml(url: &str) -> Option<String> {
     let url_trimmed = url.trim();

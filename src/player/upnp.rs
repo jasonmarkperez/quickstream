@@ -1,13 +1,13 @@
 //! UPnP / DLNA MediaRenderer playback implementation using SOAP AVTransport and RenderingControl.
 
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::discovery::{extract_xml_tag, get_local_ip_for_target, DLNADevice};
+use crate::discovery::{
+    extract_xml_tag, get_local_ip_for_target, http_exchange, parse_http_url, DLNADevice, HttpError,
+};
 use crate::metadata::{extract_metadata, get_audio_mime_type};
 use crate::player::AudioPlayer;
 
@@ -129,11 +129,108 @@ pub fn create_didl_lite_xml(
     )
 }
 
+/// Largest SOAP response accepted from a renderer.
+const MAX_SOAP_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Why a SOAP action failed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SoapError {
+    /// Bad or missing control URL.
+    InvalidUrl(String),
+    /// Connection, timeout or framing failure before a response was read.
+    Transport(HttpError),
+    /// The renderer answered with a non-2xx status, usually carrying a UPnP fault.
+    Fault {
+        http_status: u16,
+        upnp_code: Option<u32>,
+        description: Option<String>,
+    },
+}
+
+impl SoapError {
+    /// Numeric UPnP `errorCode` from the fault body, if any.
+    pub fn upnp_code(&self) -> Option<u32> {
+        match self {
+            SoapError::Fault { upnp_code, .. } => *upnp_code,
+            _ => None,
+        }
+    }
+
+    /// For faults without a numeric code, match the standard description text.
+    fn description_matches(&self, phrases: &[&str]) -> bool {
+        match self {
+            SoapError::Fault {
+                upnp_code: None,
+                description: Some(desc),
+                ..
+            } => {
+                let d = desc.to_ascii_lowercase();
+                phrases.iter().any(|p| d.contains(p))
+            }
+            _ => false,
+        }
+    }
+
+    /// UPnP 701 "Transition not available".
+    pub fn is_transition_unavailable(&self) -> bool {
+        self.upnp_code() == Some(701) || self.description_matches(&["transition not available"])
+    }
+
+    /// Errors worth retrying a Play for: the renderer is busy or transitioning
+    /// (501 Action Failed, 701 Transition not available, 705 Transport locked)
+    /// or the connection timed out / dropped.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            SoapError::Transport(e) => e.is_transient(),
+            SoapError::Fault { upnp_code: Some(code), .. } => matches!(code, 501 | 701 | 705),
+            SoapError::Fault { .. } => self.description_matches(&[
+                "transition not available",
+                "action failed",
+                "transport locked",
+            ]),
+            SoapError::InvalidUrl(_) => false,
+        }
+    }
+}
+
+impl std::fmt::Display for SoapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SoapError::InvalidUrl(m) => write!(f, "{}", m),
+            SoapError::Transport(e) => write!(f, "{}", e),
+            SoapError::Fault {
+                http_status,
+                upnp_code,
+                description,
+            } => match (upnp_code, description) {
+                (Some(c), Some(d)) => write!(f, "UPnP error {}: {}", c, d),
+                (Some(c), None) => write!(f, "UPnP error {}", c),
+                (None, Some(d)) => write!(f, "{} (HTTP {})", d, http_status),
+                (None, None) => write!(f, "HTTP {}", http_status),
+            },
+        }
+    }
+}
+
+/// Parse a UPnP fault (`errorCode` / `errorDescription`) from a SOAP error body.
+pub fn parse_soap_fault(http_status: u16, body: &str) -> SoapError {
+    let upnp_code = extract_xml_tag(body, "errorCode").and_then(|c| c.trim().parse::<u32>().ok());
+    let description = extract_xml_tag(body, "errorDescription").filter(|d| !d.is_empty());
+    SoapError::Fault {
+        http_status,
+        upnp_code,
+        description,
+    }
+}
+
 /// SOAP XML client controlling DLNA MediaRenderers.
 pub struct UPnPClient {
     pub device: DLNADevice,
     pub timeout: Duration,
+    /// Human-readable description of the last failure.
     pub last_error: Arc<Mutex<String>>,
+    /// Structured form of the last failure.
+    pub last_fault: Arc<Mutex<Option<SoapError>>>,
 }
 
 impl UPnPClient {
@@ -142,6 +239,7 @@ impl UPnPClient {
             device,
             timeout: Duration::from_millis(4000),
             last_error: Arc::new(Mutex::new(String::new())),
+            last_fault: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -157,6 +255,7 @@ impl UPnPClient {
     }
 
     /// Send a UPnP SOAP POST action with custom timeout and return response XML body.
+    /// On failure, `last_error` / `last_fault` describe what went wrong.
     pub fn send_soap_action_with_timeout(
         &self,
         control_url: &str,
@@ -165,10 +264,41 @@ impl UPnPClient {
         arguments: &[(&str, &str)],
         timeout: Duration,
     ) -> Option<String> {
-        if control_url.is_empty() {
-            *self.last_error.lock().unwrap() = "Missing control URL".to_string();
-            return None;
+        self.call_action(control_url, service_type, action, arguments, timeout).ok()
+    }
+
+    /// Send a UPnP SOAP POST action. `timeout` bounds the whole request (connect,
+    /// send and receive), not each individual read.
+    pub fn call_action(
+        &self,
+        control_url: &str,
+        service_type: &str,
+        action: &str,
+        arguments: &[(&str, &str)],
+        timeout: Duration,
+    ) -> Result<String, SoapError> {
+        let result = self.call_action_inner(control_url, service_type, action, arguments, timeout);
+        if let Err(ref e) = result {
+            *self.last_error.lock().unwrap() = e.to_string();
+            *self.last_fault.lock().unwrap() = Some(e.clone());
         }
+        result
+    }
+
+    fn call_action_inner(
+        &self,
+        control_url: &str,
+        service_type: &str,
+        action: &str,
+        arguments: &[(&str, &str)],
+        timeout: Duration,
+    ) -> Result<String, SoapError> {
+        let deadline = Instant::now() + timeout;
+        if control_url.is_empty() {
+            return Err(SoapError::InvalidUrl("Missing control URL".to_string()));
+        }
+        let url = parse_http_url(control_url)
+            .ok_or_else(|| SoapError::InvalidUrl(format!("Invalid control URL: {}", control_url)))?;
 
         let mut args_xml = String::new();
         for (k, v) in arguments {
@@ -187,58 +317,6 @@ impl UPnPClient {
             action, service_type, args_xml, action
         );
 
-        let url_trimmed = control_url.trim();
-        let without_proto = match url_trimmed.strip_prefix("http://") {
-            Some(p) => p,
-            None => {
-                *self.last_error.lock().unwrap() = format!("Invalid control URL: {}", control_url);
-                return None;
-            }
-        };
-        let (host_port, path) = if let Some(slash) = without_proto.find('/') {
-            (&without_proto[..slash], &without_proto[slash..])
-        } else {
-            (without_proto, "/")
-        };
-
-        let (host, port) = if let Some(colon) = host_port.find(':') {
-            let h = &host_port[..colon];
-            match host_port[colon + 1..].parse::<u16>() {
-                Ok(p) => (h, p),
-                Err(e) => {
-                    *self.last_error.lock().unwrap() = format!("Invalid port in {}: {}", control_url, e);
-                    return None;
-                }
-            }
-        } else {
-            (host_port, 80)
-        };
-
-        let addrs = match (host, port).to_socket_addrs() {
-            Ok(a) => a,
-            Err(e) => {
-                *self.last_error.lock().unwrap() = format!("Address resolution failed for {}:{}: {}", host, port, e);
-                return None;
-            }
-        };
-
-        let mut stream = None;
-        for addr in addrs {
-            if let Ok(s) = TcpStream::connect_timeout(&addr, timeout) {
-                let _ = s.set_read_timeout(Some(timeout));
-                let _ = s.set_write_timeout(Some(timeout));
-                stream = Some(s);
-                break;
-            }
-        }
-        let mut stream = match stream {
-            Some(s) => s,
-            None => {
-                *self.last_error.lock().unwrap() = format!("Connection timed out to {}:{}", host, port);
-                return None;
-            }
-        };
-
         let request = format!(
             "POST {} HTTP/1.1\r\n\
             Host: {}\r\n\
@@ -248,38 +326,23 @@ impl UPnPClient {
             Content-Length: {}\r\n\
             Connection: close\r\n\r\n\
             {}",
-            path, host_port, service_type, action, body.len(), body
+            url.path, url.host_port, service_type, action, body.len(), body
         );
 
-        if let Err(e) = stream.write_all(request.as_bytes()) {
-            *self.last_error.lock().unwrap() = format!("Write failed: {}", e);
-            return None;
-        }
-        let _ = stream.flush();
+        let response = http_exchange(
+            &url.host,
+            url.port,
+            request.as_bytes(),
+            deadline,
+            MAX_SOAP_RESPONSE_BYTES,
+        )
+        .map_err(SoapError::Transport)?;
 
-        let mut response = Vec::new();
-        if let Err(e) = stream.read_to_end(&mut response) {
-            *self.last_error.lock().unwrap() = format!("SOAP read timeout/error: {}", e);
-            return None;
-        }
-        let resp_str = String::from_utf8_lossy(&response).to_string();
-
-        if let Some(pos) = resp_str.find("\r\n\r\n") {
-            let header_part = &resp_str[..pos];
-            let body_part = &resp_str[pos + 4..];
-
-            if let Some(status_line) = header_part.lines().next() {
-                if !status_line.contains("200") {
-                    let err = extract_xml_tag(body_part, "errorDescription")
-                        .or_else(|| extract_xml_tag(body_part, "errorCode"))
-                        .unwrap_or_else(|| status_line.to_string());
-                    *self.last_error.lock().unwrap() = err;
-                    return None;
-                }
-            }
-            Some(body_part.to_string())
+        let body_text = response.body_text();
+        if (200..300).contains(&response.status) {
+            Ok(body_text)
         } else {
-            Some(resp_str)
+            Err(parse_soap_fault(response.status, &body_text))
         }
     }
 
@@ -305,7 +368,7 @@ impl UPnPClient {
         crate::log_info!("upnp", "Calling SetAVTransportURI on {} with stream URL: {}", self.device.friendly_name, stream_url);
 
         for attempt in 0..3 {
-            let res = self.send_soap_action_with_timeout(
+            let res = self.call_action(
                 &self.device.av_transport_control_url,
                 AV_TRANSPORT_SERVICE,
                 "SetAVTransportURI",
@@ -317,17 +380,17 @@ impl UPnPClient {
                 Duration::from_secs(20),
             );
 
-            if res.is_some() {
-                crate::log_info!("upnp", "SetAVTransportURI with DIDL succeeded on {}", self.device.friendly_name);
-                return true;
+            match res {
+                Ok(_) => {
+                    crate::log_info!("upnp", "SetAVTransportURI with DIDL succeeded on {}", self.device.friendly_name);
+                    return true;
+                }
+                Err(e) if e.is_transition_unavailable() && attempt < 2 => {
+                    std::thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+                Err(_) => break,
             }
-
-            let err = self.last_error.lock().unwrap().clone();
-            if (err.contains("701") || err.contains("Transition not available")) && attempt < 2 {
-                std::thread::sleep(Duration::from_millis(250));
-                continue;
-            }
-            break;
         }
 
         crate::log_info!(
@@ -367,78 +430,60 @@ impl UPnPClient {
     /// Send Play command with retries if renderer is transitioning, busy, or buffering.
     pub fn play(&self, speed: &str) -> bool {
         for attempt in 0..5 {
-            let res = self.send_soap_action_with_timeout(
+            let res = self.call_action(
                 &self.device.av_transport_control_url,
                 AV_TRANSPORT_SERVICE,
                 "Play",
                 &[("InstanceID", "0"), ("Speed", speed)],
                 Duration::from_millis(6000),
             );
-            if res.is_some() {
-                return true;
+            match res {
+                Ok(_) => return true,
+                Err(e) if e.is_transient() => {
+                    crate::log_info!(
+                        "upnp",
+                        "Renderer returned '{}' on Play (attempt {}/5); retrying in 400ms...",
+                        e,
+                        attempt + 1
+                    );
+                    std::thread::sleep(Duration::from_millis(400));
+                }
+                Err(_) => break,
             }
-            let err = self.last_error.lock().unwrap().clone();
-            if err.contains("701")
-                || err.contains("Transition not available")
-                || err.contains("501")
-                || err.contains("Action Failed")
-                || err.contains("705")
-                || err.contains("Transport locked")
-                || err.contains("timeout")
-                || err.contains("Resource temporarily unavailable")
-                || err.contains("os error 35")
-                || err.contains("Connection reset")
-                || err.contains("Broken pipe")
-            {
-                crate::log_info!(
-                    "upnp",
-                    "Renderer returned '{}' on Play (attempt {}/5); retrying in 400ms...",
-                    err,
-                    attempt + 1
-                );
-                std::thread::sleep(Duration::from_millis(400));
-                continue;
-            }
-            break;
         }
         false
     }
 
-    /// Send Pause command with fallback to Stop if unsupported.
+    /// Send Pause command, falling back to Stop if the renderer rejects it
+    /// (many reject Pause on progressive HTTP streams, e.g. 401 Invalid Action).
     pub fn pause(&self) -> bool {
-        let res = self.send_soap_action(
+        match self.call_action(
             &self.device.av_transport_control_url,
             AV_TRANSPORT_SERVICE,
             "Pause",
             &[("InstanceID", "0")],
-        );
-        if res.is_some() {
-            return true;
+            self.timeout,
+        ) {
+            Ok(_) => true,
+            Err(e) => {
+                crate::log_info!("upnp", "Pause failed ('{}'); falling back to Stop", e);
+                self.stop()
+            }
         }
-        let err = self.last_error.lock().unwrap().clone();
-        if err.contains("401") || err.contains("Invalid Action") || err.contains("501") || err.contains("Not Implemented") {
-            return self.stop();
-        }
-        // Fallback: If Pause failed for any reason on a progressive stream, try Stop
-        self.stop()
     }
 
-    /// Send Stop command.
+    /// Send Stop command. A 701 reply means the renderer is already stopped.
     pub fn stop(&self) -> bool {
-        let res = self.send_soap_action(
+        match self.call_action(
             &self.device.av_transport_control_url,
             AV_TRANSPORT_SERVICE,
             "Stop",
             &[("InstanceID", "0")],
-        );
-        if res.is_some() {
-            return true;
+            self.timeout,
+        ) {
+            Ok(_) => true,
+            Err(e) => e.is_transition_unavailable(),
         }
-        let err = self.last_error.lock().unwrap().clone();
-        if err.contains("701") || err.contains("Transition not available") {
-            return true;
-        }
-        false
     }
 
     /// Seek to specific position in track (REL_TIME).
