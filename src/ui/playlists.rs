@@ -40,6 +40,8 @@ struct QueueCheckResult {
     exists: Vec<bool>,
     /// Track to play from (`Enter`: replace the queue); `None` appends (`a`).
     play_from: Option<usize>,
+    /// [`PlaylistChecks::queue_generation`] when the request was made.
+    generation: u64,
 }
 
 /// Background existence checks for tab 5. Files are only checked on workers: a `stat` on an
@@ -52,6 +54,11 @@ struct PlaylistChecks {
     exists_rx: std::sync::mpsc::Receiver<(std::path::PathBuf, bool)>,
     queue_tx: std::sync::mpsc::Sender<QueueCheckResult>,
     queue_rx: std::sync::mpsc::Receiver<QueueCheckResult>,
+    /// Name of the playlist whose queue check is running; at most one runs at a time.
+    queue_pending: Option<String>,
+    /// Bumped by anything else that replaces the queue or starts playback, so a check that
+    /// finishes afterwards is dropped instead of undoing it.
+    queue_generation: u64,
     /// Set on shutdown: workers stop checking and send nothing more.
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -68,6 +75,8 @@ impl PlaylistChecks {
             exists_rx,
             queue_tx,
             queue_rx,
+            queue_pending: None,
+            queue_generation: 0,
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -1101,6 +1110,11 @@ impl PlaylistsUi {
         self.checks.in_flight.len()
     }
 
+    /// Whether a play/queue request is still checking its files.
+    pub fn queue_check_pending(&self) -> bool {
+        self.checks.queue_pending.is_some()
+    }
+
     /// Tell playlist workers to stop checking (shutdown). A check already stuck in a hung `stat`
     /// is detached by the bounded worker join.
     pub fn stop_checks(&self) {
@@ -1183,9 +1197,17 @@ impl AppUI {
             self.status_message = format!("{} is empty", playlist.name);
             return;
         }
+        // One request at a time: a hung share would otherwise pile up workers, and each result
+        // would replace the queue again whenever it arrived.
+        if let Some(pending) = &self.playlists.checks.queue_pending {
+            self.status_message = format!("Still checking {}…", pending);
+            return;
+        }
         let name = playlist.name.clone();
         let entries = playlist.entries.clone();
         self.status_message = format!("Checking {} tracks in {}…", entries.len(), name);
+        self.playlists.checks.queue_pending = Some(name.clone());
+        let generation = self.playlists.checks.queue_generation;
         let checker = self.playlists.checks.checker.clone();
         let tx = self.playlists.checks.queue_tx.clone();
         let stop = self.playlists.checks.stop.clone();
@@ -1202,6 +1224,7 @@ impl AppUI {
                 entries,
                 exists,
                 play_from,
+                generation,
             });
         });
     }
@@ -1209,9 +1232,14 @@ impl AppUI {
     /// Queue the files of a checked playlist that exist. Replace (`play_from` set) only clears
     /// the queue once something can be queued, so an all-missing playlist leaves it as it was.
     fn apply_playlist_queue(&mut self, result: QueueCheckResult) {
+        self.playlists.checks.queue_pending = None;
         // Fresh results update the session cache; they never change the playlist or its file.
         for (entry, exists) in result.entries.iter().zip(&result.exists) {
             self.playlists.exists.insert(entry.path.clone(), *exists);
+        }
+        if result.generation != self.playlists.checks.queue_generation {
+            // The queue was replaced or playback started while this check ran.
+            return;
         }
         let cached = |path: &std::path::Path| self.metadata_cache.get(path);
         let crate::playlist::QueuePlan {
@@ -1257,6 +1285,12 @@ impl AppUI {
             None => summary,
         };
         self.update_web_state();
+    }
+
+    /// Drop the result of any playlist play/queue check still running: called by every other
+    /// action that replaces the queue or starts playback.
+    pub fn supersede_playlist_queue(&mut self) {
+        self.playlists.checks.queue_generation = self.playlists.checks.queue_generation.wrapping_add(1);
     }
 
     /// Before a playlist replaces the queue: stop any autopilot scan, end any continuous DLNA

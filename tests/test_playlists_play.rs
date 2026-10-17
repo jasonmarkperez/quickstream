@@ -559,3 +559,134 @@ fn test_symlink_to_a_non_audio_file_is_not_queued() {
     assert!(app.playlists.is_missing(&link));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A checker that counts its calls and blocks like a stat on a hung share until the returned
+/// sender is dropped, then reports every path present.
+fn gated_checker() -> (
+    ExistsChecker,
+    std::sync::mpsc::Sender<()>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+    let gate_rx = Arc::new(Mutex::new(gate_rx));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+    let checker: ExistsChecker = Arc::new(move |_path: &Path| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = gate_rx.lock().unwrap().recv();
+        true
+    });
+    (checker, gate_tx, calls)
+}
+
+/// Poll for `window`, so a second (wrong) result has time to arrive.
+fn poll_for(app: &mut AppUI, window: Duration) {
+    let deadline = Instant::now() + window;
+    while Instant::now() < deadline {
+        app.poll_playlists();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn test_second_queue_request_while_one_is_checking_starts_nothing() {
+    common::isolate();
+    let dir = temp_dir("one_request");
+    let track = dir.join("a.mp3");
+    touch(&track);
+    write_playlist(vec![entry(&track, "Alpha", "One")]);
+    let mut app = app_with_playlist(&dir);
+    let (checker, gate_tx, calls) = gated_checker();
+    app.playlists.set_exists_checker(checker);
+
+    // The active tab stays off tab 5, so no row existence checks call the checker.
+    app.queue_selected_playlist(None);
+    assert_eq!(app.status_message, "Checking 1 tracks in Road Trip…");
+    assert!(app.playlists.queue_check_pending());
+    app.queue_selected_playlist(None);
+    assert_eq!(app.status_message, "Still checking Road Trip…");
+
+    drop(gate_tx);
+    assert!(
+        poll_until(&mut app, |app| app.status_message.starts_with("Queued")),
+        "status: {}",
+        app.status_message
+    );
+    poll_for(&mut app, Duration::from_millis(200));
+    assert_eq!(queue_paths(&app).len(), 1, "the playlist was queued twice");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a second worker ran"
+    );
+    assert!(!app.playlists.queue_check_pending());
+
+    // Once the result is in, a new request starts.
+    app.queue_selected_playlist(None);
+    assert_eq!(app.status_message, "Checking 1 tracks in Road Trip…");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_playlist_result_after_autopilot_start_does_not_touch_the_queue() {
+    common::isolate();
+    let dir = temp_dir("stale_autopilot");
+    let track = dir.join("a.mp3");
+    touch(&track);
+    write_playlist(vec![entry(&track, "Alpha", "One")]);
+    let mut app = app_with_playlist(&dir);
+    let calls = install_recording_player(&mut app);
+    let (checker, gate_tx, _) = gated_checker();
+    app.playlists.set_exists_checker(checker);
+    app.queue.add_track(old_track(&dir));
+
+    app.queue_selected_playlist(Some(0));
+    let empty = temp_dir("stale_autopilot_lib");
+    app.start_autopilot(empty.clone());
+
+    drop(gate_tx);
+    assert!(
+        poll_until(&mut app, |app| !app.playlists.queue_check_pending()),
+        "the playlist check never finished"
+    );
+    poll_for(&mut app, Duration::from_millis(100));
+    assert_eq!(queue_paths(&app), vec![dir.join("old.mp3")]);
+    assert!(
+        !calls.lock().unwrap().iter().any(|c| c.starts_with("play ")),
+        "a stale playlist result started playback"
+    );
+    if let Some(stop) = app.autopilot_scan_stop.take() {
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+#[test]
+fn test_playlist_result_after_clearing_the_queue_does_not_touch_it() {
+    common::isolate();
+    let dir = temp_dir("stale_clear");
+    let track = dir.join("a.mp3");
+    touch(&track);
+    write_playlist(vec![entry(&track, "Alpha", "One")]);
+    let mut app = app_with_playlist(&dir);
+    install_recording_player(&mut app);
+    let (checker, gate_tx, _) = gated_checker();
+    app.playlists.set_exists_checker(checker);
+    app.queue.add_track(old_track(&dir));
+
+    app.queue_selected_playlist(None);
+    app.active_tab = 1;
+    app.queue_focus = true;
+    press(&mut app, crossterm::event::KeyCode::Char('c'));
+    assert!(app.queue.is_empty());
+
+    drop(gate_tx);
+    assert!(
+        poll_until(&mut app, |app| !app.playlists.queue_check_pending()),
+        "the playlist check never finished"
+    );
+    poll_for(&mut app, Duration::from_millis(100));
+    assert!(app.queue.is_empty(), "queue: {:?}", queue_paths(&app));
+    let _ = std::fs::remove_dir_all(&dir);
+}

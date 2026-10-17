@@ -2418,6 +2418,7 @@ impl AppUI {
                     }
                     (KeyCode::Enter, KeyModifiers::NONE) => {
                         if self.queue_focus {
+                            self.supersede_playlist_queue();
                             self.queue.current_index = self.queue_cursor;
                             self.play_current_track();
                         } else if self.browser_cursor < self.browser_entries.len() {
@@ -2482,6 +2483,7 @@ impl AppUI {
                         }
                     }
                     (KeyCode::Char('c'), KeyModifiers::NONE) if self.queue_focus => {
+                        self.supersede_playlist_queue();
                         self.queue.clear();
                         self.clamp_queue_cursor();
                         self.status_message = "Cleared queue".to_string();
@@ -2865,6 +2867,7 @@ impl AppUI {
     }
 
     pub fn start_autopilot_with_mode(&mut self, dir: PathBuf, mode: AutopilotRunMode) {
+        self.supersede_playlist_queue();
         // 1. Cancel any active autopilot scanner
         if let Some(stop) = self.autopilot_scan_stop.take() {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3245,6 +3248,7 @@ impl AppUI {
                 }
                 crate::web::WebCommand::PlayIndex(idx) => {
                     if idx < self.queue.len() {
+                        self.supersede_playlist_queue();
                         self.queue.current_index = idx;
                         self.queue_cursor = idx;
                         self.play_current_track();
@@ -3257,6 +3261,7 @@ impl AppUI {
                     }
                 }
                 crate::web::WebCommand::ClearQueue => {
+                    self.supersede_playlist_queue();
                     let _ = self.player.stop();
                     self.queue.clear();
                     self.clamp_queue_cursor();
