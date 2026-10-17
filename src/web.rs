@@ -1340,6 +1340,80 @@ fn resolve_stream_file(name: &str, stream_state: &StreamServerState, current: Op
     found.is_file().then_some(found)
 }
 
+/// How a `Range` request header applies to a representation of a given length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteRange {
+    /// No usable range: send the whole representation with `200 OK`.
+    Full,
+    /// Send bytes `start..=end` with `206 Partial Content`.
+    Partial { start: u64, end: u64 },
+    /// No requested range overlaps the representation: send `416`.
+    Unsatisfiable,
+}
+
+/// Evaluate a `Range` header value against a representation of `len` bytes (RFC 9110 §14).
+///
+/// - Invalid syntax or a unit other than `bytes` is ignored (`Full`), as RFC 9110 allows.
+/// - Suffix ranges (`bytes=-N`) select the last N bytes.
+/// - With several ranges, only the first satisfiable one is served, as a single-part 206 whose
+///   `Content-Range` says which bytes it holds. Renderers do not send multi-range requests, and
+///   this avoids multipart/byteranges responses; a 416 would wrongly claim nothing overlaps.
+/// - `Unsatisfiable` only when no range overlaps the representation (including `first > last`).
+pub fn parse_byte_range(header: &str, len: u64) -> ByteRange {
+    fn decimal(s: &str) -> Option<u64> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        // Digits only, so a parse failure means overflow; any such value is past the end.
+        Some(s.parse().unwrap_or(u64::MAX))
+    }
+
+    let Some((unit, set)) = header.trim().split_once('=') else {
+        return ByteRange::Full;
+    };
+    if !unit.trim().eq_ignore_ascii_case("bytes") {
+        return ByteRange::Full;
+    }
+
+    let mut any_spec = false;
+    let mut first_satisfiable = None;
+    for spec in set.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        any_spec = true;
+        let Some((first, last)) = spec.split_once('-') else {
+            return ByteRange::Full;
+        };
+        let range = if first.is_empty() {
+            let Some(suffix) = decimal(last) else {
+                return ByteRange::Full;
+            };
+            (suffix > 0 && len > 0).then(|| (len.saturating_sub(suffix), len - 1))
+        } else {
+            let Some(start) = decimal(first) else {
+                return ByteRange::Full;
+            };
+            let end = if last.is_empty() {
+                u64::MAX
+            } else {
+                match decimal(last) {
+                    Some(end) => end,
+                    None => return ByteRange::Full,
+                }
+            };
+            (start <= end && start < len).then(|| (start, end.min(len - 1)))
+        };
+        // Keep parsing so a later malformed spec still makes the whole header invalid.
+        if first_satisfiable.is_none() {
+            first_satisfiable = range;
+        }
+    }
+
+    match first_satisfiable {
+        Some((start, end)) => ByteRange::Partial { start, end },
+        None if any_spec => ByteRange::Unsatisfiable,
+        None => ByteRange::Full,
+    }
+}
+
 fn serve_audio_stream(
     mut stream: TcpStream,
     path: &str,
@@ -1427,44 +1501,29 @@ fn serve_audio_stream(
     };
 
     // 3. Parse Range header if present
-    let mut req_start = 0u64;
-    let mut req_end = effective_total.saturating_sub(1);
-    let mut is_range = false;
-
-    if let Some(range) = range_header {
-        if let Some(spec) = range.strip_prefix("bytes=") {
-            let parts: Vec<&str> = spec.split('-').collect();
-            if parts.len() == 2 {
-                if let Ok(s) = parts[0].parse::<u64>() {
-                    req_start = s;
-                    is_range = true;
-                    if let Ok(e) = parts[1].parse::<u64>() {
-                        req_end = e.min(effective_total.saturating_sub(1));
-                    }
-                }
-            }
+    let range = range_header.map_or(ByteRange::Full, |h| parse_byte_range(h, effective_total));
+    let (req_start, req_end, is_range) = match range {
+        ByteRange::Full => (0, effective_total.saturating_sub(1), false),
+        ByteRange::Partial { start, end } => (start, end, true),
+        ByteRange::Unsatisfiable => {
+            crate::log_warn!(
+                "web",
+                "Stream 416 Range Not Satisfiable: {:?} of {} bytes for client {}",
+                range_header,
+                effective_total,
+                client_ip
+            );
+            let err_resp = format!(
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                effective_total
+            );
+            stream.write_all(err_resp.as_bytes())?;
+            stream.flush()?;
+            return Ok(());
         }
-    }
+    };
 
-    if req_start >= effective_total || req_start > req_end {
-        crate::log_warn!(
-            "web",
-            "Stream 416 Range Not Satisfiable: bytes={}-{}/{} for client {}",
-            req_start,
-            req_end,
-            effective_total,
-            client_ip
-        );
-        let err_resp = format!(
-            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nConnection: close\r\n\r\n",
-            effective_total
-        );
-        stream.write_all(err_resp.as_bytes())?;
-        stream.flush()?;
-        return Ok(());
-    }
-
-    let content_length = req_end - req_start + 1;
+    let content_length = if is_range { req_end - req_start + 1 } else { effective_total };
 
     // 4. Write DLNA HTTP headers
     let status_line = if is_range {
@@ -1499,7 +1558,7 @@ fn serve_audio_stream(
         Accept-Ranges: bytes\r\n\
         transferMode.dlna.org: Streaming\r\n\
         contentFeatures.dlna.org: DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000\r\n\
-        Connection: keep-alive\r\n",
+        Connection: close\r\n",
         status_line, mime, content_length
     );
 
@@ -1601,6 +1660,21 @@ fn serve_audio_stream(
         }
     }
     let _ = stream.flush();
+
+    if streamed_count < content_length {
+        // The file shrank or failed to read after Content-Length was sent. Close at once so the
+        // client sees an incomplete response instead of a silently short body.
+        crate::log_warn!(
+            "web",
+            "Source for '{}' ended after {} of {} advertised bytes; closing connection to {}",
+            display_name,
+            streamed_count,
+            content_length,
+            client_ip
+        );
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return Ok(());
+    }
 
     crate::log_info!(
         "web",

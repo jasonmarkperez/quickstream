@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use std::path::PathBuf;
 
 use quickstream::web::{
-    NowPlayingState, ServerLimits, StreamServerState,
+    parse_byte_range, ByteRange, NowPlayingState, ServerLimits, StreamServerState,
     WebBrowserResponse, WebBind, WebCommand, WebDeviceItem, WebQueueItem, WebServer,
     WebServerHandle,
 };
@@ -808,6 +808,154 @@ fn start_limited(
     )
     .expect("start web server");
     (handle, state, rx)
+}
+
+/// Registers a 100-byte file (bytes 0..100) and returns the server and its contents.
+fn start_range_fixture(tag: &str) -> (WebServerHandle, PathBuf, Vec<u8>) {
+    let dir = std::env::temp_dir().join(format!("qs_range_{}_{}", tag, std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("range_song.mp3");
+    let data: Vec<u8> = (0..100).collect();
+    fs::write(&file, &data).unwrap();
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state, tx).expect("start web server");
+    handle.register_stream_file(&file);
+    (handle, dir, data)
+}
+
+fn range_get(port: u16, range: &str) -> (u16, String, Vec<u8>) {
+    let req = format!(
+        "GET /stream/range_song.mp3 HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: {}\r\n\r\n",
+        range
+    );
+    http_raw(port, req.as_bytes())
+}
+
+#[test]
+fn test_parse_byte_range_cases() {
+    use ByteRange::{Full, Partial, Unsatisfiable};
+    let p = |start, end| Partial { start, end };
+
+    assert_eq!(parse_byte_range("bytes=10-24", 100), p(10, 24));
+    assert_eq!(parse_byte_range("bytes=90-", 100), p(90, 99));
+    assert_eq!(parse_byte_range("bytes=50-1000", 100), p(50, 99));
+    assert_eq!(parse_byte_range("Bytes=0-0", 100), p(0, 0));
+    assert_eq!(parse_byte_range("bytes=0-99999999999999999999999", 100), p(0, 99));
+
+    // Suffix ranges: the last N bytes.
+    assert_eq!(parse_byte_range("bytes=-10", 100), p(90, 99));
+    assert_eq!(parse_byte_range("bytes=-500", 100), p(0, 99));
+    assert_eq!(parse_byte_range("bytes=-0", 100), Unsatisfiable);
+
+    // Unsatisfiable ranges.
+    assert_eq!(parse_byte_range("bytes=100-", 100), Unsatisfiable);
+    assert_eq!(parse_byte_range("bytes=99999999999999999999999-", 100), Unsatisfiable);
+    assert_eq!(parse_byte_range("bytes=5-2", 100), Unsatisfiable);
+    assert_eq!(parse_byte_range("bytes=0-", 0), Unsatisfiable);
+    assert_eq!(parse_byte_range("bytes=-5", 0), Unsatisfiable);
+
+    // Multiple ranges: the first satisfiable one is served.
+    assert_eq!(parse_byte_range("bytes=10-19, 50-59", 100), p(10, 19));
+    assert_eq!(parse_byte_range("bytes=200-300,5-9", 100), p(5, 9));
+    assert_eq!(parse_byte_range("bytes=200-300,400-", 100), Unsatisfiable);
+
+    // Invalid syntax or unknown units: the Range header is ignored.
+    for bad in [
+        "bytes=abc-",
+        "bytes=",
+        "bytes=-",
+        "bytes=1-2-3",
+        "bytes=+1-2",
+        "bytes=0-5,x",
+        "items=0-5",
+        "bytes 0-5",
+    ] {
+        assert_eq!(parse_byte_range(bad, 100), Full, "{:?} should be ignored", bad);
+    }
+}
+
+#[test]
+fn test_web_server_stream_suffix_range() {
+    let (handle, dir, data) = start_range_fixture("suffix");
+
+    let (status, headers, body) = range_get(handle.port, "bytes=-10");
+    assert_eq!(status, 206, "headers: {}", headers);
+    assert_eq!(header_value(&headers, "Content-Range").as_deref(), Some("bytes 90-99/100"));
+    assert_eq!(header_value(&headers, "Content-Length").as_deref(), Some("10"));
+    assert_eq!(body, &data[90..]);
+
+    // A suffix longer than the file selects the whole file.
+    let (status, headers, body) = range_get(handle.port, "bytes=-500");
+    assert_eq!(status, 206, "headers: {}", headers);
+    assert_eq!(header_value(&headers, "Content-Range").as_deref(), Some("bytes 0-99/100"));
+    assert_eq!(body, data);
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_web_server_stream_multi_range_serves_first_range() {
+    let (handle, dir, data) = start_range_fixture("multi");
+
+    let (status, headers, body) = range_get(handle.port, "bytes=10-19,50-59");
+    assert_eq!(status, 206, "headers: {}", headers);
+    assert_eq!(header_value(&headers, "Content-Range").as_deref(), Some("bytes 10-19/100"));
+    assert_eq!(header_value(&headers, "Content-Length").as_deref(), Some("10"));
+    assert_eq!(body, &data[10..20]);
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_web_server_stream_invalid_range_serves_full_body() {
+    let (handle, dir, data) = start_range_fixture("invalid");
+
+    for bad in ["bytes=abc-", "bytes=1-2-3", "items=0-5"] {
+        let (status, headers, body) = range_get(handle.port, bad);
+        assert_eq!(status, 200, "{}: headers: {}", bad, headers);
+        assert_eq!(header_value(&headers, "Content-Range"), None);
+        assert_eq!(header_value(&headers, "Content-Length").as_deref(), Some("100"));
+        assert_eq!(body, data);
+    }
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_web_server_stream_416_headers() {
+    let (handle, dir, _data) = start_range_fixture("416");
+
+    for unsatisfiable in ["bytes=100-", "bytes=5-2", "bytes=-0"] {
+        let (status, headers, body) = range_get(handle.port, unsatisfiable);
+        assert_eq!(status, 416, "{}: headers: {}", unsatisfiable, headers);
+        assert_eq!(header_value(&headers, "Content-Range").as_deref(), Some("bytes */100"));
+        assert_eq!(header_value(&headers, "Content-Length").as_deref(), Some("0"));
+        assert_eq!(header_value(&headers, "Connection").as_deref(), Some("close"));
+        assert!(body.is_empty());
+    }
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_web_server_stream_responses_advertise_connection_close() {
+    let (handle, dir, _data) = start_range_fixture("close");
+
+    let (status, headers, _) = http_get(handle.port, "/stream/range_song.mp3");
+    assert_eq!(status, 200);
+    assert_eq!(header_value(&headers, "Connection").as_deref(), Some("close"));
+
+    let (status, headers, _) = range_get(handle.port, "bytes=0-9");
+    assert_eq!(status, 206);
+    assert_eq!(header_value(&headers, "Connection").as_deref(), Some("close"));
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
