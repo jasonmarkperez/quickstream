@@ -164,6 +164,8 @@ fn test_browser_api_round_trips_hostile_names() {
     assert_eq!(expected_files.len(), HOSTILE.len());
 
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    // The browser API only lists folders under the configured library roots.
+    state.write().unwrap().allowed_roots = vec![dir.canonicalize().expect("canonical temp dir")];
     let (tx, _rx) = mpsc::channel();
     let handle = WebServer::start(0, state, tx).expect("start web server");
     let encoded = quickstream::player::upnp::url_encode(&dir.to_string_lossy());
@@ -183,7 +185,8 @@ fn test_browser_api_round_trips_hostile_names() {
     assert_eq!(got_dirs, expected_dirs);
     assert_eq!(got_files, expected_files);
     for entry in &resp.entries {
-        assert_eq!(Path::new(&entry.path), dir.join(&entry.name));
+        // The browser API reports canonical paths (e.g. /private/var/... on macOS).
+        assert_eq!(Path::new(&entry.path), dir.canonicalize().unwrap().join(&entry.name));
     }
 
     let _ = fs::remove_dir_all(&dir);

@@ -390,6 +390,8 @@ fn test_web_server_close_active_streams_terminates_clients() {
 fn test_web_server_browser_api() {
     let temp_dir = std::env::temp_dir().join(format!("qs_browser_test_{}", std::process::id()));
     let _ = fs::create_dir_all(&temp_dir);
+    // The browser lists canonical paths (macOS: /var -> /private/var).
+    let temp_dir = fs::canonicalize(&temp_dir).unwrap();
 
     // Create subfolders
     fs::create_dir_all(temp_dir.join("Rock")).unwrap();
@@ -401,6 +403,8 @@ fn test_web_server_browser_api() {
     fs::write(temp_dir.join("notes.txt"), b"some text").unwrap();
 
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    // The web browser only reaches folders inside the allowed roots.
+    state.write().unwrap().allowed_roots = vec![temp_dir.parent().unwrap().to_path_buf()];
     let (tx, _rx) = mpsc::channel();
     let handle = WebServer::start(0, state.clone(), tx).expect("start web server");
     let port = handle.port;
@@ -458,7 +462,14 @@ fn test_web_server_browser_api() {
 
 #[test]
 fn test_web_server_extended_action_commands() {
+    // Path commands only reach files inside the allowed roots and carry the resolved path.
+    let music = std::env::temp_dir().join(format!("qs_web_actions_{}", std::process::id()));
+    fs::create_dir_all(music.join("album")).unwrap();
+    fs::write(music.join("song.flac"), b"fake_flac").unwrap();
+    let music = fs::canonicalize(&music).unwrap();
+    let json_path = |p: &std::path::Path| serde_json::to_string(&p.to_string_lossy()).unwrap();
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    state.write().unwrap().allowed_roots = vec![music.clone()];
     let (tx, rx) = mpsc::channel();
     let handle = WebServer::start(0, state, tx).expect("start web server");
     let port = handle.port;
@@ -479,14 +490,16 @@ fn test_web_server_extended_action_commands() {
     assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::ClearQueue);
 
     // 4. Add file
-    let (status, _, _) = http_post(port, "/api/action", r#"{"action":"add_file","path":"/music/song.flac"}"#);
+    let body = format!(r#"{{"action":"add_file","path":{}}}"#, json_path(&music.join("song.flac")));
+    let (status, _, _) = http_post(port, "/api/action", &body);
     assert_eq!(status, 200);
-    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::AddFile(PathBuf::from("/music/song.flac")));
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::AddFile(music.join("song.flac")));
 
     // 5. Add folder
-    let (status, _, _) = http_post(port, "/api/action", r#"{"action":"add_folder","path":"/music/album"}"#);
+    let body = format!(r#"{{"action":"add_folder","path":{}}}"#, json_path(&music.join("album")));
+    let (status, _, _) = http_post(port, "/api/action", &body);
     assert_eq!(status, 200);
-    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::AddFolder(PathBuf::from("/music/album")));
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::AddFolder(music.join("album")));
 
     // 6. Select device
     let (status, _, _) = http_post(port, "/api/action", r#"{"action":"select_device","id":1}"#);
@@ -504,9 +517,13 @@ fn test_web_server_extended_action_commands() {
     assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::SetQueueMode("repeat_one".to_string()));
 
     // 9. Set home with directory path
-    let (status, _, _) = http_post(port, "/api/action", r#"{"action":"set_home","path":"/test/home"}"#);
+    let body = format!(r#"{{"action":"set_home","path":{}}}"#, json_path(&music.join("album")));
+    let (status, _, _) = http_post(port, "/api/action", &body);
     assert_eq!(status, 200);
-    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::SetHome(Some("/test/home".to_string())));
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        WebCommand::SetHome(Some(music.join("album").to_string_lossy().to_string()))
+    );
 
     // 10. Clear home (path: null)
     let (status, _, _) = http_post(port, "/api/action", r#"{"action":"set_home"}"#);
@@ -514,6 +531,7 @@ fn test_web_server_extended_action_commands() {
     assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::SetHome(None));
 
     handle.stop();
+    let _ = fs::remove_dir_all(&music);
 }
 
 #[test]
@@ -995,8 +1013,9 @@ fn test_web_server_rejects_oversized_request_line() {
 fn test_web_server_rejects_too_many_headers() {
     let (handle, _state, _rx) = start_limited(ServerLimits::default());
 
+    let port = handle.port;
     let build = |count: usize| {
-        let mut req = String::from("GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+        let mut req = format!("GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n", port);
         for i in 1..count {
             req.push_str(&format!("X-Header-{}: v\r\n", i));
         }

@@ -99,6 +99,10 @@ pub struct NowPlayingState {
     pub bpm: Option<f64>,
     #[serde(default)]
     pub key: Option<String>,
+    /// Folders the web dashboard may browse and act on (startup home, bookmarks, launch folder).
+    /// Never sent to clients.
+    #[serde(skip)]
+    pub allowed_roots: Vec<PathBuf>,
 }
 
 impl Default for NowPlayingState {
@@ -134,6 +138,7 @@ impl Default for NowPlayingState {
             active_mix_profile: "Diverse Artists Shuffle".to_string(),
             bpm: None,
             key: None,
+            allowed_roots: Vec::new(),
         }
     }
 }
@@ -163,6 +168,8 @@ pub enum WebCommand {
     ShuffleQueue,
     SetMixProfile(String),
     SeedRadio(PathBuf),
+    /// A web request named a path outside the allowed folders; it was ignored.
+    PathRejected(PathBuf),
 }
 
 #[derive(Deserialize)]
@@ -839,6 +846,10 @@ fn handle_client(
     let path = head.path.as_str();
     let content_length = head.content_length;
     let range_header = head.header("range").map(str::to_string);
+    let mut auth_headers = crate::web_access::AuthHeaders::default();
+    for (name, value) in &head.headers {
+        auth_headers.observe(&format!("{}: {}", name, value));
+    }
 
     // Streams can run for hours: move them to their own pool so they do not use up the slots
     // for short requests.
@@ -855,6 +866,10 @@ fn handle_client(
         permit
     };
 
+    if !crate::web_access::check_request(&mut stream, method, path, &auth_headers)? {
+        return Ok(());
+    }
+
     // Route dispatch
     if method == "GET" || method == "HEAD" {
         let is_head = method == "HEAD";
@@ -862,7 +877,7 @@ fn handle_client(
             // Serve single-page dashboard
             let body = NOW_PLAYING_HTML.as_bytes();
             let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             stream.write_all(header.as_bytes())?;
@@ -872,14 +887,21 @@ fn handle_client(
             stream.flush()?;
         } else if path.starts_with("/api/status") {
             // Serve JSON playback status
-            let current = {
+            let mut current = {
                 let s = state.read().unwrap();
                 s.clone()
             };
+            // Only reveal where the terminal is browsing when the dashboard may go there too.
+            if !current.current_browser_dir.is_empty()
+                && crate::web_access::resolve_allowed_path(Path::new(&current.current_browser_dir), &current.allowed_roots)
+                    .is_none()
+            {
+                current.current_browser_dir.clear();
+            }
             let json = serde_json::to_string(&current).unwrap_or_else(|_| "{}".to_string());
             let body = json.as_bytes();
             let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             stream.write_all(header.as_bytes())?;
@@ -897,7 +919,7 @@ fn handle_client(
             let art_opt = filepath.as_deref().and_then(extract_cover_art);
             if let Some((bytes, mime)) = art_opt {
                 let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: public, max-age=10\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nCache-Control: public, max-age=10\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     mime,
                     bytes.len()
                 );
@@ -909,7 +931,7 @@ fn handle_client(
             } else {
                 let svg = default_cover_svg().as_bytes();
                 let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: public, max-age=10\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nCache-Control: public, max-age=10\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     svg.len()
                 );
                 stream.write_all(header.as_bytes())?;
@@ -936,35 +958,34 @@ fn handle_client(
                 None
             };
 
-            let (current_home_dir, current_terminal_dir) = {
+            let (current_home_dir, current_terminal_dir, roots) = {
                 let s = state.read().unwrap();
-                (s.home_dir.clone(), s.current_browser_dir.clone())
+                (s.home_dir.clone(), s.current_browser_dir.clone(), s.allowed_roots.clone())
             };
-
-            let target_dir = if let Some(ref p) = requested_path {
-                let pb = PathBuf::from(p);
-                if pb.is_dir() {
-                    pb
-                } else if !current_terminal_dir.is_empty() && PathBuf::from(&current_terminal_dir).is_dir() {
-                    PathBuf::from(&current_terminal_dir)
-                } else {
-                    current_home_dir
-                        .as_ref()
-                        .map(PathBuf::from)
-                        .filter(|p| p.is_dir())
-                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-                }
-            } else if !current_terminal_dir.is_empty() && PathBuf::from(&current_terminal_dir).is_dir() {
-                PathBuf::from(&current_terminal_dir)
+            // Only folders inside the allowed roots (startup home, bookmarks, launch folder).
+            let allowed_dir = |p: &Path| crate::web_access::resolve_allowed_path(p, &roots).filter(|d| d.is_dir());
+            let terminal_dir = if current_terminal_dir.is_empty() {
+                None
             } else {
-                current_home_dir
-                    .as_ref()
-                    .map(PathBuf::from)
-                    .filter(|p| p.is_dir())
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+                allowed_dir(Path::new(&current_terminal_dir)).map(|_| current_terminal_dir.clone())
+            };
+            let target_opt = match requested_path {
+                Some(ref p) => allowed_dir(Path::new(p)),
+                None => terminal_dir
+                    .as_deref()
+                    .and_then(|t| allowed_dir(Path::new(t)))
+                    .or_else(|| current_home_dir.as_deref().and_then(|h| allowed_dir(Path::new(h))))
+                    .or_else(|| roots.iter().find_map(|r| allowed_dir(r))),
+            };
+            let Some(target_dir) = target_opt else {
+                crate::web_access::write_path_forbidden(&mut stream)?;
+                return Ok(());
             };
 
-            let parent_path = target_dir.parent().map(|p| p.to_string_lossy().to_string());
+            let parent_path = target_dir
+                .parent()
+                .and_then(allowed_dir)
+                .map(|p| p.to_string_lossy().to_string());
 
             let bookmarks_file = crate::paths::get_bookmarks_path();
             let bookmarks: Vec<String> = if bookmarks_file.exists() {
@@ -1017,17 +1038,13 @@ fn handle_client(
                 bookmarks,
                 entries: all_entries,
                 home_dir: current_home_dir,
-                terminal_dir: if current_terminal_dir.is_empty() {
-                    None
-                } else {
-                    Some(current_terminal_dir)
-                },
+                terminal_dir,
             };
 
             let json = serde_json::to_string(&resp_data).unwrap_or_else(|_| "{}".to_string());
             let body = json.as_bytes();
             let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             stream.write_all(header.as_bytes())?;
@@ -1051,6 +1068,16 @@ fn handle_client(
         // content_length was checked against limits.max_body_bytes with the headers.
         let body_bytes = read_request_body(&mut reader, content_length, deadline).unwrap_or_default();
 
+        // Paths must resolve inside the allowed folders; commands carry the resolved path.
+        let roots = state.read().unwrap().allowed_roots.clone();
+        let mut rejected: Option<PathBuf> = None;
+        let mut allow = |p: String| -> Option<PathBuf> {
+            let resolved = crate::web_access::resolve_allowed_path(Path::new(&p), &roots);
+            if resolved.is_none() {
+                rejected = Some(PathBuf::from(p));
+            }
+            resolved
+        };
         if let Ok(payload) = serde_json::from_slice::<ActionPayload>(&body_bytes) {
             match payload.action.as_str() {
                 "toggle_pause" => {
@@ -1097,13 +1124,13 @@ fn handle_client(
                     let _ = cmd_tx.send(WebCommand::ClearQueue);
                 }
                 "add_file" | "add_track" => {
-                    if let Some(p) = payload.path {
-                        let _ = cmd_tx.send(WebCommand::AddFile(PathBuf::from(p)));
+                    if let Some(p) = payload.path.and_then(&mut allow) {
+                        let _ = cmd_tx.send(WebCommand::AddFile(p));
                     }
                 }
                 "add_folder" => {
-                    if let Some(p) = payload.path {
-                        let _ = cmd_tx.send(WebCommand::AddFolder(PathBuf::from(p)));
+                    if let Some(p) = payload.path.and_then(&mut allow) {
+                        let _ = cmd_tx.send(WebCommand::AddFolder(p));
                     }
                 }
                 "select_device" => {
@@ -1119,17 +1146,36 @@ fn handle_client(
                         let _ = cmd_tx.send(WebCommand::SetQueueMode(mode));
                     }
                 }
-                "set_home" => {
-                    let _ = cmd_tx.send(WebCommand::SetHome(payload.path));
-                }
-                "autopilot" => {
-                    let p = payload.path.map(PathBuf::from);
-                    let _ = cmd_tx.send(WebCommand::Autopilot(p));
-                }
-                "autopilot_reshuffle" | "reshuffle" => {
-                    let p = payload.path.map(PathBuf::from);
-                    let _ = cmd_tx.send(WebCommand::AutopilotReshuffle(p));
-                }
+                "set_home" => match payload.path {
+                    None => {
+                        let _ = cmd_tx.send(WebCommand::SetHome(None));
+                    }
+                    Some(p) => {
+                        if let Some(dir) = allow(p) {
+                            let _ = cmd_tx.send(WebCommand::SetHome(Some(dir.to_string_lossy().to_string())));
+                        }
+                    }
+                },
+                "autopilot" => match payload.path {
+                    None => {
+                        let _ = cmd_tx.send(WebCommand::Autopilot(None));
+                    }
+                    Some(p) => {
+                        if let Some(dir) = allow(p) {
+                            let _ = cmd_tx.send(WebCommand::Autopilot(Some(dir)));
+                        }
+                    }
+                },
+                "autopilot_reshuffle" | "reshuffle" => match payload.path {
+                    None => {
+                        let _ = cmd_tx.send(WebCommand::AutopilotReshuffle(None));
+                    }
+                    Some(p) => {
+                        if let Some(dir) = allow(p) {
+                            let _ = cmd_tx.send(WebCommand::AutopilotReshuffle(Some(dir)));
+                        }
+                    }
+                },
                 "shuffle" => {
                     let _ = cmd_tx.send(WebCommand::ShuffleQueue);
                 }
@@ -1139,15 +1185,21 @@ fn handle_client(
                     }
                 }
                 "seed_radio" => {
-                    if let Some(p) = payload.path {
-                        let _ = cmd_tx.send(WebCommand::SeedRadio(PathBuf::from(p)));
+                    if let Some(p) = payload.path.and_then(&mut allow) {
+                        let _ = cmd_tx.send(WebCommand::SeedRadio(p));
                     }
                 }
                 _ => {}
             }
         }
 
-        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}";
+        if let Some(path) = rejected {
+            let _ = cmd_tx.send(WebCommand::PathRejected(path));
+            crate::web_access::write_path_forbidden(&mut stream)?;
+            return Ok(());
+        }
+
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}";
         stream.write_all(resp)?;
         stream.flush()?;
     } else {

@@ -78,6 +78,7 @@ quickstream/
 │   ├── metadata.rs       # Lofty audio metadata extraction, cover art decoding, path heuristics
 │   ├── queue.rs          # PlaybackQueue, FastRng (SplitMix64 deterministic PRNG), shuffle & loop
 │   ├── web.rs            # Embedded HTTP byte-range server, continuous WAV streaming, REST API, Web UI
+│   ├── web_access.rs     # Web access control: pairing token, Host/Origin/Content-Type checks, allowed folders
 │   ├── discovery.rs      # SSDP UDP multicast discovery (239.255.255.250:1900), XML device parsing
 │   ├── settings.rs       # User preferences model, cycle definitions, config.json persistence
 │   ├── paths.rs          # XDG Base Directory resolution and backward-compatible migration
