@@ -38,3 +38,12 @@ Rendered row at 80 columns (the same for every selected tab): " [1] Now Playing�
 Covering test: test_tab_bar_shows_all_five_labels_at_80_columns (tests/test_playlists_ui.rs).
 Command: cargo test --test test_playlists_ui -- --test-threads=1 [--nocapture test_tab_bar]; cargo fmt --check; cargo clippy --all-targets -- -D warnings.
 Output: 9 passed, 0 failed; fmt clean; clippy clean (no warnings).
+
+## Fix round 5
+
+Finding 1 (tab bar clipped at 80 columns): the code fix has been in place since b38bc2e and is unchanged. The finding cites the 50689f2 diff, which used the default Tabs padding. render_tabs (src/ui/mod.rs:3546) now calls `.padding("", "")` and gives each title one leading space, so the bar is 79 columns. The title text is unchanged, as the brief requires. The project uses ratatui 0.29.0 (Cargo.lock). The statement that the tests only render at 120 columns is out of date: test_tab_bar_shows_all_five_labels_at_80_columns has rendered at 80x30 since b38bc2e.
+What changed this round (a0372c6): added test_tab_5_label_is_highlighted_at_80_columns_after_pressing_5. It presses `5`, renders at 80x30, finds '[5] Playlists' on the tab bar row, and asserts that it ends at or before column 80. It also asserts that every cell of the label is Cyan and BOLD, which shows the new tab is both visible and drawn as the active tab.
+Mutation check: I removed `.padding("", "")` and both 80-column tests failed. The bar was cut off at "...│  [4] Settings │  [5] P", which matches the finding. I then restored the line. The source is unchanged from c8b1fe0.
+Covering tests: test_tab_bar_shows_all_five_labels_at_80_columns, test_tab_5_label_is_highlighted_at_80_columns_after_pressing_5 (tests/test_playlists_ui.rs).
+Command: cargo test --test test_playlists_ui -- --test-threads=1; cargo fmt --check; cargo clippy --all-targets -- -D warnings; cargo test -- --test-threads=1.
+Output: test_playlists_ui 10 passed, 0 failed; fmt clean; clippy clean (no warnings); every suite in the full run reports ok, none failed.
