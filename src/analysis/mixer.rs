@@ -202,16 +202,28 @@ impl DjMixer {
             for (idx, (meta, feat)) in track_items.iter().enumerate() {
                 let mut score: i64 = 100;
 
-                // Strongly penalize back-to-back identical artist
+                let is_generic_artist = |a: &str| -> bool {
+                    let lower = a.trim().to_lowercase();
+                    lower.is_empty()
+                        || lower == "various artists"
+                        || lower == "various"
+                        || lower == "unknown artist"
+                        || lower == "unknown"
+                };
+
+                // Strongly penalize back-to-back identical artist (unless generic / various)
                 if let Some(last) = sequenced.last() {
-                    if !meta.artist.is_empty() && meta.artist == last.artist {
+                    if !is_generic_artist(&meta.artist)
+                        && !is_generic_artist(&last.artist)
+                        && meta.artist.eq_ignore_ascii_case(&last.artist)
+                    {
                         score -= 50_000;
                     }
                 }
 
                 // Penalize repeating recent artists heavily to enforce diversity
-                if !meta.artist.is_empty() {
-                    if let Some(pos) = recent_artists.iter().rposition(|a| a == &meta.artist) {
+                if !is_generic_artist(&meta.artist) {
+                    if let Some(pos) = recent_artists.iter().rposition(|a| a.eq_ignore_ascii_case(&meta.artist)) {
                         let distance = recent_artists.len() - pos;
                         if distance < 8 {
                             score -= (8 - distance as i64) * 2000;
@@ -254,12 +266,6 @@ impl DjMixer {
                     best_score = score;
                     best_idx = idx;
                 }
-            }
-
-            // In multi-artist mixes, strictly prevent consecutive back-to-back identical artist tracks
-            let unique_artists_count = recent_artists.iter().collect::<std::collections::HashSet<_>>().len();
-            if unique_artists_count > 1 && best_score <= -40_000 {
-                break;
             }
 
             let (chosen_meta, _) = track_items.remove(best_idx);

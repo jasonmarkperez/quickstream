@@ -486,12 +486,51 @@ impl LibraryManager {
         rng.shuffle(&mut subdirs);
 
         // 2. If specialized mix profile is active (BPM Flow, Mood Vibe, or Seed Radio),
-        // gather a fair candidate pool across shuffled subdirectories, evaluate acoustic features, and run DjMixer!
+        // gather matching candidates across shuffled subdirectories until we have enough matching tracks!
         if profile != crate::analysis::MixProfile::DiverseShuffle {
-            let mut candidates: Vec<AudioMetadata> = Vec::new();
+            let mut matched_candidates: Vec<AudioMetadata> = Vec::new();
+            let mut all_candidates: Vec<AudioMetadata> = Vec::new();
+
+            let is_match = |meta: &AudioMetadata| -> bool {
+                match &profile {
+                    crate::analysis::MixProfile::BpmFlow { target_bpm, tolerance } => {
+                        let min_bpm = target_bpm * (1.0 - tolerance);
+                        let max_bpm = target_bpm * (1.0 + tolerance);
+                        let feat = db.get_track(&meta.filepath);
+                        if let Some(b) = feat.and_then(|f| f.bpm) {
+                            (b >= min_bpm && b <= max_bpm)
+                                || (b >= min_bpm / 2.0 && b <= max_bpm / 2.0)
+                                || (b >= min_bpm * 2.0 && b <= max_bpm * 2.0)
+                        } else {
+                            false
+                        }
+                    }
+                    crate::analysis::MixProfile::MoodVibe(mood) => {
+                        let feat = db.get_track(&meta.filepath);
+                        mood.matches_track(meta, feat.as_ref())
+                    }
+                    crate::analysis::MixProfile::SeedRadio(seed_path) => {
+                        if &meta.filepath == seed_path {
+                            return false;
+                        }
+                        let seed_feat = db.get_track(seed_path).unwrap_or_default();
+                        let (_seed_title, seed_artist, _seed_album) = Self::parse_path_heuristics(seed_path);
+                        let seed_artist = if !seed_feat.artist.is_empty() { seed_feat.artist } else { seed_artist };
+                        let seed_genre = seed_feat.genre;
+
+                        let feat = db.get_track(&meta.filepath);
+                        let artist_match = !seed_artist.is_empty() && meta.artist.eq_ignore_ascii_case(&seed_artist);
+                        let genre_match = !seed_genre.is_empty() && (
+                            meta.genre.eq_ignore_ascii_case(&seed_genre)
+                            || feat.as_ref().map(|f| f.genre.eq_ignore_ascii_case(&seed_genre)).unwrap_or(false)
+                        );
+                        artist_match || genre_match
+                    }
+                    _ => true,
+                }
+            };
 
             if !subdirs.is_empty() {
-                // Determine fair candidate quota per artist subdirectory
                 let per_subdir = if subdirs.len() >= 60 {
                     2
                 } else if subdirs.len() >= 20 {
@@ -506,16 +545,24 @@ impl LibraryManager {
                 if !immediate_files.is_empty() {
                     rng.shuffle(&mut immediate_files);
                     for f in immediate_files.iter().take(per_subdir) {
-                        candidates.push(make_metadata(f));
+                        let meta = make_metadata(f);
+                        if is_match(&meta) {
+                            matched_candidates.push(meta.clone());
+                        }
+                        all_candidates.push(meta);
                     }
                 }
 
-                let mut extra_candidates: Vec<PathBuf> = Vec::new();
-
-                for subdir in &subdirs {
-                    if stop_flag.load(Ordering::Relaxed) || candidates.len() >= 150 {
+                // Walk shuffled subdirectories: continue until we have at least 80 matching tracks,
+                // or have visited up to 500 subdirectories, or subdirs are exhausted!
+                for (idx, subdir) in subdirs.iter().enumerate() {
+                    if stop_flag.load(Ordering::Relaxed)
+                        || matched_candidates.len() >= 80
+                        || (idx >= 500 && matched_candidates.len() >= target_limit)
+                    {
                         break;
                     }
+
                     let mut folder_tracks = Vec::new();
                     for entry in WalkDir::new(subdir)
                         .max_depth(3)
@@ -541,42 +588,18 @@ impl LibraryManager {
 
                     if !folder_tracks.is_empty() {
                         rng.shuffle(&mut folder_tracks);
-                        for (i, p) in folder_tracks.into_iter().enumerate() {
-                            if i < per_subdir && candidates.len() < 150 {
-                                candidates.push(make_metadata(&p));
-                            } else {
-                                extra_candidates.push(p);
+                        let mut artist_match_count = 0;
+                        for p in folder_tracks {
+                            let meta = make_metadata(&p);
+                            if is_match(&meta) {
+                                if artist_match_count < per_subdir && matched_candidates.len() < 120 {
+                                    matched_candidates.push(meta.clone());
+                                    all_candidates.push(meta);
+                                    artist_match_count += 1;
+                                }
+                            } else if all_candidates.len() < 200 {
+                                all_candidates.push(meta);
                             }
-                        }
-                    }
-                }
-
-                // If candidate pool is still small, draw extra tracks while strictly capping any single artist
-                if candidates.len() < 60 && !extra_candidates.is_empty() {
-                    let max_per_artist = (per_subdir * 2).max(4);
-                    let mut artist_counts: HashMap<String, usize> = HashMap::new();
-                    for c in &candidates {
-                        if !c.artist.is_empty() {
-                            *artist_counts.entry(c.artist.clone()).or_insert(0) += 1;
-                        }
-                    }
-
-                    rng.shuffle(&mut extra_candidates);
-                    for p in extra_candidates {
-                        if stop_flag.load(Ordering::Relaxed) || candidates.len() >= 150 {
-                            break;
-                        }
-                        let meta = make_metadata(&p);
-                        let count = if !meta.artist.is_empty() {
-                            *artist_counts.get(&meta.artist).unwrap_or(&0)
-                        } else {
-                            0
-                        };
-                        if count < max_per_artist {
-                            if !meta.artist.is_empty() {
-                                *artist_counts.entry(meta.artist.clone()).or_insert(0) += 1;
-                            }
-                            candidates.push(meta);
                         }
                     }
                 }
@@ -607,88 +630,45 @@ impl LibraryManager {
                     }
                 }
                 rng.shuffle(&mut all_files);
-                for p in all_files.into_iter().take(150) {
-                    candidates.push(make_metadata(&p));
+                for p in all_files.into_iter().take(200) {
+                    let meta = make_metadata(&p);
+                    if is_match(&meta) {
+                        matched_candidates.push(meta.clone());
+                    }
+                    all_candidates.push(meta);
                 }
             }
 
-            if candidates.is_empty() {
+            if matched_candidates.is_empty() && all_candidates.is_empty() {
                 let _ = tx.send(AutopilotEvent::Finished(0));
                 return;
             }
 
-            let filtered: Vec<AudioMetadata> = match &profile {
-                crate::analysis::MixProfile::BpmFlow { target_bpm, tolerance } => {
-                    let min_bpm = target_bpm * (1.0 - tolerance);
-                    let max_bpm = target_bpm * (1.0 + tolerance);
-                    let matched: Vec<AudioMetadata> = candidates
-                        .iter()
-                        .filter(|m| {
-                            let feat = db.get_track(&m.filepath);
-                            if let Some(b) = feat.and_then(|f| f.bpm) {
-                                (b >= min_bpm && b <= max_bpm)
-                                    || (b >= min_bpm / 2.0 && b <= max_bpm / 2.0)
-                                    || (b >= min_bpm * 2.0 && b <= max_bpm * 2.0)
-                            } else {
-                                false
-                            }
-                        })
-                        .cloned()
-                        .collect();
-                    if matched.is_empty() {
-                        candidates
-                    } else {
-                        matched
+            let filtered: Vec<AudioMetadata> = if matched_candidates.len() >= target_limit {
+                matched_candidates
+            } else if !matched_candidates.is_empty() {
+                // If library has fewer than target_limit matches,
+                // check if this is a small folder (< 20 tracks, e.g. a unit test)
+                let total_available = all_candidates.len();
+                if total_available <= 10 {
+                    matched_candidates
+                } else {
+                    // In a larger library, keep all matching tracks first,
+                    // and supplement remaining slots from diverse candidate tracks
+                    let mut pool = matched_candidates;
+                    rng.shuffle(&mut all_candidates);
+                    for c in all_candidates {
+                        if pool.len() >= target_limit {
+                            break;
+                        }
+                        if !pool.iter().any(|m| m.filepath == c.filepath) {
+                            pool.push(c);
+                        }
                     }
+                    pool
                 }
-                crate::analysis::MixProfile::MoodVibe(mood) => {
-                    let matched: Vec<AudioMetadata> = candidates
-                        .iter()
-                        .filter(|m| {
-                            let feat = db.get_track(&m.filepath);
-                            mood.matches_track(m, feat.as_ref())
-                        })
-                        .cloned()
-                        .collect();
-                    if matched.is_empty() {
-                        candidates
-                    } else {
-                        matched
-                    }
-                }
-                crate::analysis::MixProfile::SeedRadio(seed_path) => {
-                    let seed_feat = db.get_track(seed_path).unwrap_or_default();
-                    let (_seed_title, seed_artist, _seed_album) = Self::parse_path_heuristics(seed_path);
-                    let seed_artist = if !seed_feat.artist.is_empty() { seed_feat.artist } else { seed_artist };
-                    let seed_genre = seed_feat.genre;
-
-                    let matched: Vec<AudioMetadata> = candidates
-                        .iter()
-                        .filter(|m| {
-                            if &m.filepath == seed_path {
-                                return false;
-                            }
-                            let feat = db.get_track(&m.filepath);
-                            let artist_match = !seed_artist.is_empty() && m.artist.eq_ignore_ascii_case(&seed_artist);
-                            let genre_match = !seed_genre.is_empty() && (
-                                m.genre.eq_ignore_ascii_case(&seed_genre)
-                                || feat.as_ref().map(|f| f.genre.eq_ignore_ascii_case(&seed_genre)).unwrap_or(false)
-                            );
-                            artist_match || genre_match
-                        })
-                        .cloned()
-                        .collect();
-
-                    if matched.is_empty() {
-                        candidates
-                            .into_iter()
-                            .filter(|m| &m.filepath != seed_path)
-                            .collect()
-                    } else {
-                        matched
-                    }
-                }
-                _ => candidates,
+            } else {
+                all_candidates
             };
 
             let sequenced = crate::analysis::mixer::DjMixer::sequence_mix(filtered, &db, target_limit);

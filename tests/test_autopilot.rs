@@ -704,6 +704,45 @@ fn test_autopilot_mood_vibe_diverse_artist_sampling_no_single_artist_loop() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_autopilot_mix_generates_full_queue_when_library_has_sparse_matches() {
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_sparse_mix_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    // Create 15 artists, each with 2 tracks (30 tracks total > 10 tracks)
+    // Only Artist 1 has a track matching "Chill"
+    for i in 1..=15 {
+        let artist_dir = temp_dir.join(format!("Artist_{:02}", i)).join("Album");
+        fs::create_dir_all(&artist_dir).unwrap();
+        for j in 1..=2 {
+            let title = if i == 1 && j == 1 {
+                "01 Chill Vibes.wav".to_string()
+            } else {
+                format!("0{} Regular Track {}.wav", j, j)
+            };
+            create_dummy_audio(&artist_dir.join(title));
+        }
+    }
+
+    let mgr = SettingsManager::default();
+    let mut app = AppUI::new(Some(temp_dir.clone()), mgr);
+
+    app.active_mix_profile = quickstream::analysis::MixProfile::MoodVibe(quickstream::analysis::MoodType::Chill);
+    app.start_autopilot(temp_dir.clone());
+    app.wait_for_autopilot_scan(Duration::from_secs(3));
+
+    // Even though only 1 track matched the "Chill" mood keyword,
+    // the mix must NOT be truncated to 1 song! It should supplement up to all available candidates.
+    assert!(
+        app.queue.len() >= 20,
+        "Expected at least 20 tracks queued in a 30-track library, but found only {}",
+        app.queue.len()
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
 
 
 
