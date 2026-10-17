@@ -23,7 +23,8 @@ fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("qs_pl_play_{}_{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    // Canonical (macOS: /private/var/...), since the queue holds checked, canonical paths.
+    std::fs::canonicalize(&dir).unwrap()
 }
 
 fn touch(path: &Path) {
@@ -155,7 +156,7 @@ fn test_hung_existence_check_does_not_block_ui() {
     let gate_rx = Arc::new(Mutex::new(gate_rx));
     let checker: ExistsChecker = Arc::new(move |_path: &Path| {
         let _ = gate_rx.lock().unwrap().recv();
-        false
+        None
     });
     app.playlists.set_exists_checker(checker);
     let (open_tx, open_rx) = std::sync::mpsc::channel::<()>();
@@ -571,10 +572,10 @@ fn gated_checker() -> (
     let gate_rx = Arc::new(Mutex::new(gate_rx));
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = calls.clone();
-    let checker: ExistsChecker = Arc::new(move |_path: &Path| {
+    let checker: ExistsChecker = Arc::new(move |path: &Path| {
         counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _ = gate_rx.lock().unwrap().recv();
-        true
+        Some(path.to_path_buf())
     });
     (checker, gate_tx, calls)
 }
@@ -688,5 +689,34 @@ fn test_playlist_result_after_clearing_the_queue_does_not_touch_it() {
     );
     poll_for(&mut app, Duration::from_millis(100));
     assert!(app.queue.is_empty(), "queue: {:?}", queue_paths(&app));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The queue check resolves symlinks, and the queue (and so the stream registry) gets the path
+/// it checked: a link swapped after the check can't point playback at another file.
+#[test]
+fn test_symlinked_entry_is_queued_by_its_checked_target() {
+    common::isolate();
+    let dir = temp_dir("symlink_target");
+    let target = dir.join("real.mp3");
+    let link = dir.join("link.mp3");
+    touch(&target);
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let file = write_playlist(vec![entry(&link, "Alpha", "One")]);
+    let before = std::fs::read(&file).unwrap();
+    let mut app = app_with_playlist(&dir);
+
+    app.queue_selected_playlist(None);
+    assert!(
+        poll_until(&mut app, |app| app.queue.len() == 1),
+        "status: {}",
+        app.status_message
+    );
+    let canonical = std::fs::canonicalize(&target).unwrap();
+    assert_eq!(queue_paths(&app), vec![canonical]);
+    // The playlist keeps the link.
+    app.persistence.flush();
+    assert_eq!(std::fs::read(&file).unwrap(), before);
+    assert_eq!(app.playlists.store.get(PLAYLIST).unwrap().entries[0].path, link);
     let _ = std::fs::remove_dir_all(&dir);
 }

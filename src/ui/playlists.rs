@@ -29,15 +29,17 @@ pub enum NamePurpose {
     CreateAndAdd(PendingAdd),
 }
 
-/// Existence test used by the playlist workers. Tests swap in a slow one to stand in for a
-/// hung network share.
-pub type ExistsChecker = std::sync::Arc<dyn Fn(&std::path::Path) -> bool + Send + Sync>;
+/// Existence test used by the playlist workers: the path that may be played (symlinks
+/// resolved), or `None` when the entry can't be queued. Tests swap in a slow one to stand in
+/// for a hung network share.
+pub type ExistsChecker = std::sync::Arc<dyn Fn(&std::path::Path) -> Option<std::path::PathBuf> + Send + Sync>;
 
 /// A playlist snapshot whose files were checked on a worker, ready to be queued.
 struct QueueCheckResult {
     name: String,
     entries: Vec<crate::playlist::PlaylistEntry>,
-    exists: Vec<bool>,
+    /// Per entry, the checked (canonical) path to queue, or `None` when it can't be queued.
+    resolved: Vec<Option<std::path::PathBuf>>,
     /// Track to play from (`Enter`: replace the queue); `None` appends (`a`).
     play_from: Option<usize>,
     /// [`PlaylistChecks::queue_generation`] when the request was made.
@@ -1122,14 +1124,13 @@ impl PlaylistsUi {
     }
 }
 
-/// Whether a playlist entry can be queued: the path resolves (through any symlinks) to a regular
-/// file with an audio extension. Checking the resolved path stops a `song.mp3` symlink from
-/// pointing the stream server at some other file. Runs on a worker; it touches the disk.
-pub fn playable_audio_file(path: &std::path::Path) -> bool {
-    match std::fs::canonicalize(path) {
-        Ok(resolved) => resolved.is_file() && crate::metadata::is_supported_audio_file(&resolved),
-        Err(_) => false,
-    }
+/// The path to queue for a playlist entry: the entry resolved (through any symlinks) to a
+/// regular file with an audio extension, or `None`. Callers queue the returned path, never the
+/// entry's own, so a `song.mp3` symlink swapped after the check can't point the stream server
+/// at some other file. Runs on a worker; it touches the disk.
+pub fn playable_audio_file(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let resolved = std::fs::canonicalize(path).ok()?;
+    (resolved.is_file() && crate::metadata::is_supported_audio_file(&resolved)).then_some(resolved)
 }
 
 impl AppUI {
@@ -1162,7 +1163,7 @@ impl AppUI {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                let exists = checker(path.as_path());
+                let exists = checker(path.as_path()).is_some();
                 if tx.send((path, exists)).is_err() {
                     break;
                 }
@@ -1212,17 +1213,17 @@ impl AppUI {
         let tx = self.playlists.checks.queue_tx.clone();
         let stop = self.playlists.checks.stop.clone();
         self.workers.spawn("playlist-queue", move || {
-            let mut exists = Vec::with_capacity(entries.len());
+            let mut resolved = Vec::with_capacity(entries.len());
             for entry in &entries {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
-                exists.push(checker(entry.path.as_path()));
+                resolved.push(checker(entry.path.as_path()));
             }
             let _ = tx.send(QueueCheckResult {
                 name,
                 entries,
-                exists,
+                resolved,
                 play_from,
                 generation,
             });
@@ -1234,19 +1235,42 @@ impl AppUI {
     fn apply_playlist_queue(&mut self, result: QueueCheckResult) {
         self.playlists.checks.queue_pending = None;
         // Fresh results update the session cache; they never change the playlist or its file.
-        for (entry, exists) in result.entries.iter().zip(&result.exists) {
-            self.playlists.exists.insert(entry.path.clone(), *exists);
+        for (entry, resolved) in result.entries.iter().zip(&result.resolved) {
+            self.playlists.exists.insert(entry.path.clone(), resolved.is_some());
         }
         if result.generation != self.playlists.checks.queue_generation {
             // The queue was replaced or playback started while this check ran.
             return;
         }
-        let cached = |path: &std::path::Path| self.metadata_cache.get(path);
+        // Queue the checked paths only: the queue and the /stream registry never see an entry's
+        // own path, which may be a symlink swapped since the check.
+        let mut originals = HashMap::new();
+        let mut checked = Vec::with_capacity(result.entries.len());
+        let mut exists = Vec::with_capacity(result.entries.len());
+        for (entry, resolved) in result.entries.iter().zip(&result.resolved) {
+            let mut entry = entry.clone();
+            if let Some(resolved) = resolved {
+                originals.insert(resolved.clone(), entry.path.clone());
+                entry.path = resolved.clone();
+            }
+            exists.push(resolved.is_some());
+            checked.push(entry);
+        }
+        let cached = |path: &std::path::Path| {
+            let original = originals.get(path).map(|p| p.as_path());
+            self.metadata_cache
+                .get(path)
+                .or_else(|| original.and_then(|o| self.metadata_cache.get(o)))
+                .map(|mut meta| {
+                    meta.filepath = path.to_path_buf();
+                    meta
+                })
+        };
         let crate::playlist::QueuePlan {
             tracks,
             start_index,
             missing,
-        } = crate::playlist::plan_queue(&result.entries, &result.exists, result.play_from, &cached);
+        } = crate::playlist::plan_queue(&checked, &exists, result.play_from, &cached);
         if tracks.is_empty() {
             let hint = result.entries.first().map(|e| mount_hint(&e.path)).unwrap_or_default();
             self.status_message = format!(
