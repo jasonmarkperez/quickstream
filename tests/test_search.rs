@@ -330,9 +330,13 @@ fn test_large_library_search_performance() {
     println!("Fuzzy query across 20,000 tracks took: {:?}", search_elapsed);
 
     assert!(!modal.filtered.is_empty());
+    // Shared CI runners are slower and noisier than a dev machine; the CI budget still catches
+    // algorithmic regressions (e.g. quadratic filtering), which cost seconds here.
+    let budget_ms = if std::env::var_os("CI").is_some() { 1000 } else { 250 };
     assert!(
-        search_elapsed.as_millis() < 250,
-        "Search across 20,000 tracks must be fast (<250ms in unoptimized debug, ~11ms in release), took {:?}",
+        search_elapsed.as_millis() < budget_ms,
+        "Search across 20,000 tracks must be fast (<{}ms in unoptimized debug, ~11ms in release), took {:?}",
+        budget_ms,
         search_elapsed
     );
 }

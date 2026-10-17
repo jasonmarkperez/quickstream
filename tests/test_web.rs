@@ -357,8 +357,9 @@ fn test_web_server_close_active_streams_terminates_clients() {
     let _ = fs::create_dir_all(&temp_dir);
     let test_file = temp_dir.join("large_stream.mp3");
 
-    // 2 MB dummy data
-    let test_data: Vec<u8> = vec![0xAA; 2 * 1024 * 1024];
+    // 32 MB dummy data: larger than loopback socket buffers (several MB on Linux), so the
+    // server cannot have handed the whole file to the kernel before the streams are closed.
+    let test_data: Vec<u8> = vec![0xAA; 32 * 1024 * 1024];
     fs::write(&test_file, &test_data).unwrap();
 
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
