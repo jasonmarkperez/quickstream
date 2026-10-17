@@ -206,11 +206,15 @@ struct RecordingPlayer {
     playing: bool,
     paused: bool,
     volume: u8,
+    fail_play: bool,
 }
 
 impl AudioPlayer for RecordingPlayer {
     fn play(&mut self, filepath: &Path) -> anyhow::Result<()> {
         self.calls.lock().unwrap().push(format!("play {}", filepath.display()));
+        if self.fail_play {
+            anyhow::bail!("no audio backend");
+        }
         self.playing = true;
         self.paused = false;
         Ok(())
@@ -267,6 +271,7 @@ fn install_recording_player(app: &mut AppUI) -> Arc<Mutex<Vec<String>>> {
         playing: false,
         paused: false,
         volume: 50,
+        fail_play: false,
     });
     calls
 }
@@ -491,5 +496,44 @@ fn test_help_modal_lists_playlist_play_and_queue_keys() {
     app.show_help_modal = true;
     let view = render(&mut app, 120, 40);
     assert!(view.contains("Play / queue playlist"), "{}", view);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_playback_error_is_kept_when_enter_queues_the_playlist() {
+    common::isolate();
+    let dir = temp_dir("play_error");
+    let first = dir.join("a.mp3");
+    let second = dir.join("b.mp3");
+    touch(&first);
+    touch(&second);
+    write_playlist(vec![entry(&first, "Alpha", "One"), entry(&second, "Beta", "Two")]);
+    let mut app = app_with_playlist(&dir);
+    app.player = Box::new(RecordingPlayer {
+        calls: Arc::new(Mutex::new(Vec::new())),
+        playing: false,
+        paused: false,
+        volume: 50,
+        fail_play: true,
+    });
+    app.active_tab = 4;
+    app.playlists.tracks_focus = true;
+    app.playlists.track_cursor = 0;
+    press(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(
+        poll_until(&mut app, |app| app.status_message.contains("Queued")),
+        "Enter did not queue the playlist; status: {}",
+        app.status_message
+    );
+    assert!(
+        app.status_message.starts_with("Playback error"),
+        "error swallowed: {}",
+        app.status_message
+    );
+    assert!(
+        app.status_message.ends_with("Queued 2 tracks from Road Trip"),
+        "{}",
+        app.status_message
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

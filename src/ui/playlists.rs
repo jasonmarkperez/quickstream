@@ -1212,11 +1212,20 @@ impl AppUI {
                 self.enqueue_tracks(tracks);
             }
         }
-        // Set after play_current_track, which clears the status on success.
-        self.status_message = if missing == 0 {
+        // play_current_track clears the status on success and sets "Playback error: ..." on
+        // failure. Keep the error visible and put the queue summary after it.
+        let playback_error = self
+            .status_message
+            .starts_with("Playback error")
+            .then(|| self.status_message.clone());
+        let summary = if missing == 0 {
             format!("Queued {} tracks from {}", queued, result.name)
         } else {
             format!("Queued {} tracks from {}, {} missing", queued, result.name, missing)
+        };
+        self.status_message = match playback_error {
+            Some(err) => format!("{}. {}", err, summary),
+            None => summary,
         };
         self.update_web_state();
     }
