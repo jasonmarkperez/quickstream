@@ -10,6 +10,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScree
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
+pub mod playlists;
 pub mod search;
 pub mod workers;
 
@@ -268,6 +269,8 @@ pub struct AppUI {
     pub mix_picker_cursor: usize,
     /// Writes bookmarks and settings off the UI thread; flushed and joined on drop.
     pub persistence: crate::persist::PersistenceWorker,
+    /// Tab 5: playlist store, cursors and the playlist modals.
+    pub playlists: playlists::PlaylistsUi,
 }
 
 impl Drop for AppUI {
@@ -290,6 +293,7 @@ impl AppUI {
     pub fn new(start_dir: Option<PathBuf>, mut settings_mgr: SettingsManager) -> Self {
         let persistence = crate::persist::PersistenceWorker::spawn();
         settings_mgr.set_persistence(persistence.handle());
+        let playlists = playlists::PlaylistsUi::new(persistence.handle());
         let cwd = start_dir
             .or_else(|| {
                 settings_mgr
@@ -400,8 +404,10 @@ impl AppUI {
             show_mix_picker_modal: false,
             mix_picker_cursor: 0,
             persistence,
+            playlists,
         };
         app.refresh_browser();
+        app.start_playlist_load();
         app.update_web_state();
         app
     }
@@ -988,12 +994,14 @@ impl AppUI {
 
     /// Resolve tags for queue tracks that still have placeholder metadata. Each path is read at
     /// most once per session by a persistent pool of 4 workers; results arrive via `metadata_rx`.
+    /// A zero sample rate marks a placeholder that has an artist and duration (a playlist's
+    /// `#EXTINF`) but no album or audio properties yet.
     pub fn start_queue_metadata_fetch(&mut self) {
         let candidates: Vec<PathBuf> = self
             .queue
             .tracks
             .iter()
-            .filter(|t| t.duration_seconds <= 0.0 || t.artist.is_empty())
+            .filter(|t| t.duration_seconds <= 0.0 || t.artist.is_empty() || t.sample_rate_hz == 0)
             .map(|t| t.filepath.clone())
             .collect();
         let new_paths: Vec<PathBuf> = candidates
@@ -1501,6 +1509,7 @@ impl AppUI {
         for stop in stops.into_iter().flatten() {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        self.playlists.stop_checks();
         // Dropping the inbox wakes queue metadata workers blocked waiting for work.
         self.queue_metadata_tx = None;
         if let Some(mut modal) = self.search_modal.take() {
@@ -1594,6 +1603,7 @@ impl AppUI {
             // Poll background metadata extraction
             self.poll_background_metadata();
             self.poll_pending_queue_adds();
+            self.poll_playlists();
 
             // Poll progressive background autopilot discovery
             self.poll_background_autopilot();
@@ -2040,6 +2050,11 @@ impl AppUI {
             return Ok(false);
         }
 
+        // A playlist modal (name prompt, delete confirmation, add picker) takes every key.
+        if self.playlists.modal.is_some() {
+            return self.handle_playlist_modal_key(key);
+        }
+
         // Global hotkeys
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), KeyModifiers::NONE)
@@ -2072,10 +2087,10 @@ impl AppUI {
                 self.show_help_modal = !self.show_help_modal;
             }
             (KeyCode::Tab, KeyModifiers::NONE) => {
-                self.active_tab = (self.active_tab + 1) % 4;
+                self.active_tab = (self.active_tab + 1) % 5;
             }
             (KeyCode::BackTab, _) => {
-                self.active_tab = (self.active_tab + 3) % 4;
+                self.active_tab = (self.active_tab + 4) % 5;
             }
             (KeyCode::Char('1'), KeyModifiers::NONE) => {
                 self.active_tab = 0;
@@ -2088,6 +2103,9 @@ impl AppUI {
             }
             (KeyCode::Char('4'), KeyModifiers::NONE) => {
                 self.active_tab = 3;
+            }
+            (KeyCode::Char('5'), KeyModifiers::NONE) => {
+                self.active_tab = 4;
             }
             (KeyCode::Char('n') | KeyCode::Char('N'), KeyModifiers::NONE) => {
                 if self.active_tab == 0 {
@@ -2247,6 +2265,9 @@ impl AppUI {
                     },
                     crate::analysis::MixProfile::SeedRadio(_) => 0,
                 };
+            }
+            (KeyCode::Char('L'), _) | (KeyCode::Char('l'), KeyModifiers::SHIFT) => {
+                self.open_add_picker();
             }
             _ => {
                 // Tab specific key handling
@@ -2657,6 +2678,7 @@ impl AppUI {
                     _ => {}
                 }
             }
+            4 => self.handle_playlists_tab_key(code, modifiers),
             _ => {}
         }
     }
@@ -2686,7 +2708,9 @@ impl AppUI {
         );
     }
 
-    pub fn play_current_track(&mut self) {
+    /// Play the queue's current track. Returns the playback error, if `player.play` failed (it
+    /// is also put in the status as "Playback error: ...").
+    pub fn play_current_track(&mut self) -> Option<String> {
         self.pending_track_skip = false;
         self.last_track_skip_time = None;
         if let Some(ref ws) = self.web_server {
@@ -2698,9 +2722,10 @@ impl AppUI {
             {
                 ws.stream_state().continuous.skip_to_index(self.queue.current_index);
                 self.update_web_state();
-                return;
+                return None;
             }
         }
+        let mut playback_error = None;
         if let Some(track) = self.queue.current_track() {
             let path = track.filepath.clone();
             if track.duration_seconds <= 0.0 || track.artist.is_empty() {
@@ -2718,11 +2743,14 @@ impl AppUI {
                     self.status_message.clear();
                 }
                 Err(e) => {
-                    self.status_message = format!("Playback error: {}", e);
+                    let message = format!("Playback error: {}", e);
+                    self.status_message = message.clone();
+                    playback_error = Some(message);
                 }
             }
             self.update_web_state();
         }
+        playback_error
     }
 
     pub fn play_next_track(&mut self) {
@@ -3510,6 +3538,7 @@ impl AppUI {
             1 => self.render_queue_tab(f, chunks[1]),
             2 => self.render_devices_tab(f, chunks[1]),
             3 => self.render_settings_tab(f, chunks[1]),
+            4 => self.render_playlists_tab(f, chunks[1]),
             _ => {}
         }
 
@@ -3517,6 +3546,8 @@ impl AppUI {
 
         if let Some(ref mut modal) = self.search_modal {
             Self::render_search_modal(modal, f);
+        } else if self.playlists.modal.is_some() {
+            self.render_playlist_modal(f);
         } else if self.show_mix_picker_modal {
             self.render_mix_picker_modal(f);
         } else if self.show_help_modal {
@@ -3526,12 +3557,15 @@ impl AppUI {
 
     fn render_tabs(&self, f: &mut Frame, area: Rect) {
         let titles = vec![
-            " [1] Now Playing ",
-            " [2] Queue & Library ",
-            " [3] Devices ",
-            " [4] Settings ",
+            " [1] Now Playing",
+            " [2] Queue & Library",
+            " [3] Devices",
+            " [4] Settings",
+            " [5] Playlists",
         ];
+        // Zero padding keeps all five labels inside a standard 80-column terminal.
         let tabs = Tabs::new(titles)
+            .padding("", "")
             .select(self.active_tab)
             .block(Block::default().borders(Borders::BOTTOM))
             .style(Style::default().fg(Color::DarkGray))
@@ -4628,7 +4662,7 @@ impl AppUI {
     }
 
     fn render_help_modal(&self, f: &mut Frame) {
-        let area = help_modal_rect(f.area());
+        let area = modal_rect_with_height(f.area(), HELP_MODAL_HEIGHT);
         f.render_widget(Clear, area);
 
         let block = Block::default()
@@ -4671,7 +4705,8 @@ impl AppUI {
             return;
         }
 
-        // Left Column: Playback & Navigation (concise to guarantee <= 34 chars)
+        // Left Column: Playback & Navigation. Both columns must fit the 19 rows an 80x24
+        // terminal leaves for the key list, and each description fits in 29 columns there.
         let left_lines = vec![
             Self::help_section_header("PLAYBACK & AUDIO"),
             Self::help_key_line("Space", "Play / Pause"),
@@ -4682,13 +4717,16 @@ impl AppUI {
             Line::from(""),
             Self::help_section_header("NAVIGATION & TABS"),
             Self::help_key_line("n", "Toggle Now Playing ↔ Queue"),
-            Self::help_key_line("1 - 4", "Switch tab (Now/Queue/Dev/Set)"),
-            Self::help_key_line("h / l", "Focus Browser ↔ Queue"),
+            Self::help_key_line("1 - 5", "Tab: Now/Queue/Dev/Set/PL"),
+            Self::help_key_line("h / l", "Focus panes (tabs 2 & 5)"),
             Self::help_key_line("j / k", "Move Up / Down (wraps)"),
-            Self::help_key_line("J / K", "Page Down / Up"),
+            Self::help_key_line("J / K", "Page (2) / Move track (5)"),
             Self::help_key_line("g / G", "Jump to Start / End"),
             Self::help_key_line("Bksp", "Go up to parent dir"),
             Self::help_key_line("~", "Jump to startup home dir"),
+            Self::help_section_header("PLAYLISTS (TAB 5)"),
+            Self::help_key_line("c / R / D", "New / Rename / Delete"),
+            Self::help_key_line("Enter/a", "Open/Play / Queue playlist"),
         ];
         f.render_widget(Paragraph::new(left_lines), cols[0]);
 
@@ -4702,6 +4740,7 @@ impl AppUI {
             Self::help_key_line("r", "Seed Radio / Rescan dev"),
             Self::help_key_line("Z / z", "Shuffle current queue"),
             Self::help_key_line("a", "Add all songs in folder"),
+            Self::help_key_line("L", "Add to playlist"),
             Self::help_key_line("d / x", "Remove track / bookmark"),
             Self::help_key_line("c", "Clear queue (queue pane)"),
             Self::help_key_line("b", "Bookmark folder in Homes"),
@@ -4889,9 +4928,17 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 fn help_modal_rect(r: Rect) -> Rect {
+    modal_rect_with_height(r, 20)
+}
+
+/// Rows of the help modal: the key list, its footer and the border must fit.
+const HELP_MODAL_HEIGHT: u16 = 30;
+
+/// Centered modal up to 90 columns wide and `height` rows tall, shrunk to fit small terminals.
+fn modal_rect_with_height(r: Rect, height: u16) -> Rect {
     let max_w = if r.width >= 96 { 90 } else { r.width.saturating_sub(2) };
     let target_width = max_w.min(r.width);
-    let target_height = 20.min(r.height.saturating_sub(2)).min(r.height);
+    let target_height = height.min(r.height.saturating_sub(2)).min(r.height);
 
     let x = r.x + (r.width.saturating_sub(target_width)) / 2;
     let y = r.y + (r.height.saturating_sub(target_height)) / 2;

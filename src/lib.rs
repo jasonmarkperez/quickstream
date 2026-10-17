@@ -6,6 +6,8 @@ pub mod metadata;
 pub mod paths;
 pub mod persist;
 pub mod player;
+pub mod playlist;
+pub mod playlist_store;
 pub mod queue;
 pub mod settings;
 pub mod ui;

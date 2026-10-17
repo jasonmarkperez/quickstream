@@ -98,6 +98,12 @@ pub fn get_bookmarks_path() -> PathBuf {
     target
 }
 
+/// Get the playlists folder (playlists/, one `<name>.m3u8` per playlist). Not created here: the
+/// background writer creates it with the first playlist it saves.
+pub fn get_playlists_dir() -> PathBuf {
+    get_config_dir().join("playlists")
+}
+
 /// Get path to the web dashboard session token (web_token, mode 0600).
 pub fn get_web_token_path() -> PathBuf {
     get_config_dir().join("web_token")
