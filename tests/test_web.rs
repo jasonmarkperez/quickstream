@@ -577,3 +577,64 @@ fn test_web_server_status_api_with_queue_and_devices() {
 
     handle.stop();
 }
+
+#[test]
+fn test_web_server_stream_rejects_unregistered_absolute_path() {
+    let temp_dir = std::env::temp_dir().join(format!("qs_stream_secret_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let secret = temp_dir.join("id_rsa");
+    fs::write(&secret, b"PRIVATE KEY").unwrap();
+
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state, tx).expect("start web server");
+    let port = handle.port;
+
+    let encoded = secret.to_string_lossy().replace('/', "%2F");
+    let (status, _, body) = http_get(port, &format!("/stream/{}", encoded));
+    assert_eq!(status, 404);
+    assert!(!String::from_utf8_lossy(&body).contains("PRIVATE KEY"));
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_web_server_stream_rejects_cwd_relative_path() {
+    // cargo runs integration tests with the crate root as cwd, so Cargo.toml exists relative to it.
+    assert!(PathBuf::from("Cargo.toml").exists());
+
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state, tx).expect("start web server");
+    let port = handle.port;
+
+    let (status, _, _) = http_get(port, "/stream/Cargo.toml");
+    assert_eq!(status, 404);
+    let (status, _, _) = http_get(port, "/stream/src%2Fmain.rs");
+    assert_eq!(status, 404);
+
+    handle.stop();
+}
+
+#[test]
+fn test_web_server_stream_unknown_name_does_not_fall_back_to_current_track() {
+    let temp_dir = std::env::temp_dir().join(format!("qs_stream_nofallback_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let current = temp_dir.join("now_playing.mp3");
+    fs::write(&current, vec![0x11; 64]).unwrap();
+
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    state.write().unwrap().filepath = Some(current.clone());
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state, tx).expect("start web server");
+    let port = handle.port;
+
+    let (status, _, _) = http_get(port, "/stream/some_other_name.mp3");
+    assert_eq!(status, 404);
+    let (status, _, _) = http_get(port, "/stream/now_playing.mp3");
+    assert_eq!(status, 200);
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
