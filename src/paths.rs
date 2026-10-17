@@ -98,6 +98,11 @@ pub fn get_bookmarks_path() -> PathBuf {
     target
 }
 
+/// Get path to the web dashboard session token (web_token, mode 0600).
+pub fn get_web_token_path() -> PathBuf {
+    get_config_dir().join("web_token")
+}
+
 /// Get path to the library index cache file (music_index.jsonl).
 pub fn get_music_index_path() -> PathBuf {
     get_cache_dir().join("music_index.jsonl")

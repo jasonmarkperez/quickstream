@@ -117,7 +117,12 @@ fn test_autopilot_recursive_scan_and_queue() {
 
 #[test]
 fn test_web_autopilot_and_shuffle_actions() {
+    // Web commands only reach folders inside the allowed roots.
+    let music = std::env::temp_dir().join(format!("qs_web_autopilot_{}", std::process::id()));
+    fs::create_dir_all(music.join("jazz")).unwrap();
+    let jazz = fs::canonicalize(music.join("jazz")).unwrap();
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    state.write().unwrap().allowed_roots = vec![music.clone()];
     let (tx, rx) = mpsc::channel();
     let handle = WebServer::start(0, state, tx).expect("Failed to start test web server");
     let port = handle.port;
@@ -125,9 +130,10 @@ fn test_web_autopilot_and_shuffle_actions() {
     // 1. Send POST /api/action with action: "autopilot"
     {
         let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-        let body = r#"{"action":"autopilot","path":"/music/jazz"}"#;
+        let body = format!(r#"{{"action":"autopilot","path":{}}}"#, serde_json::to_string(&jazz.to_string_lossy()).unwrap());
         let req = format!(
-            "POST /api/action HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "POST /api/action HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            port,
             body.len(),
             body
         );
@@ -138,7 +144,7 @@ fn test_web_autopilot_and_shuffle_actions() {
         assert!(resp.starts_with("HTTP/1.1 200 OK"));
 
         let cmd = rx.recv_timeout(Duration::from_secs(2)).expect("Command not received");
-        assert_eq!(cmd, WebCommand::Autopilot(Some(PathBuf::from("/music/jazz"))));
+        assert_eq!(cmd, WebCommand::Autopilot(Some(jazz.clone())));
     }
 
     // 2. Send POST /api/action with action: "shuffle"
@@ -146,7 +152,8 @@ fn test_web_autopilot_and_shuffle_actions() {
         let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
         let body = r#"{"action":"shuffle"}"#;
         let req = format!(
-            "POST /api/action HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "POST /api/action HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            port,
             body.len(),
             body
         );
@@ -161,6 +168,7 @@ fn test_web_autopilot_and_shuffle_actions() {
     }
 
     handle.stop();
+    let _ = fs::remove_dir_all(&music);
 }
 
 #[test]

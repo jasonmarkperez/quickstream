@@ -9,3 +9,4 @@ pub mod queue;
 pub mod settings;
 pub mod ui;
 pub mod web;
+pub mod web_access;
