@@ -2708,7 +2708,9 @@ impl AppUI {
         );
     }
 
-    pub fn play_current_track(&mut self) {
+    /// Play the queue's current track. Returns the playback error, if `player.play` failed (it
+    /// is also put in the status as "Playback error: ...").
+    pub fn play_current_track(&mut self) -> Option<String> {
         self.pending_track_skip = false;
         self.last_track_skip_time = None;
         if let Some(ref ws) = self.web_server {
@@ -2720,9 +2722,10 @@ impl AppUI {
             {
                 ws.stream_state().continuous.skip_to_index(self.queue.current_index);
                 self.update_web_state();
-                return;
+                return None;
             }
         }
+        let mut playback_error = None;
         if let Some(track) = self.queue.current_track() {
             let path = track.filepath.clone();
             if track.duration_seconds <= 0.0 || track.artist.is_empty() {
@@ -2740,11 +2743,14 @@ impl AppUI {
                     self.status_message.clear();
                 }
                 Err(e) => {
-                    self.status_message = format!("Playback error: {}", e);
+                    let message = format!("Playback error: {}", e);
+                    self.status_message = message.clone();
+                    playback_error = Some(message);
                 }
             }
             self.update_web_state();
         }
+        playback_error
     }
 
     pub fn play_next_track(&mut self) {

@@ -1200,24 +1200,22 @@ impl AppUI {
         }
         let queued = tracks.len();
         // enqueue_tracks starts the background tag fetch that fills in placeholder entries.
-        match (result.play_from, start_index) {
+        // play_current_track returns its "Playback error: ..." when the player fails to start.
+        // The status keeps that error and puts the queue summary after it, so a failed start is
+        // never reported as plain success.
+        let playback_error = match (result.play_from, start_index) {
             (Some(_), Some(start)) => {
                 self.clear_queue_for_playlist();
                 self.enqueue_tracks(tracks);
                 self.queue.current_index = start;
                 self.queue_cursor = start;
-                self.play_current_track();
+                self.play_current_track()
             }
             _ => {
                 self.enqueue_tracks(tracks);
+                None
             }
-        }
-        // play_current_track clears the status on success and sets "Playback error: ..." on
-        // failure. Keep the error visible and put the queue summary after it.
-        let playback_error = self
-            .status_message
-            .starts_with("Playback error")
-            .then(|| self.status_message.clone());
+        };
         let summary = if missing == 0 {
             format!("Queued {} tracks from {}", queued, result.name)
         } else {

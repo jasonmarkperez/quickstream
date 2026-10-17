@@ -525,15 +525,10 @@ fn test_playback_error_is_kept_when_enter_queues_the_playlist() {
         "Enter did not queue the playlist; status: {}",
         app.status_message
     );
-    assert!(
-        app.status_message.starts_with("Playback error"),
-        "error swallowed: {}",
-        app.status_message
+    assert_eq!(
+        app.status_message, "Playback error: no audio backend. Queued 2 tracks from Road Trip",
+        "error swallowed or summary missing"
     );
-    assert!(
-        app.status_message.ends_with("Queued 2 tracks from Road Trip"),
-        "{}",
-        app.status_message
-    );
+    assert!(!app.player.is_playing(), "a failed start must not report playing");
     let _ = std::fs::remove_dir_all(&dir);
 }
