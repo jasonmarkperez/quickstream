@@ -52,6 +52,10 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
+    // First thing: a panic while the TUI owns the terminal must put it back in cooked mode on the
+    // normal screen before the panic message prints (issue #9).
+    quickstream::ui::install_panic_hook();
+
     // Initialize logging and signal handler
     let log_path = quickstream::logger::init();
     quickstream::log_info!(
@@ -78,9 +82,7 @@ fn main() -> anyhow::Result<()> {
             // cleanup finish instead of exiting with mpv still running.
             return;
         }
-        let _ = crossterm::terminal::disable_raw_mode();
-        let mut stdout = std::io::stdout();
-        let _ = crossterm::execute!(stdout, crossterm::terminal::LeaveAlternateScreen, crossterm::cursor::Show);
+        quickstream::ui::restore_terminal();
         std::process::exit(0);
     });
 

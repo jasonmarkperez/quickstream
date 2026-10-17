@@ -120,6 +120,75 @@ pub fn is_tui_active() -> bool {
     TUI_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Thread that put the terminal in raw mode / the alternate screen, while it is still set up.
+static TERMINAL_OWNER: std::sync::Mutex<Option<std::thread::ThreadId>> = std::sync::Mutex::new(None);
+
+fn terminal_owner() -> std::sync::MutexGuard<'static, Option<std::thread::ThreadId>> {
+    TERMINAL_OWNER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Leave the alternate screen, disable raw mode and show the cursor, if the TUI set the terminal
+/// up and has not restored it yet. Returns whether anything was restored. Safe to call from any
+/// thread, repeatedly, and from a panic hook.
+pub fn restore_terminal() -> bool {
+    if terminal_owner().take().is_none() {
+        return false;
+    }
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+    true
+}
+
+/// Restore the terminal only if the current thread is the one running the TUI. A panic on a
+/// worker thread must not tear the screen out from under a TUI that keeps running.
+fn restore_terminal_if_owner() -> bool {
+    let owns_terminal = *terminal_owner() == Some(std::thread::current().id());
+    owns_terminal && restore_terminal()
+}
+
+/// Panic hook body: log the panic, call `restore`, then run `prev` (normally the default hook),
+/// so the panic message prints on the normal screen instead of the discarded alternate screen.
+pub fn terminal_panic_hook<R, P>(restore: R, prev: P) -> impl Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static
+where
+    R: Fn() + Send + Sync + 'static,
+    P: Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static,
+{
+    move |info| {
+        crate::log_error!("panic", "{}", info);
+        restore();
+        prev(info);
+    }
+}
+
+/// Install a process-wide panic hook that restores the terminal before the previous hook prints
+/// the panic message (issue #9). Call once, early in `main`.
+pub fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(terminal_panic_hook(
+        || {
+            restore_terminal_if_owner();
+        },
+        prev,
+    )));
+}
+
+/// Restores the terminal when `AppUI::run` returns, errors out or unwinds.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn claim() -> Self {
+        *terminal_owner() = Some(std::thread::current().id());
+        TerminalGuard
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        TUI_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+        restore_terminal();
+    }
+}
+
 pub struct AppUI {
     pub active_tab: usize,
     pub queue_focus: bool, // false = browser, true = queue
@@ -1343,6 +1412,8 @@ impl AppUI {
     pub fn run(&mut self) -> anyhow::Result<()> {
         self.device_manager.start_background_scan();
         enable_raw_mode()?;
+        // From here on the terminal is restored on every exit path, including `?` and panics.
+        let guard = TerminalGuard::claim();
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
         let backend = CrosstermBackend::new(stdout);
@@ -1351,11 +1422,7 @@ impl AppUI {
         TUI_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
         let res = self.event_loop(&mut terminal);
         SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
-        TUI_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-
-        disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-        terminal.show_cursor()?;
+        drop(guard);
 
         res
     }
@@ -4654,4 +4721,26 @@ fn format_time(seconds: f64) -> String {
     let mins = total / 60;
     let secs = total % 60;
     format!("{:02}:{:02}", mins, secs)
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+
+    #[test]
+    fn test_terminal_restore_only_from_owner_thread() {
+        let guard = TerminalGuard::claim();
+
+        // A panic on a worker thread must leave the TUI's terminal alone.
+        let restored_elsewhere = std::thread::spawn(restore_terminal_if_owner).join().unwrap();
+        assert!(!restored_elsewhere);
+        assert!(terminal_owner().is_some());
+
+        // The UI thread itself restores once; later calls (e.g. the guard's drop) are no-ops.
+        assert!(restore_terminal_if_owner());
+        assert!(terminal_owner().is_none());
+        assert!(!restore_terminal());
+        drop(guard);
+        assert!(!restore_terminal());
+    }
 }
