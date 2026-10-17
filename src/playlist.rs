@@ -11,6 +11,10 @@ pub const PLAYLIST_EXT: &str = "m3u8";
 /// Longest playlist name [`validate_name`] accepts, in characters (not bytes).
 pub const MAX_NAME_CHARS: usize = 100;
 
+/// Longest playlist name [`validate_name`] accepts, in UTF-8 bytes. File names are limited to 255
+/// bytes and the save writes `<name>.m3u8.<pid>.tmp`, so wide characters need their own limit.
+pub const MAX_NAME_BYTES: usize = 200;
+
 /// One track of a playlist. The path is the source of truth for the file; artist, title and
 /// duration are only what the `#EXTINF` line shows.
 #[derive(Debug, Clone, PartialEq)]
@@ -193,6 +197,8 @@ fn single_line(text: &str) -> String {
 pub enum NameError {
     Empty,
     TooLong,
+    /// Short enough in characters but over [`MAX_NAME_BYTES`] in UTF-8.
+    TooManyBytes,
     Slash,
     Backslash,
     ControlChar,
@@ -207,6 +213,7 @@ impl std::fmt::Display for NameError {
         match self {
             NameError::Empty => write!(f, "Name can't be empty"),
             NameError::TooLong => write!(f, "Name is too long (max {} characters)", MAX_NAME_CHARS),
+            NameError::TooManyBytes => write!(f, "Name is too long (max {} bytes)", MAX_NAME_BYTES),
             NameError::Slash => write!(f, "Name can't contain /"),
             NameError::Backslash => write!(f, "Name can't contain \\"),
             NameError::ControlChar => write!(f, "Name can't contain control characters"),
@@ -226,6 +233,9 @@ pub fn validate_name(name: &str) -> Result<String, NameError> {
     }
     if name.chars().count() > MAX_NAME_CHARS {
         return Err(NameError::TooLong);
+    }
+    if name.len() > MAX_NAME_BYTES {
+        return Err(NameError::TooManyBytes);
     }
     if name.contains('/') {
         return Err(NameError::Slash);

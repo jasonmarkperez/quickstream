@@ -504,3 +504,16 @@ fn test_plan_queue_skips_non_audio_entries_as_missing() {
     // The selected non-audio entry falls through to the next playable one.
     assert_eq!(plan.start_index, Some(1));
 }
+
+#[test]
+fn test_validate_name_limits_utf8_bytes() {
+    common::isolate();
+    // 100 CJK characters are 300 bytes: too long for a file name once the temp suffix is added.
+    let cjk = "曲".repeat(MAX_NAME_CHARS);
+    assert_eq!(validate_name(&cjk), Err(NameError::TooManyBytes));
+    // 66 CJK characters are 198 bytes: allowed. 67 are 201: refused.
+    let ok = "曲".repeat(66);
+    assert_eq!(validate_name(&ok), Ok(ok.clone()));
+    assert_eq!(validate_name(&"曲".repeat(67)), Err(NameError::TooManyBytes));
+    assert!(NameError::TooManyBytes.to_string().contains("200 bytes"));
+}
