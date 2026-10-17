@@ -1,7 +1,7 @@
 //! BPM detection and acoustic energy analysis using embedded tags or ffmpeg DSP.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -15,6 +15,24 @@ const ACOUSTIC_SLICE_SECS: u32 = 20;
 const ANALYSIS_SAMPLE_RATE: u32 = 11025;
 /// Minimum decoded audio needed for a usable analysis.
 const MIN_SLICE_SECS: u32 = 3;
+
+/// How acoustic analysis invokes ffmpeg (binary and per-call timeout).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FfmpegConfig {
+    /// ffmpeg executable; a bare name is resolved via `PATH`.
+    pub binary: PathBuf,
+    /// Hard limit for a single decode.
+    pub timeout: Duration,
+}
+
+impl Default for FfmpegConfig {
+    fn default() -> Self {
+        Self {
+            binary: PathBuf::from("ffmpeg"),
+            timeout: FFMPEG_TIMEOUT,
+        }
+    }
+}
 
 /// Tempo and energy derived from a single decoded slice.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -71,18 +89,43 @@ impl BpmAnalyzer {
 
     /// Decode one slice and derive both tempo and energy from it (single ffmpeg call).
     /// `cancel` aborts the ffmpeg subprocess early (e.g. on application shutdown).
-    pub fn analyze_acoustic(path: &Path, cancel: Option<&AtomicBool>) -> AcousticAnalysis {
-        match Self::decode_pcm_slice(path, ACOUSTIC_SEEK_SECS, ACOUSTIC_SLICE_SECS, ANALYSIS_SAMPLE_RATE, cancel) {
-            Some(samples) => AcousticAnalysis {
-                bpm: Self::compute_bpm_from_samples(&samples, ANALYSIS_SAMPLE_RATE as f32),
-                energy: Self::energy_from_samples(&samples),
+    ///
+    /// Returns `None` if the decode failed (ffmpeg missing, error exit, timeout, cancelled) or
+    /// produced no audio. A successful decode in which no tempo is found (e.g. silence, or a clip
+    /// too short for tempo analysis) is a real result: `Some` with `bpm: None`.
+    pub fn analyze_acoustic(path: &Path, cancel: Option<&AtomicBool>) -> Option<AcousticAnalysis> {
+        Self::analyze_acoustic_with(&FfmpegConfig::default(), path, cancel)
+    }
+
+    /// [`Self::analyze_acoustic`] using an explicit ffmpeg binary and timeout.
+    pub fn analyze_acoustic_with(
+        ffmpeg: &FfmpegConfig,
+        path: &Path,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<AcousticAnalysis> {
+        let samples = Self::decode_slice_unfiltered(
+            ffmpeg,
+            path,
+            ACOUSTIC_SEEK_SECS,
+            ACOUSTIC_SLICE_SECS,
+            ANALYSIS_SAMPLE_RATE,
+            cancel,
+        )
+        .filter(|s| !s.is_empty())?;
+        let long_enough = samples.len() >= (ANALYSIS_SAMPLE_RATE * MIN_SLICE_SECS) as usize;
+        Some(AcousticAnalysis {
+            bpm: if long_enough {
+                Self::compute_bpm_from_samples(&samples, ANALYSIS_SAMPLE_RATE as f32)
+            } else {
+                None
             },
-            None => AcousticAnalysis::default(),
-        }
+            energy: Self::energy_from_samples(&samples),
+        })
     }
 
     /// Decode `duration_secs` of mono PCM starting at `offset_secs`.
     /// If the track is shorter than the seek offset (too little audio returned), retry from 0.
+    /// Returns `None` if decoding failed or yielded less than the minimum usable audio.
     pub fn decode_pcm_slice(
         path: &Path,
         offset_secs: u32,
@@ -90,26 +133,52 @@ impl BpmAnalyzer {
         sample_rate: u32,
         cancel: Option<&AtomicBool>,
     ) -> Option<Vec<f32>> {
-        let min_samples = (sample_rate * MIN_SLICE_SECS) as usize;
-        let samples = Self::decode_pcm_at(path, offset_secs, duration_secs, sample_rate, cancel);
-        match samples {
-            Some(s) if s.len() >= min_samples => Some(s),
-            _ if offset_secs > 0 && !cancel.is_some_and(|c| c.load(Ordering::Relaxed)) => {
-                Self::decode_pcm_at(path, 0, duration_secs, sample_rate, cancel)
-                    .filter(|s| s.len() >= min_samples)
-            }
-            _ => None,
-        }
+        Self::decode_pcm_slice_with(&FfmpegConfig::default(), path, offset_secs, duration_secs, sample_rate, cancel)
     }
 
-    fn decode_pcm_at(
+    /// [`Self::decode_pcm_slice`] using an explicit ffmpeg binary and timeout.
+    pub fn decode_pcm_slice_with(
+        ffmpeg: &FfmpegConfig,
         path: &Path,
         offset_secs: u32,
         duration_secs: u32,
         sample_rate: u32,
         cancel: Option<&AtomicBool>,
     ) -> Option<Vec<f32>> {
-        let mut cmd = Command::new("ffmpeg");
+        let min_samples = (sample_rate * MIN_SLICE_SECS) as usize;
+        Self::decode_slice_unfiltered(ffmpeg, path, offset_secs, duration_secs, sample_rate, cancel)
+            .filter(|s| s.len() >= min_samples)
+    }
+
+    /// Decode a slice, retrying from offset 0 only when the first decode *succeeded* but returned
+    /// too little audio (track shorter than the seek offset). A failed or timed-out first decode is
+    /// not retried, so a stalled file costs at most one timeout.
+    /// Returns `None` only if a decode failed; the returned samples may be short or empty.
+    fn decode_slice_unfiltered(
+        ffmpeg: &FfmpegConfig,
+        path: &Path,
+        offset_secs: u32,
+        duration_secs: u32,
+        sample_rate: u32,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<Vec<f32>> {
+        let min_samples = (sample_rate * MIN_SLICE_SECS) as usize;
+        let first = Self::decode_pcm_at(ffmpeg, path, offset_secs, duration_secs, sample_rate, cancel)?;
+        if first.len() >= min_samples || offset_secs == 0 || cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Some(first);
+        }
+        Self::decode_pcm_at(ffmpeg, path, 0, duration_secs, sample_rate, cancel)
+    }
+
+    fn decode_pcm_at(
+        ffmpeg: &FfmpegConfig,
+        path: &Path,
+        offset_secs: u32,
+        duration_secs: u32,
+        sample_rate: u32,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<Vec<f32>> {
+        let mut cmd = Command::new(&ffmpeg.binary);
         cmd.args(["-nostdin", "-ss", &offset_secs.to_string(), "-t", &duration_secs.to_string(), "-i"])
             .arg(path)
             .args([
@@ -121,7 +190,7 @@ impl BpmAnalyzer {
                 "-loglevel", "error",
                 "-",
             ]);
-        let pcm_bytes = Self::run_with_timeout(cmd, FFMPEG_TIMEOUT, cancel)?;
+        let pcm_bytes = Self::run_with_timeout(cmd, ffmpeg.timeout, cancel)?;
         Some(
             pcm_bytes
                 .chunks_exact(2)

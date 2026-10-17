@@ -331,3 +331,241 @@ fn test_autopilot_tracks_are_analysed_in_background() {
     let _ = fs::remove_dir_all(&music);
     let _ = fs::remove_dir_all(&cache);
 }
+
+// ---------------------------------------------------------------------------
+// Failed acoustic analyses must not be persisted as up to date (PR #32 review)
+// ---------------------------------------------------------------------------
+
+use quickstream::analysis::bpm::FfmpegConfig;
+
+/// A file with an audio extension whose contents ffmpeg cannot decode (and lofty cannot tag).
+fn write_undecodable_mp3(path: &Path) {
+    fs::write(path, "this is not audio at all\n".repeat(4000)).unwrap();
+}
+
+/// Fake `ffmpeg` executable: appends a line to `log` on every invocation, then runs `body`.
+#[cfg(unix)]
+fn fake_ffmpeg(dir: &Path, log: &Path, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("fake-ffmpeg");
+    fs::write(&script, format!("#!/bin/sh\necho call >> '{}'\n{}\n", log.display(), body)).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+#[cfg(unix)]
+fn invocations(log: &Path) -> usize {
+    fs::read_to_string(log).map(|s| s.lines().count()).unwrap_or(0)
+}
+
+#[test]
+fn test_worker_does_not_persist_when_ffmpeg_fails() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not installed; skipping");
+        return;
+    }
+    let music = scratch_dir("worker_ffmpeg_fail");
+    let cache = scratch_dir("worker_ffmpeg_fail_db");
+    let track = music.join("broken.mp3");
+    write_undecodable_mp3(&track);
+
+    let db = AnalysisDatabase::open_at(&cache.join("track_analysis.db")).unwrap();
+    let mut worker = AnalysisWorker::spawn(db.clone(), 1);
+    worker.enqueue(vec![track.clone()]);
+    assert!(worker.wait_until_idle(Duration::from_secs(60)), "worker did not finish");
+
+    assert!(db.get_track(&track).is_none(), "a failed acoustic analysis must not be stored");
+    let p = worker.progress();
+    assert_eq!(p.failed, 1);
+    assert_eq!(p.analyzed, 0);
+    assert_eq!(p.skipped, 0);
+
+    worker.shutdown();
+    let _ = fs::remove_dir_all(&music);
+    let _ = fs::remove_dir_all(&cache);
+}
+
+#[test]
+fn test_worker_retries_in_later_session_when_ffmpeg_was_missing() {
+    let music = scratch_dir("worker_ffmpeg_missing");
+    let cache = scratch_dir("worker_ffmpeg_missing_db");
+    let track = music.join("untagged_120.wav");
+    write_wav(&track, &click_track(120.0, 12.0));
+    let db = AnalysisDatabase::open_at(&cache.join("track_analysis.db")).unwrap();
+
+    // Session 1: ffmpeg is not installed.
+    let missing = FfmpegConfig {
+        binary: music.join("no-such-ffmpeg"),
+        ..FfmpegConfig::default()
+    };
+    let mut worker = AnalysisWorker::spawn_with_ffmpeg(db.clone(), 1, missing);
+    worker.enqueue(vec![track.clone()]);
+    assert!(worker.wait_until_idle(Duration::from_secs(20)), "worker did not finish");
+    assert!(db.get_track(&track).is_none(), "missing ffmpeg must not mark the track as analysed");
+    let p = worker.progress();
+    assert_eq!((p.failed, p.analyzed, p.skipped), (1, 0, 0));
+    worker.shutdown();
+
+    // Session 2: the user has installed ffmpeg; the track is retried, not skipped.
+    if ffmpeg_available() {
+        let mut worker = AnalysisWorker::spawn(db.clone(), 1);
+        worker.enqueue(vec![track.clone()]);
+        assert!(worker.wait_until_idle(Duration::from_secs(60)), "worker did not finish");
+        let p = worker.progress();
+        assert_eq!((p.failed, p.analyzed, p.skipped), (0, 1, 0));
+        let bpm = db.get_track(&track).and_then(|f| f.bpm).expect("BPM must be filled on retry");
+        assert!((115.0..=125.0).contains(&bpm), "expected ~120 BPM, got {}", bpm);
+        worker.shutdown();
+    }
+
+    let _ = fs::remove_dir_all(&music);
+    let _ = fs::remove_dir_all(&cache);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_worker_does_not_persist_when_ffmpeg_produces_no_audio() {
+    let music = scratch_dir("worker_ffmpeg_empty");
+    let cache = scratch_dir("worker_ffmpeg_empty_db");
+    let track = music.join("untagged.wav");
+    write_wav(&track, &click_track(120.0, 12.0));
+    let log = cache.join("calls.log");
+    let ffmpeg = fake_ffmpeg(&cache, &log, "exit 0");
+
+    let db = AnalysisDatabase::open_at(&cache.join("track_analysis.db")).unwrap();
+    let cfg = FfmpegConfig {
+        binary: ffmpeg,
+        ..FfmpegConfig::default()
+    };
+    let mut worker = AnalysisWorker::spawn_with_ffmpeg(db.clone(), 1, cfg);
+    worker.enqueue(vec![track.clone()]);
+    assert!(worker.wait_until_idle(Duration::from_secs(20)), "worker did not finish");
+
+    assert!(invocations(&log) >= 1, "fake ffmpeg should have been invoked");
+    assert!(db.get_track(&track).is_none(), "an empty decode must not be stored");
+    let p = worker.progress();
+    assert_eq!((p.failed, p.analyzed), (1, 0));
+
+    worker.shutdown();
+    let _ = fs::remove_dir_all(&music);
+    let _ = fs::remove_dir_all(&cache);
+}
+
+#[test]
+fn test_worker_persists_silent_track_without_bpm() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not installed; skipping");
+        return;
+    }
+    let music = scratch_dir("worker_silence");
+    let cache = scratch_dir("worker_silence_db");
+    let track = music.join("silence.wav");
+    write_wav(&track, &vec![0i16; SAMPLE_RATE as usize * 12]);
+
+    let db = AnalysisDatabase::open_at(&cache.join("track_analysis.db")).unwrap();
+    let mut worker = AnalysisWorker::spawn(db.clone(), 1);
+    worker.enqueue(vec![track.clone()]);
+    assert!(worker.wait_until_idle(Duration::from_secs(60)), "worker did not finish");
+
+    let feat = db
+        .get_track(&track)
+        .expect("a successful decode with no detectable tempo is a real result and must be stored");
+    assert_eq!(feat.bpm, None);
+    assert_eq!(feat.energy, Some(0.0));
+    let p = worker.progress();
+    assert_eq!((p.failed, p.analyzed), (0, 1));
+
+    worker.shutdown();
+    let _ = fs::remove_dir_all(&music);
+    let _ = fs::remove_dir_all(&cache);
+}
+
+#[test]
+fn test_worker_persists_tagged_track_even_when_ffmpeg_missing() {
+    let music = scratch_dir("worker_tagged_no_ffmpeg");
+    let cache = scratch_dir("worker_tagged_no_ffmpeg_db");
+    let track = music.join("tagged.wav");
+    write_tagged_wav(&track, "128", "Am");
+
+    let db = AnalysisDatabase::open_at(&cache.join("track_analysis.db")).unwrap();
+    let cfg = FfmpegConfig {
+        binary: music.join("no-such-ffmpeg"),
+        ..FfmpegConfig::default()
+    };
+    let mut worker = AnalysisWorker::spawn_with_ffmpeg(db.clone(), 1, cfg);
+    worker.enqueue(vec![track.clone()]);
+    assert!(worker.wait_until_idle(Duration::from_secs(20)), "worker did not finish");
+
+    assert_eq!(db.get_track(&track).and_then(|f| f.bpm), Some(128.0));
+    let p = worker.progress();
+    assert_eq!((p.failed, p.analyzed), (0, 1));
+
+    worker.shutdown();
+    let _ = fs::remove_dir_all(&music);
+    let _ = fs::remove_dir_all(&cache);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_decode_does_not_retry_from_zero_after_ffmpeg_failure() {
+    let dir = scratch_dir("decode_no_retry_fail");
+    let track = dir.join("track.wav");
+    write_wav(&track, &click_track(120.0, 12.0));
+    let log = dir.join("calls.log");
+    let cfg = FfmpegConfig {
+        binary: fake_ffmpeg(&dir, &log, "exit 1"),
+        ..FfmpegConfig::default()
+    };
+
+    let out = BpmAnalyzer::decode_pcm_slice_with(&cfg, &track, 30, 20, SAMPLE_RATE, None);
+    assert!(out.is_none());
+    assert_eq!(invocations(&log), 1, "a failed decode must not be retried from offset 0");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_decode_does_not_retry_from_zero_after_timeout() {
+    let dir = scratch_dir("decode_no_retry_timeout");
+    let track = dir.join("track.wav");
+    write_wav(&track, &click_track(120.0, 12.0));
+    let log = dir.join("calls.log");
+    let cfg = FfmpegConfig {
+        binary: fake_ffmpeg(&dir, &log, "exec sleep 30"),
+        // Long enough for the fake script to start and log, short enough to keep the test fast.
+        timeout: Duration::from_secs(1),
+    };
+
+    let start = Instant::now();
+    let out = BpmAnalyzer::decode_pcm_slice_with(&cfg, &track, 30, 20, SAMPLE_RATE, None);
+    let elapsed = start.elapsed();
+    assert!(out.is_none());
+    assert_eq!(invocations(&log), 1, "a timed-out decode must not be retried from offset 0");
+    assert!(
+        elapsed < 2 * cfg.timeout,
+        "a stalled file must cost at most one timeout, took {:?}",
+        elapsed
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_decode_retries_from_zero_when_first_decode_is_too_short() {
+    let dir = scratch_dir("decode_retry_short");
+    let track = dir.join("track.wav");
+    write_wav(&track, &click_track(120.0, 12.0));
+    let log = dir.join("calls.log");
+    // Succeeds with no audio at the seek offset (track shorter than offset); 10s of audio from 0.
+    let body = "case \" $* \" in *\" -ss 0 \"*) head -c 220500 /dev/zero ;; esac\nexit 0";
+    let cfg = FfmpegConfig {
+        binary: fake_ffmpeg(&dir, &log, body),
+        ..FfmpegConfig::default()
+    };
+
+    let out = BpmAnalyzer::decode_pcm_slice_with(&cfg, &track, 30, 20, SAMPLE_RATE, None)
+        .expect("a short first decode must be retried from offset 0");
+    assert_eq!(out.len(), 110_250);
+    assert_eq!(invocations(&log), 2);
+    let _ = fs::remove_dir_all(&dir);
+}

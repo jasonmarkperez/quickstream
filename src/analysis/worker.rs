@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::bpm::BpmAnalyzer;
+use super::bpm::{BpmAnalyzer, FfmpegConfig};
 use super::db::{AnalysisDatabase, TrackFeatures};
 use super::harmonic::MusicalKey;
 
@@ -29,6 +29,9 @@ pub struct AnalysisProgress {
     pub analyzed: usize,
     /// Tracks skipped because the database already had an up-to-date row.
     pub skipped: usize,
+    /// Tracks whose acoustic analysis failed (ffmpeg missing / error / timeout / no audio).
+    /// Nothing is stored for them, so they are retried in a later session.
+    pub failed: usize,
     /// Tracks queued but not yet processed.
     pub pending: usize,
 }
@@ -37,8 +40,10 @@ struct Shared {
     stop: AtomicBool,
     analyzed: AtomicUsize,
     skipped: AtomicUsize,
+    failed: AtomicUsize,
     pending: AtomicUsize,
     seen: Mutex<HashSet<PathBuf>>,
+    ffmpeg: FfmpegConfig,
 }
 
 /// Handle to the background analysis thread pool. Dropping it stops and joins the threads.
@@ -51,14 +56,21 @@ pub struct AnalysisWorker {
 impl AnalysisWorker {
     /// Spawn `threads` (clamped to 1..=2) analysis threads writing into `db`.
     pub fn spawn(db: AnalysisDatabase, threads: usize) -> Self {
+        Self::spawn_with_ffmpeg(db, threads, FfmpegConfig::default())
+    }
+
+    /// Like [`Self::spawn`], but with an explicit ffmpeg binary / timeout for acoustic analysis.
+    pub fn spawn_with_ffmpeg(db: AnalysisDatabase, threads: usize, ffmpeg: FfmpegConfig) -> Self {
         let (tx, rx) = mpsc::channel::<PathBuf>();
         let rx = Arc::new(Mutex::new(rx));
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             analyzed: AtomicUsize::new(0),
             skipped: AtomicUsize::new(0),
+            failed: AtomicUsize::new(0),
             pending: AtomicUsize::new(0),
             seen: Mutex::new(HashSet::new()),
+            ffmpeg,
         });
 
         let handles = (0..threads.clamp(1, 2))
@@ -99,6 +111,7 @@ impl AnalysisWorker {
         AnalysisProgress {
             analyzed: self.shared.analyzed.load(Ordering::SeqCst),
             skipped: self.shared.skipped.load(Ordering::SeqCst),
+            failed: self.shared.failed.load(Ordering::SeqCst),
             pending: self.shared.pending.load(Ordering::SeqCst),
         }
     }
@@ -162,11 +175,21 @@ fn process_track(path: &Path, shared: &Shared, db: &AnalysisDatabase) {
         }
     }
 
-    let Some(features) = analyze_track(path, Some(&shared.stop)) else { return };
-    // Never persist a half-finished analysis interrupted by shutdown.
+    let result = analyze_track_with(&shared.ffmpeg, path, Some(&shared.stop));
+    // Never persist (or count) a half-finished analysis interrupted by shutdown.
     if shared.stop.load(Ordering::SeqCst) {
         return;
     }
+    let features = match result {
+        Ok(features) => features,
+        Err(AnalysisError::AcousticFailed) => {
+            // Not stored, so the stamp check above does not skip it next session.
+            shared.failed.fetch_add(1, Ordering::SeqCst);
+            crate::log_info!("analysis", "Acoustic analysis failed for '{}'; will retry later", path.display());
+            return;
+        }
+        Err(AnalysisError::Unreadable | AnalysisError::Cancelled) => return,
+    };
     match db.upsert_track(&features) {
         Ok(()) => {
             shared.analyzed.fetch_add(1, Ordering::SeqCst);
@@ -192,10 +215,31 @@ fn file_stamp(path: &Path) -> Option<(u64, u64)> {
     Some((mtime, md.len()))
 }
 
+/// Why [`analyze_track`] produced no features. None of these may be persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisError {
+    /// The path is missing or not a regular file.
+    Unreadable,
+    /// `cancel` was raised before the analysis finished.
+    Cancelled,
+    /// No BPM tag, and the ffmpeg acoustic pass failed (ffmpeg missing, error exit, timeout or
+    /// no audio decoded). Transient: the track should be retried later.
+    AcousticFailed,
+}
+
 /// Analyse a single track: embedded tags first, ffmpeg acoustic analysis only if no BPM tag.
-/// Returns `None` if the file cannot be read or `cancel` is raised. Never modifies the file.
-pub fn analyze_track(path: &Path, cancel: Option<&AtomicBool>) -> Option<TrackFeatures> {
-    let (mtime, file_size) = file_stamp(path)?;
+/// Never modifies the file.
+pub fn analyze_track(path: &Path, cancel: Option<&AtomicBool>) -> Result<TrackFeatures, AnalysisError> {
+    analyze_track_with(&FfmpegConfig::default(), path, cancel)
+}
+
+fn analyze_track_with(
+    ffmpeg: &FfmpegConfig,
+    path: &Path,
+    cancel: Option<&AtomicBool>,
+) -> Result<TrackFeatures, AnalysisError> {
+    let cancelled = || cancel.is_some_and(|c| c.load(Ordering::SeqCst));
+    let (mtime, file_size) = file_stamp(path).ok_or(AnalysisError::Unreadable)?;
     let tags = read_tags(path);
 
     let (h_title, h_artist, h_album) = crate::metadata::parse_path_heuristics(path);
@@ -221,23 +265,27 @@ pub fn analyze_track(path: &Path, cancel: Option<&AtomicBool>) -> Option<TrackFe
     };
 
     if features.bpm.is_none() {
-        if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
-            return None;
+        if cancelled() {
+            return Err(AnalysisError::Cancelled);
         }
-        let acoustic = BpmAnalyzer::analyze_acoustic(path, cancel);
+        let acoustic = BpmAnalyzer::analyze_acoustic_with(ffmpeg, path, cancel);
+        if cancelled() {
+            return Err(AnalysisError::Cancelled);
+        }
+        let acoustic = acoustic.ok_or(AnalysisError::AcousticFailed)?;
         features.bpm = acoustic.bpm;
         features.energy = acoustic.energy;
     }
 
-    if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
-        return None;
+    if cancelled() {
+        return Err(AnalysisError::Cancelled);
     }
 
     features.analyzed_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    Some(features)
+    Ok(features)
 }
 
 #[derive(Default)]
