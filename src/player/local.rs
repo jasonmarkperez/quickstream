@@ -428,6 +428,14 @@ impl LocalPlayer {
         self.ffplay_child = Some(cmd.spawn()?);
         self.start_time = Some(Instant::now());
         self.accumulated_offset = 0.0;
+
+        // ffplay has no IPC to report duration, so read it from the file's tags/headers.
+        // This runs on AsyncPlayer's worker thread, never the UI thread.
+        let duration = crate::metadata::extract_metadata(filepath)
+            .map(|m| m.duration_seconds)
+            .unwrap_or(0.0);
+        *self.shared_state.duration.lock().unwrap() =
+            if duration.is_finite() && duration > 0.0 { duration } else { 0.0 };
         Ok(())
     }
 }
@@ -466,9 +474,10 @@ impl AudioPlayer for LocalPlayer {
         };
         self.current_file = Some(abs_path.clone());
 
-        // Do not block UI thread on synchronous tag extraction!
-        // Duration is streamed asynchronously via IPC ("observe_property", "duration").
+        // Duration is streamed asynchronously via IPC ("observe_property", "duration") for mpv
+        // and read from metadata for ffplay; clear the previous track's until then.
         *self.shared_state.position.lock().unwrap() = 0.0;
+        *self.shared_state.duration.lock().unwrap() = 0.0;
         self.accumulated_offset = 0.0;
         self.start_time = None;
         self.shared_state.is_finished.store(false, Ordering::SeqCst);
