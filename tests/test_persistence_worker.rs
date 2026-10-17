@@ -204,3 +204,196 @@ fn test_ui_change_right_before_quit_is_flushed_on_drop() {
     let saved = SettingsManager::load_from(&config).expect("settings flushed on shutdown");
     assert_eq!(saved.volume_step, after);
 }
+
+// ---------- deletes and renames (issue #37: playlist files) ----------
+
+/// File names in `dir`, sorted.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn test_delete_removes_the_file() {
+    common::isolate();
+    let dir = scratch("delete");
+    let path = dir.join("Road Trip.m3u8");
+    std::fs::write(&path, b"#EXTM3U\n").unwrap();
+    let worker = PersistenceWorker::spawn();
+
+    worker.delete(path.clone());
+    assert!(worker.flush());
+    assert!(!path.exists(), "delete removes the file");
+
+    worker.delete(path.clone()); // already gone: nothing to do, the worker keeps running
+    worker.save(dir.join("after.m3u8"), b"ok".to_vec());
+    assert!(worker.flush());
+    assert_eq!(names_in(&dir), vec!["after.m3u8".to_string()]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_rename_moves_the_file() {
+    common::isolate();
+    let dir = scratch("rename");
+    let from = dir.join("Road Trip.m3u8");
+    let to = dir.join("Holiday.m3u8");
+    std::fs::write(&from, b"#EXTM3U\n/a.flac\n").unwrap();
+    let worker = PersistenceWorker::spawn();
+
+    worker.rename(from.clone(), to.clone());
+    assert!(worker.flush());
+    assert!(!from.exists(), "old name is gone");
+    assert_eq!(std::fs::read(&to).unwrap(), b"#EXTM3U\n/a.flac\n");
+    assert_eq!(names_in(&dir), vec!["Holiday.m3u8".to_string()]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_save_then_delete_leaves_no_file() {
+    common::isolate();
+    let dir = scratch("save_delete");
+    let path = dir.join("Road Trip.m3u8");
+    let worker = PersistenceWorker::spawn();
+
+    worker.save(path.clone(), b"v1".to_vec());
+    worker.delete(path.clone());
+    assert!(worker.flush());
+    assert!(names_in(&dir).is_empty(), "left behind: {:?}", names_in(&dir));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_delete_then_save_leaves_the_new_bytes() {
+    common::isolate();
+    let dir = scratch("delete_save");
+    let path = dir.join("Road Trip.m3u8");
+    std::fs::write(&path, b"old").unwrap();
+    let worker = PersistenceWorker::spawn();
+
+    worker.delete(path.clone());
+    worker.save(path.clone(), b"new".to_vec());
+    assert!(worker.flush());
+    assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_save_after_a_delete_is_not_merged_into_the_earlier_save() {
+    common::isolate();
+    let dir = scratch("save_delete_save");
+    let path = dir.join("Road Trip.m3u8");
+    let worker = PersistenceWorker::spawn();
+
+    // Merging v2 into the v1 slot would write v2 and then delete it.
+    worker.save(path.clone(), b"v1".to_vec());
+    worker.delete(path.clone());
+    worker.save(path.clone(), b"v2".to_vec());
+    assert!(worker.flush());
+    assert_eq!(std::fs::read(&path).unwrap(), b"v2");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_save_rename_save_leaves_only_the_new_name_with_the_last_bytes() {
+    common::isolate();
+    let dir = scratch("save_rename_save");
+    let old = dir.join("Road Trip.m3u8");
+    let new = dir.join("Holiday.m3u8");
+    let worker = PersistenceWorker::spawn();
+
+    worker.save(old.clone(), b"#PLAYLIST:Road Trip\n".to_vec());
+    worker.rename(old.clone(), new.clone());
+    worker.save(new.clone(), b"#PLAYLIST:Holiday\n".to_vec());
+    assert!(worker.flush());
+    assert_eq!(names_in(&dir), vec!["Holiday.m3u8".to_string()]);
+    assert_eq!(std::fs::read(&new).unwrap(), b"#PLAYLIST:Holiday\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_save_to_the_old_name_after_a_rename_is_not_merged_into_the_earlier_save() {
+    common::isolate();
+    let dir = scratch("save_rename_save_old");
+    let old = dir.join("a.m3u8");
+    let new = dir.join("b.m3u8");
+    let worker = PersistenceWorker::spawn();
+
+    // Merging the second save of a.m3u8 into the first would carry v2 along to b.m3u8.
+    worker.save(old.clone(), b"v1".to_vec());
+    worker.rename(old.clone(), new.clone());
+    worker.save(old.clone(), b"v2".to_vec());
+    assert!(worker.flush());
+    assert_eq!(std::fs::read(&new).unwrap(), b"v1");
+    assert_eq!(std::fs::read(&old).unwrap(), b"v2");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_case_only_rename_keeps_one_file_with_the_new_case() {
+    common::isolate();
+    let dir = scratch("case_rename");
+    let lower = dir.join("road trip.m3u8");
+    let upper = dir.join("Road Trip.m3u8");
+    let worker = PersistenceWorker::spawn();
+
+    // On a case-insensitive disk (the macOS default) these are one file: the OS rename must
+    // change its case, and the save after it must not land under the old spelling.
+    worker.save(lower.clone(), b"#PLAYLIST:road trip\n/a.flac\n".to_vec());
+    worker.rename(lower.clone(), upper.clone());
+    worker.save(upper.clone(), b"#PLAYLIST:Road Trip\n/a.flac\n".to_vec());
+    assert!(worker.flush());
+    assert_eq!(names_in(&dir), vec!["Road Trip.m3u8".to_string()]);
+    assert_eq!(std::fs::read(&upper).unwrap(), b"#PLAYLIST:Road Trip\n/a.flac\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_many_rapid_saves_end_with_the_last_bytes() {
+    common::isolate();
+    let dir = scratch("rapid");
+    let path = dir.join("Road Trip.m3u8");
+    let other = dir.join("Holiday.m3u8");
+    let worker = PersistenceWorker::spawn();
+
+    // Holding K/J in the tracks pane: one save per keypress, interleaved with another file.
+    for i in 0..200 {
+        worker.save(path.clone(), format!("v{}", i).into_bytes());
+        if i % 50 == 0 {
+            worker.save(other.clone(), format!("o{}", i).into_bytes());
+        }
+    }
+    assert!(worker.flush());
+    assert_eq!(std::fs::read(&path).unwrap(), b"v199");
+    assert_eq!(std::fs::read(&other).unwrap(), b"o150");
+    assert_eq!(
+        names_in(&dir),
+        vec!["Holiday.m3u8".to_string(), "Road Trip.m3u8".to_string()]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_delete_and_rename_after_shutdown_run_on_the_calling_thread() {
+    common::isolate();
+    let dir = scratch("late_ops");
+    let a = dir.join("a.m3u8");
+    let b = dir.join("b.m3u8");
+    let gone = dir.join("gone.m3u8");
+    std::fs::write(&a, b"a").unwrap();
+    std::fs::write(&gone, b"x").unwrap();
+    let worker = PersistenceWorker::spawn();
+    let handle = worker.handle();
+    drop(worker);
+
+    handle.rename(a.clone(), b.clone());
+    handle.delete(gone.clone());
+    assert_eq!(names_in(&dir), vec!["b.m3u8".to_string()]);
+    assert_eq!(std::fs::read(&b).unwrap(), b"a");
+    let _ = std::fs::remove_dir_all(&dir);
+}

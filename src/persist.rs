@@ -5,8 +5,9 @@
 //!   content, never a truncated file.
 //! - [`load_json_or_backup`] copies a file that fails to parse to `<file>.bak` before the caller
 //!   falls back to defaults, so the next save can't silently destroy the user's settings.
-//! - [`PersistenceWorker`] performs those writes on one background thread so the UI thread
-//!   never waits on disk; it coalesces rapid saves and flushes on drop.
+//! - [`PersistenceWorker`] performs those writes, and deletes and renames of the same files
+//!   (playlists), on one background thread so the UI thread never waits on disk. It applies
+//!   them in the order they were queued, coalesces rapid saves and flushes on drop.
 
 use serde::de::DeserializeOwned;
 use std::fs;
@@ -48,13 +49,18 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         }
         return result;
     }
-    // Persist the rename itself. Best effort: not every filesystem supports fsync on a directory.
-    if let Some(parent) = parent {
+    sync_parent_dir(path);
+    Ok(())
+}
+
+/// Persist a rename or unlink in `path`'s directory. Best effort: not every filesystem supports
+/// fsync on a directory.
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         if let Ok(dir) = fs::File::open(parent) {
             let _ = dir.sync_all();
         }
     }
-    Ok(())
 }
 
 /// Keep a copy of a file that failed to parse and return where it went.
@@ -164,6 +170,8 @@ const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum Msg {
     Write(PathBuf, Vec<u8>),
+    Delete(PathBuf),
+    Rename(PathBuf, PathBuf),
     Flush(mpsc::Sender<()>),
     Shutdown,
 }
@@ -177,11 +185,34 @@ pub struct PersistHandle {
 
 impl PersistHandle {
     /// Queue `bytes` to replace `path`. Returns immediately; a later save of the same path that
-    /// is queued before this one is written replaces it. If the worker has already shut down,
-    /// the write happens on the calling thread so it is never lost.
+    /// is queued before this one is written replaces it, unless a delete or rename was queued
+    /// in between. If the worker has already shut down, the write happens on the calling thread
+    /// so it is never lost.
     pub fn save(&self, path: PathBuf, bytes: Vec<u8>) {
         if let Err(mpsc::SendError(Msg::Write(path, bytes))) = self.tx.send(Msg::Write(path, bytes)) {
             write_logged(&self.writer, &path, &bytes);
+        }
+    }
+
+    /// Queue removing `path`, after everything queued before it. Returns immediately. A file
+    /// that is already gone is not an error. If the worker has already shut down, the delete
+    /// happens on the calling thread.
+    pub fn delete(&self, path: PathBuf) {
+        if let Err(mpsc::SendError(Msg::Delete(path))) = self.tx.send(Msg::Delete(path)) {
+            delete_logged(&path);
+        }
+    }
+
+    /// Queue moving `from` to `to` with the operating system's rename, after everything queued
+    /// before it. Returns immediately. A case-only rename (`road trip.m3u8` to `Road Trip.m3u8`)
+    /// keeps its one file on a case-insensitive disk. If the worker has already shut down, the
+    /// rename happens on the calling thread.
+    ///
+    /// Deletes and renames always act on the file system directly; a custom [`Writer`] only
+    /// replaces how saves are written.
+    pub fn rename(&self, from: PathBuf, to: PathBuf) {
+        if let Err(mpsc::SendError(Msg::Rename(from, to))) = self.tx.send(Msg::Rename(from, to)) {
+            rename_logged(&from, &to);
         }
     }
 
@@ -237,6 +268,14 @@ impl PersistenceWorker {
         self.handle.save(path, bytes)
     }
 
+    pub fn delete(&self, path: PathBuf) {
+        self.handle.delete(path)
+    }
+
+    pub fn rename(&self, from: PathBuf, to: PathBuf) {
+        self.handle.rename(from, to)
+    }
+
     pub fn flush(&self) -> bool {
         self.handle.flush()
     }
@@ -272,10 +311,51 @@ fn write_logged(writer: &Writer, path: &Path, bytes: &[u8]) {
     }
 }
 
-/// Queued writes, at most one per path (the latest), in first-queued order.
+/// Remove `path`. A file that is already gone is what the caller asked for, so it is not logged.
+fn delete_logged(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => sync_parent_dir(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => crate::logger::log_raw(
+            "WARN",
+            "persist",
+            &format!("failed to delete '{}': {}", path.display(), e),
+        ),
+    }
+}
+
+fn rename_logged(from: &Path, to: &Path) {
+    match fs::rename(from, to) {
+        Ok(()) => sync_parent_dir(to),
+        Err(e) => crate::logger::log_raw(
+            "WARN",
+            "persist",
+            &format!("failed to rename '{}' to '{}': {}", from.display(), to.display(), e),
+        ),
+    }
+}
+
+/// One queued file operation.
+enum Op {
+    Write(PathBuf, Vec<u8>),
+    Delete(PathBuf),
+    Rename(PathBuf, PathBuf),
+}
+
+impl Op {
+    fn apply(&self, writer: &Writer) {
+        match self {
+            Op::Write(path, bytes) => write_logged(writer, path, bytes),
+            Op::Delete(path) => delete_logged(path),
+            Op::Rename(from, to) => rename_logged(from, to),
+        }
+    }
+}
+
+/// Queued operations in the order they were sent, with rapid saves of one path merged.
 #[derive(Default)]
 struct Batch {
-    writes: Vec<(PathBuf, Vec<u8>)>,
+    ops: Vec<Op>,
     acks: Vec<mpsc::Sender<()>>,
     shutdown: bool,
 }
@@ -283,13 +363,31 @@ struct Batch {
 impl Batch {
     fn absorb(&mut self, msg: Msg) {
         match msg {
-            Msg::Write(path, bytes) => match self.writes.iter_mut().find(|(p, _)| *p == path) {
-                Some(slot) => slot.1 = bytes,
-                None => self.writes.push((path, bytes)),
-            },
+            Msg::Write(path, bytes) => self.queue_write(path, bytes),
+            Msg::Delete(path) => self.ops.push(Op::Delete(path)),
+            Msg::Rename(from, to) => self.ops.push(Op::Rename(from, to)),
             Msg::Flush(ack) => self.acks.push(ack),
             Msg::Shutdown => self.shutdown = true,
         }
+    }
+
+    /// A save replaces an earlier queued save of the same path (keeping that save's place), but
+    /// never one queued before a delete or rename: moving the bytes ahead of it would let the
+    /// delete remove them or the rename carry them to the new name. Any delete or rename stops
+    /// the merge, not only one naming this path, because on a case-insensitive disk
+    /// `road trip.m3u8` and `Road Trip.m3u8` are one file.
+    fn queue_write(&mut self, path: PathBuf, bytes: Vec<u8>) {
+        for op in self.ops.iter_mut().rev() {
+            match op {
+                Op::Write(p, queued) if *p == path => {
+                    *queued = bytes;
+                    return;
+                }
+                Op::Write(..) => {}
+                Op::Delete(_) | Op::Rename(..) => break,
+            }
+        }
+        self.ops.push(Op::Write(path, bytes));
     }
 
     /// A flush or shutdown is waiting: write now instead of waiting for more saves.
@@ -317,8 +415,8 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, writer: &Writer) {
         while let Ok(msg) = rx.try_recv() {
             batch.absorb(msg);
         }
-        for (path, bytes) in &batch.writes {
-            write_logged(writer, path, bytes);
+        for op in &batch.ops {
+            op.apply(writer);
         }
         for ack in batch.acks {
             let _ = ack.send(());
