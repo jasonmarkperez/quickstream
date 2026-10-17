@@ -65,6 +65,17 @@ fn main() -> anyhow::Result<()> {
     crate::log_info!("main", "Starting Quickstream v0.2.0 (PID {}, log: {})", std::process::id(), log_path.display());
 
     let _ = ctrlc::set_handler(move || {
+        if crate::ui::is_tui_active() {
+            // Let the event loop return so Drop cleanup runs (kills mpv, removes its socket, stops renderers).
+            crate::ui::request_shutdown();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while crate::ui::is_tui_active() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if !crate::ui::is_tui_active() {
+                return;
+            }
+        }
         let _ = crossterm::terminal::disable_raw_mode();
         let mut stdout = std::io::stdout();
         let _ = crossterm::execute!(stdout, crossterm::terminal::LeaveAlternateScreen, crossterm::cursor::Show);

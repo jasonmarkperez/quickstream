@@ -52,6 +52,24 @@ pub enum DirScanEvent {
     },
 }
 
+static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TUI_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask the running TUI to exit cleanly on its next tick. Safe to call from a signal handler thread.
+pub fn request_shutdown() {
+    SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Reset a pending shutdown request.
+pub fn clear_shutdown_request() {
+    SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether the interactive TUI event loop is currently running.
+pub fn is_tui_active() -> bool {
+    TUI_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub struct AppUI {
     pub active_tab: usize,
     pub queue_focus: bool, // false = browser, true = queue
@@ -1222,6 +1240,16 @@ impl AppUI {
         }
     }
 
+    /// Stop playback and return true if a shutdown was requested (e.g. by SIGINT/SIGTERM/SIGHUP).
+    pub fn poll_shutdown_request(&mut self) -> bool {
+        if !SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        crate::log_info!("ui", "Shutdown requested by signal, stopping playback");
+        let _ = self.player.stop();
+        true
+    }
+
     pub fn run(&mut self) -> anyhow::Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -1229,7 +1257,9 @@ impl AppUI {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
+        TUI_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
         let res = self.event_loop(&mut terminal);
+        TUI_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
 
         disable_raw_mode()?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -1240,6 +1270,10 @@ impl AppUI {
 
     fn event_loop<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> anyhow::Result<()> {
         loop {
+            if self.poll_shutdown_request() {
+                return Ok(());
+            }
+
             // Check if active track finished and auto-advance queue
             if self.player.is_track_finished() {
                 self.player.reset_finished();
