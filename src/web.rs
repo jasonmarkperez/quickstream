@@ -2735,19 +2735,51 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
     }
 
-    function escapeHtml(str) {
-      if (!str) return '';
-      return String(str)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
+    // --- SAFE DOM BUILDING ---
+    // Track titles, file names, paths and device names are untrusted (tags,
+    // shared volumes, SSDP). They are only ever written with textContent or
+    // dataset, never parsed as HTML or JS. Markup strings are constants only.
+    const ICON_SEED_RADIO = '<span style="font-size:12px;">📻</span>';
+    const ICON_REMOVE = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>';
+    const ICON_ADD = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>';
+
+    function el(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined && text !== null) node.textContent = String(text);
+      return node;
     }
 
-    function escapeAttr(str) {
-      if (!str) return '';
-      return String(str).replace(/'/g, "\\'").replace(/"/g, '&quot;');
+    function iconButton(className, title, action, iconMarkup) {
+      const btn = el('button', className);
+      btn.title = title;
+      btn.dataset.action = action;
+      btn.innerHTML = iconMarkup;
+      return btn;
+    }
+
+    function clearChildren(node) {
+      node.textContent = '';
+    }
+
+    // Find the innermost element carrying a data-action between the click
+    // target and the delegating container.
+    function findActionTarget(target, container) {
+      for (let n = target; n && n !== container; n = n.parentNode) {
+        if (n.dataset && n.dataset.action) return n;
+      }
+      return null;
+    }
+
+    function delegateClicks(containerId, handlers) {
+      const container = document.getElementById(containerId);
+      if (!container) return;
+      container.addEventListener('click', (e) => {
+        const node = findActionTarget(e.target, container);
+        if (!node) return;
+        const handler = handlers[node.dataset.action];
+        if (handler) handler(node.dataset);
+      });
     }
 
     function showToast(msg) {
@@ -3050,28 +3082,40 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
         return;
       }
 
-      list.innerHTML = queue.map(item => `
-        <div class="queue-item ${item.is_current ? 'current' : ''}">
-          <div class="queue-item-main" onclick="playIndex(${item.index})">
-            <span class="queue-num">${item.is_current ? '▶' : (item.index + 1) + '.'}</span>
-            <div class="queue-item-meta">
-              <div class="queue-item-title">${escapeHtml(item.title)}</div>
-              <div class="queue-item-artist">${escapeHtml(item.artist || 'Unknown Artist')}</div>
-            </div>
-          </div>
-          <span class="queue-item-dur">${formatTime(item.duration_seconds)}</span>
-          <button class="btn-icon-sm" onclick="event.stopPropagation(); seedRadio('${escapeAttr(item.filepath)}')" title="Seed Radio station from this track">
-            <span style="font-size:12px;">📻</span>
-          </button>
-          <button class="btn-icon-sm danger-hover" onclick="event.stopPropagation(); removeIndex(${item.index})" title="Remove track">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <line x1="18" y1="6" x2="6" y2="18"></line>
-              <line x1="6" y1="6" x2="18" y2="18"></line>
-            </svg>
-          </button>
-        </div>
-      `).join('');
+      clearChildren(list);
+      for (const item of queue) {
+        const index = String(item.index);
+        const row = el('div', item.is_current ? 'queue-item current' : 'queue-item');
+
+        const main = el('div', 'queue-item-main');
+        main.dataset.action = 'play';
+        main.dataset.index = index;
+        main.appendChild(el('span', 'queue-num', item.is_current ? '▶' : (item.index + 1) + '.'));
+        const meta = el('div', 'queue-item-meta');
+        meta.appendChild(el('div', 'queue-item-title', item.title || ''));
+        meta.appendChild(el('div', 'queue-item-artist', item.artist || 'Unknown Artist'));
+        main.appendChild(meta);
+        row.appendChild(main);
+
+        row.appendChild(el('span', 'queue-item-dur', formatTime(item.duration_seconds)));
+
+        const seedBtn = iconButton('btn-icon-sm', 'Seed Radio station from this track', 'seed', ICON_SEED_RADIO);
+        seedBtn.dataset.path = item.filepath || '';
+        row.appendChild(seedBtn);
+
+        const removeBtn = iconButton('btn-icon-sm danger-hover', 'Remove track', 'remove', ICON_REMOVE);
+        removeBtn.dataset.index = index;
+        row.appendChild(removeBtn);
+
+        list.appendChild(row);
+      }
     }
+
+    delegateClicks('queueList', {
+      play: (d) => playIndex(Number(d.index)),
+      seed: (d) => seedRadio(d.path),
+      remove: (d) => removeIndex(Number(d.index)),
+    });
 
     function playIndex(idx) {
       sendAction('play_index', null, { index: idx });
@@ -3144,11 +3188,15 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       const bmRow = document.getElementById('bookmarksRow');
       if (data.bookmarks && data.bookmarks.length > 0) {
         bmRow.style.display = "flex";
-        bmRow.innerHTML = data.bookmarks.map(b => {
-          const parts = b.split(/[/\\]/);
+        clearChildren(bmRow);
+        for (const b of data.bookmarks) {
+          const parts = String(b).split(/[/\\]/);
           const name = parts[parts.length - 1] || parts[parts.length - 2] || b;
-          return `<button class="chip-btn" onclick="browseTo('${escapeAttr(b)}')">★ ${escapeHtml(name)}</button>`;
-        }).join('');
+          const chip = el('button', 'chip-btn', '★ ' + name);
+          chip.dataset.action = 'browse';
+          chip.dataset.path = b;
+          bmRow.appendChild(chip);
+        }
       } else {
         bmRow.style.display = "none";
       }
@@ -3165,34 +3213,46 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
         return;
       }
 
-      list.innerHTML = entries.map(item => {
+      clearChildren(list);
+      for (const item of entries) {
+        const path = item.path || '';
         if (item.is_dir) {
-          return `
-            <div class="browser-item dir" onclick="browseTo('${escapeAttr(item.path)}')">
-              <span class="browser-icon">📁</span>
-              <span class="browser-name">${escapeHtml(item.name)}/</span>
-              <span class="browser-arrow">›</span>
-            </div>`;
+          const row = el('div', 'browser-item dir');
+          row.dataset.action = 'browse';
+          row.dataset.path = path;
+          row.appendChild(el('span', 'browser-icon', '📁'));
+          row.appendChild(el('span', 'browser-name', (item.name || '') + '/'));
+          row.appendChild(el('span', 'browser-arrow', '›'));
+          list.appendChild(row);
         } else {
-          return `
-            <div class="browser-item file" onclick="addFile('${escapeAttr(item.path)}')">
-              <span class="browser-icon">🎵</span>
-              <span class="browser-name">${escapeHtml(item.name)}</span>
-              <div style="display:flex;gap:0.35rem;align-items:center;">
-                <button class="btn-icon-sm" title="Seed Radio station from this track" onclick="event.stopPropagation(); seedRadio('${escapeAttr(item.path)}')">
-                  <span style="font-size:12px;">📻</span>
-                </button>
-                <button class="btn-icon-sm add-btn" title="Add to queue" onclick="event.stopPropagation(); addFile('${escapeAttr(item.path)}')">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                    <line x1="12" y1="5" x2="12" y2="19"></line>
-                    <line x1="5" y1="12" x2="19" y2="12"></line>
-                  </svg>
-                </button>
-              </div>
-            </div>`;
+          const row = el('div', 'browser-item file');
+          row.dataset.action = 'add';
+          row.dataset.path = path;
+          row.appendChild(el('span', 'browser-icon', '🎵'));
+          row.appendChild(el('span', 'browser-name', item.name || ''));
+          const actions = el('div');
+          actions.style.display = 'flex';
+          actions.style.gap = '0.35rem';
+          actions.style.alignItems = 'center';
+          const seedBtn = iconButton('btn-icon-sm', 'Seed Radio station from this track', 'seed', ICON_SEED_RADIO);
+          seedBtn.dataset.path = path;
+          actions.appendChild(seedBtn);
+          const addBtn = iconButton('btn-icon-sm add-btn', 'Add to queue', 'add', ICON_ADD);
+          addBtn.dataset.path = path;
+          actions.appendChild(addBtn);
+          row.appendChild(actions);
+          list.appendChild(row);
         }
-      }).join('');
+      }
     }
+
+    const browserClickHandlers = {
+      browse: (d) => browseTo(d.path),
+      add: (d) => addFile(d.path),
+      seed: (d) => seedRadio(d.path),
+    };
+    delegateClicks('browserList', browserClickHandlers);
+    delegateClicks('bookmarksRow', browserClickHandlers);
 
     function browseTo(path) {
       document.getElementById('browserSearchInput').value = "";
@@ -3299,19 +3359,28 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
         return;
       }
 
-      list.innerHTML = devices.map(dev => `
-        <div class="device-item ${dev.is_active ? 'active' : ''}" onclick="selectDevice(${dev.id})">
-          <div class="device-radio">${dev.is_active ? '●' : '○'}</div>
-          <div class="device-info">
-            <div class="device-name">
-              ${escapeHtml(dev.name)}
-              ${dev.is_active ? '<span class="active-tag">ACTIVE</span>' : ''}
-            </div>
-            <div class="device-host">${escapeHtml(dev.host_port)}</div>
-          </div>
-        </div>
-      `).join('');
+      clearChildren(list);
+      for (const dev of devices) {
+        const row = el('div', dev.is_active ? 'device-item active' : 'device-item');
+        row.dataset.action = 'select';
+        row.dataset.id = String(dev.id);
+        row.appendChild(el('div', 'device-radio', dev.is_active ? '●' : '○'));
+        const info = el('div', 'device-info');
+        const name = el('div', 'device-name');
+        name.appendChild(document.createTextNode(dev.name || ''));
+        if (dev.is_active) {
+          name.appendChild(el('span', 'active-tag', 'ACTIVE'));
+        }
+        info.appendChild(name);
+        info.appendChild(el('div', 'device-host', dev.host_port || ''));
+        row.appendChild(info);
+        list.appendChild(row);
+      }
     }
+
+    delegateClicks('devicesList', {
+      select: (d) => selectDevice(Number(d.id)),
+    });
 
     function selectDevice(id) {
       sendAction('select_device', null, { id });
