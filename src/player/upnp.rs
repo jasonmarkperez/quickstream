@@ -300,6 +300,13 @@ impl UPnPClient {
         }
         let url = parse_http_url(control_url)
             .ok_or_else(|| SoapError::InvalidUrl(format!("Invalid control URL: {}", control_url)))?;
+        // Host names would need a DNS lookup that the request deadline cannot bound.
+        if url.host.parse::<std::net::IpAddr>().is_err() {
+            return Err(SoapError::InvalidUrl(format!(
+                "Control URL host is not an IP address: {}",
+                control_url
+            )));
+        }
 
         let mut args_xml = String::new();
         for (k, v) in arguments {

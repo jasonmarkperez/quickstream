@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -446,7 +446,9 @@ fn remaining_until(deadline: Instant) -> Result<Duration, HttpError> {
 
 /// Send a raw HTTP/1.x request to `host:port` and read the response.
 ///
-/// The whole exchange (resolve, connect, write, read) must finish by `deadline`, and the
+/// `host` must be an IP literal (IPv6 without brackets); host names are refused with
+/// [`HttpError::Resolve`] rather than looked up, since a DNS lookup cannot be bounded
+/// by the deadline. The whole exchange (connect, write, read) must finish by `deadline`, and the
 /// raw response may not exceed `max_bytes`; a peer that trickles bytes or never closes
 /// the connection cannot hold the caller past the deadline or grow memory without bound.
 pub fn http_exchange(
@@ -471,23 +473,14 @@ pub fn http_exchange_with_first_byte_deadline(
     max_bytes: usize,
 ) -> Result<HttpResponse, HttpError> {
     let first_byte_deadline = first_byte_deadline.min(deadline);
-    let addrs = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| HttpError::Resolve(format!("{}:{}: {}", host, port, e)))?;
-
-    let mut stream = None;
-    let mut last_err = String::from("no addresses");
-    for addr in addrs {
-        let timeout = remaining_until(first_byte_deadline)?;
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(s) => {
-                stream = Some(s);
-                break;
-            }
-            Err(e) => last_err = e.to_string(),
-        }
-    }
-    let mut stream = stream.ok_or_else(|| HttpError::Connect(format!("{}:{}: {}", host, port, last_err)))?;
+    // Only IP literals are accepted: a DNS lookup cannot be bounded by the deadline,
+    // and device descriptions and SSDP replies use addresses anyway.
+    let ip: IpAddr = host.parse().map_err(|_| {
+        HttpError::Resolve(format!("{}:{}: host is not an IP address", host, port))
+    })?;
+    let addr = SocketAddr::new(ip, port);
+    let mut stream = TcpStream::connect_timeout(&addr, remaining_until(first_byte_deadline)?)
+        .map_err(|e| HttpError::Connect(format!("{}: {}", addr, e)))?;
 
     let io_err = |e: std::io::Error| {
         if Instant::now() >= deadline {

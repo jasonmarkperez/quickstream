@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use quickstream::discovery::{
-    extract_xml_tag, fetch_xml, parse_device_description, parse_http_response, DLNADevice,
+    extract_xml_tag, fetch_xml, http_exchange, parse_device_description, parse_http_response, DLNADevice,
     DescriptionFetcher, FetchJob, FetchScheduler, HttpError, DESCRIPTION_FETCH_TIMEOUT,
     MAX_PARALLEL_DESCRIPTION_FETCHES,
 };
@@ -315,6 +315,59 @@ fn test_soap_response_size_is_capped() {
         "got {:?}",
         res.map(|b| b.len())
     );
+}
+
+// ---------------------------------------------------------------------------
+// Control URLs must name an IP address
+// ---------------------------------------------------------------------------
+
+/// SOAP actions to a control URL whose host is a name are refused up front instead
+/// of waiting on a DNS lookup outside the request deadline.
+#[test]
+fn test_soap_control_url_must_be_ip_literal() {
+    let device = DLNADevice {
+        friendly_name: "Named".to_string(),
+        location: "http://10.0.0.9:49152/desc.xml".to_string(),
+        host: "10.0.0.9".to_string(),
+        port: 49152,
+        manufacturer: String::new(),
+        model_name: String::new(),
+        av_transport_control_url: "http://renderer.invalid:49152/ctrl".to_string(),
+        rendering_control_url: String::new(),
+        udn: String::new(),
+    };
+    let client = UPnPClient::new(device);
+    let res = client.call_action(
+        &client.device.av_transport_control_url,
+        AV_TRANSPORT_SERVICE,
+        "GetTransportInfo",
+        &[("InstanceID", "0")],
+        Duration::from_secs(3),
+    );
+    assert!(matches!(res, Err(SoapError::InvalidUrl(_))), "got {:?}", res);
+}
+
+/// The shared HTTP client never resolves host names.
+#[test]
+fn test_http_exchange_rejects_host_names() {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let res = http_exchange("renderer.invalid", 80, b"GET / HTTP/1.1\r\n\r\n", deadline, 1024);
+    assert!(matches!(res, Err(HttpError::Resolve(_))), "got {:?}", res);
+    // IP literals, including IPv6, still work.
+    let server = spawn_server(Arc::new(|s: &mut TcpStream| {
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    }));
+    let res = http_exchange("127.0.0.1", server.port, b"GET / HTTP/1.1\r\n\r\n", deadline, 1024);
+    assert_eq!(res.unwrap().body, b"ok");
+    if let Some(v6) = spawn_server_on(
+        "::1",
+        Arc::new(|s: &mut TcpStream| {
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nv6");
+        }),
+    ) {
+        let res = http_exchange("::1", v6.port, b"GET / HTTP/1.1\r\n\r\n", deadline, 1024);
+        assert_eq!(res.unwrap().body, b"v6");
+    }
 }
 
 fn drain(s: &mut FetchScheduler) -> Vec<FetchJob> {
