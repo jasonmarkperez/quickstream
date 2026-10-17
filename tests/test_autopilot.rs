@@ -178,9 +178,10 @@ fn test_continuous_wav_stream_endpoint() {
     let handle = WebServer::start(0, state.clone(), tx).expect("Failed to start test web server");
     let port = handle.port;
 
-    // Send GET /stream/continuous.wav
+    // The continuous stream is served at the armed session's path.
+    let session = handle.stream_state().arm_continuous_session();
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-    let req = format!("GET /stream/continuous.wav HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", port);
+    let req = format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", session, port);
     stream.write_all(req.as_bytes()).unwrap();
 
     let mut reader = BufReader::new(stream);

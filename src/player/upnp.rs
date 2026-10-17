@@ -1007,10 +1007,15 @@ impl AudioPlayer for UPnPPlayer {
         // 1. Terminate any previous polling thread, close streaming sockets, & stop renderer.
         // The old thread is not joined (it may be inside a multi-second SOAP call); the
         // command epoch bumped above makes it drop whatever it observes from now on.
+        // `__continuous__.wav` is a placeholder that selects the gapless continuous stream.
+        let is_continuous = filepath.file_name().is_some_and(|f| f == "__continuous__.wav");
         self.poll_stop_flag.store(true, Ordering::SeqCst);
         if let Some(ref ss) = self.stream_state {
+            // Also ends any previous continuous session.
             ss.close_active_streams();
-            ss.register_file(filepath);
+            if !is_continuous {
+                ss.register_file(filepath);
+            }
         }
         let _ = self.client.stop();
         std::thread::sleep(Duration::from_millis(100));
@@ -1021,10 +1026,13 @@ impl AudioPlayer for UPnPPlayer {
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| "track".to_string());
-        let is_continuous = file_name.contains("continuous.wav") || file_name == "__continuous__.wav";
         let encoded_name = url_encode(&file_name);
         let stream_url = if is_continuous {
-            format!("http://{}:{}/stream/continuous.wav", host_ip, self.web_port)
+            // Each continuous session is served at its own unguessable path.
+            let Some(ref ss) = self.stream_state else {
+                anyhow::bail!("Continuous streaming needs the streaming server");
+            };
+            format!("http://{}:{}{}", host_ip, self.web_port, ss.arm_continuous_session())
         } else if position_seconds > 0.0 {
             format!(
                 "http://{}:{}/stream/{}?pos={:.2}",

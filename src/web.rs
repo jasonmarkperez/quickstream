@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -187,6 +187,39 @@ struct ActionPayload {
     mode: Option<String>,
 }
 
+/// An armed continuous stream: the renderer must request `/stream/continuous-<nonce>.wav`.
+#[derive(Debug)]
+struct ContinuousSession {
+    nonce: String,
+    /// The first peer that connected; other hosts are refused for the rest of the session.
+    peer: Option<IpAddr>,
+}
+
+/// Whether a request for a continuous stream path may be served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContinuousAdmission {
+    /// Serve the stream for the session with this nonce.
+    Admitted(String),
+    /// No session is armed, or the path does not name it (404).
+    NotFound,
+    /// The session belongs to another host (409).
+    Conflict,
+}
+
+const CONTINUOUS_PREFIX: &str = "/stream/continuous-";
+const CONTINUOUS_SUFFIX: &str = ".wav";
+
+/// The nonce in a `/stream/continuous-<32 hex>.wav` route, if `route` has that shape.
+fn continuous_route_nonce(route: &str) -> Option<&str> {
+    let nonce = route.strip_prefix(CONTINUOUS_PREFIX)?.strip_suffix(CONTINUOUS_SUFFIX)?;
+    (nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_hexdigit())).then_some(nonce)
+}
+
+/// Whether `route` (path without query) addresses the continuous stream, armed or not.
+fn is_continuous_route(route: &str) -> bool {
+    route == "/stream/continuous.wav" || route == "/stream/autopilot.wav" || continuous_route_nonce(route).is_some()
+}
+
 /// Controls continuous PCM gapless streaming for DLNA renderers.
 #[derive(Debug, Default)]
 pub struct ContinuousStreamController {
@@ -200,11 +233,62 @@ pub struct ContinuousStreamController {
     pub seek_requested: Arc<AtomicBool>,
     pub target_seek: Arc<Mutex<Option<f64>>>,
     pub active_child: Arc<Mutex<Option<std::process::Child>>>,
+    session: Mutex<Option<ContinuousSession>>,
 }
 
 impl ContinuousStreamController {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Start a new continuous session (replacing any previous one) and return the URL path the
+    /// renderer must request.
+    pub fn arm_session(&self) -> String {
+        let nonce = crate::web_access::generate_token();
+        let path = format!("{}{}{}", CONTINUOUS_PREFIX, nonce, CONTINUOUS_SUFFIX);
+        *self.session.lock().unwrap() = Some(ContinuousSession { nonce, peer: None });
+        path
+    }
+
+    /// End the continuous session: its path stops being served.
+    pub fn disarm_session(&self) {
+        *self.session.lock().unwrap() = None;
+    }
+
+    /// The URL path of the armed session, if any.
+    pub fn session_path(&self) -> Option<String> {
+        self.session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| format!("{}{}{}", CONTINUOUS_PREFIX, s.nonce, CONTINUOUS_SUFFIX))
+    }
+
+    /// Decide whether `peer` may stream `route` (a path without query). The first admitted peer
+    /// owns the session.
+    pub fn admit(&self, route: &str, peer: IpAddr) -> ContinuousAdmission {
+        let Some(requested) = continuous_route_nonce(route) else {
+            return ContinuousAdmission::NotFound;
+        };
+        let mut guard = self.session.lock().unwrap();
+        let Some(session) = guard.as_mut() else {
+            return ContinuousAdmission::NotFound;
+        };
+        if !crate::web_access::constant_time_eq(requested, &session.nonce) {
+            return ContinuousAdmission::NotFound;
+        }
+        match session.peer {
+            Some(owner) if owner != peer => ContinuousAdmission::Conflict,
+            _ => {
+                session.peer = Some(peer);
+                ContinuousAdmission::Admitted(session.nonce.clone())
+            }
+        }
+    }
+
+    /// Whether the session with `nonce` is still the armed one.
+    fn is_session(&self, nonce: &str) -> bool {
+        self.session.lock().unwrap().as_ref().is_some_and(|s| s.nonce == nonce)
     }
 
     pub fn skip_to_index(&self, index: usize) {
@@ -290,8 +374,20 @@ impl StreamServerState {
         self.active_sockets.lock().unwrap().remove(&id);
     }
 
-    /// Immediately abort and close all active streaming TCP connections to stereos.
+    /// Start a continuous session; see [`ContinuousStreamController::arm_session`].
+    pub fn arm_continuous_session(&self) -> String {
+        self.continuous.arm_session()
+    }
+
+    /// The URL path of the armed continuous session, if any.
+    pub fn continuous_session_path(&self) -> Option<String> {
+        self.continuous.session_path()
+    }
+
+    /// Immediately abort and close all active streaming TCP connections to stereos, and end any
+    /// continuous session.
     pub fn close_active_streams(&self) {
+        self.continuous.disarm_session();
         self.continuous.is_active.store(false, Ordering::SeqCst);
         self.continuous.kill_active_decoder();
         let mut sockets = self.active_sockets.lock().unwrap();
@@ -844,6 +940,8 @@ fn handle_client(
 
     let method = head.method.as_str();
     let path = head.path.as_str();
+    // The path without its query string or fragment.
+    let route = path.split(['?', '#']).next().unwrap_or(path);
     let content_length = head.content_length;
     let range_header = head.header("range").map(str::to_string);
     let mut auth_headers = crate::web_access::AuthHeaders::default();
@@ -1052,8 +1150,24 @@ fn handle_client(
                 stream.write_all(body)?;
             }
             stream.flush()?;
-        } else if path.starts_with("/stream/continuous.wav") || path.starts_with("/stream/autopilot.wav") {
-            serve_continuous_stream(stream, is_head, state, cmd_tx, stream_state)?;
+        } else if is_continuous_route(route) {
+            // Only the armed UPnP continuous session's path is served, to the first host that
+            // connects to it.
+            let peer = stream.peer_addr()?.ip();
+            match stream_state.continuous.admit(route, peer) {
+                ContinuousAdmission::Admitted(nonce) => {
+                    serve_continuous_stream(stream, is_head, state, cmd_tx, stream_state, &nonce)?;
+                }
+                ContinuousAdmission::NotFound => {
+                    stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found")?;
+                    stream.flush()?;
+                }
+                ContinuousAdmission::Conflict => {
+                    crate::log_warn!("web", "Refusing continuous stream request from {}: the session belongs to another host", peer);
+                    stream.write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 8\r\nConnection: close\r\n\r\nConflict")?;
+                    stream.flush()?;
+                }
+            }
             return Ok(());
         } else if path.starts_with("/stream") {
             // Serve DLNA audio streaming with HTTP byte ranges
@@ -1761,12 +1875,15 @@ pub fn make_continuous_wav_header() -> [u8; 44] {
 
 /// Serve a continuous 16-bit 44.1kHz PCM WAV stream to DLNA renderers.
 /// Slices tracks sequentially directly into the exact same TCP socket without drops or DAC resets.
+/// `session` is the nonce of the armed session the request was admitted to; the stream ends when
+/// that session ends.
 pub fn serve_continuous_stream(
     mut stream: TcpStream,
     is_head: bool,
     state: &Arc<RwLock<NowPlayingState>>,
     cmd_tx: &mpsc::Sender<WebCommand>,
     stream_state: &Arc<StreamServerState>,
+    session: &str,
 ) -> std::io::Result<()> {
     let conn_id = stream_state.register_socket(&stream);
     let _socket_guard = SocketGuard {
@@ -1830,6 +1947,10 @@ pub fn serve_continuous_stream(
     };
 
     while controller.is_active.load(Ordering::SeqCst) {
+        if !controller.is_session(session) {
+            crate::log_info!("web", "Continuous stream connection {} outlived its session, closing", cid);
+            return Ok(());
+        }
         if cid != 0 && controller.active_conn_id.load(Ordering::SeqCst) != cid {
             crate::log_info!(
                 "web",
@@ -1995,7 +2116,10 @@ pub fn serve_continuous_stream(
         controller.kill_active_decoder();
 
         if track_finished_normally {
-            if track_index + 1 >= queue_len && queue_len > 1 {
+            // Reshuffle once per wrap, and only from the current connection of the armed session.
+            let owns_session = controller.is_session(session)
+                && (cid == 0 || controller.active_conn_id.load(Ordering::SeqCst) == cid);
+            if track_index + 1 >= queue_len && queue_len > 1 && owns_session {
                 let _ = cmd_tx.send(WebCommand::ShuffleQueue);
             }
             let next_idx = (track_index + 1) % queue_len;

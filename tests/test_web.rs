@@ -1144,15 +1144,15 @@ fn test_web_server_caps_concurrent_connections() {
     handle.stop();
 }
 
-/// Open /stream/continuous.wav and return the status code with the reader positioned after the
-/// response head.
-fn open_continuous(port: u16) -> (u16, BufReader<TcpStream>) {
+/// Open the armed continuous stream path and return the status code with the reader positioned
+/// after the response head.
+fn open_continuous(port: u16, path: &str) -> (u16, BufReader<TcpStream>) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     stream
-        .write_all(format!("GET /stream/continuous.wav HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", port).as_bytes())
+        .write_all(format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", path, port).as_bytes())
         .unwrap();
     let mut reader = BufReader::new(stream);
     let mut status_line = String::new();
@@ -1183,8 +1183,9 @@ fn test_web_server_streams_use_separate_pool_and_release_on_disconnect() {
     // Empty queue: the continuous stream sends silence until the client goes away.
     let (handle, _state, _rx) = start_limited(limits);
     let port = handle.port;
+    let session = handle.stream_state().arm_continuous_session();
 
-    let (status, mut first) = open_continuous(port);
+    let (status, mut first) = open_continuous(port, &session);
     assert_eq!(status, 200);
     let mut wav_hdr = [0u8; 44];
     first.read_exact(&mut wav_hdr).unwrap();
@@ -1195,7 +1196,7 @@ fn test_web_server_streams_use_separate_pool_and_release_on_disconnect() {
     assert_eq!(status, 200);
 
     // The stream pool is full.
-    let (status, _) = open_continuous(port);
+    let (status, _) = open_continuous(port, &session);
     assert_eq!(status, 503);
 
     // Once the client disconnects, the silence loop must notice the dead socket and exit,
@@ -1203,7 +1204,7 @@ fn test_web_server_streams_use_separate_pool_and_release_on_disconnect() {
     drop(first);
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let (status, conn) = open_continuous(port);
+        let (status, conn) = open_continuous(port, &session);
         drop(conn);
         if status == 200 {
             break;

@@ -67,7 +67,7 @@ It features a native **Ratatui** interactive terminal UI, an in-app recursive **
   - **Camelot Harmonic Mixing & BPM Flow**: Sequences transitions using Camelot wheel harmonic key compatibility and smooth tempo gradients.
   - **Mix Profiles (`M`)**: Diverse Shuffle, BPM Flow, Chill & Ambient, Workout & High Energy, and Late Night Groove.
   - **Seed Radio (`r`)**: Launches dynamic stations seeded by any track in your library or queue.
-  - **Continuous Gapless UPnP Streaming**: Optional `/stream/continuous.wav` continuous PCM WAV stream for seamless gapless playback on UPnP/DLNA stereos.
+  - **Continuous Gapless UPnP Streaming**: Optional continuous PCM WAV stream (served at a per-session `/stream/continuous-<id>.wav` path) for seamless gapless playback on UPnP/DLNA stereos.
   - **Zero-Touch SQLite Feature Store**: Acoustical features and tags stored in `~/.cache/quickstream/track_analysis.db` without ever writing to your music storage.
 
 - **Configurable Startup Home Directory**:
