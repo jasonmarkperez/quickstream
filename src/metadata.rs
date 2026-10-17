@@ -316,9 +316,42 @@ pub fn fallback_metadata(path: &Path) -> AudioMetadata {
     }
 }
 
+/// Image type of cover art bytes, from their signature.
+fn sniff_image_mime(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// The `Content-Type` to serve cover art with, or `None` when it must not be served.
+///
+/// Only JPEG, PNG, WebP and GIF are allowed. The type detected from the bytes wins; the tag's
+/// MIME string is used only when the bytes have no known signature and it names one of those
+/// types exactly.
+pub fn cover_image_mime(tag_mime: Option<&str>, data: &[u8]) -> Option<&'static str> {
+    if let Some(mime) = sniff_image_mime(data) {
+        return Some(mime);
+    }
+    match tag_mime?.trim().to_ascii_lowercase().as_str() {
+        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
+        "image/png" => Some("image/png"),
+        "image/webp" => Some("image/webp"),
+        "image/gif" => Some("image/gif"),
+        _ => None,
+    }
+}
+
 /// Extract cover artwork from an audio file.
 /// Looks first for embedded ID3/FLAC/Vorbis pictures, then scans the folder for image files.
-/// Returns (image_bytes, mime_type).
+/// Returns (image_bytes, mime_type); the MIME type is always one `cover_image_mime` allows.
 pub fn extract_cover_art(path: &Path) -> Option<(Vec<u8>, String)> {
     if !path.exists() {
         return None;
@@ -335,12 +368,12 @@ pub fn extract_cover_art(path: &Path) -> Option<(Vec<u8>, String)> {
                         .iter()
                         .find(|p| p.pic_type() == lofty::picture::PictureType::CoverFront)
                         .or_else(|| pics.first());
+                    // A picture that is not an allowed image type is skipped in favour of
+                    // the folder art below.
                     if let Some(p) = pic {
-                        let mime = p
-                            .mime_type()
-                            .map(|m| m.as_str().to_string())
-                            .unwrap_or_else(|| "image/jpeg".to_string());
-                        return Some((p.data().to_vec(), mime));
+                        if let Some(mime) = cover_image_mime(p.mime_type().map(|m| m.as_str()), p.data()) {
+                            return Some((p.data().to_vec(), mime.to_string()));
+                        }
                     }
                 }
             }
@@ -361,24 +394,14 @@ pub fn extract_cover_art(path: &Path) -> Option<(Vec<u8>, String)> {
             let candidate_path = parent.join(name);
             if candidate_path.is_file() {
                 if let Ok(data) = std::fs::read(&candidate_path) {
-                    let mime = if candidate_path
-                        .extension()
-                        .map(|e| e.to_string_lossy().to_lowercase())
-                        .as_deref()
-                        == Some("png")
-                    {
-                        "image/png"
-                    } else if candidate_path
-                        .extension()
-                        .map(|e| e.to_string_lossy().to_lowercase())
-                        .as_deref()
-                        == Some("webp")
-                    {
-                        "image/webp"
-                    } else {
-                        "image/jpeg"
+                    let ext_mime = match name.rsplit('.').next() {
+                        Some("png") => "image/png",
+                        Some("webp") => "image/webp",
+                        _ => "image/jpeg",
                     };
-                    return Some((data, mime.to_string()));
+                    if let Some(mime) = cover_image_mime(Some(ext_mime), &data) {
+                        return Some((data, mime.to_string()));
+                    }
                 }
             }
         }

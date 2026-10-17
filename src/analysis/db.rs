@@ -3,11 +3,77 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use rusqlite::{params, Connection, Result};
+use std::time::Duration;
+use rusqlite::{params, Connection, Result, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 /// Current database schema version (tracked via PRAGMA user_version).
+/// Always equal to `MIGRATIONS.len()` (checked at compile time below).
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+/// How long a connection waits on a lock held by another handle before failing with
+/// `SQLITE_BUSY`. The app opens more than one handle (autopilot scanner and UI).
+pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ordered schema migrations. `MIGRATIONS[i]` upgrades a database from `user_version = i` to
+/// `i + 1`; each step runs in its own transaction together with its `user_version` bump.
+///
+/// To change the schema, append a step (e.g. `ALTER TABLE track_features ADD COLUMN ...`) and
+/// bump `CURRENT_SCHEMA_VERSION`. Never edit or remove an existing step, and never drop user
+/// tables. Steps must not change `journal_mode` (not allowed inside a transaction).
+const MIGRATIONS: &[&str] = &[
+    // v1: initial track_features table and indexes.
+    r#"
+    CREATE TABLE IF NOT EXISTS track_features (
+        filepath TEXT PRIMARY KEY,
+        mtime INTEGER NOT NULL,
+        file_size INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        artist TEXT NOT NULL,
+        album TEXT NOT NULL,
+        genre TEXT NOT NULL,
+        year INTEGER,
+        bpm REAL,
+        initial_key TEXT,
+        camelot_key TEXT,
+        energy REAL,
+        loudness_lufs REAL,
+        mood TEXT,
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        analyzed_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_features_bpm ON track_features(bpm);
+    CREATE INDEX IF NOT EXISTS idx_features_genre ON track_features(genre);
+    CREATE INDEX IF NOT EXISTS idx_features_artist ON track_features(artist);
+    CREATE INDEX IF NOT EXISTS idx_features_mood ON track_features(mood);
+    CREATE INDEX IF NOT EXISTS idx_features_energy ON track_features(energy);
+    "#,
+];
+
+const _: () = assert!(MIGRATIONS.len() as u32 == CURRENT_SCHEMA_VERSION);
+
+/// Returned when the database on disk was written by a newer quickstream build.
+#[derive(Debug)]
+pub struct SchemaTooNewError {
+    pub path: String,
+    pub found: u32,
+    pub supported: u32,
+}
+
+impl std::fmt::Display for SchemaTooNewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "analysis database {} has schema version {}, which is newer than this build supports \
+             (version {}); refusing to open it so it is not damaged. Upgrade quickstream, or move \
+             the file aside to rebuild the analysis cache",
+            self.path, self.found, self.supported
+        )
+    }
+}
+
+impl std::error::Error for SchemaTooNewError {}
 
 /// Complete audio features and acoustic vector for intelligent mixing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -64,6 +130,47 @@ impl TrackFeatures {
     }
 }
 
+fn read_user_version(conn: &Connection) -> rusqlite::Result<u32> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+}
+
+fn ensure_supported(found: u32, supported: u32, label: &str) -> std::result::Result<(), SchemaTooNewError> {
+    if found > supported {
+        return Err(SchemaTooNewError {
+            path: label.to_string(),
+            found,
+            supported,
+        });
+    }
+    Ok(())
+}
+
+/// Apply `steps[user_version..]` in order. Each step and its `user_version` bump commit
+/// atomically, so a failing step leaves the database at the previous version.
+fn apply_migrations(conn: &mut Connection, steps: &[&str], label: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let target = steps.len() as u32;
+    if read_user_version(conn)? == target {
+        return Ok(());
+    }
+    loop {
+        // IMMEDIATE takes the write lock up front and the version is re-read inside the
+        // transaction, so two handles opening the same fresh file never run a step twice.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version = read_user_version(&tx)?;
+        ensure_supported(version, target, label)?;
+        if version == target {
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.execute_batch(steps[version as usize])
+            .with_context(|| format!("migrating analysis database {label} to schema version {}", version + 1))?;
+        tx.pragma_update(None, "user_version", version + 1)?;
+        tx.commit()?;
+    }
+}
+
 /// Thread-safe handle to the local analysis SQLite database.
 #[derive(Clone)]
 pub struct AnalysisDatabase {
@@ -81,69 +188,36 @@ impl AnalysisDatabase {
 
     /// Open an in-memory database (ideal for unit and integration testing).
     pub fn open_in_memory() -> anyhow::Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        let db = Self {
-            conn: Arc::new(Mutex::new(conn)),
-        };
-        db.run_migrations()?;
-        Ok(db)
+        Self::from_connection(Connection::open_in_memory()?, ":memory:")
     }
 
     /// Open or create SQLite database at a specific path.
+    ///
+    /// Fails with [`SchemaTooNewError`] (leaving the file untouched) if the database was written
+    /// by a newer quickstream build.
     pub fn open_at(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
-        let db = Self {
-            conn: Arc::new(Mutex::new(conn)),
-        };
-        db.run_migrations()?;
-        Ok(db)
+        Self::from_connection(conn, &path.display().to_string())
     }
 
-    /// Run automatic schema migrations using PRAGMA user_version.
-    fn run_migrations(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+    /// Configure a freshly opened connection and bring its schema up to date.
+    fn from_connection(mut conn: Connection, label: &str) -> anyhow::Result<Self> {
+        // Per-connection settings: must be applied on every open, not only on first creation.
+        conn.busy_timeout(BUSY_TIMEOUT)?;
 
-        // 1. Check existing schema version
-        let user_version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        // Refuse a newer schema before changing anything persistent (journal mode is stored in
+        // the file header).
+        let version = read_user_version(&conn)?;
+        ensure_supported(version, CURRENT_SCHEMA_VERSION, label)?;
 
-        if user_version < 1 {
-            // Version 1 Migration: Initial track_features table and indexes
-            conn.execute_batch(
-                r#"
-                PRAGMA journal_mode = WAL;
-                PRAGMA synchronous = NORMAL;
+        // journal_mode reports the resulting mode as a row ("wal", or "memory" in-memory).
+        let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
 
-                CREATE TABLE IF NOT EXISTS track_features (
-                    filepath TEXT PRIMARY KEY,
-                    mtime INTEGER NOT NULL,
-                    file_size INTEGER NOT NULL,
-                    title TEXT NOT NULL,
-                    artist TEXT NOT NULL,
-                    album TEXT NOT NULL,
-                    genre TEXT NOT NULL,
-                    year INTEGER,
-                    bpm REAL,
-                    initial_key TEXT,
-                    camelot_key TEXT,
-                    energy REAL,
-                    loudness_lufs REAL,
-                    mood TEXT,
-                    tags_json TEXT NOT NULL DEFAULT '[]',
-                    analyzed_at INTEGER NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_features_bpm ON track_features(bpm);
-                CREATE INDEX IF NOT EXISTS idx_features_genre ON track_features(genre);
-                CREATE INDEX IF NOT EXISTS idx_features_artist ON track_features(artist);
-                CREATE INDEX IF NOT EXISTS idx_features_mood ON track_features(mood);
-                CREATE INDEX IF NOT EXISTS idx_features_energy ON track_features(energy);
-
-                PRAGMA user_version = 1;
-                "#,
-            )?;
-        }
-
-        Ok(())
+        apply_migrations(&mut conn, MIGRATIONS, label)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     /// Upsert track analysis features.
@@ -346,15 +420,17 @@ mod tests {
         let db = AnalysisDatabase::open_in_memory().unwrap();
         assert_eq!(db.count_analyzed(), 0);
 
-        let mut f = TrackFeatures::default();
-        f.filepath = PathBuf::from("/music/electronic/track1.flac");
-        f.title = "Strobe".to_string();
-        f.artist = "deadmau5".to_string();
-        f.bpm = Some(128.0);
-        f.initial_key = Some("Am".to_string());
-        f.camelot_key = Some("8A".to_string());
-        f.energy = Some(0.85);
-        f.mood = Some("workout".to_string());
+        let f = TrackFeatures {
+            filepath: PathBuf::from("/music/electronic/track1.flac"),
+            title: "Strobe".to_string(),
+            artist: "deadmau5".to_string(),
+            bpm: Some(128.0),
+            initial_key: Some("Am".to_string()),
+            camelot_key: Some("8A".to_string()),
+            energy: Some(0.85),
+            mood: Some("workout".to_string()),
+            ..Default::default()
+        };
 
         db.upsert_track(&f).unwrap();
         assert_eq!(db.count_analyzed(), 1);
@@ -376,5 +452,81 @@ mod tests {
         // Query mood
         let mood_matches = db.query_by_mood("workout", 10);
         assert_eq!(mood_matches.len(), 1);
+    }
+
+    fn scratch_db_path(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("quickstream_db_unit_{}_{}_{}", name, std::process::id(), nanos));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("track_analysis.db")
+    }
+
+    fn pragma_i64(db: &AnalysisDatabase, name: &str) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0)).unwrap()
+    }
+
+    /// `synchronous` and `busy_timeout` are per-connection settings, so they must be applied on
+    /// every open, not only when the v1 migration runs on a brand-new file.
+    #[test]
+    fn test_connection_pragmas_applied_on_every_open() {
+        let path = scratch_db_path("pragmas");
+        drop(AnalysisDatabase::open_at(&path).unwrap()); // creates + migrates
+
+        let reopened = AnalysisDatabase::open_at(&path).unwrap(); // no migration runs now
+        assert_eq!(pragma_i64(&reopened, "synchronous"), 1, "synchronous must be NORMAL (1)");
+        assert_eq!(pragma_i64(&reopened, "busy_timeout"), BUSY_TIMEOUT.as_millis() as i64);
+        let mode: String = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+
+        let mem = AnalysisDatabase::open_in_memory().unwrap();
+        assert_eq!(pragma_i64(&mem, "synchronous"), 1);
+        assert_eq!(pragma_i64(&mem, "busy_timeout"), BUSY_TIMEOUT.as_millis() as i64);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn test_current_schema_version_matches_migration_steps() {
+        assert_eq!(MIGRATIONS.len() as u32, CURRENT_SCHEMA_VERSION);
+    }
+
+    /// Each step runs in its own transaction together with its `user_version` bump: a failing
+    /// step leaves the database at the previous version with none of the step's changes.
+    #[test]
+    fn test_failed_migration_step_is_rolled_back() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let steps: &[&str] = &[
+            "CREATE TABLE step_one (x INTEGER);",
+            "CREATE TABLE step_two (y INTEGER); THIS IS NOT SQL;",
+        ];
+        assert!(apply_migrations(&mut conn, steps, ":memory:").is_err());
+
+        let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 1, "step 1 committed, step 2 rolled back");
+        let count = |conn: &Connection, name: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count(&conn, "step_one"), 1);
+        assert_eq!(count(&conn, "step_two"), 0, "partial step must not be left behind");
+
+        // Re-running resumes from the recorded version rather than replaying step 1.
+        let fixed: &[&str] = &["CREATE TABLE step_one (x INTEGER);", "CREATE TABLE step_two (y INTEGER);"];
+        apply_migrations(&mut conn, fixed, ":memory:").unwrap();
+        let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(count(&conn, "step_two"), 1);
     }
 }

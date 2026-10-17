@@ -8,6 +8,15 @@ pub struct PlaybackQueue {
     pub current_index: usize,
 }
 
+/// A track taken out of the queue by [`PlaybackQueue::remove`].
+#[derive(Debug, Clone)]
+pub struct RemovedTrack {
+    pub track: AudioMetadata,
+    /// The removed track was the current one. `current_index` now points at the track that
+    /// followed it (or the new last track); the caller decides whether to start playing it.
+    pub was_current: bool,
+}
+
 impl PlaybackQueue {
     pub fn new() -> Self {
         Self {
@@ -32,16 +41,27 @@ impl PlaybackQueue {
         self.tracks.extend(tracks);
     }
 
+    /// Remove the track at `index`, keeping `current_index` on the same track. See [`Self::remove`].
     pub fn remove_track(&mut self, index: usize) -> Option<AudioMetadata> {
-        if index < self.tracks.len() {
-            let removed = self.tracks.remove(index);
-            if self.current_index >= self.tracks.len() && !self.tracks.is_empty() {
-                self.current_index = self.tracks.len() - 1;
-            }
-            Some(removed)
-        } else {
-            None
+        self.remove(index).map(|r| r.track)
+    }
+
+    /// Remove the track at `index`. A removal before the current track shifts `current_index` down
+    /// so it still names the same track. Removing the current track itself leaves `current_index`
+    /// on the track that followed it (clamped to the new last track) and reports `was_current`.
+    pub fn remove(&mut self, index: usize) -> Option<RemovedTrack> {
+        if index >= self.tracks.len() {
+            return None;
         }
+        let was_current = index == self.current_index;
+        let track = self.tracks.remove(index);
+        if index < self.current_index {
+            self.current_index -= 1;
+        }
+        if self.current_index >= self.tracks.len() {
+            self.current_index = self.tracks.len().saturating_sub(1);
+        }
+        Some(RemovedTrack { track, was_current })
     }
 
     pub fn clear(&mut self) {
@@ -91,14 +111,21 @@ impl PlaybackQueue {
         self.current_track()
     }
 
+    /// Move the track at `from` to position `to`. `current_index` keeps naming the same track,
+    /// whether that track is the one moved or another track moves across it.
     pub fn reorder_track(&mut self, from: usize, to: usize) -> bool {
         if from >= self.tracks.len() || to >= self.tracks.len() {
             return false;
         }
         let track = self.tracks.remove(from);
         self.tracks.insert(to, track);
-        if self.current_index == from {
+        let cur = self.current_index;
+        if cur == from {
             self.current_index = to;
+        } else if from < cur && to >= cur {
+            self.current_index -= 1;
+        } else if from > cur && to <= cur {
+            self.current_index += 1;
         }
         true
     }
@@ -254,6 +281,129 @@ mod tests {
         let removed = q.remove_track(1).unwrap();
         assert_eq!(removed.title, "Song 3");
         assert_eq!(q.len(), 2);
+    }
+
+    fn queue_of(n: usize, current: usize) -> PlaybackQueue {
+        let mut q = PlaybackQueue::new();
+        for i in 1..=n {
+            q.add_track(make_test_track(&format!("Song {}", i), 100.0));
+        }
+        q.current_index = current;
+        q
+    }
+
+    fn current_title(q: &PlaybackQueue) -> String {
+        q.current_track().map(|t| t.title.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn test_remove_before_current_keeps_current_track() {
+        let mut q = queue_of(5, 3); // Song 4
+        let removed = q.remove(1).unwrap();
+        assert_eq!(removed.track.title, "Song 2");
+        assert!(!removed.was_current);
+        assert_eq!(q.current_index, 2);
+        assert_eq!(current_title(&q), "Song 4");
+    }
+
+    #[test]
+    fn test_remove_after_current_keeps_index() {
+        let mut q = queue_of(5, 1); // Song 2
+        let removed = q.remove(3).unwrap();
+        assert!(!removed.was_current);
+        assert_eq!(q.current_index, 1);
+        assert_eq!(current_title(&q), "Song 2");
+    }
+
+    #[test]
+    fn test_remove_current_moves_to_following_track() {
+        let mut q = queue_of(5, 2); // Song 3
+        let removed = q.remove(2).unwrap();
+        assert_eq!(removed.track.title, "Song 3");
+        assert!(removed.was_current);
+        assert_eq!(q.current_index, 2);
+        assert_eq!(current_title(&q), "Song 4");
+    }
+
+    #[test]
+    fn test_remove_current_last_track_clamps_to_new_last() {
+        let mut q = queue_of(3, 2); // Song 3
+        let removed = q.remove(2).unwrap();
+        assert!(removed.was_current);
+        assert_eq!(q.current_index, 1);
+        assert_eq!(current_title(&q), "Song 2");
+    }
+
+    #[test]
+    fn test_remove_only_track_empties_queue() {
+        let mut q = queue_of(1, 0);
+        let removed = q.remove(0).unwrap();
+        assert!(removed.was_current);
+        assert!(q.is_empty());
+        assert_eq!(q.current_index, 0);
+        assert!(q.current_track().is_none());
+    }
+
+    #[test]
+    fn test_remove_out_of_range_is_none() {
+        let mut q = queue_of(2, 1);
+        assert!(q.remove(2).is_none());
+        assert!(q.remove_track(5).is_none());
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.current_index, 1);
+    }
+
+    #[test]
+    fn test_remove_track_wrapper_adjusts_current_index() {
+        let mut q = queue_of(4, 2); // Song 3
+        assert_eq!(q.remove_track(0).unwrap().title, "Song 1");
+        assert_eq!(current_title(&q), "Song 3");
+    }
+
+    #[test]
+    fn test_reorder_moving_earlier_track_past_current_keeps_current() {
+        let mut q = queue_of(5, 2); // Song 3
+        assert!(q.reorder_track(0, 4));
+        assert_eq!(q.current_index, 1);
+        assert_eq!(current_title(&q), "Song 3");
+    }
+
+    #[test]
+    fn test_reorder_moving_later_track_before_current_keeps_current() {
+        let mut q = queue_of(5, 2); // Song 3
+        assert!(q.reorder_track(4, 0));
+        assert_eq!(q.current_index, 3);
+        assert_eq!(current_title(&q), "Song 3");
+    }
+
+    #[test]
+    fn test_reorder_onto_current_slot_keeps_current() {
+        // Moving a later track into the current slot pushes the current track down one.
+        let mut q = queue_of(5, 2); // Song 3
+        assert!(q.reorder_track(4, 2));
+        assert_eq!(current_title(&q), "Song 3");
+        // Moving an earlier track into the current slot pulls the current track up one.
+        let mut q = queue_of(5, 2);
+        assert!(q.reorder_track(0, 2));
+        assert_eq!(current_title(&q), "Song 3");
+    }
+
+    #[test]
+    fn test_reorder_current_track_follows_it() {
+        let mut q = queue_of(5, 1); // Song 2
+        assert!(q.reorder_track(1, 4));
+        assert_eq!(q.current_index, 4);
+        assert_eq!(current_title(&q), "Song 2");
+    }
+
+    #[test]
+    fn test_reorder_tracks_on_one_side_of_current_keeps_index() {
+        let mut q = queue_of(6, 1); // Song 2
+        assert!(q.reorder_track(3, 5));
+        assert_eq!(q.current_index, 1);
+        assert_eq!(current_title(&q), "Song 2");
+        assert!(!q.reorder_track(0, 6));
+        assert_eq!(current_title(&q), "Song 2");
     }
 
     #[test]

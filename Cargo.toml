@@ -2,9 +2,15 @@
 name = "quickstream"
 version = "0.3.0"
 edition = "2021"
-authors = ["Quickstream Contributors"]
+# Minimum toolchain for the locked dependency set (lofty 0.25.4 requires 1.89).
+rust-version = "1.89"
+authors = ["Jason Perez"]
 description = "A lightweight terminal music player and DLNA network streamer in Rust"
 license = "MIT"
+repository = "https://github.com/jasonmarkperez/quickstream"
+readme = "README.md"
+keywords = ["music-player", "dlna", "upnp", "tui", "audio"]
+categories = ["command-line-utilities", "multimedia::audio"]
 
 [dependencies]
 # Audio Metadata Extraction (modeled on mpv-music)
@@ -39,7 +45,6 @@ ureq = { version = "2.10", features = ["json"] }
 
 # Error Handling & Utilities
 anyhow = "1.0"
-thiserror = "2.0"
 ctrlc = { version = "3.4", features = ["termination"] }
 chrono = "0.4"
 libc = "0.2"

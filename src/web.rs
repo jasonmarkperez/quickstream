@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::metadata::{default_cover_svg, extract_cover_art};
+use crate::metadata::{cover_image_mime, default_cover_svg, extract_cover_art};
 
 /// Individual track representation in the web queue.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1015,7 +1015,7 @@ fn handle_client(
             let json = serde_json::to_string(&current).unwrap_or_else(|_| "{}".to_string());
             let body = json.as_bytes();
             let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             stream.write_all(header.as_bytes())?;
@@ -1024,16 +1024,21 @@ fn handle_client(
             }
             stream.flush()?;
         } else if path.starts_with("/api/cover") {
-            // Serve cover art (JPEG/PNG) or SVG placeholder
+            // Serve cover art (JPEG/PNG/WebP/GIF) or SVG placeholder. `extract_cover_art` only
+            // returns allowlisted MIME types; re-check here so a tag string never reaches the
+            // response head.
             let filepath = {
                 let s = state.read().unwrap();
                 s.filepath.clone()
             };
 
-            let art_opt = filepath.as_deref().and_then(extract_cover_art);
+            let art_opt = filepath
+                .as_deref()
+                .and_then(extract_cover_art)
+                .and_then(|(bytes, mime)| cover_image_mime(Some(&mime), &bytes).map(|m| (bytes, m)));
             if let Some((bytes, mime)) = art_opt {
                 let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nCache-Control: public, max-age=10\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: public, max-age=10\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     mime,
                     bytes.len()
                 );
@@ -1045,7 +1050,7 @@ fn handle_client(
             } else {
                 let svg = default_cover_svg().as_bytes();
                 let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nCache-Control: public, max-age=10\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nX-Content-Type-Options: nosniff\r\nCache-Control: public, max-age=10\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     svg.len()
                 );
                 stream.write_all(header.as_bytes())?;
@@ -1158,7 +1163,7 @@ fn handle_client(
             let json = serde_json::to_string(&resp_data).unwrap_or_else(|_| "{}".to_string());
             let body = json.as_bytes();
             let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             stream.write_all(header.as_bytes())?;
@@ -1329,7 +1334,7 @@ fn handle_client(
             return Ok(());
         }
 
-        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}";
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}";
         stream.write_all(resp)?;
         stream.flush()?;
     } else {

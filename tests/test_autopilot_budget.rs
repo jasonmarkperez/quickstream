@@ -62,6 +62,7 @@ struct MixRun {
 fn run_chill_mix(limits: ProfileScanLimits) -> MixRun {
     let root = sparse_library();
     let log_path = root.join("data").join("quickstream").join("quickstream.log");
+    quickstream::logger::flush();
     let log_before = fs::read_to_string(&log_path).unwrap_or_default().len();
 
     let (tx, rx) = mpsc::channel();
@@ -90,6 +91,7 @@ fn run_chill_mix(limits: ProfileScanLimits) -> MixRun {
         }
     };
     handle.join().unwrap();
+    assert!(quickstream::logger::flush(), "log writer did not flush");
     let log = fs::read_to_string(&log_path).unwrap()[log_before..].to_string();
     MixRun { first_track_at, finished_at, log }
 }
