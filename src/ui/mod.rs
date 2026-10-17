@@ -14,8 +14,10 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 pub mod search;
+pub mod workers;
 
 use self::search::SearchModalState;
+use self::workers::WorkerRegistry;
 use crate::discovery::DeviceManager;
 use crate::metadata::is_supported_audio_file;
 use crate::paths;
@@ -62,16 +64,20 @@ fn spawn_local_player(backend: &str, initial_volume: u8) -> Box<dyn AudioPlayer>
 }
 
 /// Start 4 threads that read tags for paths sent to the returned inbox and report results on
-/// `metadata_tx`. The threads exit once the inbox sender is dropped.
+/// `metadata_tx`. The threads exit once the inbox sender is dropped or `stop` is set (paths still
+/// queued in the inbox are then skipped).
 fn spawn_queue_metadata_workers(
+    workers: &mut WorkerRegistry,
     metadata_tx: std::sync::mpsc::Sender<crate::metadata::AudioMetadata>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::sync::mpsc::Sender<PathBuf> {
     let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
     let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
     for _ in 0..4 {
         let rx = rx.clone();
         let metadata_tx = metadata_tx.clone();
-        std::thread::spawn(move || loop {
+        let stop = stop.clone();
+        workers.spawn("queue-metadata", move || loop {
             let path = match rx.lock() {
                 Ok(guard) => match guard.recv() {
                     Ok(p) => p,
@@ -79,6 +85,9 @@ fn spawn_queue_metadata_workers(
                 },
                 Err(_) => break,
             };
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
             if let Ok(meta) = crate::metadata::extract_metadata(&path) {
                 crate::library::LibraryManager::append_to_cache(&meta);
                 if metadata_tx.send(meta).is_err() {
@@ -90,11 +99,8 @@ fn spawn_queue_metadata_workers(
     tx
 }
 
-/// Drop a replaced player on a background thread so its shutdown (killing mpv, sending Stop to a
-/// renderer) never blocks the UI.
-fn retire_player(player: Box<dyn AudioPlayer>) {
-    std::thread::spawn(move || drop(player));
-}
+/// How long quitting waits in total for background workers to finish before detaching them.
+pub const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TUI_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -223,8 +229,12 @@ pub struct AppUI {
     pub metadata_worker_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Inbox of the queue metadata worker pool (spawned on first use; workers exit when dropped).
     pub queue_metadata_tx: Option<std::sync::mpsc::Sender<PathBuf>>,
+    /// Tells the queue metadata pool to stop reading tags (set on shutdown).
+    pub queue_metadata_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Paths already sent to the queue metadata workers this session.
     pub queue_metadata_attempted: std::collections::HashSet<PathBuf>,
+    /// Handles of background worker threads, joined (with a bounded wait) on shutdown.
+    pub workers: WorkerRegistry,
     pub browser_state: ListState,
     pub queue_state: ListState,
     pub devices_state: ListState,
@@ -256,6 +266,15 @@ pub struct AppUI {
     pub active_mix_profile: crate::analysis::MixProfile,
     pub show_mix_picker_modal: bool,
     pub mix_picker_cursor: usize,
+}
+
+impl Drop for AppUI {
+    /// Runs after the TUI has exited (and the terminal is restored): stop and join background
+    /// workers with a bounded wait so quitting stays fast. The player, web server and analysis
+    /// worker fields then shut down in their own `Drop` impls.
+    fn drop(&mut self) {
+        self.shutdown_workers(WORKER_SHUTDOWN_TIMEOUT);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,7 +364,9 @@ impl AppUI {
             queue_add_rx,
             metadata_worker_stop: None,
             queue_metadata_tx: None,
+            queue_metadata_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             queue_metadata_attempted: std::collections::HashSet::new(),
+            workers: WorkerRegistry::new(),
             browser_state: ListState::default(),
             queue_state: ListState::default(),
             devices_state: ListState::default(),
@@ -615,7 +636,7 @@ impl AppUI {
         let metadata_view = self.settings_mgr.settings.metadata_view;
         let cached_map = self.metadata_cache.clone(); // shared handle, not a copy
 
-        std::thread::spawn(move || {
+        self.workers.spawn("dir-scan", move || {
             let thread_start = std::time::Instant::now();
             match std::fs::read_dir(&scan_dir) {
                 Ok(entries) => {
@@ -939,7 +960,7 @@ impl AppUI {
         self.metadata_worker_stop = Some(stop.clone());
         let tx = self.metadata_tx.clone();
 
-        std::thread::spawn(move || {
+        self.workers.spawn("browser-metadata", move || {
             let fetch_start = std::time::Instant::now();
             let mut extracted = 0;
             for path in paths {
@@ -990,9 +1011,10 @@ impl AppUI {
         }
 
         let metadata_tx = self.metadata_tx.clone();
+        let (workers, stop) = (&mut self.workers, self.queue_metadata_stop.clone());
         let tx = self
             .queue_metadata_tx
-            .get_or_insert_with(|| spawn_queue_metadata_workers(metadata_tx));
+            .get_or_insert_with(|| spawn_queue_metadata_workers(workers, metadata_tx, stop));
         for path in new_paths {
             let _ = tx.send(path);
         }
@@ -1213,6 +1235,10 @@ impl AppUI {
         }
     }
 
+    /// Test helper: block, polling autopilot results, until the scan finishes or `timeout`
+    /// passes. It sleeps on the calling thread, so never call it from the TUI event loop. Public
+    /// only because integration tests in `tests/` drive `AppUI` directly.
+    #[doc(hidden)]
     pub fn wait_for_autopilot_scan(&mut self, timeout: std::time::Duration) {
         let start = std::time::Instant::now();
         while self.is_autopilot_scanning && start.elapsed() < timeout {
@@ -1417,6 +1443,50 @@ impl AppUI {
         if !self.queue.is_empty() {
             self.queue_cursor = self.queue.len().saturating_sub(1);
         }
+    }
+
+    /// Drop a replaced player on a worker thread so its shutdown (killing mpv, sending Stop to a
+    /// renderer) never blocks the UI. Shutdown waits for it, so mpv is gone before the process exits.
+    fn retire_player(&mut self, player: Box<dyn AudioPlayer>) {
+        self.workers.spawn("retire-player", move || drop(player));
+    }
+
+    /// Number of background worker threads still running.
+    pub fn live_worker_count(&mut self) -> usize {
+        self.workers.live_count()
+    }
+
+    /// Signal every background worker to stop (directory scan, tag readers, queue metadata pool,
+    /// search scanner, autopilot scanner), then join them, waiting at most `timeout` in total.
+    /// Workers still running at the deadline are detached. Returns how many were left running.
+    /// Called when the app is dropped; safe to call more than once.
+    pub fn shutdown_workers(&mut self, timeout: Duration) -> usize {
+        let stops = [
+            self.dir_scan_stop.take(),
+            self.metadata_worker_stop.take(),
+            self.autopilot_scan_stop.take(),
+            Some(self.queue_metadata_stop.clone()),
+        ];
+        for stop in stops.into_iter().flatten() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Dropping the inbox wakes queue metadata workers blocked waiting for work.
+        self.queue_metadata_tx = None;
+        if let Some(mut modal) = self.search_modal.take() {
+            modal.close();
+        }
+        self.autopilot_rx = None;
+        self.is_autopilot_scanning = false;
+
+        let start = Instant::now();
+        let left = self.workers.join_all(timeout);
+        crate::log_info!(
+            "ui",
+            "Background workers stopped in {:.2?} ({} detached)",
+            start.elapsed(),
+            left
+        );
+        left
     }
 
     /// Stop playback and return true if a shutdown was requested (e.g. by SIGINT/SIGTERM/SIGHUP).
@@ -2173,7 +2243,10 @@ impl AppUI {
         let stop_clone = stop_flag.clone();
         let scan_dir = target_dir.clone();
 
-        std::thread::spawn(move || {
+        if let Some(mut previous) = self.search_modal.take() {
+            previous.close();
+        }
+        self.workers.spawn("search-scan", move || {
             let cached_map = crate::library::LibraryManager::load_cache_map();
             let initial_tracks: Vec<crate::metadata::AudioMetadata> = cached_map
                 .values()
@@ -2570,7 +2643,8 @@ impl AppUI {
                 let volume = self.player.volume();
                 let mut new_player = spawn_local_player(&backend, volume);
                 let _ = new_player.set_volume(volume);
-                retire_player(std::mem::replace(&mut self.player, new_player));
+                let old = std::mem::replace(&mut self.player, new_player);
+                self.retire_player(old);
             }
         } else if self.settings_cursor == 6 || SETTING_DEFINITIONS[self.settings_cursor].key == "web_server_lan" {
             self.sync_web_server();
@@ -2776,7 +2850,7 @@ impl AppUI {
         let scan_dir = dir.clone();
         let profile = self.active_mix_profile.clone();
         let db = self.analysis_db.clone();
-        std::thread::spawn(move || {
+        self.workers.spawn("autopilot", move || {
             crate::library::LibraryManager::scan_directory_autopilot_with_profile(
                 scan_dir,
                 known_subdirs,
@@ -2935,7 +3009,8 @@ impl AppUI {
             }
         }
 
-        retire_player(std::mem::replace(&mut self.player, new_player));
+        let old = std::mem::replace(&mut self.player, new_player);
+        self.retire_player(old);
         self.status_message = "Active output: Local Audio".to_string();
         self.sync_web_server();
         self.update_web_state();
@@ -2996,7 +3071,8 @@ impl AppUI {
             }
         }
 
-        retire_player(std::mem::replace(&mut self.player, upnp_player));
+        let old = std::mem::replace(&mut self.player, upnp_player);
+        self.retire_player(old);
         self.status_message = status;
         self.update_web_state();
     }
@@ -3118,7 +3194,7 @@ impl AppUI {
                 crate::web::WebCommand::AddFolder(path) => {
                     // Listing a folder on a network share can be slow: do it off the UI thread.
                     let tx = self.queue_add_tx.clone();
-                    std::thread::spawn(move || {
+                    self.workers.spawn("add-folder", move || {
                         if let Ok(entries) = std::fs::read_dir(&path) {
                             let mut files: Vec<std::path::PathBuf> = entries
                                 .filter_map(|e| e.ok())
