@@ -90,9 +90,9 @@ pub struct Playlist {
   - `add(name, entries) -> AddResult { added, skipped_duplicates }` – a duplicate is an entry whose path is already in the playlist;
   - `remove(name, index)`;
   - `move_entry(name, index, up|down)` – no wraparound for moves;
-  - `rename(old, new)` – validates the new name; writes the new file, then deletes the old file. A case-only rename (`road trip` → `Road Trip`) is allowed;
+  - `rename(old, new)` – validates the new name. The duplicate check ignores the playlist being renamed, so a case-only rename (`road trip` → `Road Trip`) is allowed. The file is moved with the operating system's rename (`fs::rename(old_path, new_path)`), then the new file is saved again so its `#PLAYLIST` line shows the new name. Rename never uses "write new file, then delete old file": on a case-insensitive disk (the macOS default) `road trip.m3u8` and `Road Trip.m3u8` are the same file, so deleting the old name would delete the playlist just written;
   - `delete(name)` – deletes the file.
-- `src/persist.rs`: the background writer gains `PersistHandle::delete(path)`. Writes and deletes for the same path are applied in the order they were sent, so "save then delete" and "delete then save" both end in the expected state.
+- `src/persist.rs`: the background writer gains `PersistHandle::delete(path)` and `PersistHandle::rename(from, to)`. Saves, deletes and renames are applied in the order they were sent, and a pending save for a path is written before a later delete or rename of that path, so "save then delete", "delete then save" and "save, rename, save" all end in the expected state.
 - `Settings` gains `last_playlist: Option<String>` (serde default `None`) in `config.json`. It is set after every successful add and preselected by the picker. If it names a playlist that no longer exists, the picker highlights the first row.
 
 ## Section 2: Terminal UI
@@ -176,9 +176,10 @@ Tests are written before the code they cover. New file `tests/test_playlists.rs`
 2. **Names**: each rejection rule; trimming; case-insensitive duplicates on create and rename; case-only rename allowed.
 3. **Store**
    - create, add, skip duplicates, remove, move, rename (new file exists, old file gone), delete;
+   - case-only rename (`road trip` → `Road Trip`): afterwards the playlists folder holds exactly one file, its name is `Road Trip.m3u8` (exact case, checked through `read_dir`), and it contains every track;
    - writes and deletes outside the playlists folder are refused;
    - an unreadable or non-UTF-8 file is skipped at load and its bytes are unchanged afterwards.
-4. **Background writer** (`tests/test_persist.rs` or the existing persist tests): `delete` removes the file; save-then-delete and delete-then-save on one path end in the expected state.
+4. **Background writer** (`tests/test_persist.rs` or the existing persist tests): `delete` removes the file; `rename` moves it; save-then-delete, delete-then-save and save-rename-save on one path end in the expected state.
 5. **UI** (following the existing `AppUI` tests)
    - tab cycling covers 5 tabs and `5` opens the tab;
    - `L` on a browser track → picker → `Enter` adds it; `last_playlist` is preselected next time;
@@ -192,5 +193,5 @@ Before the PR: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
 ## Files touched
 
 - New: `src/playlist.rs`, `tests/test_playlists.rs`.
-- Changed: `src/lib.rs` (module export), `src/paths.rs` (`get_playlists_dir`), `src/persist.rs` (`delete`), `src/settings.rs` (`last_playlist`), `src/ui/mod.rs` (tab 5, modals, `L`, workers, status source tag), `AGENTS.md`.
+- Changed: `src/lib.rs` (module export), `src/paths.rs` (`get_playlists_dir`), `src/persist.rs` (`delete`, `rename`), `src/settings.rs` (`last_playlist`), `src/ui/mod.rs` (tab 5, modals, `L`, workers, status source tag), `AGENTS.md`.
 - If `src/ui/mod.rs` grows by more than about 600 lines, put the tab 5 rendering and key handling in `src/ui/playlists.rs` (related to issue #26).
