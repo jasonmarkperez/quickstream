@@ -154,9 +154,7 @@ pub struct SettingsManager {
 
 impl Default for SettingsManager {
     fn default() -> Self {
-        let path = paths::get_config_path();
-        let settings = Self::load_from(&path).unwrap_or_default();
-        Self { path, settings }
+        Self::with_path(paths::get_config_path())
     }
 }
 
@@ -165,8 +163,11 @@ impl SettingsManager {
         Self::default()
     }
 
+    /// Load settings from `path`, falling back to defaults. A file that exists but fails to
+    /// parse is copied to `config.json.bak` and logged first (`persist::load_json_or_backup`),
+    /// so saving the defaults later doesn't destroy the user's settings.
     pub fn with_path(path: PathBuf) -> Self {
-        let settings = Self::load_from(&path).unwrap_or_default();
+        let settings = crate::persist::load_json_or_backup(&path, "settings").unwrap_or_default();
         Self { path, settings }
     }
 
@@ -178,14 +179,12 @@ impl SettingsManager {
         serde_json::from_str(&content).ok()
     }
 
+    /// Write the settings to disk atomically (temp file + fsync + rename).
     pub fn save(&self) -> bool {
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
+        match serde_json::to_string_pretty(&self.settings) {
+            Ok(json) => crate::persist::atomic_write(&self.path, json.as_bytes()).is_ok(),
+            Err(_) => false,
         }
-        if let Ok(json) = serde_json::to_string_pretty(&self.settings) {
-            return fs::write(&self.path, json).is_ok();
-        }
-        false
     }
 
     pub fn cycle_setting(&mut self, index: usize, forward: bool) {

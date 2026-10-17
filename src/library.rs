@@ -145,6 +145,22 @@ fn log_autopilot(message: String) {
     crate::logger::log_raw("PERF", "autopilot", &message);
 }
 
+/// Serializes every write to the library cache file within this process (whole-file saves and
+/// single-line appends): queue metadata workers, browser metadata fetches and directory scans
+/// all write to it.
+static CACHE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// True if `file` is non-empty and its last byte isn't a newline.
+fn ends_mid_line(file: &mut File) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(len) = file.seek(SeekFrom::End(0)) else { return false };
+    if len == 0 || file.seek(SeekFrom::Start(len - 1)).is_err() {
+        return false;
+    }
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last).is_ok() && last[0] != b'\n'
+}
+
 #[derive(Default)]
 pub struct LibraryManager {
     pub tracks: Vec<AudioMetadata>,
@@ -157,19 +173,23 @@ impl LibraryManager {
 
     /// Load library from cached music_index.jsonl if present.
     pub fn load_cache() -> Vec<AudioMetadata> {
-        let path = paths::get_music_index_path();
-        if !path.exists() {
-            return Vec::new();
-        }
+        Self::load_cache_from(&paths::get_music_index_path())
+    }
 
+    /// Load every track entry from the JSONL cache at `path`.
+    ///
+    /// Lines that fail to parse are skipped one at a time: a line cut short by a crash mid-write
+    /// (even in the middle of a UTF-8 character) never hides the entries after it.
+    pub fn load_cache_from(path: &Path) -> Vec<AudioMetadata> {
         let mut tracks = Vec::new();
-        if let Ok(file) = File::open(&path) {
+        if let Ok(file) = File::open(path) {
             let reader = BufReader::new(file);
-            for line in reader.lines().map_while(Result::ok) {
-                if line.trim().is_empty() {
+            for line in reader.split(b'\n') {
+                let Ok(line) = line else { break };
+                if line.iter().all(|b| b.is_ascii_whitespace()) {
                     continue;
                 }
-                if let Ok(track) = serde_json::from_str::<AudioMetadata>(&line) {
+                if let Ok(track) = serde_json::from_slice::<AudioMetadata>(&line) {
                     tracks.push(track);
                 }
             }
@@ -179,24 +199,10 @@ impl LibraryManager {
 
     /// Load library from cached music_index.jsonl into a HashMap for fast key lookup.
     pub fn load_cache_map() -> HashMap<PathBuf, AudioMetadata> {
-        let path = paths::get_music_index_path();
-        if !path.exists() {
-            return HashMap::new();
-        }
-
-        let mut map = HashMap::new();
-        if let Ok(file) = File::open(&path) {
-            let reader = BufReader::new(file);
-            for line in reader.lines().map_while(Result::ok) {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                if let Ok(track) = serde_json::from_str::<AudioMetadata>(&line) {
-                    map.insert(track.filepath.clone(), track);
-                }
-            }
-        }
-        map
+        Self::load_cache_from(&paths::get_music_index_path())
+            .into_iter()
+            .map(|t| (t.filepath.clone(), t))
+            .collect()
     }
 
     /// Load cached tracks that reside within the given directory.
@@ -207,33 +213,72 @@ impl LibraryManager {
 
     /// Save library tracks to cached music_index.jsonl.
     pub fn save_cache(tracks: &[AudioMetadata]) -> bool {
-        let path = paths::get_music_index_path();
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
+        Self::save_cache_to(&paths::get_music_index_path(), tracks)
+    }
 
-        if let Ok(mut file) = File::create(&path) {
-            for track in tracks {
-                if let Ok(json) = serde_json::to_string(track) {
-                    let _ = writeln!(file, "{}", json);
+    /// Save library tracks to the JSONL cache at `path`.
+    ///
+    /// The file is replaced atomically (temp file + fsync + rename), so a crash mid-save keeps
+    /// the previous cache. Entries already on disk for paths not in `tracks` are kept: callers
+    /// pass a snapshot taken earlier, and tracks appended by other threads since then must not
+    /// be dropped. Runs under the cache write lock, so it never races `append_to_cache`.
+    pub fn save_cache_to(path: &Path, tracks: &[AudioMetadata]) -> bool {
+        let _guard = CACHE_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut written: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for track in tracks {
+            if let Ok(json) = serde_json::to_vec(track) {
+                written.insert(track.filepath.as_path());
+                out.extend_from_slice(&json);
+                out.push(b'\n');
+            }
+        }
+        for track in Self::load_cache_from(path) {
+            if !written.contains(track.filepath.as_path()) {
+                if let Ok(json) = serde_json::to_vec(&track) {
+                    out.extend_from_slice(&json);
+                    out.push(b'\n');
                 }
             }
-            return true;
         }
-        false
+
+        match crate::persist::atomic_write(path, &out) {
+            Ok(()) => true,
+            Err(e) => {
+                crate::logger::log_raw("WARN", "library", &format!("failed to save cache '{}': {}", path.display(), e));
+                false
+            }
+        }
     }
 
     /// Append a single track's metadata to cached music_index.jsonl.
     pub fn append_to_cache(track: &AudioMetadata) {
-        let path = paths::get_music_index_path();
+        Self::append_to_cache_at(&paths::get_music_index_path(), track)
+    }
+
+    /// Append a single track's metadata to the JSONL cache at `path`.
+    ///
+    /// Serialized with every other cache write through the cache write lock and written with a
+    /// single `write_all`, so lines from concurrent writers never interleave. If the file ends in
+    /// a partial line (a crash mid-append), a newline goes first so the new entry starts on its
+    /// own line.
+    pub fn append_to_cache_at(path: &Path, track: &AudioMetadata) {
+        let Ok(json) = serde_json::to_vec(track) else { return };
+        let _guard = CACHE_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-            if let Ok(json) = serde_json::to_string(track) {
-                let _ = writeln!(file, "{}", json);
-            }
+        let Ok(mut file) = fs::OpenOptions::new().create(true).read(true).append(true).open(path) else {
+            return;
+        };
+        let mut line = Vec::with_capacity(json.len() + 2);
+        if ends_mid_line(&mut file) {
+            line.push(b'\n');
         }
+        line.extend_from_slice(&json);
+        line.push(b'\n');
+        let _ = file.write_all(&line);
     }
 
     /// Scan a directory recursively using walkdir and extract metadata.

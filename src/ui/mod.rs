@@ -1,6 +1,5 @@
 //! Interactive Terminal User Interface (Ratatui + Crossterm + Skim integration).
 
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -311,24 +310,13 @@ impl AppUI {
     }
 
     fn load_bookmarks() -> Vec<String> {
-        let path = paths::get_bookmarks_path();
-        if path.exists() {
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(list) = serde_json::from_str::<Vec<String>>(&content) {
-                    return list;
-                }
-            }
-        }
-        Vec::new()
+        // A corrupt file is backed up to bookmarks.json.bak before we start from an empty list.
+        crate::persist::load_json_or_backup(&paths::get_bookmarks_path(), "bookmarks").unwrap_or_default()
     }
 
     fn save_bookmarks(&self) {
-        let path = paths::get_bookmarks_path();
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
         if let Ok(json) = serde_json::to_string_pretty(&self.bookmarks) {
-            let _ = fs::write(path, json);
+            let _ = crate::persist::atomic_write(&paths::get_bookmarks_path(), json.as_bytes());
         }
     }
 
