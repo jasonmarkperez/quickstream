@@ -89,7 +89,13 @@ pub fn is_supported_audio_file(path: &Path) -> bool {
 }
 
 pub fn get_audio_mime_type(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "mp3" => "audio/mpeg",
         "flac" => "audio/flac",
         "wav" | "wave" => "audio/wav",
@@ -204,10 +210,7 @@ pub fn extract_metadata(path: &Path) -> anyhow::Result<AudioMetadata> {
 
     // Probe and parse with lofty, skipping cover art to avoid multi-megabyte image reads
     let parse_opts = ParseOptions::new().read_cover_art(false);
-    let tagged_file = Probe::open(path)?
-        .options(parse_opts)
-        .guess_file_type()?
-        .read()?;
+    let tagged_file = Probe::open(path)?.options(parse_opts).guess_file_type()?.read()?;
     let properties = tagged_file.properties();
 
     let mut duration_seconds = properties.duration().as_secs_f64();
@@ -222,21 +225,13 @@ pub fn extract_metadata(path: &Path) -> anyhow::Result<AudioMetadata> {
 
     let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag());
 
-    let title = tag
-        .and_then(|t| t.title().map(|s| s.to_string()))
-        .unwrap_or_default();
+    let title = tag.and_then(|t| t.title().map(|s| s.to_string())).unwrap_or_default();
 
-    let artist = tag
-        .and_then(|t| t.artist().map(|s| s.to_string()))
-        .unwrap_or_default();
+    let artist = tag.and_then(|t| t.artist().map(|s| s.to_string())).unwrap_or_default();
 
-    let album = tag
-        .and_then(|t| t.album().map(|s| s.to_string()))
-        .unwrap_or_default();
+    let album = tag.and_then(|t| t.album().map(|s| s.to_string())).unwrap_or_default();
 
-    let genre = tag
-        .and_then(|t| t.genre().map(|s| s.to_string()))
-        .unwrap_or_default();
+    let genre = tag.and_then(|t| t.genre().map(|s| s.to_string())).unwrap_or_default();
 
     let (h_title, h_artist, h_album) = parse_path_heuristics(path);
 
@@ -250,17 +245,9 @@ pub fn extract_metadata(path: &Path) -> anyhow::Result<AudioMetadata> {
             .unwrap_or(filename.clone())
     };
 
-    let final_artist = if !artist.is_empty() {
-        artist
-    } else {
-        h_artist
-    };
+    let final_artist = if !artist.is_empty() { artist } else { h_artist };
 
-    let final_album = if !album.is_empty() {
-        album
-    } else {
-        h_album
-    };
+    let final_album = if !album.is_empty() { album } else { h_album };
 
     Ok(AudioMetadata {
         filepath: path.to_path_buf(),
@@ -383,11 +370,21 @@ pub fn extract_cover_art(path: &Path) -> Option<(Vec<u8>, String)> {
     // 2. Fall back to image files in the same directory
     if let Some(parent) = path.parent() {
         let candidates = [
-            "cover.jpg", "cover.jpeg", "cover.png", "cover.webp",
-            "folder.jpg", "folder.jpeg", "folder.png",
-            "front.jpg", "front.jpeg", "front.png",
-            "album.jpg", "album.jpeg", "album.png",
-            "artwork.jpg", "artwork.png",
+            "cover.jpg",
+            "cover.jpeg",
+            "cover.png",
+            "cover.webp",
+            "folder.jpg",
+            "folder.jpeg",
+            "folder.png",
+            "front.jpg",
+            "front.jpeg",
+            "front.png",
+            "album.jpg",
+            "album.jpeg",
+            "album.png",
+            "artwork.jpg",
+            "artwork.png",
         ];
 
         for name in &candidates {
@@ -478,10 +475,7 @@ mod tests {
         );
         assert_eq!(meta.format_display_label(false), "song.flac");
 
-        assert_eq!(
-            meta.format_queue_label(true),
-            "Test Artist - Test Song (02:05)"
-        );
+        assert_eq!(meta.format_queue_label(true), "Test Artist - Test Song (02:05)");
         assert_eq!(meta.format_queue_label(false), "song.flac (02:05)");
     }
 

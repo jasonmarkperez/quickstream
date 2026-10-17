@@ -36,7 +36,11 @@ fn test_open_fuzzy_search_loads_cache_off_ui_thread() {
 
     std::env::set_var("XDG_CACHE_HOME", &cache_home);
     let index = cache_home.join("quickstream").join("music_index.jsonl");
-    assert!(std::process::Command::new("mkfifo").arg(&index).status().unwrap().success());
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&index)
+        .status()
+        .unwrap()
+        .success());
     std::thread::spawn(move || {
         std::thread::sleep(SLOW_CACHE_DELAY);
         if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&index) {
@@ -47,7 +51,11 @@ fn test_open_fuzzy_search_loads_cache_off_ui_thread() {
     let start = Instant::now();
     app.open_fuzzy_search();
     let elapsed = start.elapsed();
-    assert!(elapsed < Duration::from_millis(300), "UI thread blocked for {:?}", elapsed);
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "UI thread blocked for {:?}",
+        elapsed
+    );
 
     let deadline = Instant::now() + Duration::from_secs(4);
     loop {

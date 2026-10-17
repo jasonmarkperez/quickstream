@@ -593,7 +593,11 @@ impl Rejection {
         format!(
             "HTTP/1.1 {}\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n",
             self.status_line(),
-            if self == Rejection::Busy { "Retry-After: 1\r\n" } else { "" }
+            if self == Rejection::Busy {
+                "Retry-After: 1\r\n"
+            } else {
+                ""
+            }
         )
     }
 }
@@ -669,11 +673,7 @@ fn arm_read_deadline(stream: &TcpStream, deadline: Instant) -> Result<(), LineEr
 }
 
 /// Read one line (including its `\n`) of at most `max` bytes, finishing before `deadline`.
-fn read_line_bounded(
-    reader: &mut BufReader<TcpStream>,
-    deadline: Instant,
-    max: usize,
-) -> Result<Vec<u8>, LineError> {
+fn read_line_bounded(reader: &mut BufReader<TcpStream>, deadline: Instant, max: usize) -> Result<Vec<u8>, LineError> {
     let mut line = Vec::new();
     loop {
         arm_read_deadline(reader.get_ref(), deadline)?;
@@ -768,11 +768,7 @@ fn read_request_head(
 }
 
 /// Read a request body of `len` bytes (already checked against the body limit) before `deadline`.
-fn read_request_body(
-    reader: &mut BufReader<TcpStream>,
-    len: usize,
-    deadline: Instant,
-) -> Option<Vec<u8>> {
+fn read_request_body(reader: &mut BufReader<TcpStream>, len: usize, deadline: Instant) -> Option<Vec<u8>> {
     let mut body = vec![0u8; len];
     let mut filled = 0;
     while filled < len {
@@ -955,7 +951,12 @@ fn handle_client(
         match permit.into_stream() {
             Ok(stream_permit) => stream_permit,
             Err(_request_permit) => {
-                crate::log_warn!("web", "Stream limit ({}) reached; refusing {}", limits.max_streams, path);
+                crate::log_warn!(
+                    "web",
+                    "Stream limit ({}) reached; refusing {}",
+                    limits.max_streams,
+                    path
+                );
                 reject_request(&mut stream, &mut reader, Rejection::Busy);
                 return Ok(());
             }
@@ -991,8 +992,11 @@ fn handle_client(
             };
             // Only reveal where the terminal is browsing when the dashboard may go there too.
             if !current.current_browser_dir.is_empty()
-                && crate::web_access::resolve_allowed_path(Path::new(&current.current_browser_dir), &current.allowed_roots)
-                    .is_none()
+                && crate::web_access::resolve_allowed_path(
+                    Path::new(&current.current_browser_dir),
+                    &current.allowed_roots,
+                )
+                .is_none()
             {
                 current.current_browser_dir.clear();
             }
@@ -1009,7 +1013,11 @@ fn handle_client(
                     current.filepath = fp.file_name().map(PathBuf::from);
                 }
             }
-            if current.autopilot_dir.as_deref().is_some_and(|d| !visible.contains(Path::new(d))) {
+            if current
+                .autopilot_dir
+                .as_deref()
+                .is_some_and(|d| !visible.contains(Path::new(d)))
+            {
                 current.autopilot_dir = None;
             }
             let json = serde_json::to_string(&current).unwrap_or_else(|_| "{}".to_string());
@@ -1079,7 +1087,11 @@ fn handle_client(
 
             let (current_home_dir, current_terminal_dir, roots) = {
                 let s = state.read().unwrap();
-                (s.home_dir.clone(), s.current_browser_dir.clone(), s.allowed_roots.clone())
+                (
+                    s.home_dir.clone(),
+                    s.current_browser_dir.clone(),
+                    s.allowed_roots.clone(),
+                )
             };
             // Only folders inside the allowed roots (startup home, bookmarks, launch folder).
             let allowed_dir = |p: &Path| crate::web_access::resolve_allowed_path(p, &roots).filter(|d| d.is_dir());
@@ -1180,12 +1192,20 @@ fn handle_client(
                     serve_continuous_stream(stream, is_head, state, cmd_tx, stream_state, &nonce)?;
                 }
                 ContinuousAdmission::NotFound => {
-                    stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found")?;
+                    stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found",
+                    )?;
                     stream.flush()?;
                 }
                 ContinuousAdmission::Conflict => {
-                    crate::log_warn!("web", "Refusing continuous stream request from {}: the session belongs to another host", peer);
-                    stream.write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 8\r\nConnection: close\r\n\r\nConflict")?;
+                    crate::log_warn!(
+                        "web",
+                        "Refusing continuous stream request from {}: the session belongs to another host",
+                        peer
+                    );
+                    stream.write_all(
+                        b"HTTP/1.1 409 Conflict\r\nContent-Length: 8\r\nConnection: close\r\n\r\nConflict",
+                    )?;
                     stream.flush()?;
                 }
             }
@@ -1441,7 +1461,8 @@ fn find_wav_pcm_offset(file: &mut std::fs::File, offset_seconds: f64) -> (u64, O
         }
     }
 
-    if let (Some((audio_fmt, channels, srate, brate, align, bps)), true) = (fmt_info, data_offset > 0 && data_size > 0) {
+    if let (Some((audio_fmt, channels, srate, brate, align, bps)), true) = (fmt_info, data_offset > 0 && data_size > 0)
+    {
         let pcm_offset = (offset_seconds * brate as f64) as u64;
         let aligned_pcm = if align > 0 {
             (pcm_offset / align as u64) * align as u64
@@ -1710,7 +1731,11 @@ fn serve_audio_stream(
         }
     };
 
-    let content_length = if is_range { req_end - req_start + 1 } else { effective_total };
+    let content_length = if is_range {
+        req_end - req_start + 1
+    } else {
+        effective_total
+    };
 
     // 4. Write DLNA HTTP headers
     let status_line = if is_range {
@@ -1719,10 +1744,7 @@ fn serve_audio_stream(
         "HTTP/1.1 200 OK"
     };
 
-    let display_name = filepath
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("track");
+    let display_name = filepath.file_name().and_then(|f| f.to_str()).unwrap_or("track");
 
     crate::log_info!(
         "web",
@@ -1883,11 +1905,11 @@ pub fn make_continuous_wav_header() -> [u8; 44] {
     hdr[8..12].copy_from_slice(b"WAVE");
     hdr[12..16].copy_from_slice(b"fmt ");
     hdr[16..20].copy_from_slice(&16u32.to_le_bytes()); // Subchunk1 size: 16
-    hdr[20..22].copy_from_slice(&1u16.to_le_bytes());  // Audio format: PCM (1)
-    hdr[22..24].copy_from_slice(&2u16.to_le_bytes());  // Channels: 2 (Stereo)
+    hdr[20..22].copy_from_slice(&1u16.to_le_bytes()); // Audio format: PCM (1)
+    hdr[22..24].copy_from_slice(&2u16.to_le_bytes()); // Channels: 2 (Stereo)
     hdr[24..28].copy_from_slice(&44100u32.to_le_bytes()); // Sample rate: 44,100 Hz
     hdr[28..32].copy_from_slice(&(44100u32 * 2 * 2).to_le_bytes()); // Byte rate: 176,400 B/s
-    hdr[32..34].copy_from_slice(&4u16.to_le_bytes());  // Block align: 4
+    hdr[32..34].copy_from_slice(&4u16.to_le_bytes()); // Block align: 4
     hdr[34..36].copy_from_slice(&16u16.to_le_bytes()); // Bits per sample: 16
     hdr[36..40].copy_from_slice(b"data");
     hdr[40..44].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // Data size: infinite
@@ -1916,7 +1938,11 @@ pub fn serve_continuous_stream(
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
     let _ = stream.set_nodelay(true);
 
-    crate::log_info!("web", "Continuous gapless stream client connected (conn_id: {:?})", conn_id);
+    crate::log_info!(
+        "web",
+        "Continuous gapless stream client connected (conn_id: {:?})",
+        conn_id
+    );
 
     let headers = concat!(
         "HTTP/1.1 200 OK\r\n",
@@ -1951,7 +1977,11 @@ pub fn serve_continuous_stream(
             if self.conn_id == 0 || self.controller.active_conn_id.load(Ordering::SeqCst) == self.conn_id {
                 self.controller.is_active.store(false, Ordering::SeqCst);
                 self.controller.kill_active_decoder();
-                crate::log_info!("web", "Continuous gapless stream finished or disconnected (conn_id: {})", self.conn_id);
+                crate::log_info!(
+                    "web",
+                    "Continuous gapless stream finished or disconnected (conn_id: {})",
+                    self.conn_id
+                );
             } else {
                 crate::log_info!(
                     "web",
@@ -1969,7 +1999,11 @@ pub fn serve_continuous_stream(
 
     while controller.is_active.load(Ordering::SeqCst) {
         if !controller.is_session(session) {
-            crate::log_info!("web", "Continuous stream connection {} outlived its session, closing", cid);
+            crate::log_info!(
+                "web",
+                "Continuous stream connection {} outlived its session, closing",
+                cid
+            );
             return Ok(());
         }
         if cid != 0 && controller.active_conn_id.load(Ordering::SeqCst) != cid {
@@ -1999,7 +2033,12 @@ pub fn serve_continuous_stream(
             let idx = *controller.current_track_index.lock().unwrap();
             let safe_idx = if idx < s.queue.len() { idx } else { 0 };
             let track = &s.queue[safe_idx];
-            (PathBuf::from(&track.filepath), track.duration_seconds, safe_idx, s.queue.len())
+            (
+                PathBuf::from(&track.filepath),
+                track.duration_seconds,
+                safe_idx,
+                s.queue.len(),
+            )
         };
 
         *controller.current_track_index.lock().unwrap() = track_index;
@@ -2050,11 +2089,16 @@ pub fn serve_continuous_stream(
         if start_pos > 0.0 {
             cmd.arg("-ss").arg(format!("{:.3}", start_pos));
         }
-        cmd.arg("-v").arg("quiet")
-            .arg("-i").arg(&track_path)
-            .arg("-f").arg("s16le")
-            .arg("-ac").arg("2")
-            .arg("-ar").arg("44100")
+        cmd.arg("-v")
+            .arg("quiet")
+            .arg("-i")
+            .arg(&track_path)
+            .arg("-f")
+            .arg("s16le")
+            .arg("-ac")
+            .arg("2")
+            .arg("-ar")
+            .arg("44100")
             .arg("-")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
@@ -2138,8 +2182,8 @@ pub fn serve_continuous_stream(
 
         if track_finished_normally {
             // Reshuffle once per wrap, and only from the current connection of the armed session.
-            let owns_session = controller.is_session(session)
-                && (cid == 0 || controller.active_conn_id.load(Ordering::SeqCst) == cid);
+            let owns_session =
+                controller.is_session(session) && (cid == 0 || controller.active_conn_id.load(Ordering::SeqCst) == cid);
             if track_index + 1 >= queue_len && queue_len > 1 && owns_session {
                 let _ = cmd_tx.send(WebCommand::ShuffleQueue);
             }

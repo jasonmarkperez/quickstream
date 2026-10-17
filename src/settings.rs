@@ -69,7 +69,10 @@ impl Default for Settings {
 impl Settings {
     pub fn mix_profile(&self) -> crate::analysis::MixProfile {
         match self.default_mix_profile.as_str() {
-            "bpm_flow" => crate::analysis::MixProfile::BpmFlow { target_bpm: 120.0, tolerance: 0.15 },
+            "bpm_flow" => crate::analysis::MixProfile::BpmFlow {
+                target_bpm: 120.0,
+                tolerance: 0.15,
+            },
             "chill" => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Chill),
             "workout" => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Workout),
             "groove" => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Groove),
@@ -171,7 +174,11 @@ impl SettingsManager {
     /// so saving the defaults later doesn't destroy the user's settings.
     pub fn with_path(path: PathBuf) -> Self {
         let settings = crate::persist::load_json_or_backup(&path, "settings").unwrap_or_default();
-        Self { path, settings, persist: None }
+        Self {
+            path,
+            settings,
+            persist: None,
+        }
     }
 
     /// Route future `save()` calls through a persistence worker (off the calling thread).
@@ -249,10 +256,7 @@ impl SettingsManager {
             4 => {
                 // queue_mode: "loop", "stop", "repeat_one"
                 let options = ["loop", "stop", "repeat_one"];
-                let current_idx = options
-                    .iter()
-                    .position(|&v| v == self.settings.queue_mode)
-                    .unwrap_or(0);
+                let current_idx = options.iter().position(|&v| v == self.settings.queue_mode).unwrap_or(0);
                 let next_idx = if forward {
                     (current_idx + 1) % options.len()
                 } else {
@@ -304,10 +308,7 @@ impl SettingsManager {
                     }
                 }
 
-                let current_idx = options
-                    .iter()
-                    .position(|o| o == &self.settings.home_dir)
-                    .unwrap_or(0);
+                let current_idx = options.iter().position(|o| o == &self.settings.home_dir).unwrap_or(0);
                 let next_idx = if forward {
                     (current_idx + 1) % options.len()
                 } else {
@@ -322,7 +323,10 @@ impl SettingsManager {
             9 => {
                 // default_mix_profile
                 let profiles = ["diverse", "bpm_flow", "chill", "workout", "groove"];
-                let cur_idx = profiles.iter().position(|&p| p == self.settings.default_mix_profile).unwrap_or(0);
+                let cur_idx = profiles
+                    .iter()
+                    .position(|&p| p == self.settings.default_mix_profile)
+                    .unwrap_or(0);
                 let next_idx = if forward {
                     (cur_idx + 1) % profiles.len()
                 } else {
@@ -345,8 +349,18 @@ impl SettingsManager {
 
     pub fn get_display_value(&self, index: usize) -> String {
         match index {
-            0 => if self.settings.metadata_view { "Metadata (Tags)" } else { "Filename" }.to_string(),
-            1 => if self.settings.player_backend == "mpv" { "MPV (IPC socket)" } else { "FFplay (subprocess)" }.to_string(),
+            0 => if self.settings.metadata_view {
+                "Metadata (Tags)"
+            } else {
+                "Filename"
+            }
+            .to_string(),
+            1 => if self.settings.player_backend == "mpv" {
+                "MPV (IPC socket)"
+            } else {
+                "FFplay (subprocess)"
+            }
+            .to_string(),
             2 => format!("{} seconds", self.settings.seek_step_seconds),
             3 => format!("{}%", self.settings.volume_step),
             4 => match self.settings.queue_mode.as_str() {
@@ -354,28 +368,36 @@ impl SettingsManager {
                 "stop" => "Stop at End",
                 "repeat_one" => "Repeat Current Track",
                 other => other,
-            }.to_string(),
-            5 => if self.settings.force_transcode { "Force 16-bit PCM WAV" } else { "Direct Stream (Auto)" }.to_string(),
-            6 => if self.settings.web_server_enabled {
-                let ip = if self.settings.web_server_lan {
-                    crate::discovery::get_local_ip_for_target("8.8.8.8", 80)
-                } else {
-                    "127.0.0.1".to_string()
-                };
-                if self.settings.web_server_lan {
-                    // Other devices need the pairing link; it carries the session token.
-                    let link = crate::web_access::pairing_url(
-                        &ip,
-                        self.settings.web_server_port,
-                        crate::web_access::web_token(),
-                    );
-                    format!("Enabled ({})", link)
-                } else {
-                    format!("Enabled (http://{}:{})", ip, self.settings.web_server_port)
-                }
+            }
+            .to_string(),
+            5 => if self.settings.force_transcode {
+                "Force 16-bit PCM WAV"
             } else {
-                "Disabled".to_string()
-            },
+                "Direct Stream (Auto)"
+            }
+            .to_string(),
+            6 => {
+                if self.settings.web_server_enabled {
+                    let ip = if self.settings.web_server_lan {
+                        crate::discovery::get_local_ip_for_target("8.8.8.8", 80)
+                    } else {
+                        "127.0.0.1".to_string()
+                    };
+                    if self.settings.web_server_lan {
+                        // Other devices need the pairing link; it carries the session token.
+                        let link = crate::web_access::pairing_url(
+                            &ip,
+                            self.settings.web_server_port,
+                            crate::web_access::web_token(),
+                        );
+                        format!("Enabled ({})", link)
+                    } else {
+                        format!("Enabled (http://{}:{})", ip, self.settings.web_server_port)
+                    }
+                } else {
+                    "Disabled".to_string()
+                }
+            }
             7 => {
                 if let Some(ref h) = self.settings.home_dir {
                     if let Some(base) = directories::BaseDirs::new() {
@@ -392,7 +414,12 @@ impl SettingsManager {
                     "Default (Launch Directory)".to_string()
                 }
             }
-            8 => if self.settings.gapless_autopilot { "Enabled (Seamless PCM)" } else { "Disabled (Track-by-track)" }.to_string(),
+            8 => if self.settings.gapless_autopilot {
+                "Enabled (Seamless PCM)"
+            } else {
+                "Disabled (Track-by-track)"
+            }
+            .to_string(),
             9 => match self.settings.default_mix_profile.as_str() {
                 "diverse" => "Diverse Library Shuffle",
                 "bpm_flow" => "DJ BPM Flow (124 BPM)",
@@ -400,9 +427,20 @@ impl SettingsManager {
                 "workout" => "Workout & High Energy",
                 "groove" => "Late Night Groove",
                 other => other,
-            }.to_string(),
-            10 => if self.settings.online_enrichment { "Enabled (Last.fm Cache)" } else { "Disabled (Local Analysis Only)" }.to_string(),
-            11 => if self.settings.web_server_lan { "Any device on your network" } else { "This computer only" }.to_string(),
+            }
+            .to_string(),
+            10 => if self.settings.online_enrichment {
+                "Enabled (Last.fm Cache)"
+            } else {
+                "Disabled (Local Analysis Only)"
+            }
+            .to_string(),
+            11 => if self.settings.web_server_lan {
+                "Any device on your network"
+            } else {
+                "This computer only"
+            }
+            .to_string(),
             _ => String::new(),
         }
     }
@@ -454,12 +492,18 @@ mod tests {
             r#"{"metadata_view":true,"default_device":"local-audio","seek_step_seconds":10.0,"volume_step":5,"queue_mode":"loop","force_transcode":false,"player_backend":"mpv"}"#,
         )
         .unwrap();
-        assert!(!legacy.web_server_lan, "configs saved before this setting existed stay loopback-only");
+        assert!(
+            !legacy.web_server_lan,
+            "configs saved before this setting existed stay loopback-only"
+        );
 
         let temp_dir = env::temp_dir().join(format!("quickstream_test_lan_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         let mut mgr = SettingsManager::with_path(temp_dir.join("test_config.json"));
-        let idx = SETTING_DEFINITIONS.iter().position(|d| d.key == "web_server_lan").expect("setting row");
+        let idx = SETTING_DEFINITIONS
+            .iter()
+            .position(|d| d.key == "web_server_lan")
+            .expect("setting row");
         mgr.cycle_setting(idx, true);
         assert!(mgr.settings.web_server_lan);
         assert!(mgr.get_display_value(idx).contains("network"));

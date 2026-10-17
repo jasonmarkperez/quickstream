@@ -12,8 +12,11 @@ use std::sync::OnceLock;
 
 /// The XDG variables `quickstream::paths` reads, and the subdirectory of the isolated root each
 /// one points at.
-pub const XDG_DIRS: [(&str, &str); 3] =
-    [("XDG_CONFIG_HOME", "config"), ("XDG_CACHE_HOME", "cache"), ("XDG_DATA_HOME", "data")];
+pub const XDG_DIRS: [(&str, &str); 3] = [
+    ("XDG_CONFIG_HOME", "config"),
+    ("XDG_CACHE_HOME", "cache"),
+    ("XDG_DATA_HOME", "data"),
+];
 
 /// Point `XDG_CONFIG_HOME`, `XDG_CACHE_HOME` and `XDG_DATA_HOME` at a fresh temp root for this
 /// test process and return that root.
@@ -47,7 +50,12 @@ pub fn isolate() -> &'static Path {
         std::fs::write(config.join("config.json"), defaults).unwrap();
         std::fs::write(config.join("bookmarks.json"), "[]").unwrap();
         for dir in app_dirs() {
-            assert!(dir.starts_with(&root), "{} is outside the isolated root {}", dir.display(), root.display());
+            assert!(
+                dir.starts_with(&root),
+                "{} is outside the isolated root {}",
+                dir.display(),
+                root.display()
+            );
         }
         root
     });

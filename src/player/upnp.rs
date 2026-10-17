@@ -183,12 +183,12 @@ impl SoapError {
     pub fn is_transient(&self) -> bool {
         match self {
             SoapError::Transport(e) => e.is_transient(),
-            SoapError::Fault { upnp_code: Some(code), .. } => matches!(code, 501 | 701 | 705),
-            SoapError::Fault { .. } => self.description_matches(&[
-                "transition not available",
-                "action failed",
-                "transport locked",
-            ]),
+            SoapError::Fault {
+                upnp_code: Some(code), ..
+            } => matches!(code, 501 | 701 | 705),
+            SoapError::Fault { .. } => {
+                self.description_matches(&["transition not available", "action failed", "transport locked"])
+            }
             SoapError::InvalidUrl(_) => false,
         }
     }
@@ -265,7 +265,8 @@ impl UPnPClient {
         arguments: &[(&str, &str)],
         timeout: Duration,
     ) -> Option<String> {
-        self.call_action(control_url, service_type, action, arguments, timeout).ok()
+        self.call_action(control_url, service_type, action, arguments, timeout)
+            .ok()
     }
 
     /// Send a UPnP SOAP POST action. `timeout` bounds the whole request (connect,
@@ -334,7 +335,12 @@ impl UPnPClient {
             Content-Length: {}\r\n\
             Connection: close\r\n\r\n\
             {}",
-            url.path, url.host_port, service_type, action, body.len(), body
+            url.path,
+            url.host_port,
+            service_type,
+            action,
+            body.len(),
+            body
         );
 
         let response = http_exchange(
@@ -364,16 +370,14 @@ impl UPnPClient {
         duration_sec: f64,
         mime_type: &str,
     ) -> bool {
-        let didl = create_didl_lite_xml(
-            stream_url,
-            title,
-            artist,
-            album,
-            duration_sec,
-            mime_type,
-        );
+        let didl = create_didl_lite_xml(stream_url, title, artist, album, duration_sec, mime_type);
 
-        crate::log_info!("upnp", "Calling SetAVTransportURI on {} with stream URL: {}", self.device.friendly_name, stream_url);
+        crate::log_info!(
+            "upnp",
+            "Calling SetAVTransportURI on {} with stream URL: {}",
+            self.device.friendly_name,
+            stream_url
+        );
 
         for attempt in 0..3 {
             let res = self.call_action(
@@ -390,7 +394,11 @@ impl UPnPClient {
 
             match res {
                 Ok(_) => {
-                    crate::log_info!("upnp", "SetAVTransportURI with DIDL succeeded on {}", self.device.friendly_name);
+                    crate::log_info!(
+                        "upnp",
+                        "SetAVTransportURI with DIDL succeeded on {}",
+                        self.device.friendly_name
+                    );
                     return true;
                 }
                 Err(e) if e.is_transition_unavailable() && attempt < 2 => {
@@ -422,7 +430,11 @@ impl UPnPClient {
         );
 
         if res_fallback.is_some() {
-            crate::log_info!("upnp", "SetAVTransportURI with empty metadata succeeded on {}", self.device.friendly_name);
+            crate::log_info!(
+                "upnp",
+                "SetAVTransportURI with empty metadata succeeded on {}",
+                self.device.friendly_name
+            );
             true
         } else {
             crate::log_info!(
@@ -501,11 +513,7 @@ impl UPnPClient {
             &self.device.av_transport_control_url,
             AV_TRANSPORT_SERVICE,
             "Seek",
-            &[
-                ("InstanceID", "0"),
-                ("Unit", "REL_TIME"),
-                ("Target", &target_str),
-            ],
+            &[("InstanceID", "0"), ("Unit", "REL_TIME"), ("Target", &target_str)],
         );
         res.is_some()
     }
@@ -555,11 +563,7 @@ impl UPnPClient {
             &self.device.rendering_control_url,
             RENDERING_CONTROL_SERVICE,
             "SetVolume",
-            &[
-                ("InstanceID", "0"),
-                ("Channel", "Master"),
-                ("DesiredVolume", &vol_str),
-            ],
+            &[("InstanceID", "0"), ("Channel", "Master"), ("DesiredVolume", &vol_str)],
         );
         res.is_some()
     }
@@ -629,8 +633,14 @@ impl Drop for CommandGuard {
 /// What one poll tick learned from the renderer.
 enum PollObservation {
     /// Continuous (gapless) stream: only the transport state is tracked.
-    Continuous { state: String },
-    Track { rel_sec: f64, dur_sec: f64, state: String },
+    Continuous {
+        state: String,
+    },
+    Track {
+        rel_sec: f64,
+        dur_sec: f64,
+        state: String,
+    },
 }
 
 /// An `AudioPlayer` implementation streaming audio over DLNA/UPnP to remote renderers.
@@ -747,7 +757,11 @@ impl UPnPPlayer {
                 } else {
                     let (rel_sec, dur_sec) = client.get_position_info();
                     let state = client.get_transport_info();
-                    PollObservation::Track { rel_sec, dur_sec, state }
+                    PollObservation::Track {
+                        rel_sec,
+                        dur_sec,
+                        state,
+                    }
                 };
 
                 // The SOAP calls above can take seconds. Apply their result only if this
@@ -774,7 +788,11 @@ impl UPnPPlayer {
                         }
                         continue;
                     }
-                    PollObservation::Track { rel_sec, dur_sec, state } => (rel_sec, dur_sec, state),
+                    PollObservation::Track {
+                        rel_sec,
+                        dur_sec,
+                        state,
+                    } => (rel_sec, dur_sec, state),
                 };
 
                 // If user sought, sync last_seek_instant and reset max_observed_pos / total_playing_seconds
@@ -807,11 +825,7 @@ impl UPnPPlayer {
                                 rel_sec
                             };
                             let dur = *dur_ref.lock().unwrap();
-                            let clamped_pos = if dur > 0.0 {
-                                actual_pos.min(dur)
-                            } else {
-                                actual_pos
-                            };
+                            let clamped_pos = if dur > 0.0 { actual_pos.min(dur) } else { actual_pos };
 
                             // Guard against transient zero-readings near end of playback
                             if clamped_pos > 0.0 || max_observed_pos < 5.0 {
@@ -833,11 +847,7 @@ impl UPnPPlayer {
                                 rel_sec
                             };
                             let dur = *dur_ref.lock().unwrap();
-                            let clamped_pos = if dur > 0.0 {
-                                actual_pos.min(dur)
-                            } else {
-                                actual_pos
-                            };
+                            let clamped_pos = if dur > 0.0 { actual_pos.min(dur) } else { actual_pos };
                             *pos_ref.lock().unwrap() = clamped_pos;
                             max_observed_pos = max_observed_pos.max(clamped_pos);
                         }
@@ -878,8 +888,7 @@ impl UPnPPlayer {
                                 || current_pos >= threshold
                                 || total_playing_seconds >= threshold
                         } else {
-                            (max_observed_pos >= 15.0 || total_playing_seconds >= 15.0)
-                                && consecutive_stopped >= 3
+                            (max_observed_pos >= 15.0 || total_playing_seconds >= 15.0) && consecutive_stopped >= 3
                         };
 
                         if consecutive_stopped >= 1 && near_end {
@@ -948,7 +957,11 @@ impl UPnPPlayer {
             "http://{}:{}/stream/{}?pos={:.2}",
             host_ip, self.web_port, encoded_name, target
         );
-        crate::log_info!("player", "Reloading UPnP transport URI with seek offset: {}", stream_url);
+        crate::log_info!(
+            "player",
+            "Reloading UPnP transport URI with seek offset: {}",
+            stream_url
+        );
 
         let mime = get_audio_mime_type(&filepath);
         let (title, artist, album, duration) = if let Ok(m) = extract_metadata(&filepath) {
@@ -958,7 +971,10 @@ impl UPnPPlayer {
         };
 
         // Set transport URI with offset URL
-        if !self.client.set_transport_uri(&stream_url, &title, &artist, &album, duration, mime) {
+        if !self
+            .client
+            .set_transport_uri(&stream_url, &title, &artist, &album, duration, mime)
+        {
             let err = self.client.last_error.lock().unwrap().clone();
             crate::log_warn!("player", "SetAVTransportURI with seek offset failed: {}", err);
             anyhow::bail!("SetAVTransportURI offset failed: {}", err);
@@ -977,7 +993,11 @@ impl UPnPPlayer {
         self.is_playing.store(true, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);
 
-        crate::log_info!("player", "UPnP stream offset seek to {:.2}s successfully started", target);
+        crate::log_info!(
+            "player",
+            "UPnP stream offset seek to {:.2}s successfully started",
+            target
+        );
         Ok(())
     }
 }
@@ -1052,9 +1072,18 @@ impl AudioPlayer for UPnPPlayer {
         crate::log_info!("player", "UPnP stream URL for '{}': {}", filepath.display(), stream_url);
 
         // 3. Extract audio metadata & MIME type
-        let mime = if is_continuous { "audio/x-wav" } else { get_audio_mime_type(filepath) };
+        let mime = if is_continuous {
+            "audio/x-wav"
+        } else {
+            get_audio_mime_type(filepath)
+        };
         let (title, artist, album, duration) = if is_continuous {
-            ("Autopilot (Gapless Stream)".to_string(), "Quickstream".to_string(), "Autopilot".to_string(), 0.0)
+            (
+                "Autopilot (Gapless Stream)".to_string(),
+                "Quickstream".to_string(),
+                "Autopilot".to_string(),
+                0.0,
+            )
         } else if let Ok(m) = extract_metadata(filepath) {
             (m.title, m.artist, m.album, m.duration_seconds)
         } else {
@@ -1069,9 +1098,17 @@ impl AudioPlayer for UPnPPlayer {
         self.track_finished.store(false, Ordering::SeqCst);
 
         // 4. Set URI on stereo
-        if !self.client.set_transport_uri(&stream_url, &title, &artist, &album, duration, mime) {
+        if !self
+            .client
+            .set_transport_uri(&stream_url, &title, &artist, &album, duration, mime)
+        {
             let err = self.client.last_error.lock().unwrap().clone();
-            crate::log_info!("player", "SetAVTransportURI failed on {}: {}", self.device.friendly_name, err);
+            crate::log_info!(
+                "player",
+                "SetAVTransportURI failed on {}: {}",
+                self.device.friendly_name,
+                err
+            );
             anyhow::bail!("SetAVTransportURI failed on {}: {}", self.device.friendly_name, err);
         }
 
@@ -1083,11 +1120,20 @@ impl AudioPlayer for UPnPPlayer {
         // 5. Send Play command (UPnPClient::play automatically retries on 501 Action Failed / 701 Transition not available / timeout)
         if !self.client.play("1") {
             let err = self.client.last_error.lock().unwrap().clone();
-            crate::log_info!("player", "Play command failed on {}: {}", self.device.friendly_name, err);
+            crate::log_info!(
+                "player",
+                "Play command failed on {}: {}",
+                self.device.friendly_name,
+                err
+            );
             anyhow::bail!("Play command failed on {}: {}", self.device.friendly_name, err);
         }
 
-        crate::log_info!("player", "UPnP playback successfully started on {}", self.device.friendly_name);
+        crate::log_info!(
+            "player",
+            "UPnP playback successfully started on {}",
+            self.device.friendly_name
+        );
 
         self.is_playing.store(true, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);
@@ -1113,7 +1159,11 @@ impl AudioPlayer for UPnPPlayer {
         self.is_playing.store(false, Ordering::SeqCst);
         self.is_paused.store(true, Ordering::SeqCst);
         if paused {
-            crate::log_info!("player", "UPnPPlayer paused at {:.2}s", *self.position_seconds.lock().unwrap());
+            crate::log_info!(
+                "player",
+                "UPnPPlayer paused at {:.2}s",
+                *self.position_seconds.lock().unwrap()
+            );
             Ok(())
         } else {
             let err = self.client.last_error.lock().unwrap().clone();

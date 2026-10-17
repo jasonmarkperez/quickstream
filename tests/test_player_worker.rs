@@ -191,7 +191,11 @@ fn test_async_player_applies_commands_in_order() {
     assert!(wait_until(Duration::from_secs(2), || probe.calls.lock().unwrap().len() == 3));
     assert_eq!(
         *probe.calls.lock().unwrap(),
-        vec!["play_at 42".to_string(), "pause".to_string(), "set_volume 30".to_string()]
+        vec![
+            "play_at 42".to_string(),
+            "pause".to_string(),
+            "set_volume 30".to_string()
+        ]
     );
     assert!(wait_until(Duration::from_secs(1), || player.is_paused()));
     assert!((player.position_seconds() - 42.0).abs() < 0.01);
@@ -258,7 +262,9 @@ fn test_async_player_track_finished_round_trip() {
 
     player.reset_finished();
     assert!(!player.is_track_finished());
-    assert!(wait_until(Duration::from_secs(2), || !probe.finished.load(Ordering::SeqCst)));
+    assert!(wait_until(Duration::from_secs(2), || !probe
+        .finished
+        .load(Ordering::SeqCst)));
     std::thread::sleep(Duration::from_millis(300));
     assert!(!player.is_track_finished());
 }
@@ -321,7 +327,11 @@ fn test_switching_to_unresponsive_renderer_does_not_block_ui() {
     app.player.play(Path::new("/music/a.flac")).unwrap();
     app.player.stop().unwrap();
     let elapsed = start.elapsed();
-    assert!(elapsed < Duration::from_millis(500), "UI thread blocked for {:?}", elapsed);
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "UI thread blocked for {:?}",
+        elapsed
+    );
 }
 
 #[test]
@@ -343,7 +353,10 @@ fn test_async_player_reports_backend_volume_while_commands_are_pending() {
     player.play_at(Path::new("/music/a.flac"), 10.0).unwrap();
 
     assert!(wait_until(Duration::from_millis(400), || player.volume() == 20));
-    assert!(player.is_playing(), "optimistic play state is kept while play_at is pending");
+    assert!(
+        player.is_playing(),
+        "optimistic play state is kept while play_at is pending"
+    );
 }
 
 #[test]
@@ -434,5 +447,8 @@ fn test_reselecting_active_renderer_keeps_current_player() {
     let first = &*app.player as *const dyn quickstream::player::AudioPlayer as *const u8;
     app.switch_to_upnp_player(hung_device(port, "uuid:hung-same"));
     let second = &*app.player as *const dyn quickstream::player::AudioPlayer as *const u8;
-    assert_eq!(first, second, "re-selecting the active renderer must not restart playback on it");
+    assert_eq!(
+        first, second,
+        "re-selecting the active renderer must not restart playback on it"
+    );
 }

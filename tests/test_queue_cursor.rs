@@ -86,5 +86,10 @@ fn test_reshuffle_truncation_clamps_cursor() {
     app.queue_cursor = 4;
     app.reshuffle_autopilot(dir.clone());
     assert_eq!(app.queue.len(), 2);
-    assert!(app.queue_cursor < app.queue.len(), "cursor {} past queue of {}", app.queue_cursor, app.queue.len());
+    assert!(
+        app.queue_cursor < app.queue.len(),
+        "cursor {} past queue of {}",
+        app.queue_cursor,
+        app.queue.len()
+    );
 }

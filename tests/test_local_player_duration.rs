@@ -47,7 +47,16 @@ fn have(bin: &str) -> bool {
 fn silent_wav(dir: &Path, name: &str, secs: u32) -> PathBuf {
     let path = dir.join(name);
     let status = Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t"])
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=44100:cl=stereo",
+            "-t",
+        ])
         .arg(secs.to_string())
         .arg(&path)
         .status()
@@ -70,7 +79,11 @@ fn test_ffplay_duration_comes_from_metadata_and_bounds_seek() {
     let mut player = LocalPlayer::new("ffplay");
     player.play(&a).unwrap();
     let dur_a = player.duration_seconds();
-    assert!((dur_a - 4.0).abs() < 0.3, "ffplay duration should be ~4s, got {:.3}", dur_a);
+    assert!(
+        (dur_a - 4.0).abs() < 0.3,
+        "ffplay duration should be ~4s, got {:.3}",
+        dur_a
+    );
 
     player.pause().unwrap();
     player.seek_to(1000.0).unwrap();
@@ -79,7 +92,11 @@ fn test_ffplay_duration_comes_from_metadata_and_bounds_seek() {
 
     player.play(&b).unwrap();
     let dur_b = player.duration_seconds();
-    assert!((dur_b - 2.0).abs() < 0.3, "duration should follow the new track, got {:.3}", dur_b);
+    assert!(
+        (dur_b - 2.0).abs() < 0.3,
+        "duration should follow the new track, got {:.3}",
+        dur_b
+    );
 
     let _ = player.stop();
     drop(player);
@@ -103,7 +120,10 @@ fn test_mpv_play_resets_stale_duration() {
     while (player.duration_seconds() - 7.0).abs() > 0.3 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
-    assert!((player.duration_seconds() - 7.0).abs() <= 0.3, "mpv should report the first track's duration");
+    assert!(
+        (player.duration_seconds() - 7.0).abs() <= 0.3,
+        "mpv should report the first track's duration"
+    );
 
     player.play(&b).unwrap();
     let d = player.duration_seconds();

@@ -242,7 +242,11 @@ fn test_extract_xml_tag_is_linear_on_hostile_input() {
     let start = Instant::now();
     let res = finishes_within(Duration::from_secs(2), move || extract_xml_tag(&xml, "friendlyName"));
     assert_eq!(res, None);
-    assert!(start.elapsed() < Duration::from_millis(500), "took {:?}", start.elapsed());
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "took {:?}",
+        start.elapsed()
+    );
 
     // Unterminated closing tags after a matching opening tag.
     let mut xml = String::from("<u:CurrentVolume>");

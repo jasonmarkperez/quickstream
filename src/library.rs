@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use walkdir::WalkDir;
 
@@ -159,7 +159,9 @@ static CACHE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// True if `file` is non-empty and its last byte isn't a newline.
 fn ends_mid_line(file: &mut File) -> bool {
     use std::io::{Read, Seek, SeekFrom};
-    let Ok(len) = file.seek(SeekFrom::End(0)) else { return false };
+    let Ok(len) = file.seek(SeekFrom::End(0)) else {
+        return false;
+    };
     if len == 0 || file.seek(SeekFrom::Start(len - 1)).is_err() {
         return false;
     }
@@ -252,7 +254,11 @@ impl LibraryManager {
         match crate::persist::atomic_write(path, &out) {
             Ok(()) => true,
             Err(e) => {
-                crate::logger::log_raw("WARN", "library", &format!("failed to save cache '{}': {}", path.display(), e));
+                crate::logger::log_raw(
+                    "WARN",
+                    "library",
+                    &format!("failed to save cache '{}': {}", path.display(), e),
+                );
                 false
             }
         }
@@ -305,10 +311,7 @@ impl LibraryManager {
         crate::metadata::parse_path_heuristics(path)
     }
 
-    pub fn scan_directory_scoped_with_cache(
-        dir: &Path,
-        cache: &HashMap<PathBuf, AudioMetadata>,
-    ) -> Vec<AudioMetadata> {
+    pub fn scan_directory_scoped_with_cache(dir: &Path, cache: &HashMap<PathBuf, AudioMetadata>) -> Vec<AudioMetadata> {
         let mut tracks = Vec::new();
 
         // 1. Inspect immediate entries in dir: check if dir has subdirectories
@@ -711,15 +714,21 @@ impl LibraryManager {
                         }
                         let seed_feat = db.get_track(seed_path).unwrap_or_default();
                         let (_seed_title, seed_artist, _seed_album) = Self::parse_path_heuristics(seed_path);
-                        let seed_artist = if !seed_feat.artist.is_empty() { seed_feat.artist } else { seed_artist };
+                        let seed_artist = if !seed_feat.artist.is_empty() {
+                            seed_feat.artist
+                        } else {
+                            seed_artist
+                        };
                         let seed_genre = seed_feat.genre;
 
                         let feat = db.get_track(&meta.filepath);
                         let artist_match = !seed_artist.is_empty() && meta.artist.eq_ignore_ascii_case(&seed_artist);
-                        let genre_match = !seed_genre.is_empty() && (
-                            meta.genre.eq_ignore_ascii_case(&seed_genre)
-                            || feat.as_ref().map(|f| f.genre.eq_ignore_ascii_case(&seed_genre)).unwrap_or(false)
-                        );
+                        let genre_match = !seed_genre.is_empty()
+                            && (meta.genre.eq_ignore_ascii_case(&seed_genre)
+                                || feat
+                                    .as_ref()
+                                    .map(|f| f.genre.eq_ignore_ascii_case(&seed_genre))
+                                    .unwrap_or(false));
                         artist_match || genre_match
                     }
                     _ => true,
@@ -804,7 +813,10 @@ impl LibraryManager {
                                     .into_iter()
                                     .filter_entry(|e| {
                                         let name = e.file_name().to_string_lossy();
-                                        !name.starts_with('.') && name != "#recycle" && name != "$RECYCLE.BIN" && seen.first_visit(e.path())
+                                        !name.starts_with('.')
+                                            && name != "#recycle"
+                                            && name != "$RECYCLE.BIN"
+                                            && seen.first_visit(e.path())
                                     })
                                     .filter_map(|e| e.ok())
                                 {
@@ -896,7 +908,10 @@ impl LibraryManager {
                         .into_iter()
                         .filter_entry(|e| {
                             let name = e.file_name().to_string_lossy();
-                            !name.starts_with('.') && name != "#recycle" && name != "$RECYCLE.BIN" && seen.first_visit(e.path())
+                            !name.starts_with('.')
+                                && name != "#recycle"
+                                && name != "$RECYCLE.BIN"
+                                && seen.first_visit(e.path())
                         })
                         .filter_map(|e| e.ok())
                     {
@@ -974,8 +989,12 @@ impl LibraryManager {
 
             let candidate_count = filtered.len();
             let sequence_start = Instant::now();
-            let sequenced =
-                crate::analysis::mixer::DjMixer::sequence_mix_after(first_sent.as_ref(), filtered, &db, remaining_limit);
+            let sequenced = crate::analysis::mixer::DjMixer::sequence_mix_after(
+                first_sent.as_ref(),
+                filtered,
+                &db,
+                remaining_limit,
+            );
             log_autopilot(format!(
                 "sequenced {} tracks from candidates={} in {:.2?}",
                 sequenced.len(),
@@ -1051,7 +1070,10 @@ impl LibraryManager {
                     .into_iter()
                     .filter_entry(|e| {
                         let name = e.file_name().to_string_lossy();
-                        !name.starts_with('.') && name != "#recycle" && name != "$RECYCLE.BIN" && seen.first_visit(e.path())
+                        !name.starts_with('.')
+                            && name != "#recycle"
+                            && name != "$RECYCLE.BIN"
+                            && seen.first_visit(e.path())
                     })
                     .filter_map(|e| e.ok())
                 {
@@ -1092,7 +1114,10 @@ impl LibraryManager {
                     .into_iter()
                     .filter_entry(|e| {
                         let name = e.file_name().to_string_lossy();
-                        !name.starts_with('.') && name != "#recycle" && name != "$RECYCLE.BIN" && seen.first_visit(e.path())
+                        !name.starts_with('.')
+                            && name != "#recycle"
+                            && name != "$RECYCLE.BIN"
+                            && seen.first_visit(e.path())
                     })
                     .filter_map(|e| e.ok())
                 {

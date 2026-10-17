@@ -198,7 +198,11 @@ fn test_scoped_directory_scan() {
     fs::write(&txt, b"liner notes").unwrap();
 
     let scanned = LibraryManager::scan_directory_scoped(&temp_root);
-    assert_eq!(scanned.len(), 2, "Should find exactly 2 tracks, ignoring hidden and non-audio files");
+    assert_eq!(
+        scanned.len(),
+        2,
+        "Should find exactly 2 tracks, ignoring hidden and non-audio files"
+    );
 
     let filenames: Vec<String> = scanned.iter().map(|t| t.filename.clone()).collect();
     assert!(filenames.contains(&"track1.wav".to_string()));
@@ -233,33 +237,26 @@ fn test_background_streaming_scanner() {
     let (tx, rx) = std::sync::mpsc::channel();
     let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let mut modal = SearchModalState::new_with_scanner(
-        root.clone(),
-        Vec::new(),
-        Some(rx),
-        Some(stop_flag),
-    );
+    let mut modal = SearchModalState::new_with_scanner(root.clone(), Vec::new(), Some(rx), Some(stop_flag));
 
     assert!(modal.is_scanning);
     assert_eq!(modal.all_tracks.len(), 0);
 
     // Stream first batch
-    let batch1 = vec![
-        AudioMetadata {
-            filepath: root.join("track1.flac"),
-            filename: "track1.flac".to_string(),
-            title: "Track 1".to_string(),
-            artist: "Artist A".to_string(),
-            album: "Album A".to_string(),
-            genre: "Rock".to_string(),
-            format_name: "FLAC".to_string(),
-            duration_seconds: 180.0,
-            file_size: 1000,
-            bitrate_kbps: 900,
-            sample_rate_hz: 44100,
-            channels: 2,
-        },
-    ];
+    let batch1 = vec![AudioMetadata {
+        filepath: root.join("track1.flac"),
+        filename: "track1.flac".to_string(),
+        title: "Track 1".to_string(),
+        artist: "Artist A".to_string(),
+        album: "Album A".to_string(),
+        genre: "Rock".to_string(),
+        format_name: "FLAC".to_string(),
+        duration_seconds: 180.0,
+        file_size: 1000,
+        bitrate_kbps: 900,
+        sample_rate_hz: 44100,
+        channels: 2,
+    }];
     tx.send(batch1).unwrap();
 
     modal.poll_background_scan();
@@ -267,28 +264,29 @@ fn test_background_streaming_scanner() {
     assert!(modal.is_scanning);
 
     // Stream second batch and close sender
-    let batch2 = vec![
-        AudioMetadata {
-            filepath: root.join("track2.flac"),
-            filename: "track2.flac".to_string(),
-            title: "Track 2".to_string(),
-            artist: "Artist B".to_string(),
-            album: "Album B".to_string(),
-            genre: "Jazz".to_string(),
-            format_name: "FLAC".to_string(),
-            duration_seconds: 240.0,
-            file_size: 1500,
-            bitrate_kbps: 900,
-            sample_rate_hz: 44100,
-            channels: 2,
-        },
-    ];
+    let batch2 = vec![AudioMetadata {
+        filepath: root.join("track2.flac"),
+        filename: "track2.flac".to_string(),
+        title: "Track 2".to_string(),
+        artist: "Artist B".to_string(),
+        album: "Album B".to_string(),
+        genre: "Jazz".to_string(),
+        format_name: "FLAC".to_string(),
+        duration_seconds: 240.0,
+        file_size: 1500,
+        bitrate_kbps: 900,
+        sample_rate_hz: 44100,
+        channels: 2,
+    }];
     tx.send(batch2).unwrap();
     drop(tx);
 
     modal.poll_background_scan();
     assert_eq!(modal.all_tracks.len(), 2);
-    assert!(!modal.is_scanning, "Scanner should be marked complete when channel disconnects");
+    assert!(
+        !modal.is_scanning,
+        "Scanner should be marked complete when channel disconnects"
+    );
 }
 
 #[test]
@@ -300,7 +298,12 @@ fn test_large_library_search_performance() {
     // Generate 20,000 synthetic tracks
     for i in 0..20_000 {
         large_tracks.push(AudioMetadata {
-            filepath: root.join(format!("artist_{:04}/album_{:03}/track_{:05}.flac", i % 100, i % 500, i)),
+            filepath: root.join(format!(
+                "artist_{:04}/album_{:03}/track_{:05}.flac",
+                i % 100,
+                i % 500,
+                i
+            )),
             filename: format!("track_{:05}.flac", i),
             title: format!("Song Title {:05}", i),
             artist: format!("Popular Artist {:03}", i % 200),
@@ -373,7 +376,11 @@ fn test_flutter_vs_future_sound_of_london() {
     modal.update_query("flutter".to_string());
 
     // Only Autechre - Flutter should match! The Future Sound of London should NOT match!
-    assert_eq!(modal.filtered.len(), 1, "Should strictly match Flutter and exclude Future Sound of London");
+    assert_eq!(
+        modal.filtered.len(),
+        1,
+        "Should strictly match Flutter and exclude Future Sound of London"
+    );
     assert_eq!(modal.selected_track().unwrap().artist, "Autechre");
     assert_eq!(modal.selected_track().unwrap().title, "Flutter");
 }
@@ -431,9 +438,6 @@ fn test_search_modal_paging_and_jumping() {
     modal.home();
     assert_eq!(modal.selected_index, 0);
 }
-
-
-
 
 fn streamed_track(root: &Path, i: usize) -> AudioMetadata {
     AudioMetadata {

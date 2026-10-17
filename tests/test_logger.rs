@@ -43,7 +43,11 @@ fn test_lines_from_multiple_threads_are_all_written_in_per_thread_order() {
     let content = fs::read_to_string(&path).unwrap();
     let mut next = [0usize; 4];
     for line in content.lines().filter(|l| l.contains("[order]")) {
-        assert!(line.contains("[INFO ] [order] thread="), "unexpected line format: {}", line);
+        assert!(
+            line.contains("[INFO ] [order] thread="),
+            "unexpected line format: {}",
+            line
+        );
         let rest = line.split("thread=").nth(1).unwrap();
         let (t, seq) = rest.split_once(" seq=").unwrap();
         let (t, seq): (usize, usize) = (t.parse().unwrap(), seq.parse().unwrap());
@@ -58,7 +62,11 @@ fn test_lines_from_multiple_threads_are_all_written_in_per_thread_order() {
 fn test_log_file_rotates_at_size_limit_and_keeps_configured_backups() {
     common::isolate();
     let path = temp_log("rotate");
-    let config = LoggerConfig { max_bytes: 1024, max_backups: 2, ..LoggerConfig::default() };
+    let config = LoggerConfig {
+        max_bytes: 1024,
+        max_backups: 2,
+        ..LoggerConfig::default()
+    };
     let logger = Logger::with_config(path.clone(), config);
 
     for i in 0..200 {
@@ -69,10 +77,18 @@ fn test_log_file_rotates_at_size_limit_and_keeps_configured_backups() {
     let active = fs::read_to_string(&path).unwrap();
     let first_backup = fs::read_to_string(rotated(&path, 1)).unwrap();
     let second_backup = fs::read_to_string(rotated(&path, 2)).unwrap();
-    assert!(!rotated(&path, 3).exists(), "only max_backups rotated files may be kept");
+    assert!(
+        !rotated(&path, 3).exists(),
+        "only max_backups rotated files may be kept"
+    );
 
     for (name, content) in [("active", &active), (".1", &first_backup), (".2", &second_backup)] {
-        assert!(content.len() <= 1024, "{} file exceeds the size limit: {} bytes", name, content.len());
+        assert!(
+            content.len() <= 1024,
+            "{} file exceeds the size limit: {} bytes",
+            name,
+            content.len()
+        );
         assert!(!content.is_empty(), "{} file is empty", name);
     }
 
@@ -85,8 +101,16 @@ fn test_log_file_rotates_at_size_limit_and_keeps_configured_backups() {
         let line = s.lines().find(|l| l.contains("[rotate]")).unwrap();
         line.split("line ").nth(1).unwrap()[..4].parse().unwrap()
     };
-    assert_eq!(last_of(&second_backup) + 1, first_of(&first_backup), ".2 must directly precede .1");
-    assert_eq!(last_of(&first_backup) + 1, first_of(&active), ".1 must directly precede the active file");
+    assert_eq!(
+        last_of(&second_backup) + 1,
+        first_of(&first_backup),
+        ".2 must directly precede .1"
+    );
+    assert_eq!(
+        last_of(&first_backup) + 1,
+        first_of(&active),
+        ".1 must directly precede the active file"
+    );
 }
 
 #[test]
@@ -94,7 +118,13 @@ fn test_existing_oversized_log_is_rotated_before_appending() {
     common::isolate();
     let path = temp_log("preexisting");
     fs::write(&path, "x".repeat(2048)).unwrap();
-    let logger = Logger::with_config(path.clone(), LoggerConfig { max_bytes: 1024, ..LoggerConfig::default() });
+    let logger = Logger::with_config(
+        path.clone(),
+        LoggerConfig {
+            max_bytes: 1024,
+            ..LoggerConfig::default()
+        },
+    );
 
     logger.log("INFO", "pre", "fresh line");
     assert!(logger.flush());
@@ -120,15 +150,29 @@ fn test_caller_does_not_block_when_writer_is_slow() {
         logger.log("INFO", "slow", &format!("burst {}", i));
     }
     let elapsed = start.elapsed();
-    assert!(elapsed < Duration::from_millis(250), "logging 1000 lines blocked the caller for {:?}", elapsed);
-    assert!(logger.dropped_count() > 0, "a full queue must drop (and count) lines instead of blocking");
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "logging 1000 lines blocked the caller for {:?}",
+        elapsed
+    );
+    assert!(
+        logger.dropped_count() > 0,
+        "a full queue must drop (and count) lines instead of blocking"
+    );
 
     // Once the writer catches up it records how many lines were lost.
     logger.log("INFO", "slow", "after burst");
     assert!(logger.flush());
     let content = fs::read_to_string(&path).unwrap();
-    assert!(content.contains("burst 0"), "lines queued before the queue filled are still written");
-    assert!(content.contains("[logger] dropped"), "dropped-line notice missing:\n{}", content);
+    assert!(
+        content.contains("burst 0"),
+        "lines queued before the queue filled are still written"
+    );
+    assert!(
+        content.contains("[logger] dropped"),
+        "dropped-line notice missing:\n{}",
+        content
+    );
 }
 
 #[test]
@@ -138,14 +182,21 @@ fn test_drop_flushes_pending_lines() {
     {
         let logger = Logger::with_config(
             path.clone(),
-            LoggerConfig { write_delay: Some(Duration::from_millis(2)), ..LoggerConfig::default() },
+            LoggerConfig {
+                write_delay: Some(Duration::from_millis(2)),
+                ..LoggerConfig::default()
+            },
         );
         for i in 0..50 {
             logger.log("WARN", "drop", &format!("pending {}", i));
         }
     }
     let content = fs::read_to_string(&path).unwrap();
-    assert!(content.contains("[WARN ] [drop] pending 49"), "drop must flush queued lines:\n{}", content);
+    assert!(
+        content.contains("[WARN ] [drop] pending 49"),
+        "drop must flush queued lines:\n{}",
+        content
+    );
 }
 
 #[test]
@@ -157,7 +208,10 @@ fn test_error_lines_reach_disk_without_explicit_flush() {
 
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        if fs::read_to_string(&path).unwrap_or_default().contains("[ERROR] [err] something broke") {
+        if fs::read_to_string(&path)
+            .unwrap_or_default()
+            .contains("[ERROR] [err] something broke")
+        {
             break;
         }
         assert!(Instant::now() < deadline, "ERROR line was not flushed to disk");

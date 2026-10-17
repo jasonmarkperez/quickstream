@@ -43,7 +43,16 @@ fn have(bin: &str) -> bool {
 fn silent_wav(dir: &Path, name: &str, secs: u32) -> PathBuf {
     let path = dir.join(name);
     let status = Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t"])
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=44100:cl=stereo",
+            "-t",
+        ])
         .arg(secs.to_string())
         .arg(&path)
         .status()
@@ -85,7 +94,10 @@ fn test_private_ipc_dir_refuses_existing_directory() {
     fs::create_dir(&dir).unwrap();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
 
-    assert!(create_private_ipc_dir(&dir).is_err(), "pre-existing dir must be refused");
+    assert!(
+        create_private_ipc_dir(&dir).is_err(),
+        "pre-existing dir must be refused"
+    );
     // Must not have been "fixed up" and adopted either.
     let mode = fs::symlink_metadata(&dir).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o777);
@@ -124,7 +136,10 @@ fn test_verify_ipc_socket_checks_type_and_owner() {
 
     let link = base.join("link.sock");
     std::os::unix::fs::symlink(&sock, &link).unwrap();
-    assert!(verify_ipc_socket(&link).is_err(), "symlink to a socket must be rejected");
+    assert!(
+        verify_ipc_socket(&link).is_err(),
+        "symlink to a socket must be rejected"
+    );
 
     assert!(verify_ipc_socket(&base.join("missing.sock")).is_err());
 
@@ -155,9 +170,16 @@ fn test_mpv_socket_lives_in_private_runtime_dir_and_is_removed_on_drop() {
     }
     res.expect("play should succeed");
 
-    let sock = player.ipc_socket_path().expect("mpv backend should have an ipc socket").to_path_buf();
+    let sock = player
+        .ipc_socket_path()
+        .expect("mpv backend should have an ipc socket")
+        .to_path_buf();
     let dir = sock.parent().unwrap().to_path_buf();
-    assert_eq!(dir.parent().unwrap(), runtime.as_path(), "socket dir should live under XDG_RUNTIME_DIR");
+    assert_eq!(
+        dir.parent().unwrap(),
+        runtime.as_path(),
+        "socket dir should live under XDG_RUNTIME_DIR"
+    );
     let meta = fs::symlink_metadata(&dir).unwrap();
     assert!(meta.is_dir() && !meta.file_type().is_symlink());
     assert_eq!(meta.permissions().mode() & 0o777, 0o700);
@@ -186,12 +208,30 @@ fn test_mpv_socket_dir_name_is_unpredictable() {
     player.play(&audio).expect("play should succeed");
     let sock = player.ipc_socket_path().unwrap().to_path_buf();
     let dir = sock.parent().unwrap();
-    assert_ne!(dir, Path::new("/tmp"), "socket must not sit directly in shared /tmp: {:?}", sock);
-    assert_ne!(dir, std::env::temp_dir().as_path(), "socket must be in its own dir: {:?}", sock);
+    assert_ne!(
+        dir,
+        Path::new("/tmp"),
+        "socket must not sit directly in shared /tmp: {:?}",
+        sock
+    );
+    assert_ne!(
+        dir,
+        std::env::temp_dir().as_path(),
+        "socket must be in its own dir: {:?}",
+        sock
+    );
     let pid = std::process::id().to_string();
     let dir_name = dir.file_name().unwrap().to_string_lossy().to_string();
-    assert!(!dir_name.contains(&pid), "socket dir name must not be derived from the pid: {}", dir_name);
-    assert!(dir_name.len() >= 16, "socket dir name should carry a random component: {}", dir_name);
+    assert!(
+        !dir_name.contains(&pid),
+        "socket dir name must not be derived from the pid: {}",
+        dir_name
+    );
+    assert!(
+        dir_name.len() >= 16,
+        "socket dir name should carry a random component: {}",
+        dir_name
+    );
 
     // A second player gets a different, unrelated directory.
     let mut other = LocalPlayer::new("mpv");
@@ -257,5 +297,9 @@ fn test_failed_mpv_connect_kills_and_reaps_spawned_child() {
     drop(player);
     cleanup(&base);
 
-    assert!(leaked.is_empty(), "fake mpv children leaked (running or zombie): {:?}", leaked);
+    assert!(
+        leaked.is_empty(),
+        "fake mpv children leaked (running or zombie): {:?}",
+        leaked
+    );
 }

@@ -14,9 +14,7 @@ use std::time::{Duration, Instant};
 use quickstream::discovery::{
     decode_chunked, parse_http_response, parse_http_url, parse_status_code, DLNADevice, HttpError,
 };
-use quickstream::player::upnp::{
-    parse_soap_fault, SoapError, UPnPClient, UPnPPlayer, AV_TRANSPORT_SERVICE,
-};
+use quickstream::player::upnp::{parse_soap_fault, SoapError, UPnPClient, UPnPPlayer, AV_TRANSPORT_SERVICE};
 use quickstream::player::AudioPlayer;
 
 type Handler = Arc<dyn Fn(&str, &str, &mut TcpStream) + Send + Sync>;
@@ -226,16 +224,25 @@ fn test_upnp_stale_poller_cannot_mark_new_track_finished() {
         }
         "Stop" => {
             *st_h.transport.lock().unwrap() = "STOPPED".to_string();
-            write_ok(stream, "<u:StopResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>");
+            write_ok(
+                stream,
+                "<u:StopResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>",
+            );
         }
         "Play" => {
             *st_h.transport.lock().unwrap() = "PLAYING".to_string();
             if st_h.gti_in_flight.load(Ordering::SeqCst) {
                 st_h.play_after_arm.store(true, Ordering::SeqCst);
             }
-            write_ok(stream, "<u:PlayResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>");
+            write_ok(
+                stream,
+                "<u:PlayResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>",
+            );
         }
-        _ => write_ok(stream, "<u:OkResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>"),
+        _ => write_ok(
+            stream,
+            "<u:OkResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>",
+        ),
     }));
 
     let track_a = temp_path("qs_test_stale_poller_a.wav");
@@ -252,7 +259,10 @@ fn test_upnp_stale_poller_cannot_mark_new_track_finished() {
 
     // Hold the poller's next GetTransportInfo until the new track's Play has gone out.
     st.slow_gti_armed.store(true, Ordering::SeqCst);
-    assert!(wait_for(&st.gti_in_flight, Duration::from_secs(3)), "poller never queried transport state");
+    assert!(
+        wait_for(&st.gti_in_flight, Duration::from_secs(3)),
+        "poller never queried transport state"
+    );
     *st.rel.lock().unwrap() = "00:00:00".to_string();
 
     assert!(player.play(&track_b).is_ok());
@@ -307,16 +317,25 @@ fn test_upnp_stale_position_report_is_dropped_after_seek() {
         }
         "Stop" => {
             *st_h.transport.lock().unwrap() = "STOPPED".to_string();
-            write_ok(stream, "<u:StopResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>");
+            write_ok(
+                stream,
+                "<u:StopResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>",
+            );
         }
         "Play" => {
             *st_h.transport.lock().unwrap() = "PLAYING".to_string();
             if st_h.gpi_in_flight.load(Ordering::SeqCst) {
                 st_h.play_after_arm.store(true, Ordering::SeqCst);
             }
-            write_ok(stream, "<u:PlayResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>");
+            write_ok(
+                stream,
+                "<u:PlayResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>",
+            );
         }
-        _ => write_ok(stream, "<u:OkResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>"),
+        _ => write_ok(
+            stream,
+            "<u:OkResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>",
+        ),
     }));
 
     let track = temp_path("qs_test_stale_seek.mp3");
@@ -326,7 +345,10 @@ fn test_upnp_stale_position_report_is_dropped_after_seek() {
     assert!(player.play(&track).is_ok());
 
     st.slow_gpi_armed.store(true, Ordering::SeqCst);
-    assert!(wait_for(&st.gpi_in_flight, Duration::from_secs(3)), "poller never queried position");
+    assert!(
+        wait_for(&st.gpi_in_flight, Duration::from_secs(3)),
+        "poller never queried position"
+    );
 
     assert!(player.seek_to(50.0).is_ok());
     std::thread::sleep(Duration::from_millis(400));
@@ -345,7 +367,9 @@ fn test_upnp_stale_position_report_is_dropped_after_seek() {
 // ---------------------------------------------------------------------------
 
 fn write_fault(stream: &mut TcpStream, code: Option<u32>, description: Option<&str>) {
-    let code_xml = code.map(|c| format!("<errorCode>{}</errorCode>", c)).unwrap_or_default();
+    let code_xml = code
+        .map(|c| format!("<errorCode>{}</errorCode>", c))
+        .unwrap_or_default();
     let desc_xml = description
         .map(|d| format!("<errorDescription>{}</errorDescription>", d))
         .unwrap_or_default();
@@ -375,11 +399,17 @@ fn test_upnp_play_retries_on_numeric_code_with_custom_description() {
         if action == "Play" && attempts_h.fetch_add(1, Ordering::SeqCst) < 2 {
             write_fault(stream, Some(705), Some("Locked"));
         } else {
-            write_ok(stream, "<u:PlayResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>");
+            write_ok(
+                stream,
+                "<u:PlayResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>",
+            );
         }
     }));
     let client = client_for(&mock);
-    assert!(client.play("1"), "Play must retry on errorCode 705 regardless of its description");
+    assert!(
+        client.play("1"),
+        "Play must retry on errorCode 705 regardless of its description"
+    );
     assert_eq!(attempts.load(Ordering::SeqCst), 3);
 }
 
@@ -393,7 +423,10 @@ fn test_upnp_play_retries_on_description_only_fault() {
         if action == "Play" && attempts_h.fetch_add(1, Ordering::SeqCst) < 1 {
             write_fault(stream, None, Some("Transition not available"));
         } else {
-            write_ok(stream, "<u:PlayResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>");
+            write_ok(
+                stream,
+                "<u:PlayResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>",
+            );
         }
     }));
     let client = client_for(&mock);
@@ -412,12 +445,19 @@ fn test_upnp_play_does_not_retry_on_unrelated_code() {
             attempts_h.fetch_add(1, Ordering::SeqCst);
             write_fault(stream, Some(714), Some("Illegal MIME-type (error 501 in decoder)"));
         } else {
-            write_ok(stream, "<u:OkResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>");
+            write_ok(
+                stream,
+                "<u:OkResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>",
+            );
         }
     }));
     let client = client_for(&mock);
     assert!(!client.play("1"));
-    assert_eq!(attempts.load(Ordering::SeqCst), 1, "714 is not transient and must not be retried");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "714 is not transient and must not be retried"
+    );
 }
 
 /// Stop answered with 701 (already stopped) counts as success even with a vendor description.
@@ -428,7 +468,10 @@ fn test_upnp_stop_accepts_numeric_701() {
         if action == "Stop" {
             write_fault(stream, Some(701), Some("Busy"));
         } else {
-            write_ok(stream, "<u:OkResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>");
+            write_ok(
+                stream,
+                "<u:OkResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>",
+            );
         }
     }));
     let client = client_for(&mock);
@@ -549,7 +592,10 @@ fn test_parse_http_response_framing() {
 fn test_parse_http_url() {
     common::isolate();
     let u = parse_http_url("http://192.168.1.5:8080/ctrl/AVT").unwrap();
-    assert_eq!((u.host.as_str(), u.port, u.path.as_str()), ("192.168.1.5", 8080, "/ctrl/AVT"));
+    assert_eq!(
+        (u.host.as_str(), u.port, u.path.as_str()),
+        ("192.168.1.5", 8080, "/ctrl/AVT")
+    );
     assert_eq!(u.host_port, "192.168.1.5:8080");
     let u = parse_http_url("HTTP://renderer.local").unwrap();
     assert_eq!((u.host.as_str(), u.port, u.path.as_str()), ("renderer.local", 80, "/"));
@@ -563,9 +609,17 @@ fn test_parse_http_url() {
 #[test]
 fn test_parse_soap_fault_and_retry_classification() {
     common::isolate();
-    let body = |inner: &str| format!("<s:Envelope><s:Body><s:Fault><detail><UPnPError>{}</UPnPError></detail></s:Fault></s:Body></s:Envelope>", inner);
+    let body = |inner: &str| {
+        format!(
+            "<s:Envelope><s:Body><s:Fault><detail><UPnPError>{}</UPnPError></detail></s:Fault></s:Body></s:Envelope>",
+            inner
+        )
+    };
 
-    let e = parse_soap_fault(500, &body("<errorCode> 701 </errorCode><errorDescription>Busy</errorDescription>"));
+    let e = parse_soap_fault(
+        500,
+        &body("<errorCode> 701 </errorCode><errorDescription>Busy</errorDescription>"),
+    );
     assert_eq!(e.upnp_code(), Some(701));
     assert!(e.is_transition_unavailable());
     assert!(e.is_transient());
@@ -577,7 +631,10 @@ fn test_parse_soap_fault_and_retry_classification() {
     assert!(!e.is_transition_unavailable());
 
     // The numeric code wins over a description that happens to mention another code.
-    let e = parse_soap_fault(500, &body("<errorCode>402</errorCode><errorDescription>Invalid Args (701)</errorDescription>"));
+    let e = parse_soap_fault(
+        500,
+        &body("<errorCode>402</errorCode><errorDescription>Invalid Args (701)</errorDescription>"),
+    );
     assert!(!e.is_transient());
     assert!(!e.is_transition_unavailable());
 

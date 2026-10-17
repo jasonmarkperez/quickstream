@@ -205,7 +205,9 @@ fn test_worker_analyses_untagged_short_track_acoustically() {
     assert!(worker.wait_until_idle(Duration::from_secs(60)), "worker did not finish");
 
     let feat = db.get_track(&track).expect("track_features row must exist");
-    let bpm = feat.bpm.expect("acoustic BPM must be detected for a short untagged track");
+    let bpm = feat
+        .bpm
+        .expect("acoustic BPM must be detected for a short untagged track");
     assert!((115.0..=125.0).contains(&bpm), "expected ~120 BPM, got {}", bpm);
     assert!(feat.energy.is_some(), "energy should be filled from the same decode");
 
@@ -298,7 +300,10 @@ fn test_worker_shutdown_is_prompt_with_pending_work() {
         "shutdown took {:?}",
         start.elapsed()
     );
-    assert!(db.count_analyzed() < 200, "worker should have stopped before finishing everything");
+    assert!(
+        db.count_analyzed() < 200,
+        "worker should have stopped before finishing everything"
+    );
     let _ = fs::remove_dir_all(&music);
     let _ = fs::remove_dir_all(&cache);
 }
@@ -332,7 +337,10 @@ fn test_autopilot_tracks_are_analysed_in_background() {
     assert!(app.analysis_worker.wait_until_idle(Duration::from_secs(20)));
     assert_eq!(app.analysis_worker.progress().analyzed, 2);
     assert_eq!(app.analysis_db.get_track(&a).and_then(|f| f.bpm), Some(124.0));
-    assert_eq!(app.analysis_db.get_track(&b).and_then(|f| f.camelot_key), Some("9A".to_string()));
+    assert_eq!(
+        app.analysis_db.get_track(&b).and_then(|f| f.camelot_key),
+        Some("9A".to_string())
+    );
     assert!(cache.join("quickstream").join("track_analysis.db").exists());
 
     let _ = app.player.stop();
@@ -356,7 +364,11 @@ fn write_undecodable_mp3(path: &Path) {
 fn fake_ffmpeg(dir: &Path, log: &Path, body: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let script = dir.join("fake-ffmpeg");
-    fs::write(&script, format!("#!/bin/sh\necho call >> '{}'\n{}\n", log.display(), body)).unwrap();
+    fs::write(
+        &script,
+        format!("#!/bin/sh\necho call >> '{}'\n{}\n", log.display(), body),
+    )
+    .unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
     script
 }
@@ -383,7 +395,10 @@ fn test_worker_does_not_persist_when_ffmpeg_fails() {
     worker.enqueue(vec![track.clone()]);
     assert!(worker.wait_until_idle(Duration::from_secs(60)), "worker did not finish");
 
-    assert!(db.get_track(&track).is_none(), "a failed acoustic analysis must not be stored");
+    assert!(
+        db.get_track(&track).is_none(),
+        "a failed acoustic analysis must not be stored"
+    );
     let p = worker.progress();
     assert_eq!(p.failed, 1);
     assert_eq!(p.analyzed, 0);
@@ -411,7 +426,10 @@ fn test_worker_retries_in_later_session_when_ffmpeg_was_missing() {
     let mut worker = AnalysisWorker::spawn_with_ffmpeg(db.clone(), 1, missing);
     worker.enqueue(vec![track.clone()]);
     assert!(worker.wait_until_idle(Duration::from_secs(20)), "worker did not finish");
-    assert!(db.get_track(&track).is_none(), "missing ffmpeg must not mark the track as analysed");
+    assert!(
+        db.get_track(&track).is_none(),
+        "missing ffmpeg must not mark the track as analysed"
+    );
     let p = worker.progress();
     assert_eq!((p.failed, p.analyzed, p.skipped), (1, 0, 0));
     worker.shutdown();
@@ -423,7 +441,10 @@ fn test_worker_retries_in_later_session_when_ffmpeg_was_missing() {
         assert!(worker.wait_until_idle(Duration::from_secs(60)), "worker did not finish");
         let p = worker.progress();
         assert_eq!((p.failed, p.analyzed, p.skipped), (0, 1, 0));
-        let bpm = db.get_track(&track).and_then(|f| f.bpm).expect("BPM must be filled on retry");
+        let bpm = db
+            .get_track(&track)
+            .and_then(|f| f.bpm)
+            .expect("BPM must be filled on retry");
         assert!((115.0..=125.0).contains(&bpm), "expected ~120 BPM, got {}", bpm);
         worker.shutdown();
     }
@@ -533,7 +554,11 @@ fn test_decode_does_not_retry_from_zero_after_ffmpeg_failure() {
 
     let out = BpmAnalyzer::decode_pcm_slice_with(&cfg, &track, 30, 20, SAMPLE_RATE, None);
     assert!(out.is_none());
-    assert_eq!(invocations(&log), 1, "a failed decode must not be retried from offset 0");
+    assert_eq!(
+        invocations(&log),
+        1,
+        "a failed decode must not be retried from offset 0"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -555,7 +580,11 @@ fn test_decode_does_not_retry_from_zero_after_timeout() {
     let out = BpmAnalyzer::decode_pcm_slice_with(&cfg, &track, 30, 20, SAMPLE_RATE, None);
     let elapsed = start.elapsed();
     assert!(out.is_none());
-    assert_eq!(invocations(&log), 1, "a timed-out decode must not be retried from offset 0");
+    assert_eq!(
+        invocations(&log),
+        1,
+        "a timed-out decode must not be retried from offset 0"
+    );
     assert!(
         elapsed < 2 * cfg.timeout,
         "a stalled file must cost at most one timeout, took {:?}",

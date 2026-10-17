@@ -129,10 +129,7 @@ impl SearchModalState {
             let lower_album = track.album.to_lowercase();
             let lower_filename = track.filename.to_lowercase();
 
-            let sort_key = format!(
-                "{} - {} - {}",
-                lower_artist, lower_title, lower_filename
-            );
+            let sort_key = format!("{} - {} - {}", lower_artist, lower_title, lower_filename);
 
             self.search_items.push(SearchItem {
                 track_idx: idx,
@@ -153,9 +150,7 @@ impl SearchModalState {
             self.all_tracks.push(track);
         }
 
-        let recently_filtered = self
-            .last_filter_at
-            .is_some_and(|t| t.elapsed() < SCAN_FILTER_INTERVAL);
+        let recently_filtered = self.last_filter_at.is_some_and(|t| t.elapsed() < SCAN_FILTER_INTERVAL);
         if self.is_scanning && recently_filtered {
             self.filter_pending = true;
         } else {
@@ -184,9 +179,7 @@ impl SearchModalState {
                 self.add_tracks(batches);
             }
 
-            let interval_passed = self
-                .last_filter_at
-                .is_none_or(|t| t.elapsed() >= SCAN_FILTER_INTERVAL);
+            let interval_passed = self.last_filter_at.is_none_or(|t| t.elapsed() >= SCAN_FILTER_INTERVAL);
             if self.filter_pending && (disconnected || interval_passed) {
                 self.apply_filter();
             }
@@ -284,7 +277,8 @@ impl SearchModalState {
                     let score_title = score_field(&matcher, &item.title, &item.lower_title, token, lower_token);
                     let score_artist = score_field(&matcher, &item.artist, &item.lower_artist, token, lower_token);
                     let score_album = score_field(&matcher, &item.album, &item.lower_album, token, lower_token);
-                    let score_filename = score_field(&matcher, &item.filename, &item.lower_filename, token, lower_token);
+                    let score_filename =
+                        score_field(&matcher, &item.filename, &item.lower_filename, token, lower_token);
 
                     let score_comp = item
                         .path_components
@@ -326,9 +320,8 @@ impl SearchModalState {
 
             // Sort by match score descending, then by precomputed sort_key
             scored.sort_by(|a, b| {
-                b.0.cmp(&a.0).then_with(|| {
-                    self.search_items[a.1].sort_key.cmp(&self.search_items[b.1].sort_key)
-                })
+                b.0.cmp(&a.0)
+                    .then_with(|| self.search_items[a.1].sort_key.cmp(&self.search_items[b.1].sort_key))
             });
 
             self.filtered = scored

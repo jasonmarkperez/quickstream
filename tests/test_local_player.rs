@@ -88,7 +88,10 @@ fn test_local_playback_lifecycle() {
         "Position when seeking while paused should be ~6.0s, got {:.3}s",
         player.position_seconds()
     );
-    assert!(player.is_paused(), "Player should remain paused after seeking while paused");
+    assert!(
+        player.is_paused(),
+        "Player should remain paused after seeking while paused"
+    );
     assert!(player.resume().is_ok());
     assert!(player.is_playing());
 

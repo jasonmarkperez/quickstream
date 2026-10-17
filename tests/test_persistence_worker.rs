@@ -61,7 +61,10 @@ fn test_save_returns_while_writer_is_busy_and_rapid_saves_coalesce() {
 
     let start = Instant::now();
     worker.save(path.clone(), b"v1".to_vec());
-    assert!(wait_for(|| log.lock().unwrap().len() == 1), "worker never started the first write");
+    assert!(
+        wait_for(|| log.lock().unwrap().len() == 1),
+        "worker never started the first write"
+    );
     worker.save(path.clone(), b"v2".to_vec());
     worker.save(path.clone(), b"v3".to_vec());
     worker.save(path.clone(), b"v4".to_vec());
@@ -74,7 +77,11 @@ fn test_save_returns_while_writer_is_busy_and_rapid_saves_coalesce() {
     release.store(true, Ordering::SeqCst);
     assert!(worker.flush());
     let writes: Vec<Vec<u8>> = log.lock().unwrap().iter().map(|(_, b)| b.clone()).collect();
-    assert_eq!(writes, vec![b"v1".to_vec(), b"v4".to_vec()], "queued saves of one file coalesce to the latest");
+    assert_eq!(
+        writes,
+        vec![b"v1".to_vec(), b"v4".to_vec()],
+        "queued saves of one file coalesce to the latest"
+    );
 }
 
 #[test]
@@ -99,7 +106,11 @@ fn test_handle_outliving_worker_still_writes() {
     let handle = worker.handle();
     drop(worker);
     handle.save(path.clone(), b"{}".to_vec());
-    assert_eq!(std::fs::read(&path).unwrap(), b"{}", "a save after shutdown falls back to a direct write");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"{}",
+        "a save after shutdown falls back to a direct write"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -118,7 +129,11 @@ fn test_settings_manager_save_goes_through_worker() {
     assert!(mgr.save());
     assert!(wait_for(|| log.lock().unwrap().len() == 1));
     mgr.cycle_setting(5, true); // force_transcode, saves again
-    assert!(start.elapsed() < Duration::from_millis(500), "settings save blocked for {:?}", start.elapsed());
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "settings save blocked for {:?}",
+        start.elapsed()
+    );
 
     release.store(true, Ordering::SeqCst);
     assert!(worker.flush());
@@ -152,15 +167,24 @@ fn test_ui_bookmark_and_setting_saves_do_not_block_the_ui_thread() {
     app.active_tab = 3;
     app.settings_cursor = 3; // volume step
     app.handle_tab_key(KeyCode::Right);
-    assert!(start.elapsed() < Duration::from_millis(500), "UI blocked on a save for {:?}", start.elapsed());
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "UI blocked on a save for {:?}",
+        start.elapsed()
+    );
 
     release.store(true, Ordering::SeqCst);
     assert!(app.persistence.flush());
     let log = log.lock().unwrap();
     let bookmarks_path = quickstream::paths::get_bookmarks_path();
-    assert!(bookmarks_path.starts_with(root), "test must not use the real config dir");
-    assert!(log.iter().any(|(p, b)| p == &bookmarks_path
-        && String::from_utf8_lossy(b).contains(&*std::env::temp_dir().to_string_lossy())));
+    assert!(
+        bookmarks_path.starts_with(root),
+        "test must not use the real config dir"
+    );
+    assert!(log
+        .iter()
+        .any(|(p, b)| p == &bookmarks_path
+            && String::from_utf8_lossy(b).contains(&*std::env::temp_dir().to_string_lossy())));
     assert!(log.iter().any(|(p, _)| p == &config));
 }
 

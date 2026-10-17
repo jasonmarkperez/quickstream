@@ -65,7 +65,11 @@ impl MockServer {
                     }
                     headers.push(line.trim_end().to_string());
                 }
-                seen2.lock().unwrap().push(Seen { at, request_line: request_line.trim_end().to_string(), headers });
+                seen2.lock().unwrap().push(Seen {
+                    at,
+                    request_line: request_line.trim_end().to_string(),
+                    headers,
+                });
                 let body = bodies[served.min(bodies.len() - 1)];
                 served += 1;
                 let mut stream = reader.into_inner();
@@ -78,7 +82,12 @@ impl MockServer {
                 let _ = stream.flush();
             }
         });
-        MockServer { base_url, seen, stop, handle: Some(handle) }
+        MockServer {
+            base_url,
+            seen,
+            stop,
+            handle: Some(handle),
+        }
     }
 
     fn requests(&self) -> Vec<Seen> {
@@ -117,7 +126,10 @@ fn test_source_has_no_hardcoded_api_key() {
     let has_hex_run = bytes
         .windows(32)
         .any(|w| w.iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b)));
-    assert!(!has_hex_run, "online.rs contains a 32-character hex string (an API key?)");
+    assert!(
+        !has_hex_run,
+        "online.rs contains a 32-character hex string (an API key?)"
+    );
     assert!(!src.contains("api_key=b"), "online.rs embeds an api_key value");
 }
 
@@ -135,14 +147,21 @@ fn test_config_from_settings_is_off_by_default_and_reads_key_from_env() {
     assert_eq!(cfg.api_key, None);
     assert!(!OnlineMetadataClient::new(cfg).is_enabled());
 
-    let opted_in = Settings { online_enrichment: true, ..Settings::default() };
+    let opted_in = Settings {
+        online_enrichment: true,
+        ..Settings::default()
+    };
     let cfg = OnlineConfig::from_settings(&opted_in);
     assert!(cfg.enabled);
     assert_eq!(cfg.api_key, None);
     assert!(!OnlineMetadataClient::new(cfg).is_enabled(), "no key means no client");
 
     std::env::set_var(API_KEY_ENV, "  ");
-    assert_eq!(OnlineConfig::from_settings(&opted_in).api_key, None, "blank key counts as absent");
+    assert_eq!(
+        OnlineConfig::from_settings(&opted_in).api_key,
+        None,
+        "blank key counts as absent"
+    );
 
     std::env::set_var(API_KEY_ENV, " envkey123 ");
     let cfg = OnlineConfig::from_settings(&opted_in);
@@ -204,7 +223,10 @@ fn test_fetch_tags_sends_key_and_user_agent_and_parses_response() {
     let ua = reqs[0]
         .headers
         .iter()
-        .find_map(|h| h.strip_prefix("User-Agent: ").or_else(|| h.strip_prefix("user-agent: ")))
+        .find_map(|h| {
+            h.strip_prefix("User-Agent: ")
+                .or_else(|| h.strip_prefix("user-agent: "))
+        })
         .expect("User-Agent header");
     assert!(ua.starts_with("quickstream/"), "{}", ua);
     assert!(ua.contains(env!("CARGO_PKG_VERSION")), "{}", ua);
@@ -219,7 +241,11 @@ fn test_fetch_similar_artists_parses_response() {
     assert_eq!(similar, vec![("Ride".to_string(), 0.92), ("Lush".to_string(), 0.81)]);
     let reqs = server.requests();
     assert_eq!(reqs.len(), 1);
-    assert!(reqs[0].request_line.contains("method=artist.getsimilar"), "{}", reqs[0].request_line);
+    assert!(
+        reqs[0].request_line.contains("method=artist.getsimilar"),
+        "{}",
+        reqs[0].request_line
+    );
 }
 
 #[test]

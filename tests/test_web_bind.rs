@@ -75,8 +75,8 @@ fn test_dlna_renderer_switches_server_to_lan_and_back() {
 #[ignore = "binds all network interfaces (macOS firewall prompt); run with --include-ignored"]
 fn test_lan_request_never_falls_back_to_loopback_on_busy_port() {
     common::isolate();
-    use std::sync::{mpsc, Arc, RwLock};
     use quickstream::web::{NowPlayingState, WebServer};
+    use std::sync::{mpsc, Arc, RwLock};
 
     // Another app holds *:port. Binding 127.0.0.1:port would still succeed on macOS, which
     // would send renderers' LAN requests to that other app.
@@ -106,7 +106,10 @@ fn test_creating_app_does_not_start_network_discovery() {
     let app = app(false, false);
     // Discovery runs on a background thread for ~2.5s once started.
     std::thread::sleep(std::time::Duration::from_millis(300));
-    assert!(!app.device_manager.is_scanning(), "discovery must start from run(), not AppUI::new");
+    assert!(
+        !app.device_manager.is_scanning(),
+        "discovery must start from run(), not AppUI::new"
+    );
 }
 
 #[test]

@@ -22,11 +22,25 @@ fn test_app_paths_resolve_under_isolated_root() {
     ];
     let real = common::real_user_dirs();
     for path in paths {
-        assert!(path.starts_with(root), "{} is outside {}", path.display(), root.display());
-        assert!(!real.iter().any(|r| path.starts_with(r)), "{} is a real user path", path.display());
+        assert!(
+            path.starts_with(root),
+            "{} is outside {}",
+            path.display(),
+            root.display()
+        );
+        assert!(
+            !real.iter().any(|r| path.starts_with(r)),
+            "{} is a real user path",
+            path.display()
+        );
     }
     for (var, sub) in common::XDG_DIRS {
-        assert_eq!(std::env::var_os(var).map(PathBuf::from), Some(root.join(sub)), "{}", var);
+        assert_eq!(
+            std::env::var_os(var).map(PathBuf::from),
+            Some(root.join(sub)),
+            "{}",
+            var
+        );
     }
 }
 
@@ -100,13 +114,23 @@ fn test_every_integration_test_isolates_xdg_dirs() {
             problems.push(format!("{}: `{}` does not call `common::isolate()` first", file, name));
         }
     }
-    assert!(checked > 30, "only found {} test files in {}", checked, tests_dir.display());
-    assert!(problems.is_empty(), "integration tests must isolate XDG dirs:\n{}", problems.join("\n"));
+    assert!(
+        checked > 30,
+        "only found {} test files in {}",
+        checked,
+        tests_dir.display()
+    );
+    assert!(
+        problems.is_empty(),
+        "integration tests must isolate XDG dirs:\n{}",
+        problems.join("\n")
+    );
 }
 
 #[test]
 fn test_isolate_check_detects_missing_call() {
     common::isolate();
-    let source = "#[test]\nfn good() {\n    common::isolate();\n}\n\n#[test]\n#[ignore]\nfn bad() {\n    let x = 1;\n}\n";
+    let source =
+        "#[test]\nfn good() {\n    common::isolate();\n}\n\n#[test]\n#[ignore]\nfn bad() {\n    let x = 1;\n}\n";
     assert_eq!(tests_missing_isolate(source), vec!["fn bad() {".to_string()]);
 }

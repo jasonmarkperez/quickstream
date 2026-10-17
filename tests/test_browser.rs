@@ -65,7 +65,10 @@ fn test_browser_metadata_view_toggle() {
 
     // Verify song1 is found in browser_entries
     let label_meta = {
-        let entry = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song1);
+        let entry = app
+            .browser_entries
+            .iter()
+            .find(|(_, p, is_dir)| !*is_dir && p == &song1);
         assert!(entry.is_some(), "WAV track should be in browser entries");
         entry.unwrap().0.clone()
     };
@@ -76,13 +79,20 @@ fn test_browser_metadata_view_toggle() {
         "Metadata label should contain duration: {}",
         label_meta
     );
-    assert!(label_meta.contains("[WAV]"), "Metadata label should contain format badge: {}", label_meta);
+    assert!(
+        label_meta.contains("[WAV]"),
+        "Metadata label should contain format badge: {}",
+        label_meta
+    );
 
     // Now toggle metadata_view to false
     app.settings_mgr.settings.metadata_view = false;
     app.refresh_browser();
 
-    let entry_file = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song1);
+    let entry_file = app
+        .browser_entries
+        .iter()
+        .find(|(_, p, is_dir)| !*is_dir && p == &song1);
     assert!(entry_file.is_some());
     let (label_filename, _, _) = entry_file.unwrap();
 
@@ -133,20 +143,29 @@ fn test_browser_non_blocking_navigation_large_directory() {
     assert_eq!(app.browser_entries.len(), 62);
 
     // Initial labels for uncached tracks should be fast filenames
-    let first_track = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p.ends_with("track_00.wav"));
+    let first_track = app
+        .browser_entries
+        .iter()
+        .find(|(_, p, is_dir)| !*is_dir && p.ends_with("track_00.wav"));
     assert!(first_track.is_some());
 
     // Allow background worker to populate metadata
     for _ in 0..50 {
         app.poll_background_metadata();
-        if app.browser_entries.iter().any(|(l, p, is_dir)| !*is_dir && p.ends_with("track_00.wav") && (l.contains("00:01") || l.contains("01:00"))) {
+        if app.browser_entries.iter().any(|(l, p, is_dir)| {
+            !*is_dir && p.ends_with("track_00.wav") && (l.contains("00:01") || l.contains("01:00"))
+        }) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(15));
     }
     app.poll_background_metadata();
 
-    let updated_track = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p.ends_with("track_00.wav")).unwrap();
+    let updated_track = app
+        .browser_entries
+        .iter()
+        .find(|(_, p, is_dir)| !*is_dir && p.ends_with("track_00.wav"))
+        .unwrap();
     assert!(
         updated_track.0.contains("00:01") || updated_track.0.contains("01:00"),
         "Track label should be updated by background worker: {}",
@@ -174,7 +193,11 @@ fn test_browser_scrolling_beyond_viewport() {
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
 
     let total_entries = app.browser_entries.len();
-    assert!(total_entries >= 40, "Should have at least 40 entries, found {}", total_entries);
+    assert!(
+        total_entries >= 40,
+        "Should have at least 40 entries, found {}",
+        total_entries
+    );
 
     // Set up a mock terminal with height 20 (viewport fits ~12 list items)
     let backend = ratatui::backend::TestBackend::new(80, 20);
@@ -295,10 +318,7 @@ fn test_browser_paging_and_jump_shortcuts() {
     assert_eq!(app.browser_cursor, 0);
 
     // 11. MacBook friendly: Shift + Down jumps down by page height (10)
-    app.handle_tab_key_with_modifiers(
-        crossterm::event::KeyCode::Down,
-        crossterm::event::KeyModifiers::SHIFT,
-    );
+    app.handle_tab_key_with_modifiers(crossterm::event::KeyCode::Down, crossterm::event::KeyModifiers::SHIFT);
     assert_eq!(app.browser_cursor, 10);
 
     // 12. MacBook friendly: Ctrl+D jumps down by page height (10 -> 20)
@@ -316,10 +336,7 @@ fn test_browser_paging_and_jump_shortcuts() {
     assert_eq!(app.browser_cursor, 10);
 
     // 14. MacBook friendly: Shift + Up jumps up by page height (10 -> 0)
-    app.handle_tab_key_with_modifiers(
-        crossterm::event::KeyCode::Up,
-        crossterm::event::KeyModifiers::SHIFT,
-    );
+    app.handle_tab_key_with_modifiers(crossterm::event::KeyCode::Up, crossterm::event::KeyModifiers::SHIFT);
     assert_eq!(app.browser_cursor, 0);
 
     let _ = fs::remove_dir_all(&temp_dir);
@@ -442,11 +459,31 @@ fn test_browser_spotlight_subfolder_jump() {
     let settings_mgr = SettingsManager::with_path(config_path);
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
 
-    let ambient_idx = app.browser_entries.iter().position(|(name, _, _)| name.contains("Ambient Works")).unwrap();
-    let audio_bullys_idx = app.browser_entries.iter().position(|(name, _, _)| name.contains("Audio Bullys")).unwrap();
-    let audioslave_idx = app.browser_entries.iter().position(|(name, _, _)| name.contains("Audioslave")).unwrap();
-    let austin_wintory_idx = app.browser_entries.iter().position(|(name, _, _)| name.contains("Austin Wintory")).unwrap();
-    let beatles_idx = app.browser_entries.iter().position(|(name, _, _)| name.contains("Beatles")).unwrap();
+    let ambient_idx = app
+        .browser_entries
+        .iter()
+        .position(|(name, _, _)| name.contains("Ambient Works"))
+        .unwrap();
+    let audio_bullys_idx = app
+        .browser_entries
+        .iter()
+        .position(|(name, _, _)| name.contains("Audio Bullys"))
+        .unwrap();
+    let audioslave_idx = app
+        .browser_entries
+        .iter()
+        .position(|(name, _, _)| name.contains("Audioslave"))
+        .unwrap();
+    let austin_wintory_idx = app
+        .browser_entries
+        .iter()
+        .position(|(name, _, _)| name.contains("Austin Wintory"))
+        .unwrap();
+    let beatles_idx = app
+        .browser_entries
+        .iter()
+        .position(|(name, _, _)| name.contains("Beatles"))
+        .unwrap();
 
     // 1. Initially spotlight is not active
     assert!(app.browser_spotlight.is_none());
@@ -576,13 +613,19 @@ fn test_browser_cancellation_on_navigation() {
 
     // Navigate to DirA, starting scan
     app.navigate_browser(dir_a.clone());
-    let stop_a = app.dir_scan_stop.clone().expect("Stop flag should be set for active scan");
+    let stop_a = app
+        .dir_scan_stop
+        .clone()
+        .expect("Stop flag should be set for active scan");
 
     // Immediately navigate to DirB
     app.navigate_browser(dir_b.clone());
 
     // Old scan's stop flag must be signaled
-    assert!(stop_a.load(std::sync::atomic::Ordering::Relaxed), "DirA scan should be cancelled");
+    assert!(
+        stop_a.load(std::sync::atomic::Ordering::Relaxed),
+        "DirA scan should be cancelled"
+    );
     assert_eq!(app.browser_dir, dir_b);
 
     let _ = fs::remove_dir_all(&temp_dir);
@@ -624,7 +667,10 @@ fn test_browser_cache_instant_back_navigation() {
     assert_eq!(app.browser_dir, parent_dir);
     assert!(!app.browser_loading);
     // Cursor must be restored to ArtistA
-    let artist_pos = app.browser_entries.iter().position(|(_name, p, is_dir)| *is_dir && p == &sub_dir);
+    let artist_pos = app
+        .browser_entries
+        .iter()
+        .position(|(_name, p, is_dir)| *is_dir && p == &sub_dir);
     assert!(artist_pos.is_some());
     assert_eq!(app.browser_cursor, artist_pos.unwrap());
 
@@ -672,7 +718,10 @@ fn test_browser_small_folder_streaming_and_incremental_sorting() {
     assert!(app.browser_entries[4].0.contains("02_Track_B"));
 
     // Verify cache has is_complete == true
-    let cached = app.browser_dir_cache.get(&album_dir).expect("Cache should contain album_dir");
+    let cached = app
+        .browser_dir_cache
+        .get(&album_dir)
+        .expect("Cache should contain album_dir");
     assert!(cached.is_complete, "Cache should be marked complete");
 
     // Incomplete cache test: if is_complete is false, refresh_browser removes partial cache and rescans
@@ -776,7 +825,11 @@ fn test_browser_add_track_to_queue_does_not_start_playback() {
     assert!(!app.player.is_playing());
 
     // Locate song 1 in browser entries and position cursor
-    let song1_idx = app.browser_entries.iter().position(|(_, p, is_dir)| !*is_dir && p == &song1).unwrap();
+    let song1_idx = app
+        .browser_entries
+        .iter()
+        .position(|(_, p, is_dir)| !*is_dir && p == &song1)
+        .unwrap();
     app.browser_cursor = song1_idx;
     assert!(!app.queue_focus);
 
@@ -791,10 +844,17 @@ fn test_browser_add_track_to_queue_does_not_start_playback() {
     assert_eq!(app.queue.len(), 1);
     assert!(app.status_message.contains("Added to queue: "));
     // 2. Playback did NOT start immediately!
-    assert!(!app.player.is_playing(), "Adding track to queue must NOT start playback immediately!");
+    assert!(
+        !app.player.is_playing(),
+        "Adding track to queue must NOT start playback immediately!"
+    );
 
     // Locate song 2 in browser entries and position cursor
-    let song2_idx = app.browser_entries.iter().position(|(_, p, is_dir)| !*is_dir && p == &song2).unwrap();
+    let song2_idx = app
+        .browser_entries
+        .iter()
+        .position(|(_, p, is_dir)| !*is_dir && p == &song2)
+        .unwrap();
     app.browser_cursor = song2_idx;
 
     // Press Enter to add song2 to queue
@@ -1042,7 +1102,11 @@ fn test_browser_metadata_view_toggle_in_place_and_settings_tab() {
     // Wait a brief moment for metadata worker to parse tag and poll
     for _ in 0..50 {
         app.poll_background_metadata();
-        let e = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song).unwrap();
+        let e = app
+            .browser_entries
+            .iter()
+            .find(|(_, p, is_dir)| !*is_dir && p == &song)
+            .unwrap();
         if e.0.contains("01:00") || e.0.contains("00:01") {
             break;
         }
@@ -1050,7 +1114,11 @@ fn test_browser_metadata_view_toggle_in_place_and_settings_tab() {
     }
     app.poll_background_metadata();
 
-    let tag_entry = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song).unwrap();
+    let tag_entry = app
+        .browser_entries
+        .iter()
+        .find(|(_, p, is_dir)| !*is_dir && p == &song)
+        .unwrap();
     assert!(tag_entry.0.contains("[WAV]"));
     assert!(tag_entry.0.contains("01:00") || tag_entry.0.contains("00:01"));
 
@@ -1061,12 +1129,20 @@ fn test_browser_metadata_view_toggle_in_place_and_settings_tab() {
     ));
     assert!(!app.settings_mgr.settings.metadata_view);
 
-    let filename_entry = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song).unwrap();
+    let filename_entry = app
+        .browser_entries
+        .iter()
+        .find(|(_, p, is_dir)| !*is_dir && p == &song)
+        .unwrap();
     assert_eq!(filename_entry.0, "01_test_song.wav");
 
     // Also verify cached directory has the filename updated
     if let Some(cached) = app.browser_dir_cache.get(&temp_dir) {
-        let cached_file = cached.files.iter().find(|(_, p, is_dir)| !*is_dir && p == &song).unwrap();
+        let cached_file = cached
+            .files
+            .iter()
+            .find(|(_, p, is_dir)| !*is_dir && p == &song)
+            .unwrap();
         assert_eq!(cached_file.0, "01_test_song.wav");
     }
 
@@ -1080,7 +1156,11 @@ fn test_browser_metadata_view_toggle_in_place_and_settings_tab() {
         crossterm::event::KeyModifiers::NONE,
     ));
     assert!(app.settings_mgr.settings.metadata_view);
-    let entry_after_tab3 = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song).unwrap();
+    let entry_after_tab3 = app
+        .browser_entries
+        .iter()
+        .find(|(_, p, is_dir)| !*is_dir && p == &song)
+        .unwrap();
     assert!(entry_after_tab3.0.contains("01:00") || entry_after_tab3.0.contains("00:01"));
 
     // Press 'Left' on Tab 3 to cycle backward -> filenames mode
@@ -1089,7 +1169,11 @@ fn test_browser_metadata_view_toggle_in_place_and_settings_tab() {
         crossterm::event::KeyModifiers::NONE,
     ));
     assert!(!app.settings_mgr.settings.metadata_view);
-    let entry_after_left = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song).unwrap();
+    let entry_after_left = app
+        .browser_entries
+        .iter()
+        .find(|(_, p, is_dir)| !*is_dir && p == &song)
+        .unwrap();
     assert_eq!(entry_after_left.0, "01_test_song.wav");
 
     let _ = fs::remove_dir_all(&temp_dir);
@@ -1121,7 +1205,10 @@ fn test_browser_perf_and_scan_lifecycle_tracking() {
     // Since folder is small, fast path reads it immediately and fires DirScanEvent::Complete
     assert!(!app.browser_loading);
     assert!(app.browser_load_start.is_none());
-    assert!(app.browser_entries.iter().any(|(_, p, is_dir)| !*is_dir && p.ends_with("song_0.wav")));
+    assert!(app
+        .browser_entries
+        .iter()
+        .any(|(_, p, is_dir)| !*is_dir && p.ends_with("song_0.wav")));
 
     // When cached, refresh_browser is instant and browser_load_start remains None
     app.refresh_browser();
@@ -1188,7 +1275,11 @@ fn test_queue_rendering_without_file_type_and_file_list_display_swap() {
     assert!(!view2.contains("[WAV] 01_test_song.wav (01:00)"));
 
     // Browser entries also show clean filename
-    let browser_entry = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song_path).unwrap();
+    let browser_entry = app
+        .browser_entries
+        .iter()
+        .find(|(_, p, is_dir)| !*is_dir && p == &song_path)
+        .unwrap();
     assert_eq!(browser_entry.0, "01_test_song.wav");
 
     let _ = fs::remove_dir_all(&temp_dir);
@@ -1214,13 +1305,19 @@ fn test_settings_view_file_actions_disabled_and_home_dir_editing() {
         crossterm::event::KeyCode::Char('/'),
         crossterm::event::KeyModifiers::NONE,
     ));
-    assert!(app.search_modal.is_none(), "Fuzzy search must not open on settings view with '/'");
+    assert!(
+        app.search_modal.is_none(),
+        "Fuzzy search must not open on settings view with '/'"
+    );
 
     let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Char('f'),
         crossterm::event::KeyModifiers::NONE,
     ));
-    assert!(app.search_modal.is_none(), "Fuzzy search must not open on settings view with 'f'");
+    assert!(
+        app.search_modal.is_none(),
+        "Fuzzy search must not open on settings view with 'f'"
+    );
 
     // 'v' must NOT toggle metadata view from settings view
     let initial_meta = app.settings_mgr.settings.metadata_view;
@@ -1290,7 +1387,6 @@ fn test_settings_view_file_actions_disabled_and_home_dir_editing() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
-
 
 #[test]
 fn test_browser_drops_duplicate_directory_entries_from_os() {

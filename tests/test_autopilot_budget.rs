@@ -94,7 +94,11 @@ fn run_chill_mix(limits: ProfileScanLimits) -> MixRun {
     handle.join().unwrap();
     assert!(quickstream::logger::flush(), "log writer did not flush");
     let log = fs::read_to_string(&log_path).unwrap()[log_before..].to_string();
-    MixRun { first_track_at, finished_at, log }
+    MixRun {
+        first_track_at,
+        finished_at,
+        log,
+    }
 }
 
 fn gathered_line(log: &str) -> String {
@@ -155,13 +159,28 @@ fn test_sequencing_after_queued_track_keeps_artist_spacing() {
 
     let rest = DjMixer::sequence_mix_after(Some(&queued), candidates, &db, 3);
     assert_eq!(rest.len(), 3);
-    assert!(rest.iter().all(|t| t.filepath != queued.filepath), "queued track is not repeated");
-    assert_ne!(rest[0].artist, "Alpha", "next track must not repeat the queued track's artist");
+    assert!(
+        rest.iter().all(|t| t.filepath != queued.filepath),
+        "queued track is not repeated"
+    );
+    assert_ne!(
+        rest[0].artist, "Alpha",
+        "next track must not repeat the queued track's artist"
+    );
 }
 
 fn counter(line: &str, name: &str) -> usize {
-    let start = line.find(&format!("{}=", name)).unwrap_or_else(|| panic!("no {} in {}", name, line)) + name.len() + 1;
-    line[start..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap()
+    let start = line
+        .find(&format!("{}=", name))
+        .unwrap_or_else(|| panic!("no {} in {}", name, line))
+        + name.len()
+        + 1;
+    line[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap()
 }
 
 #[test]

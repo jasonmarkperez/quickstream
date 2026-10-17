@@ -83,7 +83,10 @@ fn test_artist_cooldown_with_uneven_artist_pools() {
     common::isolate();
     let db = AnalysisDatabase::open_in_memory().unwrap();
     let mut candidates = Vec::new();
-    for (i, a) in ["Big", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"].iter().enumerate() {
+    for (i, a) in ["Big", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]
+        .iter()
+        .enumerate()
+    {
         let count = if i == 0 { 12 } else { 3 };
         for n in 0..count {
             candidates.push(track(a, &format!("{a} album {n}"), n));
@@ -122,9 +125,17 @@ fn test_untagged_tracks_count_as_positions_and_are_exempt() {
     }
     let mix = DjMixer::sequence_mix(candidates, &db, 11);
     assert_eq!(mix.len(), 11);
-    let solo: Vec<usize> = mix.iter().enumerate().filter(|(_, t)| t.artist == "Solo").map(|(i, _)| i).collect();
+    let solo: Vec<usize> = mix
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.artist == "Solo")
+        .map(|(i, _)| i)
+        .collect();
     assert_eq!(solo.len(), 2);
-    assert!(solo[1] - solo[0] > ARTIST_COOLDOWN, "Solo repeated at positions {solo:?}");
+    assert!(
+        solo[1] - solo[0] > ARTIST_COOLDOWN,
+        "Solo repeated at positions {solo:?}"
+    );
 
     // Untagged tracks are allowed back-to-back.
     let untagged_adjacent = mix.windows(2).any(|w| w[0].artist.is_empty() && w[1].artist.is_empty());
@@ -155,9 +166,16 @@ fn test_already_queued_track_starts_the_artist_cooldown() {
         candidates.push(track(&format!("Other {n}"), &format!("Other album {n}"), n));
     }
     let rest = DjMixer::sequence_mix_after(Some(&queued), candidates, &db, 11);
-    let alpha = rest.iter().position(|t| t.artist == "Alpha").expect("Alpha is still sequenced");
+    let alpha = rest
+        .iter()
+        .position(|t| t.artist == "Alpha")
+        .expect("Alpha is still sequenced");
     // Position in the full queue is alpha + 1 (queued track is position 0).
-    assert!(alpha + 1 > ARTIST_COOLDOWN, "Alpha repeated at queue position {}", alpha + 1);
+    assert!(
+        alpha + 1 > ARTIST_COOLDOWN,
+        "Alpha repeated at queue position {}",
+        alpha + 1
+    );
 }
 
 /// When too few artists exist to honour the cooldown, every candidate is still used and the

@@ -6,9 +6,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
@@ -59,7 +57,10 @@ pub enum DirScanEvent {
 /// Create a local (mpv/ffplay) player that runs on its own worker thread.
 fn spawn_local_player(backend: &str, initial_volume: u8) -> Box<dyn AudioPlayer> {
     let backend = backend.to_string();
-    Box::new(AsyncPlayer::spawn(move || Box::new(LocalPlayer::new(&backend)), initial_volume))
+    Box::new(AsyncPlayer::spawn(
+        move || Box::new(LocalPlayer::new(&backend)),
+        initial_volume,
+    ))
 }
 
 /// Start 4 threads that read tags for paths sent to the returned inbox and report results on
@@ -424,17 +425,15 @@ impl AppUI {
         drop(std::mem::replace(&mut self.persistence, worker));
     }
 
-    pub fn format_file_label(
-        path: &Path,
-        metadata_view: bool,
-        cache: &crate::library::MetadataCache,
-    ) -> String {
+    pub fn format_file_label(path: &Path, metadata_view: bool, cache: &crate::library::MetadataCache) -> String {
         if metadata_view {
             if let Some(m) = cache.get(path) {
                 return m.format_display_label(true);
             }
         }
-        path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()
+        path.file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default()
     }
 
     pub fn update_browser_entry_labels(&mut self) {
@@ -455,12 +454,10 @@ impl AppUI {
             let header_count = if self.browser_dir.parent().is_some() { 2 } else { 1 };
             if self.browser_entries.len() > header_count {
                 let mut content_entries = self.browser_entries.split_off(header_count);
-                content_entries.sort_by(|a, b| {
-                    match (a.2, b.2) {
-                        (true, false) => std::cmp::Ordering::Less,
-                        (false, true) => std::cmp::Ordering::Greater,
-                        _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-                    }
+                content_entries.sort_by(|a, b| match (a.2, b.2) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
                 });
                 self.browser_entries.extend(content_entries);
             }
@@ -512,7 +509,10 @@ impl AppUI {
                 .push((".. [Back to File System]".to_string(), self.browser_dir.clone(), true));
             for b in &self.bookmarks {
                 let p = PathBuf::from(b);
-                let name = p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| b.clone());
+                let name = p
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| b.clone());
                 let label = format!("📁 {}/", name);
                 self.browser_entries.push((label, p, true));
             }
@@ -560,20 +560,20 @@ impl AppUI {
                 let header_count = if self.browser_dir.parent().is_some() { 2 } else { 1 };
                 if self.browser_entries.len() > header_count {
                     let mut content_entries = self.browser_entries.split_off(header_count);
-                    content_entries.sort_by(|a, b| {
-                        match (a.2, b.2) {
-                            (true, false) => std::cmp::Ordering::Less,
-                            (false, true) => std::cmp::Ordering::Greater,
-                            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-                        }
+                    content_entries.sort_by(|a, b| match (a.2, b.2) {
+                        (true, false) => std::cmp::Ordering::Less,
+                        (false, true) => std::cmp::Ordering::Greater,
+                        _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
                     });
                     self.browser_entries.extend(content_entries);
                 }
 
                 if let Some(target_sub) = self.pending_parent_restore.take() {
-                    if let Some(pos) = self.browser_entries.iter().position(|(name, p, is_dir)| {
-                        *is_dir && p == &target_sub && name.starts_with("📁 ")
-                    }) {
+                    if let Some(pos) = self
+                        .browser_entries
+                        .iter()
+                        .position(|(name, p, is_dir)| *is_dir && p == &target_sub && name.starts_with("📁 "))
+                    {
                         self.browser_cursor = pos;
                         self.browser_state = ListState::default();
                         self.browser_state.select(Some(pos));
@@ -733,10 +733,7 @@ impl AppUI {
                                 thread_elapsed
                             ),
                         );
-                        let _ = tx.send(DirScanEvent::Complete {
-                            scan_id,
-                            dir: scan_dir,
-                        });
+                        let _ = tx.send(DirScanEvent::Complete { scan_id, dir: scan_dir });
                     }
                 }
                 Err(err) => {
@@ -820,20 +817,20 @@ impl AppUI {
                 let header_count = if self.browser_dir.parent().is_some() { 2 } else { 1 };
                 if self.browser_entries.len() > header_count {
                     let mut content_entries = self.browser_entries.split_off(header_count);
-                    content_entries.sort_by(|a, b| {
-                        match (a.2, b.2) {
-                            (true, false) => std::cmp::Ordering::Less,
-                            (false, true) => std::cmp::Ordering::Greater,
-                            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-                        }
+                    content_entries.sort_by(|a, b| match (a.2, b.2) {
+                        (true, false) => std::cmp::Ordering::Less,
+                        (false, true) => std::cmp::Ordering::Greater,
+                        _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
                     });
                     self.browser_entries.extend(content_entries);
                 }
 
                 if let Some(ref target_sub) = self.pending_parent_restore {
-                    if let Some(pos) = self.browser_entries.iter().position(|(name, p, is_dir)| {
-                        *is_dir && p == target_sub && name.starts_with("📁 ")
-                    }) {
+                    if let Some(pos) = self
+                        .browser_entries
+                        .iter()
+                        .position(|(name, p, is_dir)| *is_dir && p == target_sub && name.starts_with("📁 "))
+                    {
                         self.browser_cursor = pos;
                         self.browser_state = ListState::default();
                         self.browser_state.select(Some(pos));
@@ -850,12 +847,10 @@ impl AppUI {
                 let header_count = if self.browser_dir.parent().is_some() { 2 } else { 1 };
                 if self.browser_entries.len() > header_count {
                     let mut content_entries = self.browser_entries.split_off(header_count);
-                    content_entries.sort_by(|a, b| {
-                        match (a.2, b.2) {
-                            (true, false) => std::cmp::Ordering::Less,
-                            (false, true) => std::cmp::Ordering::Greater,
-                            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-                        }
+                    content_entries.sort_by(|a, b| match (a.2, b.2) {
+                        (true, false) => std::cmp::Ordering::Less,
+                        (false, true) => std::cmp::Ordering::Greater,
+                        _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
                     });
                     self.browser_entries.extend(content_entries);
                 }
@@ -881,9 +876,11 @@ impl AppUI {
                 }
 
                 if let Some(target_sub) = self.pending_parent_restore.take() {
-                    if let Some(pos) = self.browser_entries.iter().position(|(name, p, is_dir)| {
-                        *is_dir && p == &target_sub && name.starts_with("📁 ")
-                    }) {
+                    if let Some(pos) = self
+                        .browser_entries
+                        .iter()
+                        .position(|(name, p, is_dir)| *is_dir && p == &target_sub && name.starts_with("📁 "))
+                    {
                         self.browser_cursor = pos;
                         self.browser_state = ListState::default();
                         self.browser_state.select(Some(pos));
@@ -898,11 +895,7 @@ impl AppUI {
                     }
                 }
             }
-            DirScanEvent::Error {
-                scan_id,
-                dir,
-                message,
-            } => {
+            DirScanEvent::Error { scan_id, dir, message } => {
                 if scan_id != self.dir_scan_id || dir != self.browser_dir {
                     return;
                 }
@@ -1073,7 +1066,6 @@ impl AppUI {
         Some(removed.track)
     }
 
-
     pub fn poll_background_metadata(&mut self) {
         let mut queue_updated = false;
         while let Ok(meta) = self.metadata_rx.try_recv() {
@@ -1142,19 +1134,36 @@ impl AppUI {
         if new_tracks.is_empty() {
             if finished {
                 if self.queue.is_empty() {
-                    let dir_name = self.autopilot_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default();
+                    let dir_name = self
+                        .autopilot_dir
+                        .as_ref()
+                        .map(|d| d.display().to_string())
+                        .unwrap_or_default();
                     self.status_message = format!("No audio files found in '{}'", dir_name);
                 } else {
-                    let dir_name = self.autopilot_dir.as_ref().and_then(|d| d.file_name()).unwrap_or_default().to_string_lossy();
+                    let dir_name = self
+                        .autopilot_dir
+                        .as_ref()
+                        .and_then(|d| d.file_name())
+                        .unwrap_or_default()
+                        .to_string_lossy();
                     match self.autopilot_run_mode {
                         AutopilotRunMode::Fresh => {
-                            self.status_message = format!("⚡ Autopilot: {} tracks from '{}'", self.queue.len(), dir_name);
+                            self.status_message =
+                                format!("⚡ Autopilot: {} tracks from '{}'", self.queue.len(), dir_name);
                         }
                         AutopilotRunMode::Append => {
-                            self.status_message = format!("⚡ Autopilot: Appended {} tracks (queue: {})", self.autopilot_added_count, self.queue.len());
+                            self.status_message = format!(
+                                "⚡ Autopilot: Appended {} tracks (queue: {})",
+                                self.autopilot_added_count,
+                                self.queue.len()
+                            );
                         }
                         AutopilotRunMode::Reshuffle => {
-                            self.status_message = format!("🎲 Autopilot: Reshuffled {} tracks from next track forward", self.autopilot_added_count);
+                            self.status_message = format!(
+                                "🎲 Autopilot: Reshuffled {} tracks from next track forward",
+                                self.autopilot_added_count
+                            );
                         }
                     }
                 }
@@ -1164,7 +1173,8 @@ impl AppUI {
 
         let was_empty = self.queue.is_empty();
 
-        self.analysis_worker.enqueue(new_tracks.iter().map(|t| t.filepath.clone()));
+        self.analysis_worker
+            .enqueue(new_tracks.iter().map(|t| t.filepath.clone()));
         for track in new_tracks {
             if let Some(ref ws) = self.web_server {
                 ws.register_stream_file(&track.filepath);
@@ -1208,17 +1218,30 @@ impl AppUI {
         self.start_queue_metadata_fetch();
         self.update_web_state();
 
-        let dir_name = self.autopilot_dir.as_ref().and_then(|d| d.file_name()).unwrap_or_default().to_string_lossy();
+        let dir_name = self
+            .autopilot_dir
+            .as_ref()
+            .and_then(|d| d.file_name())
+            .unwrap_or_default()
+            .to_string_lossy();
         if self.is_autopilot_scanning {
             match self.autopilot_run_mode {
                 AutopilotRunMode::Fresh => {
                     self.status_message = format!("⚡ Autopilot: {} tracks queued (discovering...)", self.queue.len());
                 }
                 AutopilotRunMode::Append => {
-                    self.status_message = format!("⚡ Autopilot: Appending from '{}' (+{} queued, total: {})...", dir_name, self.autopilot_added_count, self.queue.len());
+                    self.status_message = format!(
+                        "⚡ Autopilot: Appending from '{}' (+{} queued, total: {})...",
+                        dir_name,
+                        self.autopilot_added_count,
+                        self.queue.len()
+                    );
                 }
                 AutopilotRunMode::Reshuffle => {
-                    self.status_message = format!("🎲 Autopilot: Reshuffling from '{}' (+{} queued)...", dir_name, self.autopilot_added_count);
+                    self.status_message = format!(
+                        "🎲 Autopilot: Reshuffling from '{}' (+{} queued)...",
+                        dir_name, self.autopilot_added_count
+                    );
                 }
             }
         } else if !self.queue.is_empty() {
@@ -1227,10 +1250,17 @@ impl AppUI {
                     self.status_message = format!("⚡ Autopilot: {} tracks from '{}'", self.queue.len(), dir_name);
                 }
                 AutopilotRunMode::Append => {
-                    self.status_message = format!("⚡ Autopilot: Appended {} tracks (queue: {})", self.autopilot_added_count, self.queue.len());
+                    self.status_message = format!(
+                        "⚡ Autopilot: Appended {} tracks (queue: {})",
+                        self.autopilot_added_count,
+                        self.queue.len()
+                    );
                 }
                 AutopilotRunMode::Reshuffle => {
-                    self.status_message = format!("🎲 Autopilot: Reshuffled {} tracks from next track forward", self.autopilot_added_count);
+                    self.status_message = format!(
+                        "🎲 Autopilot: Reshuffled {} tracks from next track forward",
+                        self.autopilot_added_count
+                    );
                 }
             }
         }
@@ -1538,7 +1568,12 @@ impl AppUI {
 
             // Synchronize continuous gapless stream track index
             if let Some(ref ws) = self.web_server {
-                if ws.stream_state().continuous.is_active.load(std::sync::atomic::Ordering::SeqCst) {
+                if ws
+                    .stream_state()
+                    .continuous
+                    .is_active
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
                     let cur_idx = *ws.stream_state().continuous.current_track_index.lock().unwrap();
                     if cur_idx != self.queue.current_index && cur_idx < self.queue.len() {
                         self.queue.current_index = cur_idx;
@@ -1731,9 +1766,7 @@ impl AppUI {
         }
 
         // If seek direction changed (+ to - or - to +), flush previous seek first
-        if (self.pending_seek_delta > 0.0 && delta < 0.0)
-            || (self.pending_seek_delta < 0.0 && delta > 0.0)
-        {
+        if (self.pending_seek_delta > 0.0 && delta < 0.0) || (self.pending_seek_delta < 0.0 && delta > 0.0) {
             self.flush_pending_seek();
         }
 
@@ -1780,12 +1813,7 @@ impl AppUI {
                         delta,
                         crate::player::upnp::format_seconds_to_upnp_time(target)
                     );
-                    crate::log_info!(
-                        "ui",
-                        "Flushed seek: target={:.2}s (delta={:.1}s)",
-                        target,
-                        delta
-                    );
+                    crate::log_info!("ui", "Flushed seek: target={:.2}s (delta={:.1}s)", target, delta);
                 }
                 Err(e) => {
                     self.status_message = format!("Seek error: {}", e);
@@ -1892,10 +1920,7 @@ impl AppUI {
             (key.code, key.modifiers),
             (KeyCode::Right, KeyModifiers::NONE) | (KeyCode::Left, KeyModifiers::NONE)
         );
-        if !is_skip_key
-            && self.pending_track_skip
-            && !matches!(key.code, KeyCode::Char('s') | KeyCode::Char('c'))
-        {
+        if !is_skip_key && self.pending_track_skip && !matches!(key.code, KeyCode::Char('s') | KeyCode::Char('c')) {
             self.flush_pending_track_skip();
         }
 
@@ -2164,7 +2189,12 @@ impl AppUI {
                 } else if self.active_tab == 0 || (self.active_tab == 1 && self.queue_focus) {
                     self.open_fuzzy_search();
                 } else if self.active_tab == 3 && self.settings_cursor == 7 {
-                    let curr = self.settings_mgr.settings.home_dir.clone().unwrap_or_else(|| "/".to_string());
+                    let curr = self
+                        .settings_mgr
+                        .settings
+                        .home_dir
+                        .clone()
+                        .unwrap_or_else(|| "/".to_string());
                     self.editing_home_dir = Some(curr);
                     self.status_message = "Editing Startup Home Directory (Enter: Save, Esc: Cancel)".to_string();
                 }
@@ -2193,8 +2223,7 @@ impl AppUI {
                 };
                 self.start_autopilot(target_dir);
             }
-            (KeyCode::Char('P'), _)
-            | (KeyCode::Char('p'), KeyModifiers::SHIFT) => {
+            (KeyCode::Char('P'), _) | (KeyCode::Char('p'), KeyModifiers::SHIFT) => {
                 let target_dir = if self.in_bookmarks_view {
                     if self.browser_cursor > 0 && self.browser_cursor < self.browser_entries.len() {
                         self.browser_entries[self.browser_cursor].1.clone()
@@ -2206,8 +2235,7 @@ impl AppUI {
                 };
                 self.reshuffle_autopilot(target_dir);
             }
-            (KeyCode::Char('M'), _)
-            | (KeyCode::Char('m'), KeyModifiers::SHIFT) => {
+            (KeyCode::Char('M'), _) | (KeyCode::Char('m'), KeyModifiers::SHIFT) => {
                 self.show_mix_picker_modal = !self.show_mix_picker_modal;
                 self.mix_picker_cursor = match &self.active_mix_profile {
                     crate::analysis::MixProfile::DiverseShuffle => 0,
@@ -2264,12 +2292,7 @@ impl AppUI {
 
         let target_name = target_dir.file_name().unwrap_or_default().to_string_lossy();
         self.status_message = format!("Fuzzy search in {}", target_name);
-        let modal = search::SearchModalState::new_with_scanner(
-            target_dir,
-            Vec::new(),
-            Some(rx),
-            Some(stop_flag),
-        );
+        let modal = search::SearchModalState::new_with_scanner(target_dir, Vec::new(), Some(rx), Some(stop_flag));
         self.search_modal = Some(modal);
     }
 
@@ -2468,7 +2491,10 @@ impl AppUI {
                         self.update_web_state();
                     }
                     (KeyCode::Char('H'), _) => {
-                        let target = if self.in_bookmarks_view && self.browser_cursor > 0 && self.browser_cursor <= self.bookmarks.len() {
+                        let target = if self.in_bookmarks_view
+                            && self.browser_cursor > 0
+                            && self.browser_cursor <= self.bookmarks.len()
+                        {
                             self.bookmarks[self.browser_cursor - 1].clone()
                         } else {
                             self.browser_dir.to_string_lossy().to_string()
@@ -2609,19 +2635,18 @@ impl AppUI {
                         self.status_message = "Cleared startup home (defaulting to launch directory)".to_string();
                         self.update_web_state();
                     }
-                    (KeyCode::Left, KeyModifiers::NONE)
-                    | (KeyCode::Char('h'), KeyModifiers::NONE) => {
+                    (KeyCode::Left, KeyModifiers::NONE) | (KeyCode::Char('h'), KeyModifiers::NONE) => {
                         self.cycle_and_apply_setting(false);
                     }
-                    (KeyCode::Right, KeyModifiers::NONE)
-                    | (KeyCode::Char('l'), KeyModifiers::NONE) => {
+                    (KeyCode::Right, KeyModifiers::NONE) | (KeyCode::Char('l'), KeyModifiers::NONE) => {
                         self.cycle_and_apply_setting(true);
                     }
                     (KeyCode::Enter, KeyModifiers::NONE) => {
                         if self.settings_cursor == 7 {
                             let curr = self.settings_mgr.settings.home_dir.clone().unwrap_or_default();
                             self.editing_home_dir = Some(curr);
-                            self.status_message = "Editing Startup Home Directory (Enter: Save, Esc: Cancel)".to_string();
+                            self.status_message =
+                                "Editing Startup Home Directory (Enter: Save, Esc: Cancel)".to_string();
                         } else {
                             self.cycle_and_apply_setting(true);
                         }
@@ -2665,7 +2690,12 @@ impl AppUI {
         self.pending_track_skip = false;
         self.last_track_skip_time = None;
         if let Some(ref ws) = self.web_server {
-            if ws.stream_state().continuous.is_active.load(std::sync::atomic::Ordering::SeqCst) {
+            if ws
+                .stream_state()
+                .continuous
+                .is_active
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
                 ws.stream_state().continuous.skip_to_index(self.queue.current_index);
                 self.update_web_state();
                 return;
@@ -2699,7 +2729,11 @@ impl AppUI {
         self.pending_track_skip = false;
         self.last_track_skip_time = None;
         if let Some(ref ws) = self.web_server {
-            if ws.stream_state().continuous.is_active.load(std::sync::atomic::Ordering::SeqCst)
+            if ws
+                .stream_state()
+                .continuous
+                .is_active
+                .load(std::sync::atomic::Ordering::SeqCst)
                 && !self.queue.is_empty()
             {
                 let next_idx = (self.queue.current_index + 1) % self.queue.len();
@@ -2739,7 +2773,11 @@ impl AppUI {
         self.pending_track_skip = false;
         self.last_track_skip_time = None;
         if let Some(ref ws) = self.web_server {
-            if ws.stream_state().continuous.is_active.load(std::sync::atomic::Ordering::SeqCst)
+            if ws
+                .stream_state()
+                .continuous
+                .is_active
+                .load(std::sync::atomic::Ordering::SeqCst)
                 && !self.queue.is_empty()
             {
                 let prev_idx = if self.queue.current_index > 0 {
@@ -2830,7 +2868,10 @@ impl AppUI {
                     self.queue.tracks.truncate(self.queue.current_index + 1);
                 }
                 self.clamp_queue_cursor();
-                self.status_message = format!("🎲 Autopilot: Reshuffling mix from next track forward (from '{}')...", dir_display);
+                self.status_message = format!(
+                    "🎲 Autopilot: Reshuffling mix from next track forward (from '{}')...",
+                    dir_display
+                );
             }
         }
 
@@ -2871,7 +2912,10 @@ impl AppUI {
     pub fn apply_mix_picker_selection(&mut self, index: usize) {
         self.show_mix_picker_modal = false;
         self.active_mix_profile = match index {
-            1 => crate::analysis::MixProfile::BpmFlow { target_bpm: 120.0, tolerance: 0.15 },
+            1 => crate::analysis::MixProfile::BpmFlow {
+                target_bpm: 120.0,
+                tolerance: 0.15,
+            },
             2 => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Chill),
             3 => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Workout),
             4 => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Groove),
@@ -2939,7 +2983,8 @@ impl AppUI {
 
     pub fn ensure_web_server_started(&mut self) -> u16 {
         let bind = self.required_web_bind();
-        self.ensure_web_server_bound(bind).unwrap_or(self.settings_mgr.settings.web_server_port)
+        self.ensure_web_server_bound(bind)
+            .unwrap_or(self.settings_mgr.settings.web_server_port)
     }
 
     /// Make sure the web server is running on `bind`, restarting it if it is bound differently.
@@ -3022,7 +3067,11 @@ impl AppUI {
     pub fn switch_to_upnp_player(&mut self, dev: crate::discovery::DLNADevice) {
         // Re-selecting the active renderer is a no-op: a new player would queue Play while the
         // old player's delayed Stop could still reach the same device.
-        if self.device_manager.get_active_device().is_some_and(|d| d.udn == dev.udn) {
+        if self
+            .device_manager
+            .get_active_device()
+            .is_some_and(|d| d.udn == dev.udn)
+        {
             self.status_message = format!("Active output: {}", dev.friendly_name);
             return;
         }
@@ -3051,9 +3100,7 @@ impl AppUI {
         // Do NOT overwrite the remote hardware volume with local software volume!
         // The UPnP device preserves its own hardware volume setting.
         let mut upnp_player: Box<dyn AudioPlayer> = Box::new(AsyncPlayer::spawn(
-            move || {
-                Box::new(crate::player::upnp::UPnPPlayer::new(worker_dev, port).with_stream_state(stream_state))
-            },
+            move || Box::new(crate::player::upnp::UPnPPlayer::new(worker_dev, port).with_stream_state(stream_state)),
             // The renderer's volume is unknown until UPnPPlayer::new has queried it. Report 0 rather
             // than the local volume so a volume key in that window cannot jump the speaker.
             0,
@@ -3081,8 +3128,8 @@ impl AppUI {
     }
 
     pub fn sync_web_server(&mut self) {
-        let needs_server = self.settings_mgr.settings.web_server_enabled
-            || self.device_manager.get_active_device().is_some();
+        let needs_server =
+            self.settings_mgr.settings.web_server_enabled || self.device_manager.get_active_device().is_some();
 
         if needs_server {
             let bind = self.required_web_bind();
@@ -3262,9 +3309,14 @@ impl AppUI {
                 }
                 crate::web::WebCommand::SetMixProfile(profile_str) => {
                     let profile = match profile_str.to_lowercase().as_str() {
-                        "bpm_flow" | "bpm" => crate::analysis::MixProfile::BpmFlow { target_bpm: 120.0, tolerance: 0.15 },
+                        "bpm_flow" | "bpm" => crate::analysis::MixProfile::BpmFlow {
+                            target_bpm: 120.0,
+                            tolerance: 0.15,
+                        },
                         "chill" | "ambient" => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Chill),
-                        "workout" | "energy" => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Workout),
+                        "workout" | "energy" => {
+                            crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Workout)
+                        }
                         "focus" => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Focus),
                         "groove" => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Groove),
                         _ => crate::analysis::MixProfile::DiverseShuffle,
@@ -3428,7 +3480,11 @@ impl AppUI {
             }
 
             if self.queue.len() > 1 && self.queue.current_index + 1 < self.queue.len() {
-                state.next_track_title = self.queue.tracks.get(self.queue.current_index + 1).map(|t| t.display_title().to_string());
+                state.next_track_title = self
+                    .queue
+                    .tracks
+                    .get(self.queue.current_index + 1)
+                    .map(|t| t.display_title().to_string());
             } else if !self.queue.is_empty() && self.settings_mgr.settings.queue_mode == "loop" {
                 state.next_track_title = self.queue.tracks.first().map(|t| t.display_title().to_string());
             } else {
@@ -3479,11 +3535,7 @@ impl AppUI {
             .select(self.active_tab)
             .block(Block::default().borders(Borders::BOTTOM))
             .style(Style::default().fg(Color::DarkGray))
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
         f.render_widget(tabs, area);
     }
 
@@ -3512,10 +3564,7 @@ impl AppUI {
         let (hero_area, up_next_area) = if show_up_next {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(8),
-                    Constraint::Min(4),
-                ])
+                .constraints([Constraint::Length(8), Constraint::Min(4)])
                 .split(inner);
             (chunks[0], Some(chunks[1]))
         } else {
@@ -3530,17 +3579,26 @@ impl AppUI {
         if self.player.is_playing() {
             row1.push(Span::styled(
                 " ▶ PLAYING ",
-                Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             ));
         } else if self.player.is_paused() {
             row1.push(Span::styled(
                 " ⏸ PAUSED ",
-                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ));
         } else {
             row1.push(Span::styled(
                 " ⏹ STOPPED ",
-                Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
             ));
         }
 
@@ -3548,9 +3606,7 @@ impl AppUI {
             .device_manager
             .get_active_device()
             .map(|d| d.friendly_name)
-            .unwrap_or_else(|| {
-                format!("Local Audio ({})", self.settings_mgr.settings.player_backend)
-            });
+            .unwrap_or_else(|| format!("Local Audio ({})", self.settings_mgr.settings.player_backend));
         row1.push(Span::raw("  "));
         row1.push(Span::styled(
             format!("[Output: {}]", active_dev_name),
@@ -3606,10 +3662,7 @@ impl AppUI {
             }
             if !track.album.is_empty() {
                 artist_album_spans.push(Span::styled("  —  ", Style::default().fg(Color::DarkGray)));
-                artist_album_spans.push(Span::styled(
-                    &track.album,
-                    Style::default().fg(Color::White),
-                ));
+                artist_album_spans.push(Span::styled(&track.album, Style::default().fg(Color::White)));
             }
             hero_lines.push(Line::from(artist_album_spans));
 
@@ -3618,14 +3671,20 @@ impl AppUI {
             if self.autopilot_dir.is_some() {
                 badge_spans.push(Span::styled(
                     "[⚡ AUTOPILOT]",
-                    Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ));
                 badge_spans.push(Span::raw(" "));
             }
             if !track.format_name.is_empty() {
                 badge_spans.push(Span::styled(
                     format!("[{}]", track.format_name.to_uppercase()),
-                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ));
                 badge_spans.push(Span::raw(" "));
             }
@@ -3707,15 +3766,9 @@ impl AppUI {
             let remaining = (dur - pos).max(0.0);
             let rem_str = format_time(remaining);
             let info_line = Line::from(vec![
-                Span::styled(
-                    format!("{}% complete", percent),
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(format!("{}% complete", percent), Style::default().fg(Color::White)),
                 Span::styled("   •   ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("-{} remaining", rem_str),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(format!("-{} remaining", rem_str), Style::default().fg(Color::DarkGray)),
                 Span::styled("   •   ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     track.filepath.display().to_string(),
@@ -3732,12 +3785,10 @@ impl AppUI {
                 ),
             ]);
             hero_lines.push(empty_title);
-            hero_lines.push(Line::from(vec![
-                Span::styled(
-                    "Press Space to play active queue, or navigate to [2] Queue & Library to browse your collection.",
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
+            hero_lines.push(Line::from(vec![Span::styled(
+                "Press Space to play active queue, or navigate to [2] Queue & Library to browse your collection.",
+                Style::default().fg(Color::DarkGray),
+            )]));
         }
 
         f.render_widget(Paragraph::new(hero_lines), hero_area);
@@ -3779,7 +3830,10 @@ impl AppUI {
                     if loop_mode && self.queue.len() > 1 {
                         let first = &self.queue.tracks[0];
                         let up_lines = vec![Line::from(vec![
-                            Span::styled("↺ End of queue reached. Loops to #1: ", Style::default().fg(Color::Cyan)),
+                            Span::styled(
+                                "↺ End of queue reached. Loops to #1: ",
+                                Style::default().fg(Color::Cyan),
+                            ),
                             Span::styled(first.display_title(), Style::default().fg(Color::Yellow)),
                             Span::styled(format!("  —  {}", first.artist), Style::default().fg(Color::White)),
                         ])];
@@ -3823,7 +3877,10 @@ impl AppUI {
                                     "Unknown Artist"
                                 };
                                 Row::new(vec![
-                                    Cell::from(Span::styled(format!("#{:02}", i + 1), Style::default().fg(Color::Cyan))),
+                                    Cell::from(Span::styled(
+                                        format!("#{:02}", i + 1),
+                                        Style::default().fg(Color::Cyan),
+                                    )),
                                     Cell::from(Span::styled(t.display_title(), Style::default().fg(Color::White))),
                                     Cell::from(Span::styled(artist_text, Style::default().fg(Color::DarkGray))),
                                     Cell::from(Span::styled(dur_label, Style::default().fg(Color::DarkGray))),
@@ -3833,18 +3890,10 @@ impl AppUI {
 
                         (header, widths, rows)
                     } else {
-                        let header = Row::new(vec![
-                            Cell::from("#"),
-                            Cell::from("FILE"),
-                            Cell::from("TIME"),
-                        ])
-                        .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+                        let header = Row::new(vec![Cell::from("#"), Cell::from("FILE"), Cell::from("TIME")])
+                            .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
-                        let widths = vec![
-                            Constraint::Length(5),
-                            Constraint::Fill(1),
-                            Constraint::Length(7),
-                        ];
+                        let widths = vec![Constraint::Length(5), Constraint::Fill(1), Constraint::Length(7)];
 
                         let rows: Vec<Row> = upcoming
                             .into_iter()
@@ -3860,7 +3909,10 @@ impl AppUI {
                                     t.filepath.file_name().and_then(|f| f.to_str()).unwrap_or("")
                                 };
                                 Row::new(vec![
-                                    Cell::from(Span::styled(format!("#{:02}", i + 1), Style::default().fg(Color::Cyan))),
+                                    Cell::from(Span::styled(
+                                        format!("#{:02}", i + 1),
+                                        Style::default().fg(Color::Cyan),
+                                    )),
                                     Cell::from(Span::styled(fname, Style::default().fg(Color::White))),
                                     Cell::from(Span::styled(dur_label, Style::default().fg(Color::DarkGray))),
                                 ])
@@ -3870,9 +3922,7 @@ impl AppUI {
                         (header, widths, rows)
                     };
 
-                    let table = Table::new(rows, widths)
-                        .header(header)
-                        .column_spacing(2);
+                    let table = Table::new(rows, widths).header(header).column_spacing(2);
 
                     f.render_widget(table, up_inner);
                 }
@@ -3921,7 +3971,11 @@ impl AppUI {
                     .position(|&i| i == self.browser_cursor)
                     .map(|p| p + 1)
                     .unwrap_or(1);
-                format!("{} of {} matching subfolders", current_match_pos, spotlight_matches.len())
+                format!(
+                    "{} of {} matching subfolders",
+                    current_match_pos,
+                    spotlight_matches.len()
+                )
             };
 
             let spotlight_block = Block::default()
@@ -3991,9 +4045,15 @@ impl AppUI {
 
                 let style = if is_selected {
                     if self.browser_spotlight.is_some() {
-                        Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .bg(Color::Yellow)
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .bg(Color::Blue)
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
                     }
                 } else if is_spotlight_match {
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -4015,11 +4075,7 @@ impl AppUI {
                 "  ⏳ Reading directory contents...".to_string()
             };
             browser_items.push(
-                ListItem::new(loading_text).style(
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::ITALIC),
-                ),
+                ListItem::new(loading_text).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC)),
             );
         }
 
@@ -4049,14 +4105,13 @@ impl AppUI {
             .iter()
             .enumerate()
             .map(|(idx, track)| {
-                let prefix = if idx == self.queue.current_index {
-                    "▶ "
-                } else {
-                    "  "
-                };
+                let prefix = if idx == self.queue.current_index { "▶ " } else { "  " };
                 let text = format!("{}{}. {}", prefix, idx + 1, track.format_queue_label(metadata_view));
                 let style = if idx == self.queue_cursor && self.queue_focus {
-                    Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .bg(Color::Blue)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -4089,7 +4144,10 @@ impl AppUI {
         let local_status = if is_local_active { " (Active)" } else { "" };
         let local_text = format!("{} Local Audio (mpv/ffplay){}", local_bullet, local_status);
         let local_style = if self.devices_cursor == 0 {
-            Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+            Style::default()
+                .bg(Color::Blue)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
         } else if is_local_active {
             Style::default().fg(Color::Green)
         } else {
@@ -4103,9 +4161,19 @@ impl AppUI {
             let is_active = active_dev.as_ref().map(|d| d.udn == dev.udn).unwrap_or(false);
             let bullet = if is_active { "●" } else { "○" };
             let status = if is_active { " (Active)" } else { "" };
-            let text = format!("{} {} [{}:{}]{}", bullet, dev.display_label(), dev.host, dev.port, status);
+            let text = format!(
+                "{} {} [{}:{}]{}",
+                bullet,
+                dev.display_label(),
+                dev.host,
+                dev.port,
+                status
+            );
             let style = if self.devices_cursor == cursor_idx {
-                Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(Color::Blue)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
             } else if is_active {
                 Style::default().fg(Color::Green)
             } else {
@@ -4115,7 +4183,10 @@ impl AppUI {
         }
 
         if devices.is_empty() && is_scanning {
-            items.push(ListItem::new("  (Searching for DLNA / UPnP MediaRenderers...)").style(Style::default().fg(Color::DarkGray)));
+            items.push(
+                ListItem::new("  (Searching for DLNA / UPnP MediaRenderers...)")
+                    .style(Style::default().fg(Color::DarkGray)),
+            );
         }
 
         self.devices_state.select(Some(self.devices_cursor));
@@ -4160,7 +4231,10 @@ impl AppUI {
                     let val_str = self.settings_mgr.get_display_value(idx);
                     let text = format!("{:<28} : {}", defn.label, val_str);
                     let style = if idx == self.settings_cursor {
-                        Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .bg(Color::Blue)
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(Color::White)
                     };
@@ -4187,11 +4261,7 @@ impl AppUI {
         let outer_block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" [🔍 Fuzzy Search: {}] ", dir_name))
-            .border_style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
         let inner_area = outer_block.inner(area);
         f.render_widget(outer_block, area);
 
@@ -4303,10 +4373,7 @@ impl AppUI {
                 ]),
                 Line::from(vec![
                     Span::styled("Duration: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        track.formatted_duration(),
-                        Style::default().fg(Color::Cyan),
-                    ),
+                    Span::styled(track.formatted_duration(), Style::default().fg(Color::Cyan)),
                 ]),
                 Line::from(vec![
                     Span::styled("Format:   ", Style::default().fg(Color::DarkGray)),
@@ -4320,10 +4387,7 @@ impl AppUI {
                 ]),
                 Line::from(vec![
                     Span::styled("Channels: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("{}", track.channels),
-                        Style::default().fg(Color::White),
-                    ),
+                    Span::styled(format!("{}", track.channels), Style::default().fg(Color::White)),
                 ]),
                 Line::from(vec![
                     Span::styled("Size:     ", Style::default().fg(Color::DarkGray)),
@@ -4337,10 +4401,7 @@ impl AppUI {
                     "Relative Path:",
                     Style::default().fg(Color::DarkGray),
                 )]),
-                Line::from(vec![Span::styled(
-                    rel_path,
-                    Style::default().fg(Color::Blue),
-                )]),
+                Line::from(vec![Span::styled(rel_path, Style::default().fg(Color::Blue))]),
             ];
             let detail_p = Paragraph::new(detail_lines).block(detail_block);
             f.render_widget(detail_p, content_split[1]);
@@ -4353,11 +4414,20 @@ impl AppUI {
 
         // 3. Action legend bar
         let action_spans = vec![
-            Span::styled(" [Enter] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " [Enter] ",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
             Span::raw("Add & Close  │  "),
-            Span::styled(" [Tab] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " [Tab] ",
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
             Span::raw("Add to Queue  │  "),
-            Span::styled(" [Shift+Tab] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " [Shift+Tab] ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(format!("Add All ({})  │  ", match_count)),
             Span::styled(" [Esc] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
             Span::raw("Cancel"),
@@ -4368,12 +4438,10 @@ impl AppUI {
     }
 
     fn render_bottom_bar(&self, f: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                " NOW PLAYING ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ));
+        let block = Block::default().borders(Borders::ALL).title(Span::styled(
+            " NOW PLAYING ",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
         f.render_widget(block, area);
 
         let inner = Layout::default()
@@ -4412,10 +4480,7 @@ impl AppUI {
             // Album (White)
             if !track.album.is_empty() {
                 spans.push(Span::styled("  —  ", Style::default().fg(Color::DarkGray)));
-                spans.push(Span::styled(
-                    &track.album,
-                    Style::default().fg(Color::White),
-                ));
+                spans.push(Span::styled(&track.album, Style::default().fg(Color::White)));
             }
 
             // Format / Bitrate (Gray)
@@ -4505,12 +4570,18 @@ impl AppUI {
         // Volume
         let vol = self.player.volume();
         row2_spans.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
-        row2_spans.push(Span::styled(format!("Vol: {}%", vol), Style::default().fg(Color::White)));
+        row2_spans.push(Span::styled(
+            format!("Vol: {}%", vol),
+            Style::default().fg(Color::White),
+        ));
 
         // Web server badge
         if let Some(ref s) = self.web_server {
             row2_spans.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
-            row2_spans.push(Span::styled(format!("🌐 :{}", s.port), Style::default().fg(Color::Cyan)));
+            row2_spans.push(Span::styled(
+                format!("🌐 :{}", s.port),
+                Style::default().fg(Color::Cyan),
+            ));
         }
 
         // Transient non-redundant notices
@@ -4582,9 +4653,7 @@ impl AppUI {
         } else {
             Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(1),
-                ])
+                .constraints([Constraint::Min(1)])
                 .margin(1)
                 .split(area)
         };
@@ -4595,10 +4664,7 @@ impl AppUI {
 
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(50),
-                Constraint::Percentage(50),
-            ])
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(inner[0]);
 
         if cols.len() < 2 {
@@ -4647,7 +4713,6 @@ impl AppUI {
             Self::help_key_line("f", "Full library fuzzy search"),
         ];
         f.render_widget(Paragraph::new(right_lines), cols[1]);
-
     }
 
     fn render_mix_picker_modal(&self, f: &mut Frame) {
@@ -4678,17 +4743,33 @@ impl AppUI {
             return;
         }
 
-        let header_p = Paragraph::new(Line::from(vec![
-            Span::styled("Select a mix profile to sequence cohesive playlists with DJ spacing & transitions:", Style::default().fg(Color::DarkGray)),
-        ]));
+        let header_p = Paragraph::new(Line::from(vec![Span::styled(
+            "Select a mix profile to sequence cohesive playlists with DJ spacing & transitions:",
+            Style::default().fg(Color::DarkGray),
+        )]));
         f.render_widget(header_p, inner[0]);
 
         let options = [
-            ("Diverse Artists Shuffle", "Fair random sampling across all artists (prevents cluster bias)"),
-            ("BPM Flow (~120 BPM)", "Cohesive tempo gradient with harmonic Camelot wheel transitions"),
-            ("Chill & Ambient", "Downtempo, acoustic, lofi & low energy vibes (60-95 BPM)"),
-            ("Workout & High Energy", "Dance, electronic, rock & upbeat vibes (124-145 BPM)"),
-            ("Late Night Groove", "Soul, funk, disco, house & groove vibes (110-128 BPM)"),
+            (
+                "Diverse Artists Shuffle",
+                "Fair random sampling across all artists (prevents cluster bias)",
+            ),
+            (
+                "BPM Flow (~120 BPM)",
+                "Cohesive tempo gradient with harmonic Camelot wheel transitions",
+            ),
+            (
+                "Chill & Ambient",
+                "Downtempo, acoustic, lofi & low energy vibes (60-95 BPM)",
+            ),
+            (
+                "Workout & High Energy",
+                "Dance, electronic, rock & upbeat vibes (124-145 BPM)",
+            ),
+            (
+                "Late Night Groove",
+                "Soul, funk, disco, house & groove vibes (110-128 BPM)",
+            ),
         ];
 
         let mut lines = Vec::new();
@@ -4698,9 +4779,18 @@ impl AppUI {
                 (&self.active_mix_profile, idx),
                 (crate::analysis::MixProfile::DiverseShuffle, 0)
                     | (crate::analysis::MixProfile::BpmFlow { .. }, 1)
-                    | (crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Chill), 2)
-                    | (crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Workout), 3)
-                    | (crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Groove), 4)
+                    | (
+                        crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Chill),
+                        2
+                    )
+                    | (
+                        crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Workout),
+                        3
+                    )
+                    | (
+                        crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Groove),
+                        4
+                    )
             );
 
             let prefix = if is_cursor { " ▶ " } else { "   " };
@@ -4718,7 +4808,10 @@ impl AppUI {
                 Span::styled(prefix, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                 Span::styled(num_key, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
                 Span::styled(format!("{:<26}", title), line_style),
-                Span::styled(active_marker, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    active_marker,
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(format!("— {}", desc), Style::default().fg(Color::DarkGray)),
             ]));
             lines.push(Line::from(""));
@@ -4727,11 +4820,17 @@ impl AppUI {
         f.render_widget(Paragraph::new(lines), inner[1]);
 
         let footer_line = Line::from(vec![
-            Span::styled(" [1-5 / Enter] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " [1-5 / Enter] ",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
             Span::styled("Select & Launch   ", Style::default().fg(Color::White)),
             Span::styled(" [r] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("Seed Radio on Track   ", Style::default().fg(Color::White)),
-            Span::styled(" [Esc / q] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " [Esc / q] ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
             Span::styled("Close", Style::default().fg(Color::White)),
         ]);
         f.render_widget(Paragraph::new(footer_line).alignment(Alignment::Center), inner[2]);
@@ -4752,12 +4851,10 @@ impl AppUI {
     }
 
     fn help_section_header(title: &str) -> Line<'static> {
-        Line::from(vec![
-            Span::styled(
-                format!("── {} ──", title),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ),
-        ])
+        Line::from(vec![Span::styled(
+            format!("── {} ──", title),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )])
     }
 
     fn help_key_line(key: &str, desc: &str) -> Line<'static> {
@@ -4792,11 +4889,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 fn help_modal_rect(r: Rect) -> Rect {
-    let max_w = if r.width >= 96 {
-        90
-    } else {
-        r.width.saturating_sub(2)
-    };
+    let max_w = if r.width >= 96 { 90 } else { r.width.saturating_sub(2) };
     let target_width = max_w.min(r.width);
     let target_height = 20.min(r.height.saturating_sub(2)).min(r.height);
 

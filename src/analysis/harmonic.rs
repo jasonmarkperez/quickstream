@@ -6,7 +6,7 @@ use std::fmt;
 /// Numbers 1-12 represent pitch class, Letter 'A' is Minor, 'B' is Major.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CamelotKey {
-    pub number: u8, // 1 to 12
+    pub number: u8,     // 1 to 12
     pub is_minor: bool, // true = A (minor), false = B (major)
 }
 
@@ -40,15 +40,15 @@ impl CamelotKey {
 
         if self.is_minor == other.is_minor {
             match num_diff {
-                1 => 90,  // Adjacent key
-                2 => 60,  // Energy shift
+                1 => 90, // Adjacent key
+                2 => 60, // Energy shift
                 _ => 20,
             }
         } else {
             // Mixed mode (major <-> minor)
             match num_diff {
-                0 => 85,  // Relative major/minor (same number)
-                1 => 75,  // Diagonal harmonic
+                0 => 85, // Relative major/minor (same number)
+                1 => 75, // Diagonal harmonic
                 _ => 20,
             }
         }
@@ -57,12 +57,7 @@ impl CamelotKey {
 
 impl fmt::Display for CamelotKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}{}",
-            self.number,
-            if self.is_minor { "A" } else { "B" }
-        )
+        write!(f, "{}{}", self.number, if self.is_minor { "A" } else { "B" })
     }
 }
 
@@ -174,20 +169,68 @@ mod tests {
 
     #[test]
     fn test_camelot_key_parsing() {
-        assert_eq!(MusicalKey::parse_to_camelot("8A"), Some(CamelotKey { number: 8, is_minor: true }));
-        assert_eq!(MusicalKey::parse_to_camelot("11B"), Some(CamelotKey { number: 11, is_minor: false }));
-        assert_eq!(MusicalKey::parse_to_camelot("Am"), Some(CamelotKey { number: 8, is_minor: true }));
-        assert_eq!(MusicalKey::parse_to_camelot("A minor"), Some(CamelotKey { number: 8, is_minor: true }));
-        assert_eq!(MusicalKey::parse_to_camelot("C"), Some(CamelotKey { number: 8, is_minor: false }));
-        assert_eq!(MusicalKey::parse_to_camelot("C Maj"), Some(CamelotKey { number: 8, is_minor: false }));
-        assert_eq!(MusicalKey::parse_to_camelot("C#m"), Some(CamelotKey { number: 12, is_minor: true }));
+        assert_eq!(
+            MusicalKey::parse_to_camelot("8A"),
+            Some(CamelotKey {
+                number: 8,
+                is_minor: true
+            })
+        );
+        assert_eq!(
+            MusicalKey::parse_to_camelot("11B"),
+            Some(CamelotKey {
+                number: 11,
+                is_minor: false
+            })
+        );
+        assert_eq!(
+            MusicalKey::parse_to_camelot("Am"),
+            Some(CamelotKey {
+                number: 8,
+                is_minor: true
+            })
+        );
+        assert_eq!(
+            MusicalKey::parse_to_camelot("A minor"),
+            Some(CamelotKey {
+                number: 8,
+                is_minor: true
+            })
+        );
+        assert_eq!(
+            MusicalKey::parse_to_camelot("C"),
+            Some(CamelotKey {
+                number: 8,
+                is_minor: false
+            })
+        );
+        assert_eq!(
+            MusicalKey::parse_to_camelot("C Maj"),
+            Some(CamelotKey {
+                number: 8,
+                is_minor: false
+            })
+        );
+        assert_eq!(
+            MusicalKey::parse_to_camelot("C#m"),
+            Some(CamelotKey {
+                number: 12,
+                is_minor: true
+            })
+        );
     }
 
     fn minor(n: u8) -> Option<CamelotKey> {
-        Some(CamelotKey { number: n, is_minor: true })
+        Some(CamelotKey {
+            number: n,
+            is_minor: true,
+        })
     }
     fn major(n: u8) -> Option<CamelotKey> {
-        Some(CamelotKey { number: n, is_minor: false })
+        Some(CamelotKey {
+            number: n,
+            is_minor: false,
+        })
     }
 
     #[test]

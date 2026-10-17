@@ -56,5 +56,9 @@ fn test_unresolvable_queue_track_is_read_once_per_session() {
     let index = root.join("cache").join("quickstream").join("music_index.jsonl");
     let lines = std::fs::read_to_string(&index).unwrap_or_default();
     let appended = lines.lines().filter(|l| l.contains("song.wav")).count();
-    assert_eq!(appended, 1, "track was read and appended to the cache {} times", appended);
+    assert_eq!(
+        appended, 1,
+        "track was read and appended to the cache {} times",
+        appended
+    );
 }

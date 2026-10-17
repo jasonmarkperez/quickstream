@@ -85,7 +85,15 @@ fn test_profile_mix_logs_phase_timings() {
     let gathered = find("candidates gathered");
     assert!(gathered.contains("folders=6"), "{}", gathered);
     assert!(gathered.contains("files=18"), "{}", gathered);
-    for field in ["walk=", "metadata=", "tag_reads=", "cache_hits=", "db_hits=", "matching=", "matched="] {
+    for field in [
+        "walk=",
+        "metadata=",
+        "tag_reads=",
+        "cache_hits=",
+        "db_hits=",
+        "matching=",
+        "matched=",
+    ] {
         assert!(gathered.contains(field), "missing {} in: {}", field, gathered);
     }
 

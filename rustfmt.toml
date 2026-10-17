@@ -1,0 +1,2 @@
+# The codebase was written with long lines; 120 keeps the one-time reformat small.
+max_width = 120

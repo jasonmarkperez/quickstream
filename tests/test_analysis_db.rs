@@ -113,7 +113,9 @@ fn test_legacy_v1_database_opens_without_data_loss() {
     }
 
     let db = AnalysisDatabase::open_at(&path).unwrap();
-    let legacy = db.get_track(Path::new("/music/legacy.flac")).expect("legacy row survives");
+    let legacy = db
+        .get_track(Path::new("/music/legacy.flac"))
+        .expect("legacy row survives");
     assert_eq!(legacy.title, "Legacy");
     assert_eq!(legacy.bpm, Some(124.0));
     drop(db);
@@ -149,11 +151,20 @@ fn test_database_from_newer_build_is_refused_untouched() {
     assert_eq!(typed.found, future);
     assert_eq!(typed.supported, CURRENT_SCHEMA_VERSION);
     let msg = err.to_string();
-    assert!(msg.contains(&future.to_string()) && msg.contains("newer"), "unclear error: {msg}");
+    assert!(
+        msg.contains(&future.to_string()) && msg.contains("newer"),
+        "unclear error: {msg}"
+    );
 
     assert_eq!(fs::read(&path).unwrap(), before, "newer database must not be modified");
-    assert!(!table_exists(&path, "track_features"), "no tables may be created in a newer database");
-    assert!(!dir.join("track_analysis.db-wal").exists(), "journal mode must not be switched");
+    assert!(
+        !table_exists(&path, "track_features"),
+        "no tables may be created in a newer database"
+    );
+    assert!(
+        !dir.join("track_analysis.db-wal").exists(),
+        "journal mode must not be switched"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 

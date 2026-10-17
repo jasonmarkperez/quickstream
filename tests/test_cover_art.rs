@@ -99,8 +99,14 @@ fn test_cover_mime_uses_magic_bytes_when_tag_type_is_missing_or_unknown() {
     assert_eq!(cover_image_mime(None, JPEG), Some("image/jpeg"));
     assert_eq!(cover_image_mime(Some(""), PNG), Some("image/png"));
     assert_eq!(cover_image_mime(Some("text/html"), PNG), Some("image/png"));
-    assert_eq!(cover_image_mime(Some("image/png\r\nSet-Cookie: x=1"), PNG), Some("image/png"));
-    assert_eq!(cover_image_mime(Some("application/octet-stream"), GIF), Some("image/gif"));
+    assert_eq!(
+        cover_image_mime(Some("image/png\r\nSet-Cookie: x=1"), PNG),
+        Some("image/png")
+    );
+    assert_eq!(
+        cover_image_mime(Some("application/octet-stream"), GIF),
+        Some("image/gif")
+    );
     assert_eq!(cover_image_mime(Some("image/x-unknown"), WEBP), Some("image/webp"));
 }
 
@@ -119,7 +125,10 @@ fn test_cover_mime_trusts_the_image_bytes_over_the_tag() {
 fn test_embedded_picture_with_hostile_mime_is_not_served() {
     common::isolate();
     let dir = temp_dir("hostile_embedded");
-    for (i, mime) in ["text/html", "image/png\r\nSet-Cookie: x=1", "", "image/svg+xml"].iter().enumerate() {
+    for (i, mime) in ["text/html", "image/png\r\nSet-Cookie: x=1", "", "image/svg+xml"]
+        .iter()
+        .enumerate()
+    {
         let track = dir.join(format!("track{}.wav", i));
         write_wav_with_picture(&track, mime, HTML);
         assert_eq!(extract_cover_art(&track), None, "mime {:?}", mime);
@@ -159,13 +168,20 @@ fn test_embedded_image_with_hostile_mime_is_served_with_detected_type() {
 fn get(port: u16, path: &str) -> (u16, String, Vec<u8>) {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect");
     stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    let req = format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", path, port);
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        path, port
+    );
     stream.write_all(req.as_bytes()).unwrap();
     let mut raw = Vec::new();
     let _ = stream.read_to_end(&mut raw);
     let header_end = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(raw.len());
     let headers = String::from_utf8_lossy(&raw[..header_end]).to_string();
-    let body = if header_end + 4 <= raw.len() { raw[header_end + 4..].to_vec() } else { Vec::new() };
+    let body = if header_end + 4 <= raw.len() {
+        raw[header_end + 4..].to_vec()
+    } else {
+        Vec::new()
+    };
     let status = headers
         .lines()
         .next()
@@ -220,7 +236,11 @@ fn test_api_cover_serves_embedded_image_with_nosniff() {
     assert_eq!(status, 200);
     assert_eq!(content_type(&headers), "image/png", "{}", headers);
     assert!(!headers.to_lowercase().contains("set-cookie"), "{}", headers);
-    assert!(headers.to_lowercase().contains("x-content-type-options: nosniff"), "{}", headers);
+    assert!(
+        headers.to_lowercase().contains("x-content-type-options: nosniff"),
+        "{}",
+        headers
+    );
     assert_eq!(body, PNG);
     let _ = fs::remove_dir_all(&dir);
 }
@@ -233,7 +253,11 @@ fn test_api_cover_placeholder_sends_nosniff() {
     handle.stop();
     assert_eq!(status, 200);
     assert_eq!(content_type(&headers), "image/svg+xml");
-    assert!(headers.to_lowercase().contains("x-content-type-options: nosniff"), "{}", headers);
+    assert!(
+        headers.to_lowercase().contains("x-content-type-options: nosniff"),
+        "{}",
+        headers
+    );
 }
 
 #[test]
@@ -248,7 +272,12 @@ fn test_dashboard_and_json_responses_send_nosniff() {
     for path in ["/", "/api/status", "/api/browser"] {
         let (status, headers, _) = get(handle.port, path);
         assert_eq!(status, 200, "{}", path);
-        assert!(headers.to_lowercase().contains("x-content-type-options: nosniff"), "{}: {}", path, headers);
+        assert!(
+            headers.to_lowercase().contains("x-content-type-options: nosniff"),
+            "{}: {}",
+            path,
+            headers
+        );
     }
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", handle.port)).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();

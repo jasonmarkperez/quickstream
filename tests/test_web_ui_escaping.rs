@@ -15,9 +15,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use quickstream::web::{
-    NowPlayingState, WebBrowserResponse, WebDeviceItem, WebQueueItem, WebServer,
-};
+use quickstream::web::{NowPlayingState, WebBrowserResponse, WebDeviceItem, WebQueueItem, WebServer};
 
 /// Names that would break naive HTML / JS-string interpolation.
 const HOSTILE: &[&str] = &[
@@ -31,9 +29,7 @@ const HOSTILE: &[&str] = &[
 
 fn http_get(port: u16, path: &str) -> (u16, String, Vec<u8>) {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
     let req = format!(
         "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
         path, port
@@ -41,10 +37,7 @@ fn http_get(port: u16, path: &str) -> (u16, String, Vec<u8>) {
     stream.write_all(req.as_bytes()).unwrap();
     let mut raw = Vec::new();
     let _ = stream.read_to_end(&mut raw);
-    let header_end = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .unwrap_or(raw.len());
+    let header_end = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(raw.len());
     let headers = String::from_utf8_lossy(&raw[..header_end]).to_string();
     let body = raw.get(header_end + 4..).map(|b| b.to_vec()).unwrap_or_default();
     let status = headers
@@ -181,8 +174,18 @@ fn test_browser_api_round_trips_hostile_names() {
     assert!(headers.contains("application/json"));
     let resp: WebBrowserResponse = serde_json::from_slice(&body).expect("valid JSON");
 
-    let mut got_dirs: Vec<String> = resp.entries.iter().filter(|e| e.is_dir).map(|e| e.name.clone()).collect();
-    let mut got_files: Vec<String> = resp.entries.iter().filter(|e| !e.is_dir).map(|e| e.name.clone()).collect();
+    let mut got_dirs: Vec<String> = resp
+        .entries
+        .iter()
+        .filter(|e| e.is_dir)
+        .map(|e| e.name.clone())
+        .collect();
+    let mut got_files: Vec<String> = resp
+        .entries
+        .iter()
+        .filter(|e| !e.is_dir)
+        .map(|e| e.name.clone())
+        .collect();
     got_dirs.sort();
     got_files.sort();
     expected_dirs.sort();

@@ -74,7 +74,11 @@ fn open(port: u16, path: &str) -> (u16, BufReader<TcpStream>) {
     let mut reader = BufReader::new(stream);
     let mut status_line = String::new();
     let _ = reader.read_line(&mut status_line);
-    let status = status_line.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
@@ -89,7 +93,9 @@ fn open(port: u16, path: &str) -> (u16, BufReader<TcpStream>) {
 fn is_session_path(path: &str) -> bool {
     path.strip_prefix("/stream/continuous-")
         .and_then(|rest| rest.strip_suffix(".wav"))
-        .is_some_and(|nonce| nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        .is_some_and(|nonce| {
+            nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
 }
 
 #[test]
@@ -117,7 +123,11 @@ fn test_continuous_stream_is_not_served_without_an_armed_session() {
     }
     std::thread::sleep(Duration::from_millis(200));
     assert!(!handle.stream_state().continuous.is_active.load(Ordering::SeqCst));
-    assert_eq!(state.read().unwrap().title, "No Track Loaded", "an unarmed request must not change playback state");
+    assert_eq!(
+        state.read().unwrap().title,
+        "No Track Loaded",
+        "an unarmed request must not change playback state"
+    );
     assert!(rx.try_recv().is_err(), "an unarmed request must not send commands");
 
     handle.stop();
@@ -136,7 +146,11 @@ fn test_armed_continuous_session_serves_only_its_own_path() {
     assert_eq!(ss.continuous_session_path().as_deref(), Some(path.as_str()));
 
     // Other continuous paths stay closed.
-    for other in ["/stream/continuous.wav", "/stream/autopilot.wav", "/stream/continuous-ffffffffffffffffffffffffffffffff.wav"] {
+    for other in [
+        "/stream/continuous.wav",
+        "/stream/autopilot.wav",
+        "/stream/continuous-ffffffffffffffffffffffffffffffff.wav",
+    ] {
         let (status, _) = open(port, other);
         assert_eq!(status, 404, "{}", other);
     }
@@ -173,7 +187,10 @@ fn test_continuous_session_admits_only_the_first_peer() {
     let renderer = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20));
     let other = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 66));
 
-    assert_eq!(c.admit("/stream/continuous.wav", renderer), ContinuousAdmission::NotFound);
+    assert_eq!(
+        c.admit("/stream/continuous.wav", renderer),
+        ContinuousAdmission::NotFound
+    );
     let path = c.arm_session();
     assert!(matches!(c.admit(&path, renderer), ContinuousAdmission::Admitted(_)));
     // The renderer may reconnect (e.g. HEAD then GET, or after a buffer underrun).
@@ -181,8 +198,14 @@ fn test_continuous_session_admits_only_the_first_peer() {
     // Another host knowing the path cannot take the stream over.
     assert_eq!(c.admit(&path, other), ContinuousAdmission::Conflict);
     // Wrong or legacy paths are unknown.
-    assert_eq!(c.admit("/stream/continuous-00000000000000000000000000000000.wav", renderer), ContinuousAdmission::NotFound);
-    assert_eq!(c.admit("/stream/autopilot.wav", renderer), ContinuousAdmission::NotFound);
+    assert_eq!(
+        c.admit("/stream/continuous-00000000000000000000000000000000.wav", renderer),
+        ContinuousAdmission::NotFound
+    );
+    assert_eq!(
+        c.admit("/stream/autopilot.wav", renderer),
+        ContinuousAdmission::NotFound
+    );
 
     // A new session binds afresh.
     let next = c.arm_session();
@@ -244,7 +267,10 @@ fn test_armed_continuous_stream_plays_queue_gaplessly_and_shuffles_on_wrap() {
             assert_eq!(cmd, WebCommand::ShuffleQueue);
         }
     }
-    assert!(rx.recv_timeout(Duration::from_millis(500)).is_err(), "closed session kept sending commands");
+    assert!(
+        rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "closed session kept sending commands"
+    );
     let (status, _) = open(port, &path);
     assert_eq!(status, 404);
 
@@ -321,13 +347,23 @@ fn test_upnp_continuous_play_uses_the_armed_session_path() {
     let ss = Arc::new(StreamServerState::new());
     let mut player = UPnPPlayer::new(device, 8080).with_stream_state(Some(ss.clone()));
 
-    player.play(Path::new("__continuous__.wav")).expect("start continuous session");
+    player
+        .play(Path::new("__continuous__.wav"))
+        .expect("start continuous session");
     let session_path = ss.continuous_session_path().expect("session armed");
     assert!(is_session_path(&session_path), "{}", session_path);
     let sent = uri.lock().unwrap().clone();
     assert!(sent.starts_with("http://"), "{}", sent);
-    assert!(sent.ends_with(&format!(":8080{}", session_path)), "{} vs {}", sent, session_path);
-    assert!(ss.lookup_file("__continuous__.wav").is_none(), "the placeholder name is not a servable file");
+    assert!(
+        sent.ends_with(&format!(":8080{}", session_path)),
+        "{} vs {}",
+        sent,
+        session_path
+    );
+    assert!(
+        ss.lookup_file("__continuous__.wav").is_none(),
+        "the placeholder name is not a servable file"
+    );
 
     // Stopping ends the session.
     let _ = player.stop();

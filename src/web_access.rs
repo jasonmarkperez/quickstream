@@ -128,9 +128,9 @@ fn token_matches(candidate: Option<&str>, token: &str) -> bool {
 
 fn is_loopback_host(host: &str, port: u16) -> bool {
     let host = host.to_ascii_lowercase();
-    ["127.0.0.1", "localhost", "[::1]"].iter().any(|name| {
-        host == format!("{}:{}", name, port) || (port == 80 && host == *name)
-    })
+    ["127.0.0.1", "localhost", "[::1]"]
+        .iter()
+        .any(|name| host == format!("{}:{}", name, port) || (port == 80 && host == *name))
 }
 
 /// Decide whether a request may proceed. `server_port` is the port the request arrived on.
@@ -147,7 +147,11 @@ pub fn authorize(
 
     if is_loopback(peer) {
         // Applies to every route, /stream/* included: a foreign Host means DNS rebinding.
-        if !headers.host.as_deref().is_some_and(|h| is_loopback_host(h, server_port)) {
+        if !headers
+            .host
+            .as_deref()
+            .is_some_and(|h| is_loopback_host(h, server_port))
+        {
             return AuthDecision::Forbidden("unexpected Host header");
         }
     } else if read_only && route.starts_with("/stream/") {
@@ -173,7 +177,11 @@ pub fn authorize(
 
     if !read_only {
         let is_json = headers.content_type.as_deref().is_some_and(|ct| {
-            ct.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/json")
+            ct.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("application/json")
         });
         if !is_json {
             return AuthDecision::Forbidden("Content-Type must be application/json");
@@ -296,7 +304,13 @@ pub fn check_request(
 
 /// Write a JSON 403 for a request naming a path outside the allowed folders.
 pub fn write_path_forbidden(out: &mut impl Write) -> std::io::Result<()> {
-    write_decision_response(out, &AuthDecision::Forbidden("path is outside the allowed folders"), "/api/", "", 0)
+    write_decision_response(
+        out,
+        &AuthDecision::Forbidden("path is outside the allowed folders"),
+        "/api/",
+        "",
+        0,
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -417,7 +431,10 @@ impl VisibleRoots {
         let home = home_dir().map(|h| std::fs::canonicalize(&h).unwrap_or(h));
         let mut forms = Vec::new();
         for root in roots {
-            for form in [Some(normalize_lexically(root)), std::fs::canonicalize(root).ok()].into_iter().flatten() {
+            for form in [Some(normalize_lexically(root)), std::fs::canonicalize(root).ok()]
+                .into_iter()
+                .flatten()
+            {
                 if is_acceptable_root(&form, home.as_deref()) && !forms.contains(&form) {
                     forms.push(form);
                 }

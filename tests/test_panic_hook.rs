@@ -31,7 +31,10 @@ fn test_panic_hook_restores_terminal_before_printing_message() {
     std::panic::set_hook(original);
 
     assert!(result.is_err());
-    assert_eq!(*events.lock().unwrap(), vec!["restore".to_string(), "prev: boom".to_string()]);
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["restore".to_string(), "prev: boom".to_string()]
+    );
 }
 
 #[test]

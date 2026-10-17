@@ -48,9 +48,16 @@ fn test_save_cache_replaces_file_by_rename_not_truncation() {
     assert!(LibraryManager::save_cache_to(&index, &[track("a"), track("b")]));
     let after = fs::metadata(&index).unwrap().ino();
 
-    assert_ne!(before, after, "save_cache must write a temp file and rename it over the cache");
+    assert_ne!(
+        before, after,
+        "save_cache must write a temp file and rename it over the cache"
+    );
     assert_eq!(LibraryManager::load_cache_from(&index).len(), 2);
-    assert!(tmp_leftovers(&dir).is_empty(), "temp file left behind: {:?}", tmp_leftovers(&dir));
+    assert!(
+        tmp_leftovers(&dir).is_empty(),
+        "temp file left behind: {:?}",
+        tmp_leftovers(&dir)
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -69,7 +76,10 @@ fn test_save_cache_keeps_entries_appended_since_the_snapshot() {
     tracks.push(track("scanned"));
     assert!(LibraryManager::save_cache_to(&index, &tracks));
 
-    let names: Vec<String> = LibraryManager::load_cache_from(&index).into_iter().map(|t| t.filename).collect();
+    let names: Vec<String> = LibraryManager::load_cache_from(&index)
+        .into_iter()
+        .map(|t| t.filename)
+        .collect();
     for want in ["old.flac", "scanned.flac", "appended_meanwhile.flac"] {
         assert!(names.iter().any(|n| n == want), "{} missing from {:?}", want, names);
     }
@@ -156,7 +166,10 @@ fn test_bad_line_in_the_middle_does_not_hide_later_entries() {
     writeln!(f, "{}", serde_json::to_string(&track("last")).unwrap()).unwrap();
     drop(f);
 
-    let names: Vec<String> = LibraryManager::load_cache_from(&index).into_iter().map(|t| t.filename).collect();
+    let names: Vec<String> = LibraryManager::load_cache_from(&index)
+        .into_iter()
+        .map(|t| t.filename)
+        .collect();
     assert_eq!(names, vec!["first.flac".to_string(), "last.flac".to_string()]);
     let _ = fs::remove_dir_all(&dir);
 }
@@ -171,7 +184,10 @@ fn test_append_after_crash_mid_line_starts_a_new_line() {
 
     LibraryManager::append_to_cache_at(&index, &track("after_crash"));
 
-    let names: Vec<String> = LibraryManager::load_cache_from(&index).into_iter().map(|t| t.filename).collect();
+    let names: Vec<String> = LibraryManager::load_cache_from(&index)
+        .into_iter()
+        .map(|t| t.filename)
+        .collect();
     assert_eq!(names, vec!["good.flac".to_string(), "after_crash.flac".to_string()]);
     let _ = fs::remove_dir_all(&dir);
 }
@@ -188,7 +204,11 @@ fn test_settings_save_is_atomic_rename() {
     let before = fs::metadata(&path).unwrap().ino();
     mgr.settings.volume_step = 10;
     assert!(mgr.save());
-    assert_ne!(before, fs::metadata(&path).unwrap().ino(), "settings must be replaced via rename");
+    assert_ne!(
+        before,
+        fs::metadata(&path).unwrap().ino(),
+        "settings must be replaced via rename"
+    );
     assert_eq!(SettingsManager::load_from(&path).unwrap().volume_step, 10);
     assert!(tmp_leftovers(&dir).is_empty());
     let _ = fs::remove_dir_all(&dir);
@@ -204,7 +224,11 @@ fn test_corrupt_settings_are_backed_up_before_defaults_are_used() {
 
     let mgr = SettingsManager::with_path(path.clone());
     assert_eq!(mgr.settings, quickstream::settings::Settings::default());
-    assert_eq!(fs::read(dir.join("config.json.bak")).unwrap(), bad, "bad file copied to config.json.bak");
+    assert_eq!(
+        fs::read(dir.join("config.json.bak")).unwrap(),
+        bad,
+        "bad file copied to config.json.bak"
+    );
     assert_eq!(fs::read(&path).unwrap(), bad, "loading never rewrites the user's file");
 
     // The next save replaces config.json but the backup stays.
@@ -238,7 +262,11 @@ fn test_existing_backup_is_never_overwritten() {
     fs::write(&path, &second_bad).unwrap();
     let _ = SettingsManager::with_path(path.clone());
 
-    assert_eq!(fs::read(dir.join("config.json.bak")).unwrap(), first_bad, "earliest backup kept");
+    assert_eq!(
+        fs::read(dir.join("config.json.bak")).unwrap(),
+        first_bad,
+        "earliest backup kept"
+    );
     let all = backups(&dir);
     assert_eq!(all.len(), 2, "second corrupt file gets its own backup: {:?}", all);
     assert!(all.iter().any(|p| fs::read(p).unwrap() == second_bad));

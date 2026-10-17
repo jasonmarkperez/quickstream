@@ -12,9 +12,7 @@ use std::time::Duration;
 use quickstream::queue::FastRng;
 use quickstream::settings::SettingsManager;
 use quickstream::ui::AppUI;
-use quickstream::web::{
-    make_continuous_wav_header, NowPlayingState, WebCommand, WebServer,
-};
+use quickstream::web::{make_continuous_wav_header, NowPlayingState, WebCommand, WebServer};
 
 fn create_dummy_audio(path: &Path) {
     if let Some(parent) = path.parent() {
@@ -136,7 +134,10 @@ fn test_web_autopilot_and_shuffle_actions() {
     // 1. Send POST /api/action with action: "autopilot"
     {
         let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-        let body = format!(r#"{{"action":"autopilot","path":{}}}"#, serde_json::to_string(&jazz.to_string_lossy()).unwrap());
+        let body = format!(
+            r#"{{"action":"autopilot","path":{}}}"#,
+            serde_json::to_string(&jazz.to_string_lossy()).unwrap()
+        );
         let req = format!(
             "POST /api/action HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             port,
@@ -188,7 +189,10 @@ fn test_continuous_wav_stream_endpoint() {
     // The continuous stream is served at the armed session's path.
     let session = handle.stream_state().arm_continuous_session();
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-    let req = format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", session, port);
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        session, port
+    );
     stream.write_all(req.as_bytes()).unwrap();
 
     let mut reader = BufReader::new(stream);
@@ -206,8 +210,12 @@ fn test_continuous_wav_stream_endpoint() {
         headers.push(line);
     }
 
-    assert!(headers.iter().any(|h| h.to_lowercase().contains("content-type: audio/x-wav")));
-    assert!(headers.iter().any(|h| h.to_lowercase().contains("transfermode.dlna.org: streaming")));
+    assert!(headers
+        .iter()
+        .any(|h| h.to_lowercase().contains("content-type: audio/x-wav")));
+    assert!(headers
+        .iter()
+        .any(|h| h.to_lowercase().contains("transfermode.dlna.org: streaming")));
 
     // Read 44-byte WAV header
     let mut wav_hdr = [0u8; 44];
@@ -353,13 +361,7 @@ fn test_autopilot_progressive_streaming_events() {
     let dir_clone = temp_dir.clone();
     let stop_clone = stop_flag.clone();
     let handle = std::thread::spawn(move || {
-        LibraryManager::scan_directory_autopilot_progressive(
-            dir_clone,
-            Vec::new(),
-            cache,
-            tx,
-            stop_clone,
-        );
+        LibraryManager::scan_directory_autopilot_progressive(dir_clone, Vec::new(), cache, tx, stop_clone);
     });
 
     // Receive events progressively
@@ -551,9 +553,17 @@ fn test_autopilot_bpm_flow_and_mood_vibe() {
         create_dummy_audio(&track_path);
 
         let (bpm, genre, mood) = if i <= 3 {
-            (Some(124.0 + (i as f64) * 2.0), "Electronic".to_string(), Some("workout".to_string()))
+            (
+                Some(124.0 + (i as f64) * 2.0),
+                "Electronic".to_string(),
+                Some("workout".to_string()),
+            )
         } else {
-            (Some(70.0 + (i as f64)), "Ambient".to_string(), Some("chill".to_string()))
+            (
+                Some(70.0 + (i as f64)),
+                "Ambient".to_string(),
+                Some("chill".to_string()),
+            )
         };
 
         let feat = quickstream::analysis::TrackFeatures {
@@ -703,7 +713,6 @@ fn test_autopilot_mood_vibe_diverse_artist_sampling_no_single_artist_loop() {
         artists_in_mix
     );
 
-
     // Verify consecutive tracks are never by the same artist
     for i in 1..app.queue.len() {
         assert_ne!(
@@ -775,7 +784,3 @@ fn test_autopilot_mix_generates_full_queue_when_library_has_sparse_matches() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
-
-
-
-

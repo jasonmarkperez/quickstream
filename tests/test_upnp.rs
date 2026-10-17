@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use quickstream::discovery::DLNADevice;
 use quickstream::player::upnp::{
-    create_didl_lite_xml, format_seconds_to_upnp_time, parse_upnp_time_to_seconds,
-    quick_xml_escape, url_decode, url_encode, UPnPClient, UPnPPlayer,
+    create_didl_lite_xml, format_seconds_to_upnp_time, parse_upnp_time_to_seconds, quick_xml_escape, url_decode,
+    url_encode, UPnPClient, UPnPPlayer,
 };
 use quickstream::player::AudioPlayer;
 
@@ -32,10 +32,7 @@ fn test_upnp_xml_escape_and_url_encoding() {
     common::isolate();
     let unescaped = "<Rock & Roll \"Greatest\" 'Hits'>";
     let escaped = quick_xml_escape(unescaped);
-    assert_eq!(
-        escaped,
-        "&lt;Rock &amp; Roll &quot;Greatest&quot; &apos;Hits&apos;&gt;"
-    );
+    assert_eq!(escaped, "&lt;Rock &amp; Roll &quot;Greatest&quot; &apos;Hits&apos;&gt;");
 
     let raw = "/Music/Rock & Roll/01. Track.flac";
     let encoded = url_encode(raw);
@@ -76,9 +73,7 @@ fn spawn_mock_upnp_renderer() -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<
 
     let handle = std::thread::spawn(move || {
         while !stop_flag_thread.load(Ordering::SeqCst) {
-            listener
-                .set_nonblocking(true)
-                .expect("set nonblocking");
+            listener.set_nonblocking(true).expect("set nonblocking");
             let stream_opt = match listener.accept() {
                 Ok((s, _)) => Some(s),
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -89,9 +84,7 @@ fn spawn_mock_upnp_renderer() -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<
             };
 
             if let Some(mut stream) = stream_opt {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut request_line = String::new();
                 if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
@@ -391,7 +384,11 @@ fn test_upnp_player_seek_mode_not_supported_fallback() {
 
     // Perform seek_to(45.0) which fails with 710 on SOAP Seek, triggering reload
     let seek_res = player.seek_to(45.0);
-    assert!(seek_res.is_ok(), "seek_to should succeed via stream offset fallback: {:?}", seek_res);
+    assert!(
+        seek_res.is_ok(),
+        "seek_to should succeed via stream offset fallback: {:?}",
+        seek_res
+    );
 
     // Verify URI was reloaded with ?pos=45.00
     let reloaded_uri = last_set_uri.lock().unwrap().clone();
@@ -560,7 +557,10 @@ fn test_upnp_player_pause_resume_after_seek() {
 
     // Wait past poller tick: renderer is STOPPED, but player is paused -> must NOT be finished!
     std::thread::sleep(Duration::from_millis(1100));
-    assert!(!player.is_track_finished(), "Poller must not mark track finished while paused!");
+    assert!(
+        !player.is_track_finished(),
+        "Poller must not mark track finished while paused!"
+    );
 
     // 4. Resume playback:
     // Renderer is STOPPED (and would return 701 on direct Play);
@@ -600,8 +600,7 @@ fn test_upnp_player_with_stream_server_state_socket_closure_and_registration() {
     };
 
     let stream_state = Arc::new(quickstream::web::StreamServerState::new());
-    let mut player = UPnPPlayer::new(device, 8080)
-        .with_stream_state(Some(stream_state.clone()));
+    let mut player = UPnPPlayer::new(device, 8080).with_stream_state(Some(stream_state.clone()));
 
     // Create a dummy audio file
     let temp_file = std::env::temp_dir().join("test_registered_upnp.mp3");
@@ -695,7 +694,7 @@ fn test_upnp_player_auto_advance_when_renderer_resets_rel_time_on_stop() {
                         format!(
                             r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetTransportInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><CurrentTransportState>{}</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed></u:GetTransportInfoResponse></s:Body></s:Envelope>"#,
                             st
-                        )
+                        ),
                     )
                 } else if soap_action.contains("GetPositionInfo") {
                     let rel = current_rel_time_thread.lock().unwrap().clone();
@@ -704,7 +703,7 @@ fn test_upnp_player_auto_advance_when_renderer_resets_rel_time_on_stop() {
                         format!(
                             r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetPositionInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><TrackDuration>00:03:00</TrackDuration><RelTime>{}</RelTime></u:GetPositionInfoResponse></s:Body></s:Envelope>"#,
                             rel
-                        )
+                        ),
                     )
                 } else {
                     ("HTTP/1.1 200 OK", r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:SuccessResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1" /></s:Body></s:Envelope>"#.to_string())
@@ -760,7 +759,10 @@ fn test_upnp_player_auto_advance_when_renderer_resets_rel_time_on_stop() {
         player.is_track_finished(),
         "Track finish must be detected even when RelTime is reset to 00:00:00!"
     );
-    assert!(!player.is_playing(), "Player must not be marked as playing once track finished");
+    assert!(
+        !player.is_playing(),
+        "Player must not be marked as playing once track finished"
+    );
     // Position must be clamped to duration (180s), NOT 0.0s
     assert_eq!(
         player.position_seconds(),
@@ -840,7 +842,7 @@ fn test_upnp_player_stopped_early_does_not_auto_advance() {
                         format!(
                             r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetTransportInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><CurrentTransportState>{}</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed></u:GetTransportInfoResponse></s:Body></s:Envelope>"#,
                             st
-                        )
+                        ),
                     )
                 } else if soap_action.contains("GetPositionInfo") {
                     let rel = current_rel_time_thread.lock().unwrap().clone();
@@ -849,7 +851,7 @@ fn test_upnp_player_stopped_early_does_not_auto_advance() {
                         format!(
                             r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetPositionInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><TrackDuration>00:03:00</TrackDuration><RelTime>{}</RelTime></u:GetPositionInfoResponse></s:Body></s:Envelope>"#,
                             rel
-                        )
+                        ),
                     )
                 } else {
                     ("HTTP/1.1 200 OK", r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:SuccessResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1" /></s:Body></s:Envelope>"#.to_string())
@@ -1005,8 +1007,15 @@ fn test_upnp_client_play_retries_on_action_failed() {
     };
 
     let client = UPnPClient::new(device);
-    assert!(client.play("1"), "Play must succeed after retrying on 501 Action Failed");
-    assert_eq!(play_attempts.load(Ordering::SeqCst), 3, "Play should have retried and succeeded on attempt 3");
+    assert!(
+        client.play("1"),
+        "Play must succeed after retrying on 501 Action Failed"
+    );
+    assert_eq!(
+        play_attempts.load(Ordering::SeqCst),
+        3,
+        "Play should have retried and succeeded on attempt 3"
+    );
 
     stop_flag.store(true, Ordering::SeqCst);
     let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
@@ -1103,7 +1112,11 @@ fn test_upnp_player_play_at_starts_directly_with_pos_offset() {
     assert!(player.is_playing());
 
     let uri = last_set_uri.lock().unwrap().clone();
-    assert!(uri.contains("?pos=4.67"), "URI must directly include ?pos=4.67 on initial handoff, got: {}", uri);
+    assert!(
+        uri.contains("?pos=4.67"),
+        "URI must directly include ?pos=4.67 on initial handoff, got: {}",
+        uri
+    );
 
     let _ = player.stop();
     let _ = std::fs::remove_file(temp_file);
@@ -1111,7 +1124,6 @@ fn test_upnp_player_play_at_starts_directly_with_pos_offset() {
     let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
     let _ = handle.join();
 }
-
 
 #[test]
 fn test_upnp_player_detached_from_stream_state_does_not_close_shared_streams() {

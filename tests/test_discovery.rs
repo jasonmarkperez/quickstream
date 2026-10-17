@@ -6,9 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use quickstream::discovery::{
-    discover_devices, fetch_device_descriptions, fetch_xml, ssdp_location_for_sender,
-};
+use quickstream::discovery::{discover_devices, fetch_device_descriptions, fetch_xml, ssdp_location_for_sender};
 
 #[test]
 #[ignore = "real SSDP scan on the local network (macOS firewall prompt); run with --include-ignored"]
@@ -135,7 +133,10 @@ fn test_fetch_xml_rejects_oversized_body() {
         }
         let _ = s.write_all(b"</root>");
     }));
-    assert!(fetch_xml(&server.url()).is_none(), "a 2 MB description must be rejected");
+    assert!(
+        fetch_xml(&server.url()).is_none(),
+        "a 2 MB description must be rejected"
+    );
 }
 
 /// Chunked descriptions are decoded.
@@ -225,7 +226,11 @@ fn test_fetch_device_descriptions_bounds_concurrency() {
     let devices = fetch_device_descriptions(&urls, 2, Duration::from_secs(3));
     let elapsed = start.elapsed();
     assert_eq!(devices.len(), 4);
-    assert!(elapsed >= Duration::from_millis(1000), "2 at a time needs two rounds, took {:?}", elapsed);
+    assert!(
+        elapsed >= Duration::from_millis(1000),
+        "2 at a time needs two rounds, took {:?}",
+        elapsed
+    );
     assert!(elapsed < Duration::from_millis(2500), "took {:?}", elapsed);
 }
 
