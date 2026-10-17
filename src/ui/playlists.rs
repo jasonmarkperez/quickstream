@@ -3,7 +3,7 @@
 //! through to disk by the persistence worker, so nothing here touches the disk on the UI thread.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -68,6 +68,9 @@ pub struct PlaylistsUi {
     pub modal: Option<PlaylistModal>,
     /// `Path::exists()` results for playlist entries, cached for the session.
     pub exists: HashMap<PathBuf, bool>,
+    /// Folder listings for folder adds (`L` on a folder), sent by `playlist-folder` workers.
+    folder_tx: mpsc::Sender<FolderListing>,
+    folder_rx: mpsc::Receiver<FolderListing>,
     /// Result of the startup load (playlists, stems of skipped files); `None` once applied.
     load_rx: Option<mpsc::Receiver<(Vec<Playlist>, Vec<String>)>>,
     /// The load worker died without sending; the store stays unloaded so no edit can overwrite
@@ -79,6 +82,7 @@ pub struct PlaylistsUi {
 
 impl PlaylistsUi {
     pub fn new(persist: crate::persist::PersistHandle) -> Self {
+        let (folder_tx, folder_rx) = mpsc::channel();
         Self {
             store: PlaylistStore::new(paths::get_playlists_dir(), persist),
             list_cursor: 0,
@@ -86,6 +90,8 @@ impl PlaylistsUi {
             tracks_focus: false,
             modal: None,
             exists: HashMap::new(),
+            folder_tx,
+            folder_rx,
             load_rx: None,
             load_failed: false,
             list_state: ListState::default(),
@@ -217,6 +223,7 @@ impl AppUI {
             }
         }
         self.playlists.clamp_cursors();
+        self.poll_playlist_folder_adds();
     }
 
     /// Keys while a playlist modal is open. Returns true when the app should quit.
@@ -224,6 +231,24 @@ impl AppUI {
         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
             self.player.stop()?;
             return Ok(true);
+        }
+        if matches!(self.playlists.modal, Some(PlaylistModal::AddPicker { .. })) {
+            self.handle_add_picker_key(key);
+            return Ok(false);
+        }
+        // Enter in a prompt opened from "+ New playlist…" creates the playlist and adds to it;
+        // typing, Backspace and Esc stay with the shared name prompt handling below.
+        if key.code == KeyCode::Enter
+            && matches!(
+                self.playlists.modal,
+                Some(PlaylistModal::NamePrompt {
+                    purpose: NamePurpose::CreateAndAdd(_),
+                    ..
+                })
+            )
+        {
+            self.confirm_create_and_add();
+            return Ok(false);
         }
         let Some(modal) = self.playlists.modal.take() else {
             return Ok(false);
@@ -407,6 +432,10 @@ impl AppUI {
     }
 
     pub(super) fn render_playlist_modal(&self, f: &mut Frame) {
+        if let Some(PlaylistModal::AddPicker { pending, cursor }) = &self.playlists.modal {
+            self.render_add_picker(f, pending, *cursor);
+            return;
+        }
         match &self.playlists.modal {
             Some(PlaylistModal::NamePrompt { purpose, input, error }) => {
                 render_name_prompt(f, purpose, input, error.as_deref())
@@ -415,62 +444,6 @@ impl AppUI {
             Some(PlaylistModal::AddPicker { pending, cursor }) => self.render_add_picker(f, pending, *cursor),
             None => {}
         }
-    }
-
-    fn render_add_picker(&self, f: &mut Frame, pending: &PendingAdd, cursor: usize) {
-        let area = super::centered_rect(60, 50, f.area());
-        f.render_widget(Clear, area);
-        let hint = Style::default().fg(Color::DarkGray);
-        let label = match pending {
-            PendingAdd::Entries { label, .. } | PendingAdd::Folder { label, .. } => label,
-        };
-        let mut lines = vec![
-            Line::from(Span::styled(
-                format!("Add {} to:", label),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-        ];
-        let names = self
-            .playlists
-            .store
-            .playlists()
-            .iter()
-            .map(|p| p.name.as_str())
-            .chain(std::iter::once(NEW_PLAYLIST_ROW));
-        for (idx, name) in names.enumerate() {
-            let (prefix, style) = if idx == cursor {
-                (
-                    " ▶ ",
-                    Style::default()
-                        .bg(Color::Blue)
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                ("   ", Style::default().fg(Color::White))
-            };
-            lines.push(Line::from(Span::styled(format!("{}{}", prefix, name), style)));
-        }
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("[Enter] Add   [Esc] Cancel", hint)));
-        // Keep the cursor row (after the 2 header lines) inside the visible rows.
-        let visible = area.height.saturating_sub(2) as usize;
-        let scroll = (2 + cursor + 1).saturating_sub(visible) as u16;
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                " ADD TO PLAYLIST ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ))
-            .border_style(Style::default().fg(Color::Cyan))
-            .style(Style::default().bg(Color::Black));
-        let body = Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0));
-        f.render_widget(body, area);
     }
 }
 
@@ -675,4 +648,337 @@ fn render_confirm_delete(f: &mut Frame, name: &str, count: usize) {
         )),
     ];
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The audio files directly inside `dir` (not recursive), sorted by name case-insensitively.
+/// Blocking: call it on a worker thread, never on the UI thread.
+pub fn list_folder_audio_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        // Skip hidden files, including the "._name" AppleDouble files macOS leaves on network shares.
+        .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+        .map(|entry| entry.path())
+        .filter(|path| crate::metadata::is_supported_audio_file(path))
+        .collect();
+    files.sort_by_cached_key(|path| path.file_name().map(|name| name.to_string_lossy().to_lowercase()));
+    Ok(files)
+}
+
+/// Status for `L` on a browser row that is neither a track nor a folder (`★ Music Homes`, `..`).
+const SELECT_TRACK_OR_FOLDER: &str = "Select a track or folder";
+
+/// A folder listing for a folder add, sent from the worker to the UI thread.
+#[derive(Debug)]
+struct FolderListing {
+    playlist: String,
+    dir: PathBuf,
+    result: std::io::Result<Vec<PathBuf>>,
+}
+
+impl PendingAdd {
+    /// What the add picker's header shows: the track title, or `<folder> (folder)`.
+    pub fn label(&self) -> &str {
+        match self {
+            PendingAdd::Entries { label, .. } | PendingAdd::Folder { label, .. } => label,
+        }
+    }
+}
+
+/// Pending add of one track; the picker header shows its title.
+fn pending_track(entry: PlaylistEntry) -> PendingAdd {
+    PendingAdd::Entries {
+        label: entry.title.clone(),
+        entries: vec![entry],
+    }
+}
+
+/// Last path component of `dir` for messages, or the whole path for a root.
+fn folder_display_name(dir: &Path) -> String {
+    dir.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string())
+}
+
+/// Status line after an add: `Added "Kerala" to Road Trip (25 tracks)`, `Already in Road Trip`
+/// or `Added 9 to Road Trip, skipped 3 already in it`.
+fn add_result_message(
+    playlist: &str,
+    single_title: Option<&str>,
+    added: usize,
+    skipped: usize,
+    total: usize,
+) -> String {
+    if added == 0 {
+        format!("Already in {}", playlist)
+    } else if let Some(title) = single_title {
+        format!("Added \"{}\" to {} ({})", title, playlist, track_count_label(total))
+    } else if skipped == 0 {
+        format!("Added {} to {} ({})", added, playlist, track_count_label(total))
+    } else {
+        format!("Added {} to {}, skipped {} already in it", added, playlist, skipped)
+    }
+}
+
+impl super::AppUI {
+    /// `L`: open the add picker for the current selection. On tab 2 that is the focused pane's
+    /// row (a browser track or folder, or a queue track); on every other tab it is the
+    /// now-playing track.
+    pub fn open_add_picker(&mut self) {
+        if !self.playlists.store.is_loaded() {
+            self.status_message = crate::playlist_store::StoreError::NotLoaded.to_string();
+            return;
+        }
+        let pending = match self.pending_add_for_selection() {
+            Ok(pending) => pending,
+            Err(message) => {
+                self.status_message = message;
+                return;
+            }
+        };
+        // Start on the playlist last added to; the first row if it is unset or gone.
+        let cursor = self
+            .settings_mgr
+            .settings
+            .last_playlist
+            .as_deref()
+            .and_then(|name| self.playlists.store.index_of(name))
+            .unwrap_or(0);
+        self.playlists.modal = Some(PlaylistModal::AddPicker { pending, cursor });
+    }
+
+    /// What `L` would add, or the status message explaining why nothing can be added.
+    fn pending_add_for_selection(&self) -> Result<PendingAdd, String> {
+        if self.active_tab == 1 && self.queue_focus {
+            return match self.queue.tracks.get(self.queue_cursor) {
+                Some(track) => Ok(pending_track(PlaylistEntry::from_metadata(track))),
+                None => Err("Queue is empty".to_string()),
+            };
+        }
+        if self.active_tab == 1 {
+            let Some((label, path, is_dir)) = self.browser_entries.get(self.browser_cursor) else {
+                return Err(SELECT_TRACK_OR_FOLDER.to_string());
+            };
+            if !*is_dir {
+                return Ok(pending_track(self.playlist_entry_for_path(path)));
+            }
+            // Folder rows (also bookmarked Music Homes) are labelled "📁 name/"; the
+            // "★ Music Homes" and ".." rows are navigation, not folders to add.
+            if label.starts_with("📁 ") {
+                return Ok(PendingAdd::Folder {
+                    label: format!("{} (folder)", folder_display_name(path)),
+                    dir: path.clone(),
+                });
+            }
+            return Err(SELECT_TRACK_OR_FOLDER.to_string());
+        }
+        if self.player.is_playing() || self.player.is_paused() {
+            if let Some(track) = self.queue.current_track() {
+                return Ok(pending_track(PlaylistEntry::from_metadata(track)));
+            }
+        }
+        Err("Nothing is playing".to_string())
+    }
+
+    /// Playlist entry for a file from metadata the app already holds. Never reads the file.
+    fn playlist_entry_for_path(&self, path: &Path) -> PlaylistEntry {
+        match self.metadata_cache.get(path) {
+            Some(meta) => PlaylistEntry::from_metadata(&meta),
+            None => PlaylistEntry::from_path(path),
+        }
+    }
+
+    /// Keys while the add picker is open: j/k/arrows move (wrapping), Enter adds, Esc/q cancel.
+    fn handle_add_picker_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.playlists.modal = None,
+            KeyCode::Up | KeyCode::Char('k') => self.move_add_picker_cursor(false),
+            KeyCode::Down | KeyCode::Char('j') => self.move_add_picker_cursor(true),
+            KeyCode::Enter => self.confirm_add_picker(),
+            _ => {}
+        }
+    }
+
+    fn move_add_picker_cursor(&mut self, down: bool) {
+        // One row per playlist, then "+ New playlist…".
+        let rows = self.playlists.store.playlists().len() + 1;
+        if let Some(PlaylistModal::AddPicker { cursor, .. }) = self.playlists.modal.as_mut() {
+            *cursor = if down {
+                (*cursor + 1) % rows
+            } else {
+                (*cursor + rows - 1) % rows
+            };
+        }
+    }
+
+    /// Enter in the add picker: add to the highlighted playlist, or open the name prompt on
+    /// "+ New playlist…".
+    fn confirm_add_picker(&mut self) {
+        let (pending, cursor) = match self.playlists.modal.take() {
+            Some(PlaylistModal::AddPicker { pending, cursor }) => (pending, cursor),
+            other => {
+                self.playlists.modal = other;
+                return;
+            }
+        };
+        match self.playlists.store.playlists().get(cursor).map(|p| p.name.clone()) {
+            Some(name) => self.apply_pending_add(&name, pending),
+            None => {
+                self.playlists.modal = Some(PlaylistModal::NamePrompt {
+                    purpose: NamePurpose::CreateAndAdd(pending),
+                    input: String::new(),
+                    error: None,
+                });
+            }
+        }
+    }
+
+    /// Enter in the name prompt opened from "+ New playlist…": create the playlist, then add.
+    fn confirm_create_and_add(&mut self) {
+        let (pending, input) = match self.playlists.modal.take() {
+            Some(PlaylistModal::NamePrompt {
+                purpose: NamePurpose::CreateAndAdd(pending),
+                input,
+                ..
+            }) => (pending, input),
+            other => {
+                self.playlists.modal = other;
+                return;
+            }
+        };
+        match self.playlists.store.create(&input) {
+            Ok(name) => {
+                // Tab 5's list cursor follows the new playlist to its sorted position.
+                if let Some(index) = self.playlists.store.index_of(&name) {
+                    self.playlists.list_cursor = index;
+                    self.playlists.track_cursor = 0;
+                }
+                self.apply_pending_add(&name, pending);
+            }
+            // Invalid or duplicate name: keep the prompt open with the error.
+            Err(e) => {
+                self.playlists.modal = Some(PlaylistModal::NamePrompt {
+                    purpose: NamePurpose::CreateAndAdd(pending),
+                    input,
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+    }
+
+    fn apply_pending_add(&mut self, playlist: &str, pending: PendingAdd) {
+        match pending {
+            PendingAdd::Entries { entries, .. } => self.add_entries_to_playlist(playlist, entries),
+            PendingAdd::Folder { dir, .. } => self.start_folder_add(playlist, dir),
+        }
+    }
+
+    /// Add `entries` to `playlist`, report the result and remember the playlist for the picker.
+    fn add_entries_to_playlist(&mut self, playlist: &str, entries: Vec<PlaylistEntry>) {
+        let single_title = match entries.as_slice() {
+            [only] => Some(only.title.clone()),
+            _ => None,
+        };
+        match self.playlists.store.add(playlist, entries) {
+            Ok(crate::playlist_store::AddResult { added, skipped, .. }) => {
+                let (stored, total) = self
+                    .playlists
+                    .store
+                    .get(playlist)
+                    .map(|p| (p.name.clone(), p.entries.len()))
+                    .unwrap_or_else(|| (playlist.to_string(), 0));
+                self.status_message = add_result_message(&stored, single_title.as_deref(), added, skipped, total);
+                self.settings_mgr.settings.last_playlist = Some(stored);
+                self.settings_mgr.save();
+            }
+            Err(e) => self.status_message = e.to_string(),
+        }
+    }
+
+    /// List `dir` on a worker (it may be on a slow or unmounted share);
+    /// `poll_playlist_folder_adds` adds the files when the listing arrives.
+    fn start_folder_add(&mut self, playlist: &str, dir: PathBuf) {
+        self.status_message = format!("Reading {}…", folder_display_name(&dir));
+        let tx = self.playlists.folder_tx.clone();
+        let playlist = playlist.to_string();
+        self.workers.spawn("playlist-folder", move || {
+            let result = list_folder_audio_files(&dir);
+            let _ = tx.send(FolderListing { playlist, dir, result });
+        });
+    }
+
+    /// Apply finished folder listings from `start_folder_add`.
+    fn poll_playlist_folder_adds(&mut self) {
+        while let Ok(listing) = self.playlists.folder_rx.try_recv() {
+            let folder = folder_display_name(&listing.dir);
+            match listing.result {
+                Ok(files) if files.is_empty() => {
+                    self.status_message = format!("No audio files in {}", folder);
+                }
+                Ok(files) => {
+                    let entries = files.iter().map(|path| self.playlist_entry_for_path(path)).collect();
+                    self.add_entries_to_playlist(&listing.playlist, entries);
+                }
+                Err(e) => {
+                    crate::log_warn!("playlists", "Couldn't read {}: {}", listing.dir.display(), e);
+                    self.status_message = format!("Couldn't read {}", folder);
+                }
+            }
+        }
+    }
+
+    /// The add picker: what is being added, one row per playlist, then "+ New playlist…".
+    fn render_add_picker(&self, f: &mut Frame, pending: &PendingAdd, cursor: usize) {
+        let area = super::centered_rect(60, 60, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                " ADD TO PLAYLIST ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Span::styled(
+                " [Enter] Add   [j/k] Move   [Esc] Cancel ",
+                Style::default().fg(Color::DarkGray),
+            ))
+            .border_style(Style::default().fg(Color::Cyan))
+            .style(Style::default().bg(Color::Black));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(1)])
+            .split(inner);
+        let header = Paragraph::new(Line::from(vec![
+            Span::styled("Adding: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                pending.label().to_string(),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        f.render_widget(header, chunks[0]);
+
+        let mut items: Vec<ListItem> = self
+            .playlists
+            .store
+            .playlists()
+            .iter()
+            .map(|p| ListItem::new(format!("{}  ({})", p.name, track_count_label(p.entries.len()))))
+            .collect();
+        items.push(ListItem::new(Span::styled(
+            NEW_PLAYLIST_ROW,
+            Style::default().fg(Color::Green),
+        )));
+        let list = List::new(items)
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+        let mut state = ListState::default();
+        state.select(Some(cursor));
+        f.render_stateful_widget(list, chunks[1], &mut state);
+    }
 }

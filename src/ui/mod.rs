@@ -2263,6 +2263,9 @@ impl AppUI {
                     crate::analysis::MixProfile::SeedRadio(_) => 0,
                 };
             }
+            (KeyCode::Char('L'), _) | (KeyCode::Char('l'), KeyModifiers::SHIFT) => {
+                self.open_add_picker();
+            }
             _ => {
                 // Tab specific key handling
                 self.handle_tab_key_with_modifiers(key.code, key.modifiers);
@@ -4731,6 +4734,7 @@ impl AppUI {
             Self::help_key_line("r", "Seed Radio / Rescan dev"),
             Self::help_key_line("Z / z", "Shuffle current queue"),
             Self::help_key_line("a", "Add all songs in folder"),
+            Self::help_key_line("L", "Add to playlist"),
             Self::help_key_line("d / x", "Remove track / bookmark"),
             Self::help_key_line("c", "Clear queue (queue pane)"),
             Self::help_key_line("b", "Bookmark folder in Homes"),
