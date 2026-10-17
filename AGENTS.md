@@ -9,7 +9,7 @@ This guide is intended for AI coding agents and automated development tools work
 1. **Native Rust 2021 Architecture**:
    - Quickstream is a high-performance terminal music player and DLNA / UPnP network streamer written in **Rust (2021 Edition)**.
    - Crate dependencies are managed strictly via [`Cargo.toml`](file:///Users/jp/Development/quickstream/Cargo.toml) (e.g. `ratatui`, `crossterm`, `lofty`, `rusqlite`, `walkdir`, `clap`, `serde`).
-   - **Do not introduce Python runtime dependencies or pip packages**: The legacy `quickstream/` Python directory and `quickstream.py` are deprecated early prototypes preserved for historical reference. All active development, bug fixes, and features live strictly in `src/`.
+   - **Do not introduce Python runtime dependencies or pip packages**: The early Python prototype (`quickstream/`, `quickstream.py`, `pyproject.toml`, `tests/*.py`) has been removed from the tree; it remains available in git history only. All active development, bug fixes, and features live strictly in `src/`.
 
 2. **System Dependencies**:
    - `ffmpeg`: Required for audio format transcoding, sample extraction, and fallback metadata extraction.
