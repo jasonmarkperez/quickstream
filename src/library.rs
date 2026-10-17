@@ -60,6 +60,19 @@ impl SkimItem for SkimTrackItem {
     }
 }
 
+/// Remembers paths visited during a directory walk. Some SMB shares (seen on macOS with a
+/// Synology NAS) return each directory entry several times; without this every duplicate
+/// subtree is walked again and its tracks are collected once per duplicate (issue #35).
+#[derive(Default)]
+pub struct SeenPaths(std::collections::HashSet<PathBuf>);
+
+impl SeenPaths {
+    /// True the first time `path` is seen.
+    pub fn first_visit(&mut self, path: &Path) -> bool {
+        self.0.insert(path.to_path_buf())
+    }
+}
+
 #[derive(Default)]
 pub struct LibraryManager {
     pub tracks: Vec<AudioMetadata>,
@@ -179,8 +192,13 @@ impl LibraryManager {
         let mut subdirs = Vec::new();
         let mut immediate_files = Vec::new();
 
+        let mut seen = SeenPaths::default();
+
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
+                if !seen.first_visit(&entry.path()) {
+                    continue;
+                }
                 let name = entry.file_name().to_string_lossy().to_string();
                 if (name.starts_with('.') && name != "." && name != "..")
                     || name == "#recycle"
@@ -266,6 +284,7 @@ impl LibraryManager {
                     break;
                 }
                 let mut folder_tracks = Vec::new();
+                let mut seen = SeenPaths::default();
                 for entry in WalkDir::new(subdir)
                     .max_depth(3)
                     .follow_links(false)
@@ -278,7 +297,7 @@ impl LibraryManager {
                         {
                             return false;
                         }
-                        true
+                        seen.first_visit(e.path())
                     })
                     .filter_map(|e| e.ok())
                 {
@@ -304,6 +323,7 @@ impl LibraryManager {
 
             for subdir in &subdirs {
                 let mut folder_tracks = Vec::new();
+                let mut seen = SeenPaths::default();
                 for entry in WalkDir::new(subdir)
                     .max_depth(3)
                     .follow_links(false)
@@ -316,7 +336,7 @@ impl LibraryManager {
                         {
                             return false;
                         }
-                        true
+                        seen.first_visit(e.path())
                     })
                     .filter_map(|e| e.ok())
                 {
@@ -447,8 +467,13 @@ impl LibraryManager {
             let mut found_subdirs = Vec::new();
             let mut found_files = Vec::new();
 
+            let mut seen = SeenPaths::default();
+
             if let Ok(entries) = fs::read_dir(&dir) {
                 for entry in entries.flatten() {
+                    if !seen.first_visit(&entry.path()) {
+                        continue;
+                    }
                     if stop_flag.load(Ordering::Relaxed) {
                         return;
                     }
@@ -564,13 +589,14 @@ impl LibraryManager {
                     }
 
                     let mut folder_tracks = Vec::new();
+                    let mut seen = SeenPaths::default();
                     for entry in WalkDir::new(subdir)
                         .max_depth(3)
                         .follow_links(false)
                         .into_iter()
                         .filter_entry(|e| {
                             let name = e.file_name().to_string_lossy();
-                            !name.starts_with('.') && name != "#recycle" && name != "$RECYCLE.BIN"
+                            !name.starts_with('.') && name != "#recycle" && name != "$RECYCLE.BIN" && seen.first_visit(e.path())
                         })
                         .filter_map(|e| e.ok())
                     {
@@ -607,13 +633,14 @@ impl LibraryManager {
                 // Flat folder with no subdirectories: sample directly from files
                 let mut all_files = immediate_files.clone();
                 if all_files.is_empty() {
+                    let mut seen = SeenPaths::default();
                     for entry in WalkDir::new(&dir)
                         .max_depth(3)
                         .follow_links(false)
                         .into_iter()
                         .filter_entry(|e| {
                             let name = e.file_name().to_string_lossy();
-                            !name.starts_with('.') && name != "#recycle" && name != "$RECYCLE.BIN"
+                            !name.starts_with('.') && name != "#recycle" && name != "$RECYCLE.BIN" && seen.first_visit(e.path())
                         })
                         .filter_map(|e| e.ok())
                     {
@@ -728,13 +755,14 @@ impl LibraryManager {
                     break;
                 }
                 let mut folder_tracks = Vec::new();
+                let mut seen = SeenPaths::default();
                 for entry in WalkDir::new(subdir)
                     .max_depth(3)
                     .follow_links(false)
                     .into_iter()
                     .filter_entry(|e| {
                         let name = e.file_name().to_string_lossy();
-                        !name.starts_with('.') && name != "#recycle" && name != "$RECYCLE.BIN"
+                        !name.starts_with('.') && name != "#recycle" && name != "$RECYCLE.BIN" && seen.first_visit(e.path())
                     })
                     .filter_map(|e| e.ok())
                 {
@@ -768,13 +796,14 @@ impl LibraryManager {
                     break;
                 }
                 let mut folder_tracks = Vec::new();
+                let mut seen = SeenPaths::default();
                 for entry in WalkDir::new(subdir)
                     .max_depth(3)
                     .follow_links(false)
                     .into_iter()
                     .filter_entry(|e| {
                         let name = e.file_name().to_string_lossy();
-                        !name.starts_with('.') && name != "#recycle" && name != "$RECYCLE.BIN"
+                        !name.starts_with('.') && name != "#recycle" && name != "$RECYCLE.BIN" && seen.first_visit(e.path())
                     })
                     .filter_map(|e| e.ok())
                 {
@@ -841,12 +870,14 @@ impl LibraryManager {
         let mut new_discovered = Vec::new();
         let mut full_cache = cache.clone();
 
+        let mut seen = SeenPaths::default();
+
         for entry in WalkDir::new(&dir)
             .follow_links(false)
             .into_iter()
             .filter_entry(|e| {
                 let name = e.file_name().to_string_lossy();
-                !(name.starts_with('.') && name != "." && name != "..")
+                !(name.starts_with('.') && name != "." && name != "..") && seen.first_visit(e.path())
             })
             .filter_map(|e| e.ok())
         {

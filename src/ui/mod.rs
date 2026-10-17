@@ -31,6 +31,8 @@ pub struct CachedDir {
     pub files: Vec<(String, PathBuf, bool)>,
     pub unfetched_tracks: Vec<PathBuf>,
     pub is_complete: bool,
+    /// Paths already listed. Some SMB shares return each entry several times (issue #35).
+    pub seen: std::collections::HashSet<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -684,12 +686,23 @@ impl AppUI {
             DirScanEvent::Batch {
                 scan_id,
                 dir,
-                dirs,
+                mut dirs,
                 mut files,
-                unfetched_tracks,
+                mut unfetched_tracks,
             } => {
                 if scan_id != self.dir_scan_id || dir != self.browser_dir {
                     return;
+                }
+
+                {
+                    let seen = &mut self.browser_dir_cache.entry(dir.clone()).or_default().seen;
+                    dirs.retain(|(_, path, _)| seen.insert(path.clone()));
+                    let before = files.len();
+                    files.retain(|(_, path, _)| seen.insert(path.clone()));
+                    if files.len() != before {
+                        let kept: std::collections::HashSet<&PathBuf> = files.iter().map(|(_, p, _)| p).collect();
+                        unfetched_tracks.retain(|p| kept.contains(p));
+                    }
                 }
 
                 let metadata_view = self.settings_mgr.settings.metadata_view;
@@ -3033,6 +3046,7 @@ impl AppUI {
                                 .filter(|p| crate::metadata::is_supported_audio_file(p))
                                 .collect();
                             files.sort();
+                            files.dedup(); // Some SMB shares return each entry several times (issue #35).
                             let tracks = files.iter().map(|p| crate::metadata::fallback_metadata(p)).collect();
                             let _ = tx.send(tracks);
                         }
