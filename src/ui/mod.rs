@@ -59,6 +59,35 @@ fn spawn_local_player(backend: &str, initial_volume: u8) -> Box<dyn AudioPlayer>
     Box::new(AsyncPlayer::spawn(move || Box::new(LocalPlayer::new(&backend)), initial_volume))
 }
 
+/// Start 4 threads that read tags for paths sent to the returned inbox and report results on
+/// `metadata_tx`. The threads exit once the inbox sender is dropped.
+fn spawn_queue_metadata_workers(
+    metadata_tx: std::sync::mpsc::Sender<crate::metadata::AudioMetadata>,
+) -> std::sync::mpsc::Sender<PathBuf> {
+    let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+    let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+    for _ in 0..4 {
+        let rx = rx.clone();
+        let metadata_tx = metadata_tx.clone();
+        std::thread::spawn(move || loop {
+            let path = match rx.lock() {
+                Ok(guard) => match guard.recv() {
+                    Ok(p) => p,
+                    Err(_) => break,
+                },
+                Err(_) => break,
+            };
+            if let Ok(meta) = crate::metadata::extract_metadata(&path) {
+                crate::library::LibraryManager::append_to_cache(&meta);
+                if metadata_tx.send(meta).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    tx
+}
+
 /// Drop a replaced player on a background thread so its shutdown (killing mpv, sending Stop to a
 /// renderer) never blocks the UI.
 fn retire_player(player: Box<dyn AudioPlayer>) {
@@ -67,6 +96,7 @@ fn retire_player(player: Box<dyn AudioPlayer>) {
 
 static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TUI_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Ask the running TUI to exit cleanly on its next tick. Safe to call from a signal handler thread.
 pub fn request_shutdown() {
@@ -76,6 +106,11 @@ pub fn request_shutdown() {
 /// Reset a pending shutdown request.
 pub fn clear_shutdown_request() {
     SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether the TUI event loop has exited and the app is releasing resources (players, mpv).
+pub fn is_shutting_down() -> bool {
+    SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Whether the interactive TUI event loop is currently running.
@@ -114,7 +149,10 @@ pub struct AppUI {
     pub queue_add_tx: std::sync::mpsc::Sender<Vec<crate::metadata::AudioMetadata>>,
     pub queue_add_rx: std::sync::mpsc::Receiver<Vec<crate::metadata::AudioMetadata>>,
     pub metadata_worker_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    pub queue_metadata_worker_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Inbox of the queue metadata worker pool (spawned on first use; workers exit when dropped).
+    pub queue_metadata_tx: Option<std::sync::mpsc::Sender<PathBuf>>,
+    /// Paths already sent to the queue metadata workers this session.
+    pub queue_metadata_attempted: std::collections::HashSet<PathBuf>,
     pub browser_state: ListState,
     pub queue_state: ListState,
     pub devices_state: ListState,
@@ -224,7 +262,8 @@ impl AppUI {
             queue_add_tx,
             queue_add_rx,
             metadata_worker_stop: None,
-            queue_metadata_worker_stop: None,
+            queue_metadata_tx: None,
+            queue_metadata_attempted: std::collections::HashSet::new(),
             browser_state: ListState::default(),
             queue_state: ListState::default(),
             devices_state: ListState::default(),
@@ -839,62 +878,33 @@ impl AppUI {
         });
     }
 
+    /// Resolve tags for queue tracks that still have placeholder metadata. Each path is read at
+    /// most once per session by a persistent pool of 4 workers; results arrive via `metadata_rx`.
     pub fn start_queue_metadata_fetch(&mut self) {
-        let paths_to_fetch: Vec<PathBuf> = self
+        let candidates: Vec<PathBuf> = self
             .queue
             .tracks
             .iter()
             .filter(|t| t.duration_seconds <= 0.0 || t.artist.is_empty())
             .map(|t| t.filepath.clone())
             .collect();
-
-        if paths_to_fetch.is_empty() {
+        let new_paths: Vec<PathBuf> = candidates
+            .into_iter()
+            .filter(|p| self.queue_metadata_attempted.insert(p.clone()))
+            .collect();
+        if new_paths.is_empty() {
             return;
         }
 
-        if let Some(stop) = self.queue_metadata_worker_stop.take() {
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.queue_metadata_worker_stop = Some(stop.clone());
-        let tx = self.metadata_tx.clone();
-
-        // 4 parallel worker threads to resolve tags and duration concurrently
-        let queue = std::sync::Arc::new(std::sync::Mutex::new(paths_to_fetch));
-        for _ in 0..4 {
-            let q = queue.clone();
-            let tx = tx.clone();
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                loop {
-                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
-                    }
-                    let path = {
-                        let mut guard = match q.lock() {
-                            Ok(g) => g,
-                            Err(_) => break,
-                        };
-                        guard.pop()
-                    };
-                    let path = match path {
-                        Some(p) => p,
-                        None => break,
-                    };
-                    if let Ok(meta) = crate::metadata::extract_metadata(&path) {
-                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                            break;
-                        }
-                        crate::library::LibraryManager::append_to_cache(&meta);
-                        let _ = tx.send(meta);
-                    }
-                }
-            });
+        let metadata_tx = self.metadata_tx.clone();
+        let tx = self
+            .queue_metadata_tx
+            .get_or_insert_with(|| spawn_queue_metadata_workers(metadata_tx));
+        for path in new_paths {
+            let _ = tx.send(path);
         }
     }
 
-    /// Add tracks listed by background folder scans (see `WebCommand::AddFolder`) to the queue.
     pub fn poll_pending_queue_adds(&mut self) {
         while let Ok(tracks) = self.queue_add_rx.try_recv() {
             let tracks: Vec<_> = tracks
@@ -1316,6 +1326,7 @@ impl AppUI {
 
         TUI_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
         let res = self.event_loop(&mut terminal);
+        SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
         TUI_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
 
         disable_raw_mode()?;
@@ -2445,8 +2456,9 @@ impl AppUI {
             let backend = self.settings_mgr.settings.player_backend.clone();
             if self.device_manager.get_active_device().is_none() {
                 let volume = self.player.volume();
-                let old = std::mem::replace(&mut self.player, spawn_local_player(&backend, volume));
-                retire_player(old);
+                let mut new_player = spawn_local_player(&backend, volume);
+                let _ = new_player.set_volume(volume);
+                retire_player(std::mem::replace(&mut self.player, new_player));
             }
         } else if self.settings_cursor == 6 {
             self.sync_web_server();
@@ -2751,6 +2763,7 @@ impl AppUI {
         let vol = self.player.volume();
         let current_track = self.queue.current_track().cloned();
 
+        self.player.detach_stream_state();
         let _ = self.player.stop();
         if let Some(ref ws) = self.web_server {
             ws.close_active_streams();
@@ -2779,12 +2792,19 @@ impl AppUI {
     }
 
     pub fn switch_to_upnp_player(&mut self, dev: crate::discovery::DLNADevice) {
+        // Re-selecting the active renderer is a no-op: a new player would queue Play while the
+        // old player's delayed Stop could still reach the same device.
+        if self.device_manager.get_active_device().is_some_and(|d| d.udn == dev.udn) {
+            self.status_message = format!("Active output: {}", dev.friendly_name);
+            return;
+        }
         let port = self.ensure_web_server_started();
         let was_playing = self.player.is_playing();
         let was_paused = self.player.is_paused();
         let pos = self.player.position_seconds();
         let current_track = self.queue.current_track().cloned();
 
+        self.player.detach_stream_state();
         let _ = self.player.stop();
         if let Some(ref ws) = self.web_server {
             ws.close_active_streams();
@@ -2803,7 +2823,9 @@ impl AppUI {
             move || {
                 Box::new(crate::player::upnp::UPnPPlayer::new(worker_dev, port).with_stream_state(stream_state))
             },
-            self.player.volume(),
+            // The renderer's volume is unknown until UPnPPlayer::new has queried it. Report 0 rather
+            // than the local volume so a volume key in that window cannot jump the speaker.
+            0,
         ));
 
         let status = format!("Active output: {}", dev.friendly_name);

@@ -577,3 +577,24 @@ fn test_web_server_status_api_with_queue_and_devices() {
 
     handle.stop();
 }
+
+#[test]
+fn test_web_server_stops_when_another_listener_shadows_its_loopback_port() {
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state, tx).expect("start web server");
+    // Another server in the process (or another app) holds 127.0.0.1 on the same port, so a
+    // wake-up connection to 127.0.0.1:port reaches it instead of this server.
+    let shadow = std::net::TcpListener::bind(("127.0.0.1", handle.port)).expect("shadow listener");
+
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        handle.stop();
+        let _ = done_tx.send(());
+    });
+    assert!(
+        done_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+        "WebServerHandle::stop must not depend on a wake-up connection reaching the listener"
+    );
+    drop(shadow);
+}

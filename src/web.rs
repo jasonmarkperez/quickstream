@@ -334,7 +334,6 @@ impl WebServerHandle {
     pub fn stop(mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         self.stream_state.close_active_streams();
-        let _ = TcpStream::connect(format!("127.0.0.1:{}", self.port));
         if let Some(h) = self.join_handle.take() {
             let _ = h.join();
         }
@@ -345,8 +344,6 @@ impl Drop for WebServerHandle {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         self.stream_state.close_active_streams();
-        // Ping socket to unblock accept()
-        let _ = TcpStream::connect(format!("127.0.0.1:{}", self.port));
         if let Some(h) = self.join_handle.take() {
             let _ = h.join();
         }
@@ -390,6 +387,10 @@ impl WebServer {
         let stop_flag_thread = stop_flag.clone();
         let stream_state_thread = stream_state.clone();
 
+        // Non-blocking accept so the loop sees the stop flag within one poll interval. A wake-up
+        // connection to 127.0.0.1:port is not reliable: another listener bound to 127.0.0.1 on
+        // the same port (allowed next to a 0.0.0.0 bind) would receive it instead.
+        listener.set_nonblocking(true)?;
         let join_handle = std::thread::Builder::new()
             .name("QuickstreamWebServer".to_string())
             .spawn(move || {
@@ -399,6 +400,8 @@ impl WebServer {
                             if stop_flag_thread.load(Ordering::SeqCst) {
                                 break;
                             }
+                            // Accepted sockets inherit O_NONBLOCK on macOS/BSD.
+                            let _ = stream.set_nonblocking(false);
                             let state_clone = state.clone();
                             let cmd_tx_clone = cmd_tx.clone();
                             let stream_state_clone = stream_state_thread.clone();

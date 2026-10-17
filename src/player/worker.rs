@@ -14,7 +14,9 @@ use std::time::Duration;
 use super::AudioPlayer;
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(100);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Longer than LocalPlayer's mpv connect loop (60 × 50ms), so quitting while mpv is starting
+/// still waits for the worker to kill it.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum Command {
     Play(PathBuf),
@@ -27,6 +29,7 @@ enum Command {
     SeekTo(f64),
     SetVolume(u8),
     ResetFinished,
+    DetachStreamState,
 }
 
 #[derive(Clone, Default)]
@@ -40,6 +43,10 @@ struct Snapshot {
     /// Commands sent but not yet applied by the worker. While non-zero the worker does not
     /// overwrite the optimistic snapshot with backend state.
     pending: usize,
+    /// `SetVolume` commands not yet applied. Volume is refreshed from the backend whenever this
+    /// is zero, even while other commands are pending: a renderer's volume must be known before
+    /// a relative volume key computes `volume() ± step`.
+    volume_pending: usize,
 }
 
 struct Shared {
@@ -129,8 +136,15 @@ where
     loop {
         match rx.recv_timeout(REFRESH_INTERVAL) {
             Ok(cmd) => {
+                let is_volume = matches!(cmd, Command::SetVolume(_));
                 let result = apply(player.as_mut(), cmd);
-                shared.state.lock().unwrap().pending -= 1;
+                {
+                    let mut state = shared.state.lock().unwrap();
+                    state.pending -= 1;
+                    if is_volume {
+                        state.volume_pending -= 1;
+                    }
+                }
                 if let Err(e) = result {
                     crate::log_warn!("player", "Player command failed: {}", e);
                     *shared.last_error.lock().unwrap() = Some(e.to_string());
@@ -158,6 +172,10 @@ fn apply(player: &mut dyn AudioPlayer, cmd: Command) -> anyhow::Result<()> {
             player.reset_finished();
             Ok(())
         }
+        Command::DetachStreamState => {
+            player.detach_stream_state();
+            Ok(())
+        }
     }
 }
 
@@ -170,10 +188,13 @@ fn refresh(player: &mut dyn AudioPlayer, shared: &Shared) {
         duration: player.duration_seconds(),
         finished: player.is_track_finished(),
         pending: 0,
+        volume_pending: 0,
     };
     let mut state = shared.state.lock().unwrap();
     if state.pending == 0 {
         *state = fresh;
+    } else if state.volume_pending == 0 {
+        state.volume = fresh.volume;
     }
 }
 
@@ -198,18 +219,28 @@ impl AudioPlayer for AsyncPlayer {
         })
     }
 
+    // Backends report playing=false while paused; the optimistic state mirrors that.
     fn pause(&mut self) -> anyhow::Result<()> {
-        self.send(Command::Pause, |s| s.paused = true)
+        self.send(Command::Pause, |s| {
+            s.paused = true;
+            s.playing = false;
+        })
     }
 
     fn resume(&mut self) -> anyhow::Result<()> {
-        self.send(Command::Resume, |s| s.paused = false)
+        self.send(Command::Resume, |s| {
+            s.paused = false;
+            s.playing = true;
+        })
     }
 
     fn toggle_pause(&mut self) -> anyhow::Result<bool> {
         let mut now_paused = false;
         self.send(Command::TogglePause, |s| {
-            s.paused = !s.paused;
+            if s.playing || s.paused {
+                s.paused = !s.paused;
+                s.playing = !s.paused;
+            }
             now_paused = s.paused;
         })?;
         Ok(now_paused)
@@ -239,7 +270,10 @@ impl AudioPlayer for AsyncPlayer {
     }
 
     fn set_volume(&mut self, volume: u8) -> anyhow::Result<()> {
-        self.send(Command::SetVolume(volume), |s| s.volume = volume)
+        self.send(Command::SetVolume(volume), |s| {
+            s.volume = volume;
+            s.volume_pending += 1;
+        })
     }
 
     fn volume(&self) -> u8 {
@@ -268,6 +302,10 @@ impl AudioPlayer for AsyncPlayer {
 
     fn reset_finished(&mut self) {
         let _ = self.send(Command::ResetFinished, |s| s.finished = false);
+    }
+
+    fn detach_stream_state(&mut self) {
+        let _ = self.send(Command::DetachStreamState, |_| {});
     }
 
     fn take_error(&mut self) -> Option<String> {

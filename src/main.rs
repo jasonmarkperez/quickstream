@@ -75,6 +75,10 @@ fn main() -> anyhow::Result<()> {
             if !crate::ui::is_tui_active() {
                 return;
             }
+        } else if crate::ui::is_shutting_down() {
+            // Already exiting (e.g. a second Ctrl-C after the terminal left raw mode): let Drop
+            // cleanup finish instead of exiting with mpv still running.
+            return;
         }
         let _ = crossterm::terminal::disable_raw_mode();
         let mut stdout = std::io::stdout();

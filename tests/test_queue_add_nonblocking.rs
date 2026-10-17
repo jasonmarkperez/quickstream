@@ -73,7 +73,7 @@ fn test_web_add_folder_does_not_block_ui_thread() {
     assert!(elapsed < UI_BUDGET, "UI thread blocked for {:?}", elapsed);
 
     let deadline = Instant::now() + Duration::from_secs(3);
-    while app.queue.len() < 1 && Instant::now() < deadline {
+    while app.queue.is_empty() && Instant::now() < deadline {
         let tick = Instant::now();
         app.poll_pending_queue_adds();
         assert!(tick.elapsed() < UI_BUDGET, "poll blocked for {:?}", tick.elapsed());

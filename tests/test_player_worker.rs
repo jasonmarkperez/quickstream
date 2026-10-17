@@ -313,3 +313,111 @@ fn test_switching_to_unresponsive_renderer_does_not_block_ui() {
     let elapsed = start.elapsed();
     assert!(elapsed < Duration::from_millis(500), "UI thread blocked for {:?}", elapsed);
 }
+
+#[test]
+fn test_async_player_reports_backend_volume_while_commands_are_pending() {
+    // Switching to a renderer: the proxy is created with a placeholder volume and play_at is
+    // queued at once. The renderer's real volume must be visible as soon as the player exists,
+    // or a volume key would send placeholder ± step to the speaker.
+    let probe = Probe::default();
+    let p = probe.clone();
+    let mut player = AsyncPlayer::spawn(
+        move || {
+            let mut inner = SlowPlayer::new(Duration::from_millis(800), &p);
+            inner.volume = 20;
+            Box::new(inner)
+        },
+        80,
+    );
+    player.play_at(Path::new("/music/a.flac"), 10.0).unwrap();
+
+    assert!(wait_until(Duration::from_millis(400), || player.volume() == 20));
+    assert!(player.is_playing(), "optimistic play state is kept while play_at is pending");
+}
+
+#[test]
+fn test_async_player_pending_volume_change_is_not_overwritten() {
+    let probe = Probe::default();
+    let p = probe.clone();
+    let mut player = AsyncPlayer::spawn(
+        move || {
+            let mut inner = SlowPlayer::new(Duration::from_millis(400), &p);
+            inner.volume = 20;
+            Box::new(inner)
+        },
+        20,
+    );
+    player.play(Path::new("/music/a.flac")).unwrap();
+    player.set_volume(35).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(player.volume(), 35);
+}
+
+#[test]
+fn test_async_player_optimistic_pause_matches_backends() {
+    let probe = Probe::default();
+    let p = probe.clone();
+    let mut player = AsyncPlayer::spawn(move || Box::new(SlowPlayer::new(Duration::from_millis(300), &p)), 50);
+    player.play(Path::new("/music/a.flac")).unwrap();
+
+    player.pause().unwrap();
+    assert!(!player.is_playing(), "backends report playing=false while paused");
+    assert!(player.is_paused());
+
+    player.resume().unwrap();
+    assert!(player.is_playing());
+    assert!(!player.is_paused());
+
+    assert!(player.toggle_pause().unwrap());
+    assert!(!player.is_playing());
+    assert!(!player.toggle_pause().unwrap());
+    assert!(player.is_playing());
+}
+
+fn hung_device(port: u16, udn: &str) -> quickstream::discovery::DLNADevice {
+    quickstream::discovery::DLNADevice {
+        udn: udn.to_string(),
+        friendly_name: "Hung Renderer".to_string(),
+        model_name: "Hung".to_string(),
+        manufacturer: "Test".to_string(),
+        host: "127.0.0.1".to_string(),
+        port,
+        location: format!("http://127.0.0.1:{}/desc.xml", port),
+        av_transport_control_url: format!("http://127.0.0.1:{}/ctrl/AVTransport", port),
+        rendering_control_url: format!("http://127.0.0.1:{}/ctrl/RenderingControl", port),
+    }
+}
+
+#[test]
+fn test_switching_to_renderer_does_not_carry_local_volume() {
+    use quickstream::settings::SettingsManager;
+    use quickstream::ui::AppUI;
+
+    let port = spawn_unresponsive_renderer();
+    let mut settings_mgr = SettingsManager::new();
+    settings_mgr.settings.web_server_enabled = false;
+    let mut app = AppUI::new(None, settings_mgr);
+    app.player.set_volume(80).unwrap();
+
+    app.switch_to_upnp_player(hung_device(port, "uuid:hung-volume"));
+    // The renderer's own volume is unknown until it answers; a volume key in this window
+    // must not send 80 ± step to the speaker.
+    assert_eq!(app.player.volume(), 0);
+}
+
+#[test]
+fn test_reselecting_active_renderer_keeps_current_player() {
+    use quickstream::settings::SettingsManager;
+    use quickstream::ui::AppUI;
+
+    let port = spawn_unresponsive_renderer();
+    let mut settings_mgr = SettingsManager::new();
+    settings_mgr.settings.web_server_enabled = false;
+    let mut app = AppUI::new(None, settings_mgr);
+
+    app.switch_to_upnp_player(hung_device(port, "uuid:hung-same"));
+    let first = &*app.player as *const dyn quickstream::player::AudioPlayer as *const u8;
+    app.switch_to_upnp_player(hung_device(port, "uuid:hung-same"));
+    let second = &*app.player as *const dyn quickstream::player::AudioPlayer as *const u8;
+    assert_eq!(first, second, "re-selecting the active renderer must not restart playback on it");
+}
