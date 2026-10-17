@@ -15,6 +15,16 @@ use quickstream::web_access::{authorize, load_or_create_token, resolve_allowed_p
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const PORT: u16 = 8080;
 
+/// Point the config dir at a temp folder before anything loads the web token, so tests never
+/// create `web_token` in the developer's real ~/.config/quickstream.
+fn isolate_config() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join(format!("qs_web_access_cfg_{}", std::process::id()));
+        std::env::set_var("XDG_CONFIG_HOME", dir);
+    });
+}
+
 fn lan_peer() -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))
 }
@@ -321,6 +331,7 @@ fn post_json(port: u16, body: &str) -> (u16, String, Vec<u8>) {
 }
 
 fn start(state: Arc<RwLock<NowPlayingState>>) -> (quickstream::web::WebServerHandle, mpsc::Receiver<WebCommand>) {
+    isolate_config();
     let (tx, rx) = mpsc::channel();
     let handle = WebServer::start(0, state, tx).expect("start web server");
     (handle, rx)
@@ -398,6 +409,7 @@ fn test_dashboard_forbids_framing() {
 
 #[test]
 fn test_pairing_link_sets_session_cookie_and_redirects() {
+    isolate_config();
     let token = quickstream::web_access::web_token();
     let (handle, _rx) = start(Arc::new(RwLock::new(NowPlayingState::default())));
     let (status, headers, _) = get(handle.port, &format!("/?token={}", token));
@@ -591,6 +603,7 @@ fn test_settings_show_pairing_link_when_lan_access_enabled() {
     let local = mgr.get_display_value(6);
     assert!(!local.contains("token"), "{}", local);
 
+    isolate_config();
     mgr.settings.web_server_lan = true;
     let lan = mgr.get_display_value(6);
     let token = quickstream::web_access::web_token();

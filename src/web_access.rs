@@ -268,7 +268,13 @@ pub fn check_request(
 ) -> std::io::Result<bool> {
     let peer = stream.peer_addr()?.ip();
     let port = stream.local_addr()?.port();
-    let token = web_token();
+    // Loopback peers only need the token to open the pairing link; loading it for every local
+    // request would create the token file on first use. An empty token never matches.
+    let token = if is_loopback(peer) && query_param(path, "token").is_none() {
+        ""
+    } else {
+        web_token()
+    };
     let decision = authorize(peer, port, method, path, headers, token);
     if decision == AuthDecision::Allow {
         return Ok(true);
