@@ -44,7 +44,7 @@ fn sparse_library() -> PathBuf {
         quickstream::logger::init();
         let library = root.join("library");
         for folder in 0..520 {
-            for track in 0..3 {
+            for track in 0..6 {
                 create_silent_wav(&library.join(format!("Band {:03}/Record/{:02} Song.wav", folder, track)));
             }
         }
@@ -150,4 +150,19 @@ fn test_sequencing_after_queued_track_keeps_artist_spacing() {
     assert_eq!(rest.len(), 3);
     assert!(rest.iter().all(|t| t.filepath != queued.filepath), "queued track is not repeated");
     assert_ne!(rest[0].artist, "Alpha", "next track must not repeat the queued track's artist");
+}
+
+fn counter(line: &str, name: &str) -> usize {
+    let start = line.find(&format!("{}=", name)).unwrap_or_else(|| panic!("no {} in {}", name, line)) + name.len() + 1;
+    line[start..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap()
+}
+
+#[test]
+fn test_profile_scan_reads_few_tags_per_folder() {
+    let run = run_chill_mix(ProfileScanLimits::default());
+    let gathered = gathered_line(&run.log);
+    let folders = counter(&gathered, "folders");
+    let tag_reads = counter(&gathered, "tag_reads");
+    // 6 tracks per folder; at most 4 are read so the time budget covers more artists.
+    assert!(tag_reads <= 4 * folders + 1, "{}", gathered);
 }
