@@ -304,6 +304,8 @@ impl AppUI {
                     .filter(|p| p.is_dir())
             })
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        // Browser entries inherit this; relative ones would be saved into playlists as-is.
+        let cwd = std::path::absolute(&cwd).unwrap_or(cwd);
         let backend = settings_mgr.settings.player_backend.clone();
         let bookmarks = Self::load_bookmarks();
         // Discovery starts in run(): SSDP opens a socket on all interfaces, which tests that

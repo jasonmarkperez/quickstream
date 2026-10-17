@@ -315,6 +315,27 @@ fn test_add_skips_paths_already_in_the_playlist() {
     assert_eq!(on_disk(&dir, "Road Trip").entries, expected);
 }
 
+/// `quickstream .` makes browser paths relative. Stored verbatim, a reload would resolve them
+/// against the playlists folder and every track would be missing.
+#[test]
+fn test_add_stores_relative_paths_as_absolute() {
+    common::isolate();
+    let dir = scratch("add_relative");
+    let (worker, mut store) = open_store(&dir);
+    store.create("Mix").unwrap();
+    let mut rel = entry("a");
+    rel.path = PathBuf::from("rel/a.mp3");
+    store.add("Mix", vec![rel]).unwrap();
+    assert!(worker.flush());
+
+    let reloaded = on_disk(&dir, "Mix");
+    assert_eq!(reloaded.entries.len(), 1);
+    let path = &reloaded.entries[0].path;
+    assert!(path.is_absolute(), "stored path {:?} is not absolute", path);
+    assert!(path.ends_with("rel/a.mp3"), "stored path {:?}", path);
+    assert_eq!(path, &std::env::current_dir().unwrap().join("rel/a.mp3"));
+}
+
 #[test]
 fn test_remove_takes_out_one_track() {
     common::isolate();

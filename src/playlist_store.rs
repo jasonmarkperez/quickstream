@@ -216,7 +216,12 @@ impl PlaylistStore {
         let playlist = &mut self.playlists[slot];
         let mut present: HashSet<PathBuf> = playlist.entries.iter().map(|e| e.path.clone()).collect();
         let (mut added, mut skipped) = (0, 0);
-        for entry in entries {
+        for mut entry in entries {
+            // A relative path (`quickstream .`) would be read back against the playlists
+            // folder, so store it absolute. `std::path::absolute` never reads the disk.
+            if let Ok(abs) = std::path::absolute(&entry.path) {
+                entry.path = abs;
+            }
             if present.insert(entry.path.clone()) {
                 playlist.entries.push(entry);
                 added += 1;
