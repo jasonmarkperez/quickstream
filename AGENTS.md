@@ -1,24 +1,50 @@
 # Quickstream Agent Developer Guide (`AGENTS.md`)
 
-This guide is intended for AI coding agents and automated development tools working on the **Quickstream** codebase. It documents architectural decisions, core invariants, technology constraints, and operational patterns.
+This guide is intended for AI coding agents and automated development tools working on the **Quickstream** codebase. It documents architectural decisions, core invariants, technology constraints, module structure, and operational patterns.
 
 ---
 
 ## 1. Project Philosophy & Core Invariants
 
-1. **Zero External Python Dependencies**:
-   - The entire codebase **MUST** run on standard Python 3.10+ without any third-party pip packages (no `requests`, `numpy`, `click`, `rich`, `textual`, etc.).
-   - Standard library modules used: `curses`, `socket`, `http.server`, `urllib`, `xml.etree.ElementTree`, `subprocess`, `threading`, `dataclasses`, `pathlib`, `typing`, `array`.
-   - **Do not add external Python dependencies** to `pyproject.toml` unless explicitly instructed by the user.
+1. **Native Rust 2021 Architecture**:
+   - Quickstream is a high-performance terminal music player and DLNA / UPnP network streamer written in **Rust (2021 Edition)**.
+   - Crate dependencies are managed strictly via [`Cargo.toml`](file:///Users/jp/Development/quickstream/Cargo.toml) (e.g. `ratatui`, `crossterm`, `lofty`, `rusqlite`, `walkdir`, `clap`, `serde`).
+   - **Do not introduce Python runtime dependencies or pip packages**: The legacy `quickstream/` Python directory and `quickstream.py` are deprecated early prototypes preserved for historical reference. All active development, bug fixes, and features live strictly in `src/`.
 
 2. **System Dependencies**:
-   - `ffmpeg`: Required for audio format transcoding, Braille waveform sample extraction, and fallback metadata extraction.
-   - `ffplay`: Required for headless local audio playback (`Local Audio` device).
+   - `ffmpeg`: Required for audio format transcoding, sample extraction, and fallback metadata extraction.
+   - `mpv`: Primary local playback backend via JSON-RPC IPC socket with dedicated event listener.
+   - `ffplay`: Fallback local audio playback if `mpv` is not installed.
 
-3. **Dual Playback Architecture**:
-   - Quickstream abstracts playback through a unified client interface providing `play()`, `pause()`, `stop()`, `seek()`, `get_position_info()`, `get_transport_info()`, `set_volume()`, and `set_mute()`.
-   - **Local Playback**: Implemented by `LocalPlayerClient` (`quickstream/local_player.py`) using `ffplay -nodisp -autoexit` via `subprocess.Popen`.
-   - **DLNA / UPnP Streaming**: Implemented by `UPnPClient` (`quickstream/upnp.py`) sending SOAP XML payloads to network renderers, while `DLNAStreamServer` (`quickstream/server.py`) serves the audio file over HTTP with Byte-Range support (`206 Partial Content`).
+3. **Zero-Touch Library Invariant**:
+   - Quickstream **MUST NEVER** write to, modify, delete, or rename files or directories in the user's music library or network shares (e.g. `/Volumes/Music`).
+   - All persistent application data strictly complies with the XDG Base Directory specification:
+     - Configuration: `~/.config/quickstream/config.json`
+     - Bookmarks: `~/.config/quickstream/bookmarks.json`
+     - Track Analysis Database: `~/.cache/quickstream/track_analysis.db` (SQLite)
+     - Cache Indexes: `~/.cache/quickstream/music_index.jsonl`
+     - Logs: `~/.local/share/quickstream/quickstream.log`
+
+4. **Non-Blocking UI Invariant**:
+   - Disk I/O, network SSDP discovery, audio decoding/analysis, metadata extraction, and library scanning **MUST** run asynchronously on background worker threads, worker pools, or Tokio tasks.
+   - Communication with the main UI loop is performed using `std::sync::mpsc` channels and lock-free/atomic states. The Ratatui UI event loop must never block or drop below 60 FPS.
+
+5. **Dual Playback Architecture**:
+   - Quickstream abstracts playback through the unified `AudioPlayer` trait (`src/player/mod.rs`):
+     - `play(path, offset)` / `pause()` / `resume()` / `stop()` / `seek(seconds)` / `set_volume(level)` / `get_position()` / `get_state()`.
+   - **Local Playback**: Implemented by `LocalPlayer` (`src/player/local.rs`) utilizing an `mpv` JSON-RPC IPC Unix domain socket with a dedicated listener thread, falling back to `ffplay` subprocess.
+   - **DLNA / UPnP Streaming**: Implemented by `UPnPPlayer` (`src/player/upnp.rs`) sending SOAP XML payloads (`AVTransport` / `RenderingControl`) to discovered network renderers, while `WebServer` (`src/web.rs`) serves audio over HTTP with Byte-Range support (`206 Partial Content`) and continuous streaming (`/stream/continuous.wav`).
+
+6. **SQLite Schema Migration Standard**:
+   - The track feature database (`src/analysis/db.rs`) uses SQLite `PRAGMA user_version` for incremental migrations.
+   - When modifying tables or adding columns, increment the version check in `TrackDatabase::new()`:
+     ```sql
+     IF user_version < 2 THEN
+         ALTER TABLE track_features ADD COLUMN ...;
+         PRAGMA user_version = 2;
+     END IF;
+     ```
+   - Never drop existing user analysis tables or risk data loss.
 
 ---
 
@@ -26,82 +52,131 @@ This guide is intended for AI coding agents and automated development tools work
 
 ```
 quickstream/
-├── __init__.py           # Package version definition
-├── __main__.py           # python -m quickstream entrypoint
-├── cli.py                # Argument parsing, discovery scan CLI, server bootstrap, signal traps
-├── tui.py                # Curses TUI, split-pane queue, persistent bottom bar, help modal
-├── queue.py              # PlaybackQueue data structure (tracks, indices, auto-advance, reorder)
-├── browser.py            # FileBrowser sub-pane, filesystem traversal, persistent bookmarks
-├── discovery.py          # SSDP UDP multicast (239.255.255.250:1900), XML parsing, DeviceManager
-├── upnp.py               # SOAP client for AVTransport and RenderingControl services
-├── local_player.py       # ffplay subprocess wrapper implementing the UPnP client interface
-├── server.py             # Custom HTTP byte-range server with DLNA profile headers
-├── transcoder.py         # On-the-fly ffmpeg pipeline to 16-bit PCM WAV
-├── metadata.py           # Native ID3v2, FLAC, RIFF WAV, AIFF metadata parser
-├── waveform.py           # Braille-based 2D high-resolution audio waveform generator
-├── paths.py              # XDG Base Directory resolution and backward-compatible migration
-└── settings.py           # User preferences and persistence (~/.config/quickstream/config.json)
-
-tests/
-├── test_browser.py           # FileBrowser navigation, bookmark management, and metadata view
-├── test_discovery.py         # SSDP packet parsing and device extraction tests
-├── test_local_player.py      # LocalPlayerClient subprocess and lifecycle tests
-├── test_metadata.py          # Audio header parsing and duration calculation tests
-├── test_paths.py             # XDG Base Directory resolution and legacy migration tests
-├── test_playback_controls.py # TUI playback orchestration, hotkeys, seeking, and server tests
-├── test_queue.py             # Queue operations, wrapping, and indexing tests
-├── test_server.py            # HTTP byte ranges, 206 Partial Content, DLNA headers
-├── test_settings.py          # Configuration loading, saving, cycling, and defaults
-├── test_upnp.py              # SOAP XML generation and response parsing tests
-└── test_waveform.py          # Waveform sample extraction and Braille plotting tests
+├── Cargo.toml            # Package manifest and Rust crate dependencies
+├── src/
+│   ├── main.rs           # CLI argument parsing (clap), startup flags, signal traps, app bootstrap
+│   ├── lib.rs            # Library entrypoint and module exports
+│   │
+│   ├── ui/               # Terminal User Interface (Ratatui + Crossterm)
+│   │   ├── mod.rs        # AppUI state machine, 60 FPS render passes, tab switching, hotkey router
+│   │   └── search.rs     # SearchModalState, streaming fuzzy search (fuzzy-matcher / SkimMatcherV2)
+│   │
+│   ├── player/           # Audio playback abstraction layer
+│   │   ├── mod.rs        # AudioPlayer trait and PlaybackState enum
+│   │   ├── local.rs      # LocalPlayer: mpv JSON-RPC IPC socket client & ffplay subprocess fallback
+│   │   └── upnp.rs       # UPnPPlayer: SOAP XML generation, AVTransport / RenderingControl client
+│   │
+│   ├── analysis/         # Intelligent Autopilot & Acoustic Analysis
+│   │   ├── mod.rs        # Analysis module exports & MixProfile definitions
+│   │   ├── bpm.rs        # Peak-picking autocorrelation BPM detection
+│   │   ├── harmonic.rs   # Musical key parsing and Camelot wheel compatibility scoring
+│   │   ├── mixer.rs      # DjMixer::sequence_mix (harmonic flow, BPM gradient, artist/album spacing)
+│   │   ├── db.rs         # SQLite persistent feature store (~/.cache/quickstream/track_analysis.db)
+│   │   └── online.rs     # Lightweight metadata/tag enrichment via ureq HTTP client
+│   │
+│   ├── library.rs        # Recursive walkdir scanner, progressive autopilot streamer, JSONL cache
+│   ├── metadata.rs       # Lofty audio metadata extraction, cover art decoding, path heuristics
+│   ├── queue.rs          # PlaybackQueue, FastRng (SplitMix64 deterministic PRNG), shuffle & loop
+│   ├── web.rs            # Embedded HTTP byte-range server, continuous WAV streaming, REST API, Web UI
+│   ├── discovery.rs      # SSDP UDP multicast discovery (239.255.255.250:1900), XML device parsing
+│   ├── settings.rs       # User preferences model, cycle definitions, config.json persistence
+│   ├── paths.rs          # XDG Base Directory resolution and backward-compatible migration
+│   └── logger.rs         # Non-blocking rotating file logger (~/.local/share/quickstream/quickstream.log)
+│
+└── tests/                # Integration test suite (Rust)
+    ├── test_autopilot.rs     # Autopilot progressive streaming, candidate gathering, DJ mix profiles
+    ├── test_browser.rs       # File browser navigation, bookmarks, cache, and metadata toggles
+    ├── test_discovery.rs     # SSDP discovery packet parsing and device extraction
+    ├── test_local_player.rs  # mpv / ffplay local audio backend lifecycle
+    ├── test_metadata.rs      # Lofty audio header parsing, duration, and path heuristics
+    ├── test_now_playing.rs   # Tab 0 Now Playing hero view layout and rendering
+    ├── test_search.rs        # Multi-threaded fuzzy search, scoped scan, and modal navigation
+    ├── test_upnp.rs          # UPnP SOAP XML generation, AVTransport state machine, continuous stream
+    └── test_web.rs           # Embedded web server, byte ranges, REST API, and command dispatch
 ```
 
 ---
 
-## 3. TUI & Curses Guidelines
+## 3. Terminal UI Architecture & Ratatui Guidelines
 
-### Layout Structure
-- **Header**: Tab bar (`[1] Queue` | `[2] Devices` | `[3] Settings`).
-- **Main View Area (`0` to `max_y - 5`)**:
-  - **Tab 0 (Queue)**: Split-pane layout.
-    - **Left Pane (`browser`)**: Bounded `FileBrowser` showing directory tree, music homes/bookmarks (`~/.config/quickstream/bookmarks.json`), and metadata view toggle (`[v]`).
-    - **Right Pane (`queue`)**: `PlaybackQueue` showing queued songs, duration, and track status.
-    - Focus toggled between panes with `h` and `l`.
-  - **Tab 1 (Devices)**: Discovered DLNA MediaRenderers and `Local Audio`.
-  - **Tab 2 (Settings)**: Configurable application settings (metadata view, default output, seek interval, volume step, queue mode, transcode).
-- **Persistent Bottom Playback Bar (`max_y - 5` to `max_y`)**:
-  - Always rendered across all tabs.
-  - Displays: State badge (`▶`, `⏸`, `⏹`), track title, artist, format, volume/mute, Braille/ASCII progress bar, and elapsed/total time.
-- **Help Modal (`?`)**:
-  - Centered popup modal overlaying the main view.
-  - Intercepts keyboard input when active; dismissed with `Esc`, `q`, or `?`.
+### 4-Tab Layout Structure
+- **Header**: Tab bar (`[1] Now Playing` | `[2] Queue & Library` | `[3] Devices` | `[4] Settings`).
+- **Main View Area**:
+  - **Tab 0 (`[1] Now Playing`)**: Hero view with large typography (Title, Artist, Album), technical codec/format badges, timeline, and upcoming queue preview.
+  - **Tab 1 (`[2] Queue & Library`)**: Split-pane layout.
+    - **Left Pane (`browser`)**: Bounded `FileBrowser` showing directory tree, bookmarked Music Homes (`~/.config/quickstream/bookmarks.json`), and metadata tag view toggle (`[v]`).
+    - **Right Pane (`queue`)**: `PlaybackQueue` showing queued songs, duration, status badges, and track index. Focus toggled with `h` and `l`.
+  - **Tab 2 (`[3] Devices`)**: Discovered DLNA MediaRenderers and `Local Audio` with active output indicator (`●`).
+  - **Tab 3 (`[4] Settings`)**: User preferences editor (metadata display, audio backend, seek interval, volume step, queue mode, PCM transcode, web server toggle, startup home directory).
+- **Persistent Bottom Playback Bar**:
+  - Rendered across all tabs.
+  - Displays: State badge (`▶`, `⏸`, `⏹`), track title, artist, format badge (`[FLAC] [24b/96k]`), volume/mute, interactive progress bar, elapsed/total time, and active mix profile badge.
+- **Overlay Modals**:
+  - **Help Modal (`?`)**: Full keyboard shortcut cheat-sheet.
+  - **Fuzzy Search Modal (`f`)**: Streaming fuzzy finder with real-time preview card.
+  - **Mix Profile Modal (`M`)**: Interactive autopilot mix profile selector (`[1]` Diverse Shuffle, `[2]` BPM Flow, `[3]` Chill & Ambient, `[4]` Workout, `[5]` Late Night Groove).
+  - Modals intercept keyboard input when active; dismissed with `Esc` or `q`.
 
-### Curses Invariants
-1. **Always Use `_safe_addstr()`**:
-   Terminal sizes vary. Direct `stdscr.addstr()` raises `curses.error` when writing to the bottom-right character or beyond screen boundaries. Always route writes through `self._safe_addstr(stdscr, y, x, text, attr)` which enforces bounds and catches `curses.error`.
-2. **List Navigation Wraparound**:
-   All lists (Queue, FileBrowser, Devices) wrap around: navigating `Up` at index `0` moves to the last item, and navigating `Down` at the end loops back to `0`.
-3. **Keybinding Precedence**:
-   - `KEY_RESIZE` handled first.
-   - `?` Help Modal toggle handled next.
-   - If Help Modal is open: only handle `Esc`, `q`, `?`.
-   - Global hotkeys (`Space`, `s`, `R`, `m`, `t`, `+`, `-`, arrows, Shift+arrows) work across all tabs.
-   - Active pane keys (browser vs queue vs devices) handle specific item manipulation.
-4. **Key Mappings**:
-   - `curses.KEY_LEFT` / `curses.KEY_RIGHT`: Global Previous / Next track.
-   - `curses.KEY_SLEFT` / `curses.KEY_SRIGHT`: Global Seek backward / forward 10s.
+### Key Navigation Invariants
+1. **List Wraparound**:
+   All interactive lists (Queue, FileBrowser, Devices, Search Results, Mix Profiles) wrap around: navigating `Up` at index `0` moves to the last item, and navigating `Down` at the end loops back to `0`.
+2. **Keybinding Precedence**:
+   - Terminal resize events handled first.
+   - Active overlay modal input handled next (dismissal on `Esc`/`q`).
+   - Global playback hotkeys (`Space`, `s`, `R`, `m`, `t`, `+`, `-`, arrows, Shift+arrows) work across all tabs.
+   - Tab-specific and pane-specific keys handle item manipulation.
+3. **Key Mappings**:
+   - `Left` / `Right`: Global Previous / Next track.
+   - `Shift+Left` / `Shift+Right`: Global Seek backward / forward by configured interval (default 10s).
+   - `A`: Start / Restart Autopilot mode on current directory.
+   - `M`: Open Mix Profile modal.
+   - `P`: Reshuffle Autopilot seed from next track forward.
+   - `r`: Start Seed Radio station from selected track.
 
 ---
 
-## 4. Development & Testing Workflow
+## 4. Autopilot & DJ Sequencing Rules
+
+1. **Fair Multi-Artist Candidate Sampling**:
+   - In large libraries, the scanner shuffles top-level subdirectories and samples evenly across artist folders rather than greedily consuming all tracks from the first alphabetical folder.
+   - Even when an artist directory has 500 tracks, it contributes only a small quota to the candidate pool, guaranteeing diverse representation across 50–100 distinct artists.
+2. **Targeted Match Gathering & Supplementation**:
+   - When filtering by mood, tempo, or seed similarity, the scanner continues searching until at least 80 matching candidates are found (or 500 folders scanned).
+   - If a library has fewer matching tracks than the queue limit (60) but contains other songs (`total_candidates > 10`), Quickstream places all matches at the top of the mix and supplements remaining slots with diverse candidates from other artists so the queue is never truncated.
+3. **DJ Sequencing (`DjMixer::sequence_mix`)**:
+   - **Artist Separation**: Minimum 8-track cooldown before repeating the same real artist (penalized at `-50,000`).
+   - **Generic Artists**: "Various Artists", "Unknown Artist", and untagged tracks are exempt from single-artist duplication penalties.
+   - **Album Separation**: Minimum 12-track cooldown before repeating the same album.
+   - **Camelot Harmonic Flow**: Key transitions scored by harmonic compatibility (exact match, relative major/minor, ±1 energy boost).
+   - **BPM Gradient**: Tracks sequenced with smooth tempo progression.
+
+---
+
+## 5. Development & Testing Workflow
 
 ### Running Tests
-Execute the full test suite using Python's standard `unittest`:
+Execute the full test suite using Cargo with single-threaded test execution (required for deterministic local TCP port binding in web server tests):
 ```bash
-python3 -m unittest discover tests
+cargo test -- --test-threads=1
+```
+
+To run a specific test:
+```bash
+cargo test --test test_autopilot test_autopilot_mix_generates_full_queue_when_library_has_sparse_matches
+```
+
+### Code Quality & Lints
+Always verify zero compiler and clippy warnings before committing:
+```bash
+cargo clippy -- -D warnings
+```
+
+### Release Build
+```bash
+cargo build --release
 ```
 
 ### Important Rules for Future Agents
-- **No Temporary Root Scripts**: Do not create ad-hoc test scripts (e.g. `test_something.py`, `scratch.py`, `patch.py`) in the repository root. Always place unit tests inside the `tests/` directory following the `test_*.py` naming convention.
-- **Graceful Resource Cleanup**: All networking threads (`DLNAScanner`), streaming sockets, and subprocesses must terminate cleanly. When editing `server.py`, `local_player.py`, or `tui.py`, verify that `cleanup()` and signal handlers close active client sockets to prevent hanging processes or `BrokenPipeError` noise.
+- **No Temporary Root Scripts**: Do not create ad-hoc test scripts (e.g. `test_something.py`, `scratch.rs`, `patch.py`) in the repository root. Always place unit and integration tests inside `tests/` following the `test_*.rs` naming convention.
+- **Graceful Resource Cleanup**: All networking threads (`DLNAScanner`), streaming HTTP sockets, Tokio runtimes, and subprocesses (`mpv`, `ffplay`) must terminate cleanly upon shutdown or `ctrlc` signal.
 - **File Modifications**: Use targeted file editing tools (`replace_file_content` or `write_to_file`) rather than shell sed/cat scripts.

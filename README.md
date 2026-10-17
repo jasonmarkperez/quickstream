@@ -60,6 +60,16 @@ It features a native **Ratatui** interactive terminal UI, an in-app recursive **
   - **Library Browser**: Navigate files and folders, access bookmarked Music Homes, live text search, add single songs or click `[ Add All ]` to enqueue entire albums.
   - **Output Device Switcher**: Switch between Local Audio and network DLNA speakers with a single tap.
 
+- **Intelligent Autopilot & DJ Mixes**:
+  - **Progressive Multi-Threaded Scanning**: Instant playback start (< 50ms) with background candidate discovery streaming into the queue.
+  - **Fair Multi-Artist Sampling**: Guarantees diversity across thousands of artist folders without letting single large discographies dominate.
+  - **DJ Sequencing Rules**: Prevents back-to-back repetitions with an 8-track artist cooldown and 12-track album cooldown.
+  - **Camelot Harmonic Mixing & BPM Flow**: Sequences transitions using Camelot wheel harmonic key compatibility and smooth tempo gradients.
+  - **Mix Profiles (`M`)**: Diverse Shuffle, BPM Flow, Chill & Ambient, Workout & High Energy, and Late Night Groove.
+  - **Seed Radio (`r`)**: Launches dynamic stations seeded by any track in your library or queue.
+  - **Continuous Gapless UPnP Streaming**: Optional `/stream/continuous.wav` continuous PCM WAV stream for seamless gapless playback on UPnP/DLNA stereos.
+  - **Zero-Touch SQLite Feature Store**: Acoustical features and tags stored in `~/.cache/quickstream/track_analysis.db` without ever writing to your music storage.
+
 - **Configurable Startup Home Directory**:
   - Set a default startup music directory via CLI (`quickstream --set-home <PATH>`), TUI hotkey (`H`), TUI Settings tab, or the Web Dashboard (`[ Set Home ]`).
   - Jump directly to home from anywhere with `~` (TUI) or `[ 🏠 Home ]` (Web).
@@ -87,16 +97,23 @@ quickstream/
 │   │   ├── mod.rs        # AudioPlayer trait definition (play, pause, resume, stop, seek, volume)
 │   │   ├── local.rs      # LocalPlayer: mpv JSON IPC listener thread & ffplay subprocess fallback
 │   │   └── upnp.rs       # UPnPPlayer: SOAP XML generation, AVTransport / RenderingControl client
+│   ├── analysis/
+│   │   ├── mod.rs        # Analysis module exports & MixProfile definitions
+│   │   ├── bpm.rs        # Peak-picking autocorrelation BPM detection
+│   │   ├── harmonic.rs   # Musical key parsing and Camelot wheel compatibility scoring
+│   │   ├── mixer.rs      # DjMixer::sequence_mix (harmonic flow, BPM gradient, artist/album spacing)
+│   │   ├── db.rs         # SQLite persistent feature store (~/.cache/quickstream/track_analysis.db)
+│   │   └── online.rs     # Metadata/tag enrichment via ureq HTTP client
 │   ├── discovery.rs      # SSDP UDP multicast (239.255.255.250:1900), XML device parsing, DeviceManager
-│   ├── library.rs        # walkdir directory indexing, jsonl cache persistence, streaming scanner
+│   ├── library.rs        # walkdir directory indexing, jsonl cache persistence, progressive autopilot
 │   ├── metadata.rs       # lofty metadata extraction (tags, duration, audio properties, cover art)
 │   ├── queue.rs          # PlaybackQueue: ordered track list, cursors, auto-advance, reordering
-│   ├── server.rs         # HTTP streaming server with Byte-Range support (206 Partial Content) & DLNA headers
-│   ├── web.rs            # Embedded Now Playing web server, REST API, single-page HTML5/CSS3 dashboard
+│   ├── web.rs            # Embedded web server, byte-range streaming, continuous WAV, REST API, Web UI
 │   ├── settings.rs       # Preferences model, cycle definitions, JSON persistence (~/.config/quickstream/config.json)
 │   ├── paths.rs          # XDG Base Directory resolution and legacy dotfile migration
 │   └── logger.rs         # Rotating file logger (~/.local/share/quickstream/quickstream.log)
 └── tests/
+    ├── test_autopilot.rs # Autopilot progressive streaming, candidate gathering, DJ mix profiles
     ├── test_browser.rs   # Browser navigation, caching, bookmarks, and modal lifecycle tests
     ├── test_discovery.rs # SSDP discovery packet parsing and device extraction tests
     ├── test_local_player.rs # mpv IPC and ffplay backend lifecycle tests
@@ -427,6 +444,7 @@ Quickstream adheres to the [XDG Base Directory Specification](https://specificat
 | **`config.json`** | Application settings & preferences | `~/.config/quickstream/config.json` |
 | **`bookmarks.json`** | Saved "Music Homes" folder bookmarks | `~/.config/quickstream/bookmarks.json` |
 | **`music_index.jsonl`** | Persistent library search metadata cache | `~/.cache/quickstream/music_index.jsonl` |
+| **`track_analysis.db`** | SQLite acoustic feature & Camelot key database | `~/.cache/quickstream/track_analysis.db` |
 | **`quickstream.log`** | Diagnostic log file | `~/.local/share/quickstream/quickstream.log` |
 
 ### Configuration File (`config.json`) Format
