@@ -761,8 +761,8 @@ fn test_upnp_player_auto_advance_when_renderer_resets_rel_time_on_stop() {
     assert!(player.is_playing());
     assert!(!player.is_track_finished());
 
-    // Wait past one poller tick (900ms) for player to query position at 175s
-    std::thread::sleep(Duration::from_millis(1100));
+    // Wait for a poller tick (every 900ms) to report position 175s.
+    wait_until(|| player.position_seconds() == 175.0);
     assert_eq!(player.position_seconds(), 175.0);
     assert!(player.is_playing());
     assert!(!player.is_track_finished());
@@ -771,8 +771,8 @@ fn test_upnp_player_auto_advance_when_renderer_resets_rel_time_on_stop() {
     *current_state.lock().unwrap() = "STOPPED".to_string();
     *current_rel_time.lock().unwrap() = "00:00:00".to_string();
 
-    // Wait for the next poller tick to detect completion
-    std::thread::sleep(Duration::from_millis(1100));
+    // Wait for a poller tick to detect completion.
+    wait_until(|| player.is_track_finished());
 
     // Player must detect that track finished playing!
     assert!(
@@ -912,8 +912,8 @@ fn test_upnp_player_stopped_early_does_not_auto_advance() {
 
     assert!(player.play(&temp_file).is_ok());
 
-    // Wait past one poller tick (900ms) for player to query position at 30s
-    std::thread::sleep(Duration::from_millis(1100));
+    // Wait for a poller tick (every 900ms) to report position 30s.
+    wait_until(|| player.position_seconds() == 30.0);
     assert_eq!(player.position_seconds(), 30.0);
 
     // Renderer stops early (at 30s)
@@ -1191,4 +1191,13 @@ fn test_upnp_player_detached_from_stream_state_does_not_close_shared_streams() {
         shared.continuous.is_active.load(Ordering::SeqCst),
         "a retired player must not close the streams of the new renderer"
     );
+}
+
+/// Poll `cond` until it holds or 5s pass. Poller ticks are 900ms apart but SOAP round-trips
+/// take longer on loaded CI runners, so fixed one-tick sleeps are not enough.
+fn wait_until(mut cond: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !cond() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

@@ -682,7 +682,17 @@ fn test_web_server_stops_when_another_listener_shadows_its_loopback_port() {
     let handle = WebServer::start_with_bind(quickstream::web::WebBind::Lan, 0, state, tx).expect("start web server");
     // Another server in the process (or another app) holds 127.0.0.1 on the same port, so a
     // wake-up connection to 127.0.0.1:port reaches it instead of this server.
-    let shadow = std::net::TcpListener::bind(("127.0.0.1", handle.port)).expect("shadow listener");
+    // macOS allows this bind next to the server's 0.0.0.0 bind; Linux refuses it, so the
+    // situation the test guards against cannot happen there.
+    let shadow = match std::net::TcpListener::bind(("127.0.0.1", handle.port)) {
+        Ok(listener) => listener,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!("SKIPPED: this OS does not allow a 127.0.0.1 bind beside 0.0.0.0");
+            handle.stop();
+            return;
+        }
+        Err(e) => panic!("shadow listener: {}", e),
+    };
 
     let (done_tx, done_rx) = mpsc::channel();
     std::thread::spawn(move || {
