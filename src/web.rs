@@ -996,6 +996,22 @@ fn handle_client(
             {
                 current.current_browser_dir.clear();
             }
+            // Likewise for track and folder paths outside the allowed folders: queue entries lose
+            // their path, the current track keeps only its file name.
+            let visible = crate::web_access::VisibleRoots::new(&current.allowed_roots);
+            for item in &mut current.queue {
+                if !visible.contains(Path::new(&item.filepath)) {
+                    item.filepath.clear();
+                }
+            }
+            if let Some(ref fp) = current.filepath {
+                if !visible.contains(fp) {
+                    current.filepath = fp.file_name().map(PathBuf::from);
+                }
+            }
+            if current.autopilot_dir.as_deref().is_some_and(|d| !visible.contains(Path::new(d))) {
+                current.autopilot_dir = None;
+            }
             let json = serde_json::to_string(&current).unwrap_or_else(|_| "{}".to_string());
             let body = json.as_bytes();
             let header = format!(
@@ -3704,9 +3720,12 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
 
         row.appendChild(el('span', 'queue-item-dur', formatTime(item.duration_seconds)));
 
-        const seedBtn = iconButton('btn-icon-sm', 'Seed Radio station from this track', 'seed', ICON_SEED_RADIO);
-        seedBtn.dataset.path = item.filepath || '';
-        row.appendChild(seedBtn);
+        // Tracks outside the allowed folders are listed without a path and cannot seed a station.
+        if (item.filepath) {
+          const seedBtn = iconButton('btn-icon-sm', 'Seed Radio station from this track', 'seed', ICON_SEED_RADIO);
+          seedBtn.dataset.path = item.filepath;
+          row.appendChild(seedBtn);
+        }
 
         const removeBtn = iconButton('btn-icon-sm danger-hover', 'Remove track', 'remove', ICON_REMOVE);
         removeBtn.dataset.index = index;

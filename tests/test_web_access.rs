@@ -668,6 +668,91 @@ fn test_app_never_publishes_root_or_home_as_allowed_roots() {
 }
 
 #[test]
+fn test_pathless_web_autopilot_only_uses_terminal_folder_inside_roots() {
+    let dir = temp_dir("pathless_ap");
+    let music = dir.join("Music");
+    let elsewhere = dir.join("Elsewhere");
+    fs::create_dir_all(&music).unwrap();
+    fs::create_dir_all(&elsewhere).unwrap();
+    let mut app = web_app(music.clone(), None);
+    let (tx, rx) = mpsc::channel();
+    app.web_cmd_rx = Some(rx);
+
+    // The terminal is browsing outside the allowed folders: path-less requests are refused.
+    for cmd in [WebCommand::Autopilot(None), WebCommand::AutopilotReshuffle(None)] {
+        app.browser_dir = elsewhere.clone();
+        app.status_message.clear();
+        tx.send(cmd.clone()).unwrap();
+        app.handle_web_commands();
+        assert_eq!(app.autopilot_dir, None, "{:?}", cmd);
+        assert!(app.status_message.contains("Elsewhere"), "{:?}: {}", cmd, app.status_message);
+    }
+
+    // Inside the allowed folders the terminal folder is used.
+    app.browser_dir = music.clone();
+    tx.send(WebCommand::Autopilot(None)).unwrap();
+    app.handle_web_commands();
+    assert_eq!(app.autopilot_dir, Some(music.clone()));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_status_api_hides_paths_outside_allowed_roots() {
+    let dir = temp_dir("status_paths");
+    let music = dir.join("Music");
+    let private = dir.join("Private");
+    fs::create_dir_all(&music).unwrap();
+    fs::create_dir_all(&private).unwrap();
+    let inside = music.join("in.mp3");
+    let outside = private.join("out.mp3");
+    let item = |index: usize, p: &Path| quickstream::web::WebQueueItem {
+        index,
+        title: format!("T{}", index),
+        artist: String::new(),
+        album: String::new(),
+        duration_seconds: 1.0,
+        filepath: p.to_string_lossy().to_string(),
+        is_current: index == 0,
+    };
+
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    {
+        let mut s = state.write().unwrap();
+        s.allowed_roots = vec![music.clone()];
+        s.queue = vec![item(0, &outside), item(1, &inside)];
+        s.filepath = Some(outside.clone());
+        s.autopilot_dir = Some(private.to_string_lossy().to_string());
+    }
+    let (handle, _rx) = start(state.clone());
+    let port = handle.port;
+
+    let (status, _, body) = get(port, "/api/status");
+    assert_eq!(status, 200);
+    assert!(!String::from_utf8_lossy(&body).contains("Private"), "{}", String::from_utf8_lossy(&body));
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["queue"][0]["filepath"], "");
+    assert_eq!(json["queue"][1]["filepath"], inside.to_string_lossy().as_ref());
+    assert_eq!(json["filepath"], "out.mp3");
+    assert!(json["autopilot_dir"].is_null());
+    // The shared state itself is untouched (the continuous stream decodes from it).
+    assert_eq!(state.read().unwrap().queue[0].filepath, outside.to_string_lossy());
+
+    // Paths inside the roots are reported in full.
+    {
+        let mut s = state.write().unwrap();
+        s.filepath = Some(inside.clone());
+        s.autopilot_dir = Some(music.to_string_lossy().to_string());
+    }
+    let (_, _, body) = get(port, "/api/status");
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["filepath"], inside.to_string_lossy().as_ref());
+    assert_eq!(json["autopilot_dir"], music.to_string_lossy().as_ref());
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_rejected_web_path_shows_status_message() {
     let dir = temp_dir("rejectmsg");
     let mut app = web_app(dir.clone(), None);

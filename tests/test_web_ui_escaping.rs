@@ -200,6 +200,8 @@ fn hostile_state() -> NowPlayingState {
         filepath: Some(PathBuf::from(format!("/music/{}", HOSTILE[4]))),
         output_device: HOSTILE[1].to_string(),
         next_track_title: Some(HOSTILE[0].to_string()),
+        // /api/status only reports paths inside the allowed folders.
+        allowed_roots: vec![PathBuf::from("/music")],
         ..NowPlayingState::default()
     };
     s.queue = HOSTILE

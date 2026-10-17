@@ -397,6 +397,33 @@ pub fn is_acceptable_root(root: &Path, home: Option<&Path>) -> bool {
     }
 }
 
+/// The allowed folders in a form for cheaply deciding which paths web clients may see.
+pub struct VisibleRoots(Vec<PathBuf>);
+
+impl VisibleRoots {
+    /// Accepts `roots` as given and as resolved on disk (so either spelling of a path matches).
+    pub fn new(roots: &[PathBuf]) -> Self {
+        let home = home_dir().map(|h| std::fs::canonicalize(&h).unwrap_or(h));
+        let mut forms = Vec::new();
+        for root in roots {
+            for form in [Some(normalize_lexically(root)), std::fs::canonicalize(root).ok()].into_iter().flatten() {
+                if is_acceptable_root(&form, home.as_deref()) && !forms.contains(&form) {
+                    forms.push(form);
+                }
+            }
+        }
+        Self(forms)
+    }
+
+    /// Whether `path` lies inside one of the roots, compared lexically (no filesystem access).
+    pub fn contains(&self, path: &Path) -> bool {
+        path.is_absolute() && {
+            let path = normalize_lexically(path);
+            self.0.iter().any(|root| path.starts_with(root))
+        }
+    }
+}
+
 /// Resolve `.` and `..` components without touching the filesystem.
 fn normalize_lexically(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();

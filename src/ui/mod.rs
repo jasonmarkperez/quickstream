@@ -3088,12 +3088,14 @@ impl AppUI {
                     self.update_web_state();
                 }
                 crate::web::WebCommand::Autopilot(path_opt) => {
-                    let target = path_opt.unwrap_or_else(|| self.browser_dir.clone());
-                    self.start_autopilot(target);
+                    if let Some(target) = path_opt.or_else(|| self.web_terminal_folder()) {
+                        self.start_autopilot(target);
+                    }
                 }
                 crate::web::WebCommand::AutopilotReshuffle(path_opt) => {
-                    let target = path_opt.unwrap_or_else(|| self.browser_dir.clone());
-                    self.reshuffle_autopilot(target);
+                    if let Some(target) = path_opt.or_else(|| self.web_terminal_folder()) {
+                        self.reshuffle_autopilot(target);
+                    }
                 }
                 crate::web::WebCommand::ShuffleQueue => {
                     if !self.queue.is_empty() {
@@ -3126,6 +3128,19 @@ impl AppUI {
                 }
             }
         }
+    }
+
+    /// The folder the terminal is browsing, for web commands that name no folder. `None` (with a
+    /// status message) when it lies outside the folders the web dashboard may act on.
+    fn web_terminal_folder(&mut self) -> Option<PathBuf> {
+        let resolved = crate::web_access::resolve_allowed_path(&self.browser_dir, &self.web_allowed_roots());
+        if resolved.is_none() {
+            self.status_message = format!(
+                "Ignored web request: {} is outside your home, bookmarks and launch folder",
+                self.browser_dir.display()
+            );
+        }
+        resolved
     }
 
     /// Folders the web dashboard may browse and act on: the startup home, the bookmarks and the
