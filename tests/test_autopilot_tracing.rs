@@ -67,6 +67,7 @@ fn test_profile_mix_logs_phase_timings() {
     }
     assert!(finished);
 
+    assert!(quickstream::logger::flush(), "log writer did not flush");
     let log = fs::read_to_string(&log_path).unwrap();
     let lines: Vec<&str> = log.lines().filter(|l| l.contains("[autopilot]")).collect();
     let find = |needle: &str| {
