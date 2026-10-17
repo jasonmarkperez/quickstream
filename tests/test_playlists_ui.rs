@@ -394,3 +394,43 @@ fn test_tab_bar_shows_all_five_labels_at_80_columns() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_tab_5_label_is_highlighted_at_80_columns_after_pressing_5() {
+    common::isolate();
+    let temp_dir = fresh_dirs("tabbar80hl");
+    let mut app = new_app(&temp_dir);
+
+    press(&mut app, KeyCode::Char('5'));
+    assert_eq!(app.active_tab, 4);
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+    terminal.draw(|f| app.render(f)).unwrap();
+    let buffer = terminal.backend().buffer();
+
+    let row: String = (0..80).map(|x| buffer[(x, 0)].symbol().to_string()).collect();
+    let label = "[5] Playlists";
+    let start = row
+        .chars()
+        .collect::<Vec<_>>()
+        .windows(label.chars().count())
+        .position(|w| w.iter().collect::<String>() == label)
+        .unwrap_or_else(|| panic!("{label:?} not on the 80-column tab bar: {row:?}"));
+    let end = start + label.chars().count();
+    assert!(end <= 80, "{label:?} clipped at the right edge: {row:?}");
+
+    for x in start..end {
+        let cell = &buffer[(x as u16, 0)];
+        assert_eq!(
+            cell.fg,
+            ratatui::style::Color::Cyan,
+            "column {x} of {label:?} is not highlighted"
+        );
+        assert!(
+            cell.modifier.contains(ratatui::style::Modifier::BOLD),
+            "column {x} of {label:?} is not bold"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
