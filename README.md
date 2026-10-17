@@ -222,7 +222,7 @@ quickstream --web
 quickstream --web --web-port 3000
 ```
 
-By default the dashboard only accepts connections from this computer (`127.0.0.1`). To open it from a phone or another device, set **Web Remote Access** to *Any device on your network* in Tab 3 Settings. While a DLNA speaker is the active output, the server always listens on the network so the speaker can fetch the audio stream.
+By default the dashboard only accepts connections from this computer (`127.0.0.1`). To open it from a phone or another device, set **Web Remote Access** to *Any device on your network* in Tab 4 (`[4] Settings`). While a DLNA speaker is the active output, the server always listens on the network so the speaker can fetch the audio stream.
 
 ### Dashboard Tabs
 1. **Now Playing**:

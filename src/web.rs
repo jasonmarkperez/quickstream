@@ -310,7 +310,6 @@ impl Drop for SocketGuard {
     }
 }
 
-/// Handle to the background web server process.
 /// Network interfaces the web server listens on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebBind {
@@ -321,6 +320,7 @@ pub enum WebBind {
     Lan,
 }
 
+/// Handle to the background web server process.
 pub struct WebServerHandle {
     pub port: u16,
     /// Interfaces the server actually bound to.
@@ -397,20 +397,21 @@ impl WebServer {
     ) -> anyhow::Result<WebServerHandle> {
         let candidate_ports = [port, 8080, 8090, 8091, 0];
         let mut listener_opt = None;
+        // Never fall back to the other interface: if another app holds *:port, binding
+        // 127.0.0.1:port still succeeds on macOS, and renderers' LAN requests would reach
+        // that other app. Move to the next candidate port instead.
+        let host = match bind {
+            WebBind::Lan => "0.0.0.0",
+            WebBind::Loopback => "127.0.0.1",
+        };
         for &p in &candidate_ports {
-            if bind == WebBind::Lan {
-                if let Ok(l) = TcpListener::bind(format!("0.0.0.0:{}", p)) {
-                    listener_opt = Some((l, WebBind::Lan));
-                    break;
-                }
-            }
-            if let Ok(l) = TcpListener::bind(format!("127.0.0.1:{}", p)) {
-                listener_opt = Some((l, WebBind::Loopback));
+            if let Ok(l) = TcpListener::bind(format!("{}:{}", host, p)) {
+                listener_opt = Some(l);
                 break;
             }
         }
-        let (listener, actual_bind) =
-            listener_opt.ok_or_else(|| anyhow::anyhow!("Failed to bind web server to any port"))?;
+        let listener = listener_opt.ok_or_else(|| anyhow::anyhow!("Failed to bind web server to any port"))?;
+        let actual_bind = bind;
         let actual_port = listener.local_addr()?.port();
         crate::log_info!("web", "Web server listening on {}", listener.local_addr()?);
         let stop_flag = Arc::new(AtomicBool::new(false));

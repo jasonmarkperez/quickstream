@@ -132,8 +132,9 @@ impl AppUI {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         let backend = settings_mgr.settings.player_backend.clone();
         let bookmarks = Self::load_bookmarks();
+        // Discovery starts in run(): SSDP opens a socket on all interfaces, which tests that
+        // only construct the app should not do (macOS firewall prompts).
         let device_manager = DeviceManager::new();
-        device_manager.start_background_scan();
 
         let web_state = std::sync::Arc::new(std::sync::RwLock::new(crate::web::NowPlayingState::default()));
         let (web_server, web_cmd_rx) = if settings_mgr.settings.web_server_enabled {
@@ -1229,6 +1230,7 @@ impl AppUI {
     }
 
     pub fn run(&mut self) -> anyhow::Result<()> {
+        self.device_manager.start_background_scan();
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
@@ -2833,15 +2835,19 @@ impl AppUI {
 
         if needs_server {
             let bind = self.required_web_bind();
-            let already_running = self.web_server.as_ref().is_some_and(|h| h.bind == bind);
-            if !already_running {
+            let was_running = self.web_server.is_some();
+            let already_bound = self.web_server.as_ref().is_some_and(|h| h.bind == bind);
+            if !already_bound {
                 match self.ensure_web_server_bound(bind) {
-                    Ok(port) => {
+                    // A rebind (e.g. after switching output) keeps the caller's status message.
+                    Ok(port) if !was_running => {
                         self.status_message = format!("Started server on port {}", port);
                     }
+                    Ok(_) => {}
                     Err(e) => {
                         self.status_message = format!("Failed to start server: {}", e);
-                        if self.settings_mgr.settings.web_server_enabled {
+                        // Only a failed cold start turns the setting off; a failed rebind may be transient.
+                        if !was_running && self.settings_mgr.settings.web_server_enabled {
                             self.settings_mgr.settings.web_server_enabled = false;
                             self.settings_mgr.save();
                         }
