@@ -225,14 +225,58 @@ impl AppUI {
             self.player.stop()?;
             return Ok(true);
         }
-        if key.code == KeyCode::Esc {
-            self.playlists.modal = None;
+        let Some(modal) = self.playlists.modal.take() else {
+            return Ok(false);
+        };
+        match modal {
+            // Like the startup-home editor: every character is text, q and digits included.
+            PlaylistModal::NamePrompt {
+                purpose,
+                mut input,
+                error,
+            } => match key.code {
+                KeyCode::Esc => self.status_message = "Cancelled".to_string(),
+                KeyCode::Enter => self.submit_name_prompt(purpose, input),
+                KeyCode::Backspace => {
+                    input.pop();
+                    self.playlists.modal = Some(PlaylistModal::NamePrompt {
+                        purpose,
+                        input,
+                        error: None,
+                    });
+                }
+                KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+                    input.push(c);
+                    self.playlists.modal = Some(PlaylistModal::NamePrompt {
+                        purpose,
+                        input,
+                        error: None,
+                    });
+                }
+                _ => self.playlists.modal = Some(PlaylistModal::NamePrompt { purpose, input, error }),
+            },
+            // Only `y` deletes; any other key cancels.
+            PlaylistModal::ConfirmDelete { name, .. } => {
+                if key.code == KeyCode::Char('y') && key.modifiers.is_empty() {
+                    self.delete_playlist(&name);
+                } else {
+                    self.status_message = format!("Kept \"{}\"", name);
+                }
+            }
+            modal @ PlaylistModal::AddPicker { .. } => {
+                if key.code != KeyCode::Esc {
+                    self.playlists.modal = Some(modal);
+                }
+            }
         }
         Ok(false)
     }
 
     /// Tab 5 keys that the global hotkeys did not take.
     pub(super) fn handle_playlists_tab_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        if self.handle_playlist_edit_key(code, modifiers) {
+            return;
+        }
         self.playlists.clamp_cursors();
         match (code, modifiers) {
             (KeyCode::Char('h'), KeyModifiers::NONE) => self.playlists.tracks_focus = false,
@@ -363,92 +407,61 @@ impl AppUI {
     }
 
     pub(super) fn render_playlist_modal(&self, f: &mut Frame) {
-        let Some(modal) = self.playlists.modal.as_ref() else {
-            return;
-        };
+        match &self.playlists.modal {
+            Some(PlaylistModal::NamePrompt { purpose, input, error }) => {
+                render_name_prompt(f, purpose, input, error.as_deref())
+            }
+            Some(PlaylistModal::ConfirmDelete { name, count }) => render_confirm_delete(f, name, *count),
+            Some(PlaylistModal::AddPicker { pending, cursor }) => self.render_add_picker(f, pending, *cursor),
+            None => {}
+        }
+    }
+
+    fn render_add_picker(&self, f: &mut Frame, pending: &PendingAdd, cursor: usize) {
         let area = super::centered_rect(60, 50, f.area());
         f.render_widget(Clear, area);
-
-        let text_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
         let hint = Style::default().fg(Color::DarkGray);
-        let mut scroll = 0u16;
-        let (title, lines) = match modal {
-            PlaylistModal::NamePrompt { purpose, input, error } => {
-                let title = match purpose {
-                    NamePurpose::Create | NamePurpose::CreateAndAdd(_) => " NEW PLAYLIST ".to_string(),
-                    NamePurpose::Rename { old } => format!(" RENAME \"{}\" ", old),
-                };
-                let mut lines = vec![
-                    Line::from(vec![
-                        Span::styled("Name: ", hint),
-                        Span::styled(input.clone(), text_style),
-                        Span::styled("█", Style::default().fg(Color::Yellow)),
-                    ]),
-                    Line::from(""),
-                ];
-                if let Some(error) = error {
-                    lines.push(Line::from(Span::styled(error.clone(), Style::default().fg(Color::Red))));
-                    lines.push(Line::from(""));
-                }
-                lines.push(Line::from(Span::styled("[Enter] Save   [Esc] Cancel", hint)));
-                (title, lines)
-            }
-            PlaylistModal::ConfirmDelete { name, count } => (
-                " DELETE PLAYLIST ".to_string(),
-                vec![
-                    Line::from(Span::styled(
-                        format!("Delete \"{}\" ({})? y/n", name, track_count_label(*count)),
-                        text_style,
-                    )),
-                    Line::from(""),
-                    Line::from(Span::styled("[y] Delete   any other key: Cancel", hint)),
-                ],
-            ),
-            PlaylistModal::AddPicker { pending, cursor } => {
-                let label = match pending {
-                    PendingAdd::Entries { label, .. } | PendingAdd::Folder { label, .. } => label,
-                };
-                let mut lines = vec![
-                    Line::from(Span::styled(
-                        format!("Add {} to:", label),
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(""),
-                ];
-                let names = self
-                    .playlists
-                    .store
-                    .playlists()
-                    .iter()
-                    .map(|p| p.name.as_str())
-                    .chain(std::iter::once(NEW_PLAYLIST_ROW));
-                for (idx, name) in names.enumerate() {
-                    let (prefix, style) = if idx == *cursor {
-                        (
-                            " ▶ ",
-                            Style::default()
-                                .bg(Color::Blue)
-                                .fg(Color::White)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                    } else {
-                        ("   ", Style::default().fg(Color::White))
-                    };
-                    lines.push(Line::from(Span::styled(format!("{}{}", prefix, name), style)));
-                }
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled("[Enter] Add   [Esc] Cancel", hint)));
-                // Keep the cursor row (after the 2 header lines) inside the visible rows.
-                let visible = area.height.saturating_sub(2) as usize;
-                scroll = (2 + *cursor + 1).saturating_sub(visible) as u16;
-                (" ADD TO PLAYLIST ".to_string(), lines)
-            }
+        let label = match pending {
+            PendingAdd::Entries { label, .. } | PendingAdd::Folder { label, .. } => label,
         };
+        let mut lines = vec![
+            Line::from(Span::styled(
+                format!("Add {} to:", label),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+        ];
+        let names = self
+            .playlists
+            .store
+            .playlists()
+            .iter()
+            .map(|p| p.name.as_str())
+            .chain(std::iter::once(NEW_PLAYLIST_ROW));
+        for (idx, name) in names.enumerate() {
+            let (prefix, style) = if idx == cursor {
+                (
+                    " ▶ ",
+                    Style::default()
+                        .bg(Color::Blue)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("   ", Style::default().fg(Color::White))
+            };
+            lines.push(Line::from(Span::styled(format!("{}{}", prefix, name), style)));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("[Enter] Add   [Esc] Cancel", hint)));
+        // Keep the cursor row (after the 2 header lines) inside the visible rows.
+        let visible = area.height.saturating_sub(2) as usize;
+        let scroll = (2 + cursor + 1).saturating_sub(visible) as u16;
 
         let block = Block::default()
             .borders(Borders::ALL)
             .title(Span::styled(
-                title,
+                " ADD TO PLAYLIST ",
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ))
             .border_style(Style::default().fg(Color::Cyan))
@@ -459,4 +472,207 @@ impl AppUI {
             .scroll((scroll, 0));
         f.render_widget(body, area);
     }
+}
+
+// Editing: name prompt (create / rename), delete confirmation, moving and removing tracks.
+impl AppUI {
+    /// Tab 5 editing keys. Returns true when the key was handled; anything else falls through
+    /// to the navigation keys in `handle_playlists_tab_key`.
+    fn handle_playlist_edit_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        let tracks_focus = self.playlists.tracks_focus;
+        match (code, modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::NONE) if !tracks_focus => self.open_create_prompt(),
+            (KeyCode::Char('R'), _) if !tracks_focus => self.open_rename_prompt(),
+            (KeyCode::Char('D'), _) if !tracks_focus => self.open_delete_confirm(),
+            (KeyCode::Char('K'), _) if tracks_focus => self.move_selected_track(crate::playlist_store::MoveDir::Up),
+            (KeyCode::Char('J'), _) if tracks_focus => self.move_selected_track(crate::playlist_store::MoveDir::Down),
+            (KeyCode::Char('d') | KeyCode::Char('x'), KeyModifiers::NONE) | (KeyCode::Delete, _) if tracks_focus => {
+                self.remove_selected_track()
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn open_create_prompt(&mut self) {
+        // Creating before the startup load arrives would let it overwrite the files on disk.
+        if !self.playlists.store.is_loaded() {
+            self.status_message = crate::playlist_store::StoreError::NotLoaded.to_string();
+            return;
+        }
+        self.playlists.modal = Some(PlaylistModal::NamePrompt {
+            purpose: NamePurpose::Create,
+            input: String::new(),
+            error: None,
+        });
+    }
+
+    fn open_rename_prompt(&mut self) {
+        let Some(old) = self.playlists.selected_name() else {
+            return;
+        };
+        self.playlists.modal = Some(PlaylistModal::NamePrompt {
+            purpose: NamePurpose::Rename { old: old.clone() },
+            input: old,
+            error: None,
+        });
+    }
+
+    fn open_delete_confirm(&mut self) {
+        let Some(name) = self.playlists.selected_name() else {
+            return;
+        };
+        let count = self.playlists.store.get(&name).map_or(0, |p| p.entries.len());
+        self.playlists.modal = Some(PlaylistModal::ConfirmDelete { name, count });
+    }
+
+    /// Apply a confirmed name prompt. An invalid or duplicate name puts the prompt back with
+    /// the error so the user can fix it.
+    fn submit_name_prompt(&mut self, purpose: NamePurpose, input: String) {
+        let result = match &purpose {
+            NamePurpose::Rename { old } => self.playlists.store.rename(old, &input),
+            NamePurpose::Create | NamePurpose::CreateAndAdd(_) => self.playlists.store.create(&input),
+        };
+        let name = match result {
+            Ok(name) => name,
+            Err(e) => {
+                self.playlists.modal = Some(PlaylistModal::NamePrompt {
+                    purpose,
+                    input,
+                    error: Some(e.to_string()),
+                });
+                return;
+            }
+        };
+        // The store re-sorts on create and rename: keep the cursor on the playlist just named.
+        if let Some(index) = self.playlists.store.index_of(&name) {
+            self.playlists.list_cursor = index;
+        }
+        match purpose {
+            NamePurpose::Rename { old } => {
+                self.status_message = format!("Renamed \"{}\" to \"{}\"", old, name);
+            }
+            NamePurpose::Create | NamePurpose::CreateAndAdd(_) => {
+                self.playlists.track_cursor = 0;
+                self.status_message = format!("Created \"{}\"", name);
+            }
+        }
+    }
+
+    fn delete_playlist(&mut self, name: &str) {
+        match self.playlists.store.delete(name) {
+            Ok(()) => {
+                // Stay on the same row, or move up to the new last row when the last one went.
+                let len = self.playlists.store.playlists().len();
+                self.playlists.list_cursor = self.playlists.list_cursor.min(len.saturating_sub(1));
+                self.playlists.track_cursor = 0;
+                self.status_message = format!("Deleted \"{}\"", name);
+            }
+            Err(e) => self.status_message = e.to_string(),
+        }
+    }
+
+    /// Move the selected track one row; the cursor stays on it. Moves do not wrap around.
+    fn move_selected_track(&mut self, dir: crate::playlist_store::MoveDir) {
+        let Some(name) = self.playlists.selected_name() else {
+            return;
+        };
+        let len = self.playlists.store.get(&name).map_or(0, |p| p.entries.len());
+        if self.playlists.track_cursor >= len {
+            return;
+        }
+        match self.playlists.store.move_entry(&name, self.playlists.track_cursor, dir) {
+            Ok(index) => self.playlists.track_cursor = index,
+            Err(e) => self.status_message = e.to_string(),
+        }
+    }
+
+    fn remove_selected_track(&mut self) {
+        let Some(name) = self.playlists.selected_name() else {
+            return;
+        };
+        let len = self.playlists.store.get(&name).map_or(0, |p| p.entries.len());
+        if self.playlists.track_cursor >= len {
+            return;
+        }
+        match self.playlists.store.remove(&name, self.playlists.track_cursor) {
+            Ok(entry) => {
+                let remaining = len - 1;
+                self.playlists.track_cursor = self.playlists.track_cursor.min(remaining.saturating_sub(1));
+                self.status_message = format!("Removed \"{}\" from {}", entry.display_label(), name);
+            }
+            Err(e) => self.status_message = e.to_string(),
+        }
+    }
+}
+
+/// A centred box `height` rows tall and at most 64 columns wide for the playlist prompts.
+fn playlist_prompt_rect(r: Rect, height: u16) -> Rect {
+    let width = 64.min(r.width.saturating_sub(4));
+    let height = height.min(r.height);
+    let x = r.x + r.width.saturating_sub(width) / 2;
+    let y = r.y + r.height.saturating_sub(height) / 2;
+    Rect::new(x, y, width, height)
+}
+
+fn render_name_prompt(f: &mut Frame, purpose: &NamePurpose, input: &str, error: Option<&str>) {
+    let area = playlist_prompt_rect(f.area(), 5);
+    f.render_widget(Clear, area);
+
+    let title = match purpose {
+        NamePurpose::Create | NamePurpose::CreateAndAdd(_) => " NEW PLAYLIST ".to_string(),
+        NamePurpose::Rename { old } => format!(" RENAME \"{}\" ", old),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            title,
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Black));
+
+    // The error replaces the key hint so the prompt keeps its height.
+    let message = match error {
+        Some(err) => Line::from(Span::styled(err.to_string(), Style::default().fg(Color::Red))),
+        None => Line::from(Span::styled(
+            "[Enter] Save   [Esc] Cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Name: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{}█", input), Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+        message,
+    ];
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_confirm_delete(f: &mut Frame, name: &str, count: usize) {
+    let area = playlist_prompt_rect(f.area(), 5);
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            " DELETE PLAYLIST ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(Color::Red))
+        .style(Style::default().bg(Color::Black));
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("Delete \"{}\" ({})? y/n", name, track_count_label(count)),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "[y] Delete   any other key: Cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }

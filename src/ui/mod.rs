@@ -4715,6 +4715,9 @@ impl AppUI {
             Self::help_section_header("PLAYLISTS (TAB 5)"),
             Self::help_key_line("h / l", "Focus Playlists ↔ Tracks"),
             Self::help_key_line("Enter", "Open playlist's tracks"),
+            Self::help_key_line("c", "New playlist (tab 5)"),
+            Self::help_key_line("R / D", "Rename / Delete playlist"),
+            Self::help_key_line("J / K", "Move track down / up"),
         ];
         f.render_widget(Paragraph::new(left_lines), cols[0]);
 
