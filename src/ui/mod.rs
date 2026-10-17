@@ -1030,6 +1030,26 @@ impl AppUI {
         added
     }
 
+    /// Keep the queue cursor on a real row after the queue shrinks.
+    pub fn clamp_queue_cursor(&mut self) {
+        self.queue_cursor = self.queue_cursor.min(self.queue.len().saturating_sub(1));
+    }
+
+    /// Remove a queue row (TUI `d` or the web dashboard). Removing the track that is playing or
+    /// paused moves playback on to the track that took its place; emptying the queue stops it.
+    pub fn remove_queue_track(&mut self, index: usize) -> Option<crate::metadata::AudioMetadata> {
+        let removed = self.queue.remove(index)?;
+        self.clamp_queue_cursor();
+        if removed.was_current {
+            if self.queue.is_empty() {
+                let _ = self.player.stop();
+            } else if self.player.is_playing() || self.player.is_paused() {
+                self.play_current_track();
+            }
+        }
+        Some(removed.track)
+    }
+
 
     pub fn poll_background_metadata(&mut self) {
         let mut queue_updated = false;
@@ -2326,7 +2346,7 @@ impl AppUI {
                     | (KeyCode::Char('x'), KeyModifiers::NONE)
                     | (KeyCode::Delete, _) => {
                         if self.queue_focus {
-                            if let Some(removed) = self.queue.remove_track(self.queue_cursor) {
+                            if let Some(removed) = self.remove_queue_track(self.queue_cursor) {
                                 self.status_message = format!("Removed {}", removed.display_title());
                             }
                         } else if self.in_bookmarks_view && self.browser_cursor > 0 {
@@ -2341,6 +2361,7 @@ impl AppUI {
                     }
                     (KeyCode::Char('c'), KeyModifiers::NONE) if self.queue_focus => {
                         self.queue.clear();
+                        self.clamp_queue_cursor();
                         self.status_message = "Cleared queue".to_string();
                     }
                     (KeyCode::Char('r'), KeyModifiers::NONE) if !self.queue_focus => {
@@ -2731,6 +2752,7 @@ impl AppUI {
                 if self.queue.current_index < self.queue.len() {
                     self.queue.tracks.truncate(self.queue.current_index + 1);
                 }
+                self.clamp_queue_cursor();
                 self.status_message = format!("🎲 Autopilot: Reshuffling mix from next track forward (from '{}')...", dir_display);
             }
         }
@@ -3074,26 +3096,14 @@ impl AppUI {
                     }
                 }
                 crate::web::WebCommand::RemoveIndex(idx) => {
-                    if idx < self.queue.len() {
-                        let was_current = idx == self.queue.current_index;
-                        self.queue.remove_track(idx);
-                        if self.queue_cursor >= self.queue.len() && !self.queue.is_empty() {
-                            self.queue_cursor = self.queue.len() - 1;
-                        }
-                        if was_current {
-                            if !self.queue.is_empty() {
-                                self.play_current_track();
-                            } else {
-                                let _ = self.player.stop();
-                            }
-                        }
+                    if self.remove_queue_track(idx).is_some() {
                         self.update_web_state();
                     }
                 }
                 crate::web::WebCommand::ClearQueue => {
                     let _ = self.player.stop();
                     self.queue.clear();
-                    self.queue_cursor = 0;
+                    self.clamp_queue_cursor();
                     self.update_web_state();
                 }
                 crate::web::WebCommand::AddFile(path) => {
