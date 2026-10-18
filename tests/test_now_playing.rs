@@ -199,3 +199,63 @@ fn test_now_playing_footer_shows_the_seek_step_setting() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+/// A fresh app browsing a temp dir of its own, with `titles` queued (5:00, 5:52, ...).
+fn hero_app(tag: &str, titles: &[&str]) -> (AppUI, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("quickstream_np_{}_{}", tag, std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let settings_mgr = SettingsManager::with_path(dir.join("config.json"));
+    let mut app = AppUI::new(Some(dir.clone()), settings_mgr);
+    for (i, title) in titles.iter().enumerate() {
+        app.queue.add_track(AudioMetadata {
+            filepath: dir.join(format!("{title}.flac")),
+            title: title.to_string(),
+            artist: "Mira Lenz".to_string(),
+            duration_seconds: 300.0 + 52.0 * i as f64,
+            ..Default::default()
+        });
+    }
+    app.active_tab = 0;
+    (app, dir)
+}
+
+/// The hero timeline: the row with the bar (`█` or `░`).
+fn timeline_row(rows: &[String]) -> String {
+    rows.iter()
+        .find(|r| r.contains('░') || r.contains('█'))
+        .cloned()
+        .unwrap_or_else(|| panic!("no timeline:\n{}", rows.join("\n")))
+}
+
+#[test]
+fn test_now_playing_shows_a_pending_skip_as_queued_from_its_start() {
+    common::isolate();
+    let (mut app, dir) = hero_app("skip", &["One", "Two"]);
+    app.player = Box::new(common::fake_player::FakePlayer::playing_at(125.0, 300.0));
+
+    let rows = common::tui::rows(&common::tui::render(&mut app, 120, 40));
+    let screen = rows.join("\n");
+    assert!(screen.contains("▶ PLAYING"), "{screen}");
+    assert!(timeline_row(&rows).contains("02:05"), "{screen}");
+
+    // Right was pressed: the queue moved to Two, the player still plays One until the debounce
+    // fires. The hero shows Two from its start, marked queued, as the strip does.
+    app.queue.current_index = 1;
+    app.pending_track_skip = true;
+    let rows = common::tui::rows(&common::tui::render(&mut app, 120, 40));
+    let screen = rows.join("\n");
+    assert!(screen.contains("» QUEUED"), "{screen}");
+    assert!(
+        !screen.contains("▶ PLAYING"),
+        "the pill no longer says PLAYING: {screen}"
+    );
+    assert!(screen.contains("Two"), "{screen}");
+    let timeline = timeline_row(&rows);
+    assert!(
+        timeline.contains("00:00") && timeline.contains("05:52"),
+        "Two from 00:00 of 05:52: {timeline:?}"
+    );
+    assert!(!screen.contains("02:05"), "One's position is gone: {screen}");
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -3703,7 +3703,11 @@ impl AppUI {
 
         // Row 1: State Pill, Active Output, Volume, Mode Pill
         let mut row1 = Vec::new();
-        if self.player.is_playing() {
+        // A debounced skip has moved the queue but not the player yet: the hero shows the target
+        // track from its start, marked as queued (the strip does the same on the other tabs).
+        if self.pending_track_skip {
+            row1.push(Span::styled(" » QUEUED ", theme::cursor()));
+        } else if self.player.is_playing() {
             row1.push(Span::styled(" ▶ PLAYING ", theme::cursor()));
         } else if self.player.is_paused() {
             row1.push(Span::styled(" ⏸ PAUSED ", theme::cursor()));
@@ -3825,9 +3829,12 @@ impl AppUI {
             hero_lines.push(Line::from(badge_spans));
 
             // Row 5: Full-Width Scrubbable Timeline Progress Bar
-            let pos = self
-                .pending_seek_target
-                .unwrap_or_else(|| self.player.position_seconds());
+            let pos = if self.pending_track_skip {
+                0.0
+            } else {
+                self.pending_seek_target
+                    .unwrap_or_else(|| self.player.position_seconds())
+            };
             let dur = if track.duration_seconds > 0.0 {
                 track.duration_seconds
             } else {
