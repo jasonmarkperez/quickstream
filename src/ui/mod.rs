@@ -10,9 +10,12 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScree
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
+pub mod kit;
 pub mod playlists;
+pub mod screen;
 pub mod search;
 pub mod tag_reads;
+pub mod theme;
 pub mod workers;
 
 use self::search::SearchModalState;

@@ -10,6 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
+use super::kit::visible_tail;
 use super::AppUI;
 use crate::paths;
 use crate::playlist::{Playlist, PlaylistEntry};
@@ -973,29 +974,6 @@ fn render_name_prompt(f: &mut Frame, purpose: &NamePurpose, input: &str, error: 
         message,
     ];
     f.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-/// Columns `c` takes in the terminal (2 for wide characters such as CJK).
-fn char_width(c: char) -> usize {
-    let mut buf = [0u8; 4];
-    Span::raw(&*c.encode_utf8(&mut buf)).width()
-}
-
-/// `text` if it fits in `width` columns; otherwise `…` followed by as much of its end as fits.
-fn visible_tail(text: &str, width: usize) -> String {
-    if Span::raw(text).width() <= width {
-        return text.to_string();
-    }
-    let mut used = 1; // the `…`
-    let mut start = text.len();
-    for (index, c) in text.char_indices().rev() {
-        used += char_width(c);
-        if used > width {
-            break;
-        }
-        start = index;
-    }
-    format!("…{}", &text[start..])
 }
 
 fn render_confirm_delete(f: &mut Frame, name: &str, count: usize) {

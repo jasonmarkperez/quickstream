@@ -65,7 +65,10 @@ quickstream/
 │   │   ├── mod.rs        # AppUI state machine, 60 FPS render passes, tab switching, hotkey router
 │   │   ├── playlists.rs  # Tab 5 Playlists: PlaylistsUi, name prompt / delete confirm / add picker, L key, play & queue
 │   │   ├── tag_reads.rs  # SharedTagReads: tag reads shared by browser/queue/folder-add workers, in-flight path set
-│   │   └── search.rs     # SearchModalState, streaming fuzzy search (fuzzy-matcher / SkimMatcherV2)
+│   │   ├── search.rs     # SearchModalState, streaming fuzzy search (fuzzy-matcher / SkimMatcherV2)
+│   │   ├── theme.rs      # Telemetry colour tokens: ColorDepth (COLORTERM), Palette, style constructors
+│   │   ├── kit.rs        # Key row, volume meter, progress bar, width-aware fit / visible_tail, ClockCache
+│   │   └── screen.rs     # WidthTier (<80 / 80–89 / 90–109 / ≥110) and Screen (tier, short) per frame
 │   │
 │   ├── player/           # Audio playback abstraction layer
 │   │   ├── mod.rs        # AudioPlayer trait and PlaybackState enum
@@ -107,6 +110,7 @@ quickstream/
     ├── test_playlists_add.rs  # L key, add picker, folder adds, last_playlist
     ├── test_playlists_play.rs # Missing-file checks, Enter replace+play, a append, all-missing
     ├── test_search.rs        # Multi-threaded fuzzy search, scoped scan, and modal navigation
+    ├── test_ui_chrome.rs     # Theme palettes, key row trimming, meters, text fitting, width tiers
     ├── test_shared_tag_reads.rs # No concurrent duplicate tag reads; skipped/waiting requests still get tags
     ├── test_upnp.rs          # UPnP SOAP XML generation, AVTransport state machine, continuous stream
     ├── test_web.rs           # Embedded web server, byte ranges, REST API, and command dispatch
