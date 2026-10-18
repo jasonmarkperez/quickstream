@@ -7,6 +7,7 @@
 use ratatui::prelude::*;
 
 use super::kit::{self, spans_width, text_width, KeyHint};
+use super::playlists::PlaylistModal;
 use super::screen::{Screen, WidthTier};
 use super::{format_time, theme, AppUI};
 
@@ -365,10 +366,14 @@ impl AppUI {
         Some(Span::styled(message.to_string(), style))
     }
 
-    /// The keys that do something on the active tab (and pane) right now, most important with
-    /// the highest priority. `? KEYS` is always among the top ones, except while a tab is taking
-    /// typed text (spotlight, startup home editor), where `?` is typed rather than opening help.
+    /// The keys that do something right now, most important with the highest priority: the open
+    /// modal's (`modal_key_hints`), else the active tab's (and pane's). On a tab `? KEYS` is always
+    /// among the top ones, except while it takes typed text (spotlight, startup home editor),
+    /// where `?` is typed rather than opening help.
     pub fn tab_key_hints(&self) -> Vec<KeyHint> {
+        if let Some(hints) = self.modal_key_hints() {
+            return hints;
+        }
         let help = || KeyHint::new("?", "KEYS", TOP);
         match self.active_tab {
             0 => {
@@ -448,6 +453,48 @@ impl AppUI {
             ],
             _ => vec![help()],
         }
+    }
+
+    /// The keys of the open modal, which takes every key before the tab does, or `None` with no
+    /// modal open. Only keys its handler acts on, in the order the handlers are asked (help,
+    /// search, mix picker, playlist modals); none offers `? KEYS`, since no modal opens help
+    /// (the name prompt and the search query take `?` as text).
+    fn modal_key_hints(&self) -> Option<Vec<KeyHint>> {
+        if self.show_help_modal {
+            return Some(vec![KeyHint::new("ESC", "CLOSE", TOP)]);
+        }
+        if self.search_modal.is_some() {
+            return Some(vec![
+                KeyHint::new("↑↓", "SELECT", 6),
+                KeyHint::new("ENTER", "ADD & CLOSE", 8),
+                KeyHint::new("TAB", "ADD", 7),
+                KeyHint::new("⇧TAB", "ADD ALL", 5),
+                KeyHint::new("ESC", "CLOSE", TOP),
+            ]);
+        }
+        if self.show_mix_picker_modal {
+            return Some(vec![
+                KeyHint::new("J K", "SELECT", 6),
+                KeyHint::new("ENTER", "START", 8),
+                KeyHint::new("1-5", "PROFILE", 7),
+                KeyHint::new("ESC", "CLOSE", TOP),
+            ]);
+        }
+        let hints = match self.playlists.modal.as_ref()? {
+            PlaylistModal::NamePrompt { .. } => {
+                vec![KeyHint::new("ENTER", "SAVE", TOP), KeyHint::new("ESC", "CANCEL", TOP)]
+            }
+            // Only `y` deletes; any other key keeps the playlist.
+            PlaylistModal::ConfirmDelete { .. } => {
+                vec![KeyHint::new("Y", "DELETE", TOP), KeyHint::new("ANY KEY", "CANCEL", TOP)]
+            }
+            PlaylistModal::AddPicker { .. } => vec![
+                KeyHint::new("J K", "SELECT", 6),
+                KeyHint::new("ENTER", "ADD", 8),
+                KeyHint::new("ESC", "CANCEL", TOP),
+            ],
+        };
+        Some(hints)
     }
 
     /// The key row: the tab's keys from the left, the status message (and on Now Playing the

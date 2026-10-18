@@ -1121,3 +1121,59 @@ fn modals_sit_on_ground_not_the_terminal_default() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// The keys each modal's handler acts on, as the key row shows them.
+fn modal_keys(modal: Modal) -> &'static [&'static str] {
+    match modal {
+        Modal::Help => &[" ESC  CLOSE"],
+        Modal::MixPicker => &[" J K  SELECT", " ENTER  START", " 1-5  PROFILE", " ESC  CLOSE"],
+        Modal::Search => &[
+            " ↑↓  SELECT",
+            " ENTER  ADD & CLOSE",
+            " TAB  ADD",
+            " ⇧TAB  ADD ALL",
+            " ESC  CLOSE",
+        ],
+        Modal::NamePrompt => &[" ENTER  SAVE", " ESC  CANCEL"],
+        Modal::ConfirmDelete => &[" Y  DELETE", " ANY KEY  CANCEL"],
+        Modal::AddPicker => &[" J K  SELECT", " ENTER  ADD", " ESC  CANCEL"],
+    }
+}
+
+#[test]
+fn key_row_shows_the_open_modals_keys_instead_of_the_tabs() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("modal_keys");
+    app.status_message.clear();
+    app.active_tab = 1;
+    app.queue_focus = false;
+    for modal in MODALS {
+        open_modal(&mut app, modal);
+        app.status_message.clear();
+        let buffer = tui::render(&mut app, 120, 40);
+        let keys = modal_keys(modal);
+        let y = (0..40)
+            .rev()
+            .find(|&y| tui::row(&buffer, y).contains(keys[0]))
+            .unwrap_or_else(|| panic!("{modal:?}: no key row\n{}", tui::rows(&buffer).join("\n")));
+        assert_eq!(y, 38, "{modal:?}: the key row stays in place");
+        let row = tui::row(&buffer, y);
+        for key in keys {
+            assert!(row.contains(key), "{modal:?}: {key:?} missing: {row:?}");
+        }
+        // Nothing from tab 2, and no `? KEYS`: no modal opens help with `?` (in the name
+        // prompt and the search query it is typed text).
+        assert!(
+            !row.contains("SPOTLIGHT") && !row.contains("PANE"),
+            "{modal:?}: {row:?}"
+        );
+        assert!(!row.contains(" ?  KEYS"), "{modal:?}: {row:?}");
+        close_modals(&mut app);
+    }
+
+    // Closed again, the tab's keys come back.
+    let buffer = tui::render(&mut app, 120, 40);
+    let row = tui::row(&buffer, key_row_index(&buffer));
+    assert!(row.contains(" /  SPOTLIGHT"), "{row:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
