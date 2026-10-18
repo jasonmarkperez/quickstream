@@ -3838,14 +3838,16 @@ impl AppUI {
                 self.pending_seek_target
                     .unwrap_or_else(|| self.player.position_seconds())
             };
-            let dur = if track.duration_seconds > 0.0 {
-                track.duration_seconds
+            // During a pending skip the player still holds the old track, so its duration is
+            // not the target's: use only the target's own (00:00 while unknown), as the strip does.
+            let dur = if track.duration_seconds > 0.0 || self.pending_track_skip {
+                track.duration_seconds.max(0.0)
             } else {
                 self.player.duration_seconds().max(1.0)
             };
             let pos_str = format_time(pos);
             let dur_str = format_time(dur);
-            let ratio = (pos / dur).clamp(0.0, 1.0);
+            let ratio = if dur > 0.0 { (pos / dur).clamp(0.0, 1.0) } else { 0.0 };
 
             let available_w = (hero_area.width as usize).saturating_sub(pos_str.len() + dur_str.len() + 6);
             let filled = (ratio * available_w as f64).round() as usize;

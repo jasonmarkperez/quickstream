@@ -262,6 +262,36 @@ fn test_now_playing_shows_a_pending_skip_as_queued_from_its_start() {
 }
 
 #[test]
+fn test_now_playing_pending_skip_never_shows_the_old_tracks_duration() {
+    common::isolate();
+    // Two's duration isn't known yet (e.g. added from the browser before its tags were read).
+    let (mut app, dir) = hero_app("skip_nodur", &["One", "Two"]);
+    app.queue.tracks[1].duration_seconds = 0.0;
+    app.player = Box::new(common::fake_player::FakePlayer::playing_at(125.0, 300.0));
+
+    // Right was pressed: the player still holds One (5:00) until the debounce fires.
+    app.queue.current_index = 1;
+    app.pending_track_skip = true;
+    let rows = common::tui::rows(&common::tui::render(&mut app, 120, 40));
+    let screen = rows.join("\n");
+    assert!(screen.contains("» QUEUED"), "{screen}");
+    let timeline = timeline_row(&rows);
+    assert!(timeline.contains("00:00"), "Two from 00:00: {timeline:?}");
+    assert!(
+        !screen.contains("05:00"),
+        "One's duration is not shown for Two: {screen}"
+    );
+
+    // The strip on tab 2 shows the same: Two from 00:00, no 05:00.
+    app.active_tab = 1;
+    let buffer = common::tui::render(&mut app, 120, 40);
+    let y = common::tui::find_row(&buffer, "QUEUED").expect("strip");
+    let strip = common::tui::row(&buffer, y);
+    assert!(strip.contains("00:00") && !strip.contains("05:00"), "{strip:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_now_playing_autopilot_badge_names_the_mix_profile() {
     common::isolate();
     let (mut app, dir) = hero_app("profile", &["One", "Two"]);
