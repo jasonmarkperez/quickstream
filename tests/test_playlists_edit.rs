@@ -593,25 +593,33 @@ fn test_unlistable_playlists_folder_refuses_edits_and_keeps_files() {
     let original = "#EXTM3U\n#PLAYLIST:bom\n/music/a.flac\n";
     fs::write(dir.join("bom.m3u8"), original).unwrap();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+    // Root lists any folder, so the test proves nothing there.
+    let listable = fs::read_dir(&dir).is_ok();
 
     app.playlists.store = PlaylistStore::new(dir.clone(), app.persistence.handle());
     app.start_playlist_load();
     for _ in 0..200 {
         app.poll_playlists();
-        if app.playlists.load_failed || app.playlists.store.is_loaded() {
+        if app.playlists.load_failed() || app.playlists.store.is_loaded() {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     let loaded = app.playlists.store.is_loaded();
-    let failed = app.playlists.load_failed;
+    let failed = app.playlists.load_failed();
     press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
     let prompt_opened = app.playlists.modal.is_some();
     let status = app.status_message.clone();
     let view = render_view(&mut app, 100, 30);
-    assert!(app.persistence.flush());
-
+    let flushed = app.persistence.flush();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    if listable {
+        drop(app);
+        let _ = fs::remove_dir_all(&temp_dir);
+        return;
+    }
+
+    assert!(flushed);
     assert!(!loaded, "store must stay not loaded");
     assert!(failed, "load must be marked failed");
     assert!(!prompt_opened, "no create prompt after a failed load");

@@ -154,9 +154,9 @@ pub struct PlaylistsUi {
     folder_rx: mpsc::Receiver<FolderUpdate>,
     /// Result of the startup load (playlists, stems of skipped files); `None` once applied.
     load_rx: Option<mpsc::Receiver<LoadResult>>,
-    /// The load worker died without sending; the store stays unloaded so no edit can overwrite
-    /// a file that was never read.
-    pub load_failed: bool,
+    /// The playlists folder couldn't be listed, or the load worker died without sending; the
+    /// store stays unloaded so no edit can overwrite a file that was never read.
+    load_failed: bool,
     list_state: ListState,
     tracks_state: ListState,
 }
@@ -189,6 +189,11 @@ impl PlaylistsUi {
     /// Name of the playlist under the left-pane cursor.
     pub fn selected_name(&self) -> Option<String> {
         self.selected_playlist().map(|p| p.name.clone())
+    }
+
+    /// True when the startup load failed; edits stay refused for the session.
+    pub fn load_failed(&self) -> bool {
+        self.load_failed
     }
 
     /// Why an edit is refused before the store is loaded: still loading, or the load failed.

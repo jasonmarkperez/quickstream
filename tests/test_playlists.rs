@@ -367,6 +367,62 @@ fn test_names_equal_ignores_unicode_normalization() {
 }
 
 #[test]
+fn test_names_equal_uses_full_case_folding() {
+    common::isolate();
+    // APFS matches names with full Unicode case folding, not lower case: each pair is one file
+    // there, so a create of the second would overwrite the first.
+    assert!(names_equal("Stra\u{df}e", "Strasse"));
+    assert!(names_equal(
+        "\u{3bf}\u{3b4}\u{3bf}\u{3c2}",
+        "\u{3bf}\u{3b4}\u{3bf}\u{3c3}"
+    ));
+    assert!(names_equal("Mu\u{17f}ic", "Music"));
+    assert!(names_equal("\u{b5}", "\u{3bc}"));
+    assert!(names_equal("\u{fb00}", "ff"));
+    // Dotted capital I folds to i + combining dot, which APFS keeps apart from plain i.
+    assert!(!names_equal("\u{130}x", "ix"));
+}
+
+/// The key must match what the file system treats as one name. Checked against the real temp
+/// folder when it is case-insensitive (default macOS APFS); skipped elsewhere.
+#[test]
+fn test_names_equal_matches_the_file_system() {
+    common::isolate();
+    let dir = std::env::temp_dir().join(format!("qs_names_fs_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("probe"), b"").unwrap();
+    let case_insensitive = dir.join("PROBE").exists();
+    std::fs::remove_file(dir.join("probe")).unwrap();
+    if case_insensitive && cfg!(target_os = "macos") {
+        let pairs = [
+            ("Road Trip", "road trip"),
+            ("Zo\u{eb}", "Zoe\u{308}"),
+            ("Stra\u{df}e", "Strasse"),
+            ("\u{3bf}\u{3b4}\u{3bf}\u{3c2}", "\u{3bf}\u{3b4}\u{3bf}\u{3c3}"),
+            ("Mu\u{17f}ic", "Music"),
+            ("\u{b5}", "\u{3bc}"),
+            ("\u{fb00}", "ff"),
+            ("\u{130}x", "ix"),
+            ("Road Trip", "Road Trip 2"),
+        ];
+        for (a, b) in pairs {
+            let file = dir.join(a);
+            std::fs::write(&file, b"").unwrap();
+            assert_eq!(
+                dir.join(b).exists(),
+                names_equal(a, b),
+                "file system and names_equal disagree on {:?} / {:?}",
+                a,
+                b
+            );
+            std::fs::remove_file(&file).unwrap();
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_playlist_file_path_stays_in_dir() {
     common::isolate();
     let dir = Path::new("/home/me/.config/quickstream/playlists");

@@ -64,6 +64,7 @@ fn file_names(dir: &Path) -> Vec<String> {
 /// The playlist called exactly `name` as a fresh load of `dir` sees it on disk.
 fn on_disk(dir: &Path, name: &str) -> Playlist {
     PlaylistStore::load_dir(dir)
+        .unwrap()
         .into_iter()
         .find(|p| p.name == name)
         .unwrap_or_else(|| panic!("no file for {:?} in {:?}", name, file_names(dir)))
@@ -92,7 +93,7 @@ fn test_edits_are_refused_until_loaded() {
 fn test_load_dir_of_missing_folder_is_empty_and_creates_nothing() {
     common::isolate();
     let dir = scratch("missing");
-    assert!(PlaylistStore::load_dir(&dir).is_empty());
+    assert!(PlaylistStore::load_dir(&dir).unwrap().is_empty());
     assert_eq!(
         PlaylistStore::load_dir_reserving(&dir).unwrap(),
         (Vec::new(), Vec::new())
@@ -117,7 +118,7 @@ fn test_load_dir_reserving_returns_the_stems_it_skipped() {
     let loaded_names: Vec<&str> = loaded.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(loaded_names, vec!["Good"]);
     assert_eq!(skipped, vec!["Latin", "Mix", "folder"]);
-    assert_eq!(PlaylistStore::load_dir(&dir), loaded);
+    assert_eq!(PlaylistStore::load_dir(&dir).unwrap(), loaded);
 }
 
 #[test]
@@ -140,7 +141,7 @@ fn test_load_dir_reads_only_lower_case_m3u8_files() {
     fs::write(dir.join("._Road Trip.m3u8"), [0u8, 5, 22, 7]).unwrap();
     fs::create_dir_all(dir.join("folder.m3u8")).unwrap();
 
-    let loaded = PlaylistStore::load_dir(&dir);
+    let loaded = PlaylistStore::load_dir(&dir).unwrap();
     let loaded_names: Vec<&str> = loaded.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(loaded_names, vec!["Road Trip"]);
     assert_eq!(paths(&loaded[0].entries), vec![PathBuf::from("/music/airbag.flac")]);
@@ -712,6 +713,22 @@ fn test_create_refuses_a_name_differing_only_in_unicode_normalization() {
 }
 
 #[test]
+fn test_create_refuses_a_name_equal_under_case_folding() {
+    common::isolate();
+    // `Straße` and `Strasse` are one file on APFS.
+    let dir = scratch("casefold_create");
+    let (worker, mut store) = open_store(&dir);
+    store.create("Stra\u{df}e").unwrap();
+    store.add("Stra\u{df}e", vec![entry("a")]).unwrap();
+    assert_eq!(
+        store.create("Strasse"),
+        Err(StoreError::Name(NameError::Duplicate("Stra\u{df}e".to_string())))
+    );
+    assert!(worker.flush());
+    assert_eq!(paths(&on_disk(&dir, "Stra\u{df}e").entries), paths(&[entry("a")]));
+}
+
+#[test]
 fn test_rename_refuses_a_name_differing_only_in_unicode_normalization() {
     common::isolate();
     let dir = scratch("nfd_rename");
@@ -770,4 +787,32 @@ fn test_load_dir_reserving_fails_when_the_folder_cannot_be_listed() {
     if !listable {
         assert!(result.is_err(), "expected an error, got {:?}", result);
     }
+}
+
+#[test]
+fn test_rename_refuses_a_reserved_name_differing_only_in_normalization() {
+    common::isolate();
+    // A case-sensitive disk that ignores normalization (case-sensitive APFS) can hold `Zoë.m3u8`
+    // and `zoë.m3u8` (NFD). `set_loaded` keeps `Zoë` and reserves the NFD `zoë`; renaming `Zoë`
+    // to `zoë` typed as NFC would open the reserved file.
+    let dir = scratch("nfd_reserved_rename");
+    let worker = PersistenceWorker::spawn();
+    let mut store = PlaylistStore::new(dir, worker.handle());
+    store.set_loaded(vec![Playlist::new(ZOE_NFC), Playlist::new("zoe\u{308}")]);
+    assert_eq!(names(&store), vec![ZOE_NFC]);
+    assert!(matches!(
+        store.rename(ZOE_NFC, "zo\u{eb}"),
+        Err(StoreError::Name(NameError::Duplicate(_)))
+    ));
+}
+
+#[test]
+fn test_load_dir_reserving_fails_on_a_dangling_symlink() {
+    common::isolate();
+    // A playlists folder linked to an unmounted volume is not "no playlists yet": loading it as
+    // empty would let a create overwrite the real file once the volume mounts.
+    let dir = scratch("dangling");
+    let target = dir.parent().unwrap().join("unmounted/playlists");
+    std::os::unix::fs::symlink(&target, &dir).unwrap();
+    assert!(PlaylistStore::load_dir_reserving(&dir).is_err());
 }

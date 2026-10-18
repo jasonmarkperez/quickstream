@@ -64,7 +64,7 @@ pub type LoadResult = io::Result<(Vec<Playlist>, Vec<String>)>;
 
 pub struct PlaylistStore {
     dir: PathBuf,
-    /// Sorted by name ignoring case; no two names are equal ignoring case.
+    /// Sorted by [`name_key`]; no two names are equal under [`names_equal`].
     playlists: Vec<Playlist>,
     /// Stems of playlist files skipped at load. `create` and `rename` refuse these names.
     reserved: Vec<String>,
@@ -84,13 +84,10 @@ impl PlaylistStore {
         }
     }
 
-    /// The playlists in `dir`, without the names of skipped files; empty when the folder can't
-    /// be listed. Blocking: call it on a worker. See
-    /// [`load_dir_reserving`](Self::load_dir_reserving).
-    pub fn load_dir(dir: &Path) -> Vec<Playlist> {
-        Self::load_dir_reserving(dir)
-            .map(|(playlists, _)| playlists)
-            .unwrap_or_default()
+    /// The playlists in `dir`, without the names of skipped files. Blocking: call it on a
+    /// worker. See [`load_dir_reserving`](Self::load_dir_reserving).
+    pub fn load_dir(dir: &Path) -> io::Result<Vec<Playlist>> {
+        Self::load_dir_reserving(dir).map(|(playlists, _)| playlists)
     }
 
     /// Read every `*.m3u8` file directly inside `dir`. Blocking: call it on a worker. Returns
@@ -107,17 +104,27 @@ impl PlaylistStore {
     pub fn load_dir_reserving(dir: &Path) -> LoadResult {
         let listing = match fs::read_dir(dir) {
             Ok(listing) => listing,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
+            // A symlink to a folder that isn't there (an unmounted volume) is not "no playlists
+            // yet": once the volume mounts, a playlist created now would overwrite its file.
+            Err(e) if e.kind() == io::ErrorKind::NotFound && fs::symlink_metadata(dir).is_err() => {
+                return Ok((Vec::new(), Vec::new()))
+            }
             Err(e) => {
                 log_warn(&format!("could not list playlists folder '{}': {}", dir.display(), e));
                 return Err(e);
             }
         };
-        let mut files: Vec<PathBuf> = listing
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| has_playlist_extension(p))
-            .collect();
+        // An entry that can't be read could be a playlist; leaving it out would let a create
+        // overwrite it, so the whole load fails instead.
+        let mut files = Vec::new();
+        for entry in listing {
+            let path = entry
+                .inspect_err(|e| log_warn(&format!("could not list playlists folder '{}': {}", dir.display(), e)))?
+                .path();
+            if has_playlist_extension(&path) {
+                files.push(path);
+            }
+        }
         files.sort();
 
         let mut playlists = Vec::new();
@@ -147,9 +154,8 @@ impl PlaylistStore {
 
     /// Install the playlists read by [`load_dir_reserving`](Self::load_dir_reserving) and allow
     /// edits. When names differ only in case or Unicode normalization (possible on a disk that
-    /// tells them apart), the first in
-    /// sort order is kept and the rest are logged and ignored. The ignored names are reserved,
-    /// so no create or rename ever writes over their files.
+    /// tells them apart), the first in sort order is kept and the rest are logged and ignored.
+    /// The ignored names are reserved, so no create or rename ever writes over their files.
     pub fn set_loaded(&mut self, playlists: Vec<Playlist>) {
         let mut playlists = playlists;
         sort_by_name(&mut playlists);
@@ -174,7 +180,8 @@ impl PlaylistStore {
     }
 
     /// Treat `names` (the stems [`load_dir_reserving`](Self::load_dir_reserving) skipped) as
-    /// taken: [`create`](Self::create) and [`rename`](Self::rename) refuse them, ignoring case.
+    /// taken: [`create`](Self::create) and [`rename`](Self::rename) refuse them, compared with
+    /// [`names_equal`].
     /// On a case-insensitive disk `latin.m3u8` is the skipped `Latin.m3u8`, so writing it would
     /// overwrite a file the store never read.
     pub fn reserve_names(&mut self, names: Vec<String>) {
@@ -311,7 +318,8 @@ impl PlaylistStore {
         }
         // Except on a case-sensitive disk, where `set_loaded` may have dropped `mix.m3u8` next
         // to the kept `Mix.m3u8`: renaming `Mix` to exactly `mix` would replace that file.
-        if let Some(r) = self.reserved.iter().find(|r| **r == new_name) {
+        // Case-sensitive APFS still ignores normalization, so compare canonical forms.
+        if let Some(r) = self.reserved.iter().find(|r| same_canonical(r, &new_name)) {
             return Err(StoreError::Name(NameError::Duplicate(r.clone())));
         }
         let new_path = self.file_for(&new_name)?;
@@ -395,11 +403,17 @@ fn read_playlist_text(path: &Path) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "not valid UTF-8".to_string())
 }
 
-/// Case-insensitive name order; the exact name breaks ties so the order is deterministic.
+/// Name order ignoring case; the exact name breaks ties so the order is deterministic.
 /// Sorting by [`name_key`] puts names that [`names_equal`] matches next to each other, which
 /// `set_loaded` relies on to drop duplicates.
 fn sort_by_name(playlists: &mut [Playlist]) {
     playlists.sort_by_cached_key(|p| (name_key(&p.name), p.name.clone()));
+}
+
+/// Equal up to Unicode normalization, but case-sensitive.
+fn same_canonical(a: &str, b: &str) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+    a.nfd().eq(b.nfd())
 }
 
 fn log_warn(message: &str) {

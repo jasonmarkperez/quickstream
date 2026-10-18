@@ -73,7 +73,7 @@ pub struct Playlist {
   - an entry without `#EXTINF` gets duration `-1`, empty artist and the file stem as title.
   The playlist's name is the file stem, not `#PLAYLIST`. The path line, not the `#EXTINF` text, is the source of truth for the file, so an artist containing ` - ` only affects display.
 - `validate_name(name: &str) -> Result<String, NameError>` trims whitespace, then rejects: empty, longer than 100 characters, containing `/`, `\`, NUL or other control characters, or starting with `.`. Returns the trimmed name.
-- Name comparison is case-insensitive (`eq_ignore_case` helper), because the default macOS file system is case-insensitive.
+- Name comparison matches the default macOS file system (APFS), which treats these names as one file: it ignores case using full Unicode case folding (`Straße` = `Strasse`) and ignores Unicode normalization (NFC `Zoë` = NFD `Zoë`). The `names_equal` helper compares `name_key`, the canonical caseless key NFD(casefold(NFD(name))) (issue #55).
 
 ### Files
 
@@ -84,7 +84,7 @@ pub struct Playlist {
 ### `PlaylistStore` (new, held by `AppUI`)
 
 - Holds `Vec<Playlist>`, sorted by name (case-insensitive).
-- At startup a worker (`self.workers.spawn`) reads every `*.m3u8` in the playlists folder and sends the parsed playlists to the UI over an mpsc channel. Until the result arrives the tab shows `Loading playlists…`. A file that cannot be read or is not valid UTF-8 is logged and skipped. It is never rewritten or renamed.
+- At startup a worker (`self.workers.spawn`) reads every `*.m3u8` in the playlists folder and sends the parsed playlists to the UI over an mpsc channel. Until the result arrives the tab shows `Loading playlists…`. A file that cannot be read or is not valid UTF-8 is logged and skipped. It is never rewritten or renamed. If the folder exists but cannot be listed (permissions, an entry that cannot be read, or a symlink whose target is missing), the load fails: the store stays not loaded, the tab shows `Couldn't load playlists`, and every edit is refused for the session, so no create can overwrite a file the store never read (issue #56).
 - Operations, each changing the in-memory copy first and then handing the full file contents to the background writer (`PersistHandle::save`, atomic temp-file-then-rename):
   - `create(name)` – fails on an invalid name or a case-insensitive duplicate;
   - `add(name, entries) -> AddResult { added, skipped_duplicates }` – a duplicate is an entry whose path is already in the playlist;
