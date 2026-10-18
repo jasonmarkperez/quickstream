@@ -10,7 +10,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use super::kit::visible_tail;
+use super::kit::{self, visible_tail};
+use super::theme;
 use super::AppUI;
 use crate::paths;
 use crate::playlist::{Playlist, PlaylistEntry};
@@ -929,7 +930,7 @@ fn playlist_prompt_rect(r: Rect, height: u16) -> Rect {
 
 fn render_name_prompt(f: &mut Frame, purpose: &NamePurpose, input: &str, error: Option<&str>) {
     let area = playlist_prompt_rect(f.area(), 5);
-    f.render_widget(Clear, area);
+    kit::clear(f.buffer_mut(), area);
 
     let title = match purpose {
         NamePurpose::Create | NamePurpose::CreateAndAdd(_) => " NEW PLAYLIST ".to_string(),
@@ -942,7 +943,7 @@ fn render_name_prompt(f: &mut Frame, purpose: &NamePurpose, input: &str, error: 
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ))
         .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Black));
+        .style(theme::base());
 
     // The error replaces the key hint so the prompt keeps its height.
     let message = match error {
@@ -975,7 +976,7 @@ fn render_name_prompt(f: &mut Frame, purpose: &NamePurpose, input: &str, error: 
 
 fn render_confirm_delete(f: &mut Frame, name: &str, count: usize) {
     let area = playlist_prompt_rect(f.area(), 5);
-    f.render_widget(Clear, area);
+    kit::clear(f.buffer_mut(), area);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -984,7 +985,7 @@ fn render_confirm_delete(f: &mut Frame, name: &str, count: usize) {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ))
         .border_style(Style::default().fg(Color::Red))
-        .style(Style::default().bg(Color::Black));
+        .style(theme::base());
     let lines = vec![
         Line::from(Span::styled(
             format!("Delete \"{}\" ({})? y/n", name, track_count_label(count)),
@@ -1373,7 +1374,7 @@ impl super::AppUI {
     /// The add picker: what is being added, one row per playlist, then "+ New playlist…".
     fn render_add_picker(&self, f: &mut Frame, pending: &PendingAdd, cursor: usize) {
         let area = super::centered_rect(60, 60, f.area());
-        f.render_widget(Clear, area);
+        kit::clear(f.buffer_mut(), area);
         let block = Block::default()
             .borders(Borders::ALL)
             .title(Span::styled(
@@ -1385,7 +1386,7 @@ impl super::AppUI {
                 Style::default().fg(Color::DarkGray),
             ))
             .border_style(Style::default().fg(Color::Cyan))
-            .style(Style::default().bg(Color::Black));
+            .style(theme::base());
         let inner = block.inner(area);
         f.render_widget(block, area);
 

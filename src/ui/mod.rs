@@ -4314,7 +4314,7 @@ impl AppUI {
 
     fn render_search_modal(modal: &mut SearchModalState, f: &mut Frame) {
         let area = centered_rect(84, 80, f.area());
-        f.render_widget(Clear, area);
+        kit::clear(f.buffer_mut(), area);
 
         let dir_name = modal
             .root_dir
@@ -4500,7 +4500,7 @@ impl AppUI {
 
     fn render_help_modal(&self, f: &mut Frame) {
         let area = modal_rect_with_height(f.area(), HELP_MODAL_HEIGHT);
-        f.render_widget(Clear, area);
+        kit::clear(f.buffer_mut(), area);
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -4509,7 +4509,7 @@ impl AppUI {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ))
             .border_style(Style::default().fg(Color::Cyan))
-            .style(Style::default().bg(Color::Black));
+            .style(theme::base());
         f.render_widget(block, area);
 
         let inner = if area.height >= 17 {
@@ -4595,7 +4595,7 @@ impl AppUI {
 
     fn render_mix_picker_modal(&self, f: &mut Frame) {
         let area = help_modal_rect(f.area());
-        f.render_widget(Clear, area);
+        kit::clear(f.buffer_mut(), area);
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -4604,7 +4604,7 @@ impl AppUI {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ))
             .border_style(Style::default().fg(Color::Cyan))
-            .style(Style::default().bg(Color::Black));
+            .style(theme::base());
         f.render_widget(block, area);
 
         let inner = Layout::default()

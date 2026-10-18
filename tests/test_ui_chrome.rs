@@ -17,6 +17,7 @@ use common::tui;
 use quickstream::metadata::AudioMetadata;
 use quickstream::settings::SettingsManager;
 use quickstream::ui::kit::{self, ClockCache, KeyHint};
+use quickstream::ui::playlists::{NamePurpose, PendingAdd, PlaylistModal};
 use quickstream::ui::screen::{Screen, WidthTier};
 use quickstream::ui::theme::{self, ColorDepth, Palette};
 use quickstream::ui::AppUI;
@@ -1011,5 +1012,97 @@ fn tab_row_cuts_the_active_chip_with_an_ellipsis_when_it_alone_does_not_fit() {
     let (chip, x) = active_chip(&buffer);
     assert_eq!(chip, " 5 PLAYL… ", "{:?}", tui::row(&buffer, 3));
     assert_eq!(x, 2, "after the left gutter");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Modals over the chrome
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum Modal {
+    Help,
+    MixPicker,
+    Search,
+    NamePrompt,
+    ConfirmDelete,
+    AddPicker,
+}
+
+const MODALS: [Modal; 6] = [
+    Modal::Help,
+    Modal::MixPicker,
+    Modal::Search,
+    Modal::NamePrompt,
+    Modal::ConfirmDelete,
+    Modal::AddPicker,
+];
+
+fn open_modal(app: &mut AppUI, modal: Modal) {
+    match modal {
+        Modal::Help => app.show_help_modal = true,
+        Modal::MixPicker => app.show_mix_picker_modal = true,
+        Modal::Search => app.open_fuzzy_search(),
+        Modal::NamePrompt => {
+            app.playlists.modal = Some(PlaylistModal::NamePrompt {
+                purpose: NamePurpose::Create,
+                input: "Road".to_string(),
+                error: None,
+            })
+        }
+        Modal::ConfirmDelete => {
+            app.playlists.modal = Some(PlaylistModal::ConfirmDelete {
+                name: "Road Trip".to_string(),
+                count: 3,
+            })
+        }
+        Modal::AddPicker => {
+            app.playlists.modal = Some(PlaylistModal::AddPicker {
+                pending: PendingAdd::Entries {
+                    label: "Halcyon Drift".to_string(),
+                    entries: Vec::new(),
+                },
+                cursor: 0,
+            })
+        }
+    }
+}
+
+fn close_modals(app: &mut AppUI) {
+    app.show_help_modal = false;
+    app.show_mix_picker_modal = false;
+    if let Some(mut search) = app.search_modal.take() {
+        search.close();
+    }
+    app.playlists.modal = None;
+}
+
+#[test]
+fn modals_sit_on_ground_not_the_terminal_default() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("modal_ground");
+    let p = theme::palette();
+    for modal in MODALS {
+        open_modal(&mut app, modal);
+        let buffer = tui::render(&mut app, 120, 40);
+        let screen = tui::rows(&buffer).join("\n");
+        for y in 0..40 {
+            for x in 0..120 {
+                // The cell under the second half of a wide character (the modal titles' emoji) is
+                // never drawn; ratatui resets it.
+                if x > 0 && Span::raw(buffer[(x - 1, y)].symbol()).width() == 2 {
+                    continue;
+                }
+                let bg = buffer[(x, y)].bg;
+                // GROUND, keycaps (RULE), cursor rows (INK) and the add picker's highlight (Cyan,
+                // restyled later), never the terminal default or black.
+                assert!(
+                    [p.ground, p.rule, p.ink, Color::Cyan].contains(&bg),
+                    "{modal:?}: cell ({x}, {y}) has background {bg:?}\n{screen}"
+                );
+            }
+        }
+        close_modals(&mut app);
+    }
     let _ = fs::remove_dir_all(&dir);
 }

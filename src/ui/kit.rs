@@ -5,6 +5,8 @@
 
 use std::time::{Duration, Instant};
 
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
@@ -185,6 +187,19 @@ fn truncate_spans(spans: Vec<Span<'_>>, width: usize) -> Vec<Span<'_>> {
         return out;
     }
     out
+}
+
+/// Blank `area` for a modal drawn over the screen: every cell is reset and set to INK on GROUND.
+/// Use this instead of ratatui's `Clear`, which leaves the cells on the terminal's default
+/// background.
+pub fn clear(buf: &mut Buffer, area: Rect) {
+    let area = area.intersection(buf.area);
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            buf[(x, y)].reset();
+        }
+    }
+    buf.set_style(area, theme::base());
 }
 
 /// `VOL ▮▮▮▮▮▮▮▯▯▯▯ 65`: 11 cells, filled in INK, empty in DIM, the number in bold INK.
