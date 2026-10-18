@@ -95,16 +95,18 @@ impl ChromeLayout {
     }
 }
 
-/// Tab labels (`1 NOW PLAYING`, …) for a terminal `width` columns wide: the label set of its
-/// width tier, else the short set, else (issue #59) only the numbers plus the active tab's short
-/// label, so the active tab is always shown whole.
-pub(super) fn tab_titles(width: u16, active: usize) -> Vec<String> {
+/// Tab labels (`1 NOW PLAYING`, …) for a terminal `width` columns wide, each with its tab index:
+/// the label set of its width tier, else the short set, else (issue #59) only the numbers plus
+/// the active tab's short label. When even that does not fit, the numbers farthest from the
+/// active tab go first (the later of two as far), and an active label too wide on its own is
+/// cut with `…`, so the active tab is always shown and never clipped.
+pub(super) fn tab_titles(width: u16, active: usize) -> Vec<(usize, String)> {
     let room = usize::from(width.saturating_sub(2 * GUTTER));
-    let numbered = |labels: &[&str; 5]| -> Vec<String> {
+    let numbered = |labels: &[&str; 5]| -> Vec<(usize, String)> {
         labels
             .iter()
             .enumerate()
-            .map(|(i, label)| format!("{} {}", i + 1, label))
+            .map(|(i, label)| (i, format!("{} {}", i + 1, label)))
             .collect()
     };
     let tier_labels = match WidthTier::from_width(width) {
@@ -118,22 +120,41 @@ pub(super) fn tab_titles(width: u16, active: usize) -> Vec<String> {
             return titles;
         }
     }
-    SHORT_TAB_LABELS
-        .iter()
-        .enumerate()
-        .map(|(i, label)| {
+    let mut titles: Vec<(usize, String)> = numbered(&SHORT_TAB_LABELS)
+        .into_iter()
+        .map(|(i, title)| {
             if i == active {
-                format!("{} {}", i + 1, label)
+                (i, title)
             } else {
-                (i + 1).to_string()
+                (i, (i + 1).to_string())
             }
         })
-        .collect()
+        .collect();
+    while tab_row_width(&titles) > room {
+        let farthest = titles
+            .iter()
+            .enumerate()
+            .filter(|(_, (i, _))| *i != active)
+            .max_by_key(|(_, (i, _))| (i.abs_diff(active), *i))
+            .map(|(pos, _)| pos);
+        match farthest {
+            Some(pos) => {
+                titles.remove(pos);
+            }
+            None => break,
+        }
+    }
+    if tab_row_width(&titles) > room {
+        for (_, title) in &mut titles {
+            *title = kit::clip(title, room.saturating_sub(2));
+        }
+    }
+    titles
 }
 
 /// Columns the tab row takes: each title padded by one column on each side, `TAB_GAP` apart.
-fn tab_row_width(titles: &[String]) -> usize {
-    titles.iter().map(|t| text_width(t) + 2).sum::<usize>() + TAB_GAP * titles.len().saturating_sub(1)
+fn tab_row_width(titles: &[(usize, String)]) -> usize {
+    titles.iter().map(|(_, t)| text_width(t) + 2).sum::<usize>() + TAB_GAP * titles.len().saturating_sub(1)
 }
 
 /// `left` at the start of a `width`-column line and `right` against its end, with spaces between.
@@ -201,11 +222,11 @@ impl AppUI {
     pub(super) fn render_tab_row(&mut self, f: &mut Frame, area: Rect, screen: &Screen, with_status: bool) {
         let titles = tab_titles(screen.area.width, self.active_tab);
         let mut left = Vec::new();
-        for (i, title) in titles.iter().enumerate() {
-            if i > 0 {
+        for (pos, (tab, title)) in titles.iter().enumerate() {
+            if pos > 0 {
                 left.push(Span::raw(" ".repeat(TAB_GAP)));
             }
-            let style = if i == self.active_tab {
+            let style = if *tab == self.active_tab {
                 theme::cursor()
             } else {
                 theme::mid()

@@ -953,3 +953,63 @@ fn spotlight_hint_is_cleared_when_spotlight_closes() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// The active tab chip on the tab row (row 3 from 24 rows): its text and first column.
+fn active_chip(buffer: &ratatui::buffer::Buffer) -> (String, u16) {
+    let ink = theme::palette().ink;
+    let y = 3;
+    let xs: Vec<u16> = (0..buffer.area.width).filter(|&x| buffer[(x, y)].bg == ink).collect();
+    assert!(
+        !xs.is_empty(),
+        "no chip on the tab row:\n{}",
+        tui::rows(buffer).join("\n")
+    );
+    let text = xs
+        .iter()
+        .map(|&x| buffer[(x, y)].symbol().to_string())
+        .collect::<String>();
+    (text, xs[0])
+}
+
+#[test]
+fn tab_row_keeps_the_active_chip_whole_down_to_20_columns() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("tabs_narrow");
+    let labels = ["1 NOW", "2 QUEUE", "3 DEVICES", "4 SETTINGS", "5 PLAYLISTS"];
+    for width in [36u16, 30, 24, 20] {
+        for (tab, label) in labels.iter().enumerate() {
+            app.active_tab = tab;
+            let buffer = tui::render(&mut app, width, 24);
+            let row = tui::row(&buffer, 3);
+            let (chip, _) = active_chip(&buffer);
+            assert_eq!(chip, format!(" {label} "), "tab {tab} at {width}: {row:?}");
+            assert!(row.ends_with("  "), "right gutter kept at {width}: {row:?}");
+            // The numbers that remain are the ones nearest the active tab, in order.
+            let numbers: Vec<usize> = row.split_whitespace().filter_map(|w| w.parse::<usize>().ok()).collect();
+            let mut sorted = numbers.clone();
+            sorted.sort();
+            assert_eq!(numbers, sorted, "tab order kept: {row:?}");
+            let farthest = numbers.iter().map(|&n| (n as isize - 1 - tab as isize).abs()).max();
+            let missing = (1..=5)
+                .filter(|n| !numbers.contains(n) && *n != tab + 1)
+                .map(|n| (n as isize - 1 - tab as isize).abs())
+                .min();
+            if let (Some(far), Some(miss)) = (farthest, missing) {
+                assert!(far <= miss, "a farther tab kept over a nearer one: {row:?}");
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tab_row_cuts_the_active_chip_with_an_ellipsis_when_it_alone_does_not_fit() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("tabs_tiny");
+    app.active_tab = 4;
+    let buffer = tui::render(&mut app, 14, 24);
+    let (chip, x) = active_chip(&buffer);
+    assert_eq!(chip, " 5 PLAYL… ", "{:?}", tui::row(&buffer, 3));
+    assert_eq!(x, 2, "after the left gutter");
+    let _ = fs::remove_dir_all(&dir);
+}
