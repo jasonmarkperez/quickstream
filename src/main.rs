@@ -181,7 +181,14 @@ fn main() -> anyhow::Result<()> {
         settings_mgr.settings.web_server_port = port;
         settings_mgr.settings.web_server_enabled = true;
     }
-    let explicit_dir = cli.paths.first().filter(|p| !is_supported_audio_file(p)).cloned();
+    // Absolute from here on: relative paths would reach playlists and resolve against the
+    // playlists folder on the next start.
+    let cli_paths: Vec<PathBuf> = cli
+        .paths
+        .iter()
+        .map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone()))
+        .collect();
+    let explicit_dir = cli_paths.first().filter(|p| !is_supported_audio_file(p)).cloned();
     let start_dir = explicit_dir.or_else(|| {
         settings_mgr
             .settings
@@ -195,7 +202,8 @@ fn main() -> anyhow::Result<()> {
     // Check for Autopilot mode
     if let Some(autopilot_target) = cli.autopilot {
         let target_dir = autopilot_target
-            .or_else(|| cli.paths.first().filter(|p| !is_supported_audio_file(p)).cloned())
+            .map(|p| std::path::absolute(&p).unwrap_or(p))
+            .or_else(|| cli_paths.first().filter(|p| !is_supported_audio_file(p)).cloned())
             .or_else(|| {
                 app.settings_mgr
                     .settings
@@ -208,7 +216,7 @@ fn main() -> anyhow::Result<()> {
         app.start_autopilot(target_dir);
     } else {
         // Pre-queue any explicit files passed on CLI
-        for path in &cli.paths {
+        for path in &cli_paths {
             if is_supported_audio_file(path) {
                 if let Ok(meta) = extract_metadata(path) {
                     app.queue.add_track(meta);

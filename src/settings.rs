@@ -31,6 +31,9 @@ pub struct Settings {
     /// while active regardless of this setting.
     #[serde(default)]
     pub web_server_lan: bool,
+    /// Playlist the add picker (`L`) highlights first: the one last added to.
+    #[serde(default)]
+    pub last_playlist: Option<String>,
 }
 
 fn default_web_port() -> u16 {
@@ -62,6 +65,7 @@ impl Default for Settings {
             default_mix_profile: "diverse".to_string(),
             online_enrichment: false,
             web_server_lan: false,
+            last_playlist: None,
         }
     }
 }
