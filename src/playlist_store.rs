@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 
 use crate::persist::PersistHandle;
 use crate::playlist::{
-    name_key, names_equal, parse_m3u8, playlist_file_path, validate_name, NameError, Playlist, PlaylistEntry,
-    PLAYLIST_EXT,
+    name_key, names_equal, normalize_path, parse_m3u8, playlist_file_path, validate_name, NameError, Playlist,
+    PlaylistEntry, PLAYLIST_EXT,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,7 +229,8 @@ impl PlaylistStore {
 
     /// Append `entries` to the playlist named `name`, skipping any whose path is already in it
     /// (including repeats within `entries`) or contains a line break, which would split its
-    /// M3U8 line. Writes the file only when something was added.
+    /// M3U8 line. Paths are made absolute and normalized before the check, so `/m/a/../a/x.mp3`
+    /// matches `/m/a/x.mp3`. Writes the file only when something was added.
     pub fn add(&mut self, name: &str, entries: Vec<PlaylistEntry>) -> Result<AddResult, StoreError> {
         let (slot, path) = self.locate(name)?;
         let playlist = &mut self.playlists[slot];
@@ -237,10 +238,13 @@ impl PlaylistStore {
         let (mut added, mut skipped) = (0, 0);
         for mut entry in entries {
             // A relative path (`quickstream .`) would be read back against the playlists
-            // folder, so store it absolute. `std::path::absolute` never reads the disk.
+            // folder, so store it absolute. `std::path::absolute` never reads the disk but keeps
+            // `..` on Unix, so normalize too: the same file reached through `..` is then a
+            // duplicate, and no `..` is written to the file (issue #58).
             if let Ok(abs) = std::path::absolute(&entry.path) {
                 entry.path = abs;
             }
+            entry.path = normalize_path(&entry.path);
             let bytes = entry.path.as_os_str().as_encoded_bytes();
             if bytes.contains(&b'\n') || bytes.contains(&b'\r') {
                 skipped += 1;

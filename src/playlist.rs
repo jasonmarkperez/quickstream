@@ -1,7 +1,7 @@
 //! Playlists (issue #37): the extended M3U8 file format, playlist names, and turning a playlist
 //! into queue tracks. Pure: nothing here reads or writes the disk, so it is safe on the UI thread.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::metadata::AudioMetadata;
 
@@ -108,8 +108,9 @@ impl Playlist {
 /// Parse extended M3U / M3U8 text, including files edited by hand or copied in from other
 /// players: a leading BOM, CRLF line endings, blank lines and unknown `#` lines are accepted.
 /// `name` (the file stem) is the playlist's name; a `#PLAYLIST` line is ignored. Relative paths
-/// are resolved against `base_dir`, the folder holding the playlist file. Any other line is kept
-/// as a path entry as written (a Windows path or a `file://` URL simply shows up as missing).
+/// are resolved against `base_dir`, the folder holding the playlist file, and every path is
+/// normalized with [`normalize_path`] so a `..` is never written back. Any other line is kept
+/// as a path entry (a Windows path or a `file://` URL simply shows up as missing).
 pub fn parse_m3u8(name: &str, text: &str, base_dir: &Path) -> Playlist {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut playlist = Playlist::new(name);
@@ -128,7 +129,7 @@ pub fn parse_m3u8(name: &str, text: &str, base_dir: &Path) -> Playlist {
             continue;
         }
         // `join` keeps an absolute path unchanged and resolves a relative one against the folder.
-        let path = base_dir.join(line);
+        let path = normalize_path(&base_dir.join(line));
         let (duration_secs, label) = pending.take().unwrap_or((-1, String::new()));
         let (artist, title) = split_label(&label);
         let title = if title.is_empty() { file_stem(&path) } else { title };
@@ -140,6 +141,39 @@ pub fn parse_m3u8(name: &str, text: &str, base_dir: &Path) -> Playlist {
         });
     }
     playlist
+}
+
+/// `path` with `.` components dropped and each `..` cancelling the component before it, worked
+/// out from the text alone (issue #58): the disk is never read and symlinks are not followed, so
+/// `link/..` becomes the folder holding `link` even when `link` points elsewhere. A `..` right
+/// after the root is dropped, as the OS does; on a relative path a leading `..` with nothing to
+/// cancel is kept. A relative path that cancels out entirely becomes `.`.
+pub fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    // Normal components in `out` that a later `..` may cancel.
+    let mut depth = 0usize;
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => out.push(component),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if depth > 0 {
+                    out.pop();
+                    depth -= 1;
+                } else if !out.has_root() {
+                    out.push(component);
+                }
+            }
+            Component::Normal(name) => {
+                out.push(name);
+                depth += 1;
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push(Component::CurDir);
+    }
+    out
 }
 
 /// The text after `#EXTINF:` (tag matched case-insensitively), or `None` for any other line.

@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use quickstream::metadata::AudioMetadata;
 use quickstream::playlist::{
-    names_equal, parse_m3u8, placeholder_metadata, plan_queue, playlist_file_path, validate_name, NameError, Playlist,
-    PlaylistEntry, MAX_NAME_CHARS,
+    names_equal, normalize_path, parse_m3u8, placeholder_metadata, plan_queue, playlist_file_path, validate_name,
+    NameError, Playlist, PlaylistEntry, MAX_NAME_CHARS,
 };
 
 fn entry(path: &str, secs: i64, artist: &str, title: &str) -> PlaylistEntry {
@@ -171,10 +171,95 @@ fn test_parse_resolves_relative_paths_against_base_dir() {
         paths,
         vec![
             base.join("Sub Dir/a.mp3"),
-            base.join("../Music/b.flac"),
+            PathBuf::from("/Users/me/.config/quickstream/Music/b.flac"),
             PathBuf::from("/abs/c.ogg"),
         ]
     );
+}
+
+/// Issue #58: a hand-written `..` entry is resolved when read, so the first edit never writes
+/// `<playlists>/../../..` back and the path does not depend on what the playlists folder is.
+#[test]
+fn test_parse_normalizes_dot_dot_and_dot_entries() {
+    common::isolate();
+    let base = Path::new("/home/me/.config/quickstream/playlists");
+    let text = "../../../../music/x.mp3\n./here.mp3\n/m/a/../b/./c.flac\n/../../root.mp3\n";
+    let parsed = parse_m3u8("p", text, base);
+    let paths: Vec<PathBuf> = parsed.entries.iter().map(|e| e.path.clone()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            PathBuf::from("/home/music/x.mp3"),
+            base.join("here.mp3"),
+            PathBuf::from("/m/b/c.flac"),
+            PathBuf::from("/root.mp3"),
+        ]
+    );
+    // The file stem fallback title still comes from the file name.
+    assert_eq!(parsed.entries[0].title, "x");
+}
+
+#[test]
+fn test_write_after_parse_contains_no_dot_dot() {
+    common::isolate();
+    let base = Path::new("/home/me/.config/quickstream/playlists");
+    let parsed = parse_m3u8("p", "#EXTINF:10,A - X\n../../../../music/x.mp3\n/m/a/../y.mp3\n", base);
+    let written = parsed.to_m3u8();
+    assert!(!written.contains(".."), "written playlist keeps `..`: {:?}", written);
+    assert!(written.contains("\n/home/music/x.mp3\n"), "{:?}", written);
+    assert!(written.contains("\n/m/y.mp3\n"), "{:?}", written);
+    assert_eq!(parse_m3u8("p", &written, base), parsed);
+}
+
+#[test]
+fn test_normalize_path_is_lexical() {
+    common::isolate();
+    let cases = [
+        ("/a/./b/../c", "/a/c"),
+        ("/../x", "/x"),
+        ("/../../x/../../y", "/y"),
+        ("/a/b/..", "/a"),
+        ("/a/b/.", "/a/b"),
+        ("/a/b/", "/a/b"),
+        ("/a//b", "/a/b"),
+        ("/a/b/../..", "/"),
+        ("/", "/"),
+        ("/a/b/c.flac", "/a/b/c.flac"),
+        ("/Music/..hidden/x...mp3", "/Music/..hidden/x...mp3"),
+        // Relative paths keep a leading `..` that has nothing to cancel.
+        ("a/../b", "b"),
+        ("./a/./b", "a/b"),
+        ("../a", "../a"),
+        ("a/../../b", "../b"),
+        ("a/..", "."),
+        (".", "."),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(
+            normalize_path(Path::new(input)).as_os_str(),
+            Path::new(expected).as_os_str(),
+            "normalize_path({:?})",
+            input
+        );
+    }
+}
+
+/// Lexical only: the disk is never read, so a symlink is not followed and a path that does not
+/// exist normalizes like any other.
+#[test]
+fn test_normalize_path_does_not_follow_symlinks() {
+    let root = common::isolate();
+    let dir = root.join("normalize_symlink");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("real/deep")).unwrap();
+    std::os::unix::fs::symlink(dir.join("real/deep"), dir.join("link")).unwrap();
+    // The OS would resolve `link/..` to `real`; lexically it is `dir` itself.
+    assert_eq!(normalize_path(&dir.join("link/../x.mp3")), dir.join("x.mp3"));
+    assert_eq!(
+        normalize_path(Path::new("/nonexistent/qs/../a.mp3")),
+        PathBuf::from("/nonexistent/a.mp3")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

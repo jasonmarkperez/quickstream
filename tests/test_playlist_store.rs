@@ -340,6 +340,100 @@ fn test_add_stores_relative_paths_as_absolute() {
     assert_eq!(path, &std::env::current_dir().unwrap().join("rel/a.mp3"));
 }
 
+/// Issue #58: `quickstream ./music/../music` hands the store `..` paths. They are normalized
+/// before the duplicate check, so the same file reached another way is not added twice and no
+/// `..` is written to the file.
+#[test]
+fn test_add_normalizes_paths_before_the_duplicate_check() {
+    common::isolate();
+    let dir = scratch("add_normalize");
+    let (worker, mut store) = open_store(&dir);
+    store.create("Mix").unwrap();
+    let mut plain = entry("x");
+    plain.path = PathBuf::from("/a/music/x.mp3");
+    store.add("Mix", vec![plain.clone()]).unwrap();
+
+    let mut dotted = entry("x");
+    dotted.path = PathBuf::from("/a/music/../music/x.mp3");
+    let mut dot = entry("x");
+    dot.path = PathBuf::from("/a/./music/./x.mp3");
+    assert_eq!(
+        store.add("Mix", vec![dotted]),
+        Ok(AddResult {
+            added: 0,
+            skipped: 1,
+            total: 1
+        })
+    );
+    assert_eq!(
+        store.add("Mix", vec![dot]),
+        Ok(AddResult {
+            added: 0,
+            skipped: 1,
+            total: 1
+        })
+    );
+
+    // A new file given with `..` is stored normalized, and a repeat within one add is skipped.
+    let mut new_dotted = entry("y");
+    new_dotted.path = PathBuf::from("/a/other/../music/y.mp3");
+    let mut new_plain = entry("y");
+    new_plain.path = PathBuf::from("/a/music/y.mp3");
+    assert_eq!(
+        store.add("Mix", vec![new_dotted, new_plain]),
+        Ok(AddResult {
+            added: 1,
+            skipped: 1,
+            total: 2
+        })
+    );
+    assert_eq!(
+        paths(&store.get("Mix").unwrap().entries),
+        vec![PathBuf::from("/a/music/x.mp3"), PathBuf::from("/a/music/y.mp3")]
+    );
+
+    // A relative `..` path is made absolute and then normalized.
+    let mut rel = entry("z");
+    rel.path = PathBuf::from("rel/../z.mp3");
+    store.add("Mix", vec![rel]).unwrap();
+    assert!(worker.flush());
+    let text = fs::read_to_string(dir.join("Mix.m3u8")).unwrap();
+    assert!(!text.contains(".."), "file keeps `..`: {:?}", text);
+    assert_eq!(
+        on_disk(&dir, "Mix").entries[2].path,
+        std::env::current_dir().unwrap().join("z.mp3")
+    );
+}
+
+/// Issue #58: a hand-written relative entry is loaded normalized and the first edit writes it
+/// back without `..`; adding the same file by its absolute path is a duplicate.
+#[test]
+fn test_hand_written_dot_dot_entry_is_written_back_normalized() {
+    common::isolate();
+    let dir = scratch("load_dot_dot");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("Hand.m3u8"), "#EXTM3U\n../music/x.mp3\n").unwrap();
+    let music = dir.parent().unwrap().join("music/x.mp3");
+
+    let (worker, mut store) = open_store(&dir);
+    assert_eq!(paths(&store.get("Hand").unwrap().entries), vec![music.clone()]);
+    let mut same = entry("x");
+    same.path = music.clone();
+    assert_eq!(
+        store.add("Hand", vec![same]),
+        Ok(AddResult {
+            added: 0,
+            skipped: 1,
+            total: 1
+        })
+    );
+    store.add("Hand", vec![entry("a")]).unwrap();
+    assert!(worker.flush());
+    let text = fs::read_to_string(dir.join("Hand.m3u8")).unwrap();
+    assert!(!text.contains(".."), "file keeps `..`: {:?}", text);
+    assert_eq!(paths(&on_disk(&dir, "Hand").entries), vec![music, entry("a").path]);
+}
+
 /// A line break in a path would split the M3U8 line and corrupt the file, so such entries
 /// are skipped.
 #[test]

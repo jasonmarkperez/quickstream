@@ -69,9 +69,10 @@ pub struct Playlist {
   - strips a leading UTF-8 BOM and accepts CRLF;
   - ignores blank lines and `#` lines other than `#EXTINF` (including `#EXTM3U` and `#PLAYLIST`);
   - takes duration, artist and title from the `#EXTINF` line before an entry; splits `<artist> - <title>` at the first ` - `; `#EXTINF` text without ` - ` is the title;
-  - resolves relative paths against `base_dir` (the playlist file's folder);
+  - resolves relative paths against `base_dir` (the playlist file's folder), then normalizes every path with `normalize_path` (issue #58);
   - an entry without `#EXTINF` gets duration `-1`, empty artist and the file stem as title.
   The playlist's name is the file stem, not `#PLAYLIST`. The path line, not the `#EXTINF` text, is the source of truth for the file, so an artist containing ` - ` only affects display.
+- `normalize_path(path: &Path) -> PathBuf` (issue #58) normalizes a path lexically: drops `.` components and lets each `..` cancel the component before it. It never reads the disk and never follows symlinks (`link/..` is the folder holding `link`). A `..` right after the root is dropped, as the OS does (`/../x` → `/x`); on a relative path a leading `..` with nothing to cancel is kept. A hand-written `../../music/x.mp3` entry is therefore loaded as an absolute path without `..`, and the first edit never writes `<playlists>/../..` back.
 - `validate_name(name: &str) -> Result<String, NameError>` trims whitespace, then rejects: empty, longer than 100 characters, containing `/`, `\`, NUL or other control characters, or starting with `.`. Returns the trimmed name.
 - Name comparison matches the default macOS file system (APFS), which treats these names as one file: it ignores case using full Unicode case folding (`Straße` = `Strasse`) and ignores Unicode normalization (NFC `Zoë` = NFD `Zoë`). The `names_equal` helper compares `name_key`, the canonical caseless key NFD(casefold(NFD(name))) (issue #55).
 
@@ -87,7 +88,7 @@ pub struct Playlist {
 - At startup a worker (`self.workers.spawn`) reads every `*.m3u8` in the playlists folder and sends the parsed playlists to the UI over an mpsc channel. Until the result arrives the tab shows `Loading playlists…`. A file that cannot be read or is not valid UTF-8 is logged and skipped. It is never rewritten or renamed. If the folder exists but cannot be listed (permissions, an entry that cannot be read, or a symlink whose target is missing), the load fails: the store stays not loaded, the tab shows `Couldn't load playlists`, and every edit is refused for the session, so no create can overwrite a file the store never read (issue #56).
 - Operations, each changing the in-memory copy first and then handing the full file contents to the background writer (`PersistHandle::save`, atomic temp-file-then-rename):
   - `create(name)` – fails on an invalid name or a case-insensitive duplicate;
-  - `add(name, entries) -> AddResult { added, skipped_duplicates }` – a duplicate is an entry whose path is already in the playlist;
+  - `add(name, entries) -> AddResult { added, skipped_duplicates }` – a duplicate is an entry whose path is already in the playlist. Each path is first made absolute (`std::path::absolute`) and normalized with `normalize_path`, so the same file reached through `..` (`quickstream ./music/../music`) is a duplicate and no `..` is stored (issue #58);
   - `remove(name, index)`;
   - `move_entry(name, index, up|down)` – no wraparound for moves;
   - `rename(old, new)` – validates the new name. The duplicate check ignores the playlist being renamed, so a case-only rename (`road trip` → `Road Trip`) is allowed. The file is moved with the operating system's rename (`fs::rename(old_path, new_path)`), then the new file is saved again so its `#PLAYLIST` line shows the new name. Rename never uses "write new file, then delete old file": on a case-insensitive disk (the macOS default) `road trip.m3u8` and `Road Trip.m3u8` are the same file, so deleting the old name would delete the playlist just written;
@@ -171,7 +172,7 @@ Tests are written before the code they cover. New file `tests/test_playlists.rs`
 
 1. **M3U8 format**
    - write then parse returns the same playlist;
-   - parse handles a BOM, CRLF, unknown `#` lines, blank lines, relative paths, `#EXTINF:-1`, entries without `#EXTINF`;
+   - parse handles a BOM, CRLF, unknown `#` lines, blank lines, relative paths, `..` and `.` entries (normalized, never written back), `#EXTINF:-1`, entries without `#EXTINF`;
    - an artist containing ` - ` keeps the path correct.
 2. **Names**: each rejection rule; trimming; case-insensitive duplicates on create and rename; case-only rename allowed.
 3. **Store**

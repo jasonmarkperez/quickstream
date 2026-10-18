@@ -21,7 +21,7 @@ This guide is intended for AI coding agents and automated development tools work
    - All persistent application data strictly complies with the XDG Base Directory specification:
      - Configuration: `~/.config/quickstream/config.json` (includes `last_playlist`, the playlist the add picker preselects)
      - Bookmarks: `~/.config/quickstream/bookmarks.json`
-     - Playlists: `~/.config/quickstream/playlists/<name>.m3u8` (`paths::get_playlists_dir()`; extended M3U8, UTF-8, LF, absolute track paths, one file per playlist). Every write, rename and delete goes through `PlaylistStore` and `playlist::playlist_file_path`, which refuses any path whose parent is not the playlists folder. Missing-file checks never prune a playlist, and a file that fails to load is skipped and never rewritten.
+     - Playlists: `~/.config/quickstream/playlists/<name>.m3u8` (`paths::get_playlists_dir()`; extended M3U8, UTF-8, LF, absolute track paths, one file per playlist). Track paths are normalized lexically with `playlist::normalize_path` (no `.` or `..`, no disk access, symlinks not followed) when a file is parsed and before `PlaylistStore::add`'s duplicate check. Every write, rename and delete goes through `PlaylistStore` and `playlist::playlist_file_path`, which refuses any path whose parent is not the playlists folder. Missing-file checks never prune a playlist, and a file that fails to load is skipped and never rewritten.
      - Track Analysis Database: `~/.cache/quickstream/track_analysis.db` (SQLite)
      - Cache Indexes: `~/.cache/quickstream/music_index.jsonl`
      - Logs: `~/.local/share/quickstream/quickstream.log`
