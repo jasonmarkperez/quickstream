@@ -514,6 +514,13 @@ fn keycap_count(buffer: &ratatui::buffer::Buffer, y: u16) -> usize {
     count
 }
 
+/// The header: the row holding `QUICKSTREAM`.
+fn header_row(buffer: &ratatui::buffer::Buffer) -> String {
+    let y = tui::find_row(buffer, "QUICKSTREAM")
+        .unwrap_or_else(|| panic!("no header row:\n{}", tui::rows(buffer).join("\n")));
+    tui::row(buffer, y)
+}
+
 /// `HH:MM` at the end of `text` (ignoring trailing spaces).
 fn ends_with_clock(text: &str) -> bool {
     let t: Vec<char> = text.trim_end().chars().collect();
@@ -560,7 +567,7 @@ fn header_shows_name_version_output_and_clock() {
     common::isolate();
     let (mut app, dir) = chrome_app("header");
     let buffer = tui::render(&mut app, 120, 40);
-    let header = tui::row(&buffer, 1);
+    let header = header_row(&buffer);
     let name = format!("  QUICKSTREAM ▪ {}", env!("CARGO_PKG_VERSION"));
     assert!(header.starts_with(&name), "{header:?}");
     assert!(header.contains("LOCAL/MPV"), "{header:?}");
@@ -578,7 +585,7 @@ fn header_shows_name_version_output_and_clock() {
 
     // The backend setting names the local output.
     app.settings_mgr.settings.player_backend = "ffplay".to_string();
-    let header = tui::row(&tui::render(&mut app, 120, 40), 1);
+    let header = header_row(&tui::render(&mut app, 120, 40));
     assert!(header.contains("LOCAL/FFPLAY"), "{header:?}");
     let _ = fs::remove_dir_all(&dir);
 }
@@ -592,17 +599,17 @@ fn header_shows_web_port_only_while_the_server_runs() {
     let mut app = AppUI::new(None, settings_mgr);
     let port = app.web_server.as_ref().expect("server running").port;
 
-    let header = tui::row(&tui::render(&mut app, 120, 40), 1);
+    let header = header_row(&tui::render(&mut app, 120, 40));
     assert!(header.contains(&format!("WEB :{port}")), "{header:?}");
     assert!(ends_with_clock(&header), "{header:?}");
 
     // Narrow: the WEB badge goes first, the clock stays.
-    let header = tui::row(&tui::render(&mut app, 40, 30), 1);
+    let header = header_row(&tui::render(&mut app, 40, 30));
     assert!(!header.contains("WEB :"), "{header:?}");
     assert!(ends_with_clock(&header), "{header:?}");
 
     app.web_server = None;
-    let header = tui::row(&tui::render(&mut app, 120, 40), 1);
+    let header = header_row(&tui::render(&mut app, 120, 40));
     assert!(!header.contains("WEB :"), "{header:?}");
 }
 

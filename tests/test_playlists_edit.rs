@@ -889,7 +889,7 @@ fn test_rename_collision_status_is_not_cut_off_at_120_columns() {
     let (row, buffer) = status_row(&mut app, 120, "Kept \"TitleOnly\"");
     assert!(row.contains(" ?  KEYS"), "{row}");
     assert!(row.contains(" C ⇧R ⇧D  NEW / RENAME / DELETE"), "{row}");
-    let header = common::tui::row(&buffer, 1);
+    let header = common::tui::row(&buffer, common::tui::find_row(&buffer, "QUICKSTREAM").expect("header"));
     assert!(header.contains("LOCAL/MPV"), "{header}");
     let strip = common::tui::find_row(&buffer, "NO TRACK LOADED").expect("strip");
     assert!(common::tui::row(&buffer, strip).contains("VOL "), "volume in the strip");
