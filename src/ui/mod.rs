@@ -3715,7 +3715,7 @@ impl AppUI {
             .device_manager
             .get_active_device()
             .map(|d| d.friendly_name)
-            .unwrap_or_else(|| format!("Local Audio ({})", self.settings_mgr.settings.player_backend));
+            .unwrap_or_else(|| format!("Local Audio ({})", self.local_backend()));
         row1.push(Span::raw("  "));
         row1.push(Span::styled(
             format!("[Output: {}]", active_dev_name),

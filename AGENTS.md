@@ -33,7 +33,7 @@ This guide is intended for AI coding agents and automated development tools work
 
 5. **Dual Playback Architecture**:
    - Quickstream abstracts playback through the unified `AudioPlayer` trait (`src/player/mod.rs`):
-     - `play(path, offset)` / `pause()` / `resume()` / `stop()` / `seek(seconds)` / `set_volume(level)` / `get_position()` / `get_state()`.
+     - `play(path, offset)` / `pause()` / `resume()` / `stop()` / `seek(seconds)` / `set_volume(level)` / `get_position()` / `get_state()` / `backend_name()` (the local backend actually playing, `mpv` or `ffplay` after a fallback; `None` for DLNA).
    - **Local Playback**: Implemented by `LocalPlayer` (`src/player/local.rs`) utilizing an `mpv` JSON-RPC IPC Unix domain socket with a dedicated listener thread, falling back to `ffplay` subprocess.
    - **DLNA / UPnP Streaming**: Implemented by `UPnPPlayer` (`src/player/upnp.rs`) sending SOAP XML payloads (`AVTransport` / `RenderingControl`) to discovered network renderers, while `WebServer` (`src/web.rs`) serves audio over HTTP with Byte-Range support (`206 Partial Content`) and continuous streaming (`/stream/continuous-<nonce>.wav`, armed per UPnP continuous session via `StreamServerState::arm_continuous_session()`; other continuous paths return 404).
 
@@ -118,7 +118,7 @@ quickstream/
     └── test_web_playlists.rs # Web playlists: snapshot, GET /api/playlists, play/append, edits, path checks
 ```
 
-TUI tests render through the shared helpers in `tests/common/tui.rs` (`render`, `rows`, `find_row`, `find_text`, `cell_style`, `text_styles`): find chrome rows by their text, not by row number.
+TUI tests render through the shared helpers in `tests/common/tui.rs` (`render`, `rows`, `find_row`, `find_text`, `cell_style`, `text_styles`): find chrome rows by their text, not by row number. `tests/common/fake_player.rs` (`FakePlayer`) stands in for the player when a test needs a given position, play state or backend.
 
 The background writer's create, delete and rename tests (used by `PlaylistStore`), including the failure reports, are in the existing `tests/test_persistence_worker.rs`, which the map above does not list.
 
@@ -128,7 +128,7 @@ The background writer's create, delete and rename tests (used by `PlaylistStore`
 
 ### 5-Tab Layout Structure
 - **Screen chrome** (`src/ui/chrome.rs`, Telemetry style 2a, colours from `ui::theme`; the tab bodies keep their own widgets and foreground colours until they are restyled, with selection rows in `theme::cursor()`): `render` first fills every cell with `theme::base()` (INK on GROUND), then draws, with 2-column gutters on both sides: top margin, **header**, blank row, **tab row**, a gap (2 rows from 30 rows tall, else 1), the tab body, blank row, **rule** and **strip** (not on Now Playing), blank row, **key row**, bottom margin. Under 24 rows: tab row (with the header's right-hand part folded in), body, strip, key row (`ChromeLayout`).
-  - **Header**: `QUICKSTREAM ▪ <version>` on the left; on the right the output (`LOCAL/<BACKEND>` or `DLNA/<RENDERER>`), `WEB :<port>` (only while the web server runs) and the clock (`HH:MM`, `kit::ClockCache`), 4 columns apart. When narrow, `WEB` goes first, then the output.
+  - **Header**: `QUICKSTREAM ▪ <version>` on the left; on the right the output (`LOCAL/<BACKEND>` or `DLNA/<RENDERER>`; the backend is the one actually playing, from `AudioPlayer::backend_name`, so `LOCAL/FFPLAY` once mpv is missing or failed, and the `player_backend` setting until the player has reported), `WEB :<port>` (only while the web server runs) and the clock (`HH:MM`, `kit::ClockCache`), 4 columns apart. When narrow, `WEB` goes first, then the output.
   - **Tab row**: `1 NOW PLAYING` `2 QUEUE & LIBRARY` `3 DEVICES` `4 SETTINGS` `5 PLAYLISTS` from 110 columns; `2 QUEUE` at 90–109; `1 NOW` … under 90; when even those don't fit, only the numbers plus the active tab's short label (#59); under about 37 columns the numbers farthest from the active tab go too, and an active label too wide on its own is cut with `…`, so the active tab is always shown and never clipped (`tab_titles`). The active tab is a chip in `theme::cursor()` (GROUND on INK, bold); the others are MID.
   - **Key row**: keycaps (` SPC ` in `theme::keycap()`) and MID labels, 4 columns apart, per tab and focused pane (`AppUI::tab_key_hints`; only keys the handlers act on, e.g. tab 5 shows `C ⇧R ⇧D` in the list pane and `⇧J ⇧K MOVE TRACK` / `D REMOVE` in the tracks pane). `? KEYS` is always kept (except while spotlight or the startup home editor takes typed text, where `?` is text). Now Playing: `SPC PLAY/PAUSE`, `←→ TRACK`, `[ ] SEEK <seek_step_seconds>S`, `+− VOL`, `N QUEUE`, `? KEYS`, then the volume meter; `N QUEUE` stays at every width and Esc is never offered (#57). At 80–89 columns at most 5 keys. The status message sits at the right end (ERROR colour when it contains error/failed/couldn't, else MID; messages that repeat the screen, such as `Welcome to Quickstream…` or `Playing:`, are not shown). A long status drops the least important keys first, then is cut with `…`.
 - **Main View Area**:

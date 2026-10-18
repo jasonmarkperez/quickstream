@@ -13,6 +13,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use common::fake_player::FakePlayer;
 use common::tui;
 use quickstream::metadata::AudioMetadata;
 use quickstream::settings::SettingsManager;
@@ -584,10 +585,24 @@ fn header_shows_name_version_output_and_clock() {
     let styles = tui::text_styles(&buffer, "LOCAL/MPV").unwrap();
     assert!(styles.iter().all(|s| s.fg == Some(theme::palette().mid)));
 
-    // The backend setting names the local output.
+    // The header names the backend the player runs, not the setting: mpv is set, but without
+    // mpv the local player falls back to ffplay.
+    app.settings_mgr.settings.player_backend = "mpv".to_string();
+    app.player = Box::new(FakePlayer {
+        backend: Some("ffplay"),
+        ..Default::default()
+    });
+    let header = header_row(&tui::render(&mut app, 120, 40));
+    assert!(header.contains("LOCAL/FFPLAY"), "{header:?}");
+
+    // A player that names no backend (before the worker's first report) falls back to the setting.
+    app.player = Box::new(FakePlayer::default());
     app.settings_mgr.settings.player_backend = "ffplay".to_string();
     let header = header_row(&tui::render(&mut app, 120, 40));
     assert!(header.contains("LOCAL/FFPLAY"), "{header:?}");
+    app.settings_mgr.settings.player_backend = "mpv".to_string();
+    let header = header_row(&tui::render(&mut app, 120, 40));
+    assert!(header.contains("LOCAL/MPV"), "{header:?}");
     let _ = fs::remove_dir_all(&dir);
 }
 

@@ -172,7 +172,16 @@ impl AppUI {
     fn output_label(&self) -> String {
         match self.device_manager.get_active_device() {
             Some(device) => format!("DLNA/{}", kit::upper(&device.friendly_name)),
-            None => format!("LOCAL/{}", kit::upper(&self.settings_mgr.settings.player_backend)),
+            None => format!("LOCAL/{}", kit::upper(&self.local_backend())),
+        }
+    }
+
+    /// The local backend playing (`mpv`, or `ffplay` after a fallback), as the player last
+    /// reported it; the backend setting until it has.
+    pub(super) fn local_backend(&self) -> String {
+        match self.player.backend_name() {
+            Some(name) => name.to_string(),
+            None => self.settings_mgr.settings.player_backend.clone(),
         }
     }
 

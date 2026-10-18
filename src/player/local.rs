@@ -167,6 +167,9 @@ pub struct LocalPlayer {
     shared_state: Arc<SharedState>,
     stop_signal: Arc<AtomicBool>,
     reader_thread: Option<thread::JoinHandle<()>>,
+    /// The backend that played the last track: `"ffplay"` after a fallback from mpv. Before
+    /// anything plays, the configured one.
+    active_backend: &'static str,
     // ffplay fallback state
     ffplay_child: Option<Child>,
     start_time: Option<Instant>,
@@ -186,6 +189,7 @@ impl LocalPlayer {
     /// Like [`LocalPlayer::new`], but launches `mpv_binary` instead of `mpv` from `PATH`.
     pub fn with_mpv_binary(backend: &str, mpv_binary: impl Into<PathBuf>) -> Self {
         Self {
+            active_backend: if backend == "mpv" { "mpv" } else { "ffplay" },
             backend: backend.to_string(),
             mpv_binary: mpv_binary.into(),
             mpv_child: None,
@@ -443,6 +447,7 @@ impl LocalPlayer {
         self.ffplay_child = Some(cmd.spawn()?);
         self.start_time = Some(Instant::now());
         self.accumulated_offset = start_seconds;
+        self.active_backend = "ffplay";
 
         // ffplay has no IPC to report duration, so read it from the file's tags/headers.
         // This runs on AsyncPlayer's worker thread, never the UI thread.
@@ -547,6 +552,7 @@ impl LocalPlayer {
                 crate::log_warn!("player", "mpv playback error ({:?}), falling back to ffplay", e);
                 return self.play_ffplay(&abs_path, start_seconds);
             }
+            self.active_backend = "mpv";
             mpv_res
         } else {
             self.play_ffplay(&abs_path, start_seconds)
@@ -555,6 +561,10 @@ impl LocalPlayer {
 }
 
 impl AudioPlayer for LocalPlayer {
+    fn backend_name(&self) -> Option<&'static str> {
+        Some(self.active_backend)
+    }
+
     fn play(&mut self, filepath: &Path) -> anyhow::Result<()> {
         self.play_from(filepath, 0.0)
     }

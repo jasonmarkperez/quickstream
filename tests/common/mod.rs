@@ -7,6 +7,7 @@
 
 #![allow(dead_code)]
 
+pub mod fake_player;
 pub mod tui;
 
 use std::path::{Path, PathBuf};
