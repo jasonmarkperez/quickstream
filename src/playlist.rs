@@ -16,7 +16,7 @@ pub const MAX_NAME_CHARS: usize = 100;
 pub const MAX_NAME_BYTES: usize = 200;
 
 /// One track of a playlist. The path is the source of truth for the file; artist, title and
-/// duration are only what the `#EXTINF` line shows.
+/// duration are only what the `#EXTINF` and `#EXTART` lines show.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlaylistEntry {
     pub path: PathBuf,
@@ -78,14 +78,29 @@ impl Playlist {
         }
     }
 
-    /// Extended M3U8 text: UTF-8, LF line endings, no BOM, an `#EXTINF` line before each path.
+    /// Extended M3U8 text: UTF-8, LF line endings, no BOM. Each path follows an `#EXTINF` line
+    /// (`Artist - Title`, as other players show it) and an `#EXTART` line holding the artist,
+    /// empty when there is none, so [`parse_m3u8`] can tell where the artist ends even when the
+    /// artist or title contains ` - ` (issue #52). Artist and title are written trimmed, since
+    /// the parser trims tag text.
     pub fn to_m3u8(&self) -> String {
         let mut out = String::from("#EXTM3U\n");
         out.push_str(&format!("#PLAYLIST:{}\n", single_line(&self.name)));
         for entry in &self.entries {
             let secs = entry.duration_secs.max(-1);
-            out.push_str(&format!("#EXTINF:{},{}\n", secs, single_line(&entry.display_label())));
-            // M3U8 is UTF-8 text, so a path that is not valid UTF-8 is written lossily.
+            let artist = single_line(&entry.artist);
+            let artist = artist.trim();
+            let title = single_line(&entry.title);
+            let title = title.trim();
+            let label = if artist.is_empty() {
+                title.to_string()
+            } else {
+                format!("{} - {}", artist, title)
+            };
+            out.push_str(&format!("#EXTINF:{},{}\n", secs, label));
+            out.push_str(&format!("#EXTART:{}\n", artist));
+            // M3U8 is UTF-8 text, so a path that is not valid UTF-8 is written lossily. The path is
+            // written as is, spaces included.
             out.push_str(&entry.path.to_string_lossy());
             out.push('\n');
         }
@@ -110,28 +125,38 @@ impl Playlist {
 /// `name` (the file stem) is the playlist's name; a `#PLAYLIST` line is ignored. Relative paths
 /// are resolved against `base_dir`, the folder holding the playlist file, and every path is
 /// normalized with [`normalize_path`] so a `..` is never written back. Any other line is kept
-/// as a path entry (a Windows path or a `file://` URL simply shows up as missing).
+/// as a path entry (a Windows path or a `file://` URL simply shows up as missing). A path line
+/// loses its line ending and leading whitespace only: a file name may end in spaces (issue #52).
+/// Artist and title come from the entry's `#EXTINF` and `#EXTART` lines, as `entry_label` describes.
 pub fn parse_m3u8(name: &str, text: &str, base_dir: &Path) -> Playlist {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut playlist = Playlist::new(name);
-    // The `#EXTINF` duration and text waiting for the path line they describe.
+    // The `#EXTINF` duration and text, and the `#EXTART` artist, waiting for the path line they
+    // describe.
     let mut pending: Option<(i64, String)> = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+    let mut pending_artist: Option<String> = None;
+    for raw in text.lines() {
+        // `lines` drops `\n` and `\r\n`; a stray `\r` left before them is a line ending too.
+        let line = raw.trim_end_matches('\r').trim_start();
+        let tag = line.trim_end();
+        if tag.is_empty() {
             continue;
         }
-        if let Some(info) = strip_extinf(line) {
+        if let Some(info) = strip_tag(tag, "#EXTINF:") {
             pending = Some(parse_extinf(info));
             continue;
         }
-        if line.starts_with('#') {
+        if let Some(artist) = strip_tag(tag, "#EXTART:") {
+            pending_artist = Some(artist.trim().to_string());
+            continue;
+        }
+        if tag.starts_with('#') {
             continue;
         }
         // `join` keeps an absolute path unchanged and resolves a relative one against the folder.
         let path = normalize_path(&base_dir.join(line));
         let (duration_secs, label) = pending.take().unwrap_or((-1, String::new()));
-        let (artist, title) = split_label(&label);
+        let (artist, title) = entry_label(&label, pending_artist.take().as_deref());
         let title = if title.is_empty() { file_stem(&path) } else { title };
         playlist.entries.push(PlaylistEntry {
             path,
@@ -176,11 +201,11 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     out
 }
 
-/// The text after `#EXTINF:` (tag matched case-insensitively), or `None` for any other line.
-fn strip_extinf(line: &str) -> Option<&str> {
-    const TAG: &str = "#EXTINF:";
-    match line.get(..TAG.len()) {
-        Some(prefix) if prefix.eq_ignore_ascii_case(TAG) => Some(&line[TAG.len()..]),
+/// The text after `tag` (such as `#EXTINF:`, matched case-insensitively), or `None` for any
+/// other line.
+fn strip_tag<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
+    match line.get(..tag.len()) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(tag) => Some(&line[tag.len()..]),
         _ => None,
     }
 }
@@ -195,6 +220,28 @@ fn parse_extinf(info: &str) -> (i64, String) {
         .map(whole_seconds)
         .unwrap_or(-1);
     (secs, text.trim().to_string())
+}
+
+/// (artist, title) of an entry from its `#EXTINF` text and `#EXTART` artist (issue #52). Our own
+/// files always have both: an empty `#EXTART` means no artist and the whole text is the title;
+/// otherwise the title is the text after `<artist> - `. Other players use `#EXTART` for the
+/// album artist, so when the text does not start with `<artist> -` the `#EXTART` line is
+/// ignored, and without one the text is split by [`split_label`] as it always was.
+fn entry_label(label: &str, extart: Option<&str>) -> (String, String) {
+    match extart {
+        Some("") => (String::new(), label.to_string()),
+        Some(artist) => {
+            // The text is trimmed, so `<artist> - ` with an empty title reads `<artist> -`.
+            let rest = label.strip_prefix(artist).and_then(|r| r.strip_prefix(" -"));
+            match rest {
+                Some(title) if title.is_empty() || title.starts_with(' ') => {
+                    (artist.to_string(), title.trim().to_string())
+                }
+                _ => split_label(label),
+            }
+        }
+        None => split_label(label),
+    }
 }
 
 /// `<artist> - <title>` split at the first ` - `; text without one is the title alone.

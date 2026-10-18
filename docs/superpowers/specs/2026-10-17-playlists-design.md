@@ -62,16 +62,18 @@ pub struct Playlist {
   #EXTM3U
   #PLAYLIST:Road Trip
   #EXTINF:284,Radiohead - Airbag
+  #EXTART:Radiohead
   /Volumes/Music/Radiohead/OK Computer/01 Airbag.flac
   ```
-  When the artist is empty the `#EXTINF` text is the title alone.
+  When the artist is empty the `#EXTINF` text is the title alone and `#EXTART:` is empty. Every entry gets an `#EXTART` line so the label round-trips even when the artist or title contains ` - ` (issue #52: an untagged `01 - Intro` used to reload as artist `01`). Artist and title are written trimmed and with control characters replaced by spaces. The path line is written unchanged, spaces included.
 - `parse_m3u8(name: &str, text: &str, base_dir: &Path) -> Playlist` accepts files edited by hand or copied in from elsewhere:
   - strips a leading UTF-8 BOM and accepts CRLF;
-  - ignores blank lines and `#` lines other than `#EXTINF` (including `#EXTM3U` and `#PLAYLIST`);
-  - takes duration, artist and title from the `#EXTINF` line before an entry; splits `<artist> - <title>` at the first ` - `; `#EXTINF` text without ` - ` is the title;
+  - ignores blank lines and `#` lines other than `#EXTINF` and `#EXTART` (including `#EXTM3U` and `#PLAYLIST`);
+  - strips only the line ending and leading whitespace from a path line, so a file name ending in spaces round-trips (issue #52);
+  - takes duration, artist and title from the `#EXTINF` and `#EXTART` lines before an entry (in either order, tags matched case-insensitively). With an empty `#EXTART` the whole `#EXTINF` text is the title. With a non-empty `#EXTART` whose value starts the text as `<artist> - `, the artist is the `#EXTART` value and the title the rest. Otherwise (no `#EXTART`, as in files from other players, or an `#EXTART` that other players use for the album artist and that does not start the text) the text splits at the first ` - ` as `<artist> - <title>`, and text without ` - ` is the title;
   - resolves relative paths against `base_dir` (the playlist file's folder), then normalizes every path with `normalize_path` (issue #58);
   - an entry without `#EXTINF` gets duration `-1`, empty artist and the file stem as title.
-  The playlist's name is the file stem, not `#PLAYLIST`. The path line, not the `#EXTINF` text, is the source of truth for the file, so an artist containing ` - ` only affects display.
+  The playlist's name is the file stem, not `#PLAYLIST`. The path line, not the `#EXTINF` text, is the source of truth for the file, so a label that does not round-trip only affects display.
 - `normalize_path(path: &Path) -> PathBuf` (issue #58) normalizes a path lexically: drops `.` components and lets each `..` cancel the component before it. It never reads the disk and never follows symlinks (`link/..` is the folder holding `link`). A `..` right after the root is dropped, as the OS does (`/../x` → `/x`); on a relative path a leading `..` with nothing to cancel is kept. A hand-written `../../music/x.mp3` entry is therefore loaded as an absolute path without `..`, and the first edit never writes `<playlists>/../..` back.
 - `validate_name(name: &str) -> Result<String, NameError>` trims whitespace, then rejects: empty, longer than 100 characters, containing `/`, `\`, NUL or other control characters, or starting with `.`. Returns the trimmed name.
 - Name comparison matches the default macOS file system (APFS), which treats these names as one file: it ignores case using full Unicode case folding (`Straße` = `Strasse`) and ignores Unicode normalization (NFC `Zoë` = NFD `Zoë`). The `names_equal` helper compares `name_key`, the canonical caseless key NFD(casefold(NFD(name))) (issue #55).
@@ -172,7 +174,7 @@ Tests are written before the code they cover. New file `tests/test_playlists.rs`
 
 1. **M3U8 format**
    - write then parse returns the same playlist;
-   - parse handles a BOM, CRLF, unknown `#` lines, blank lines, relative paths, `..` and `.` entries (normalized, never written back), `#EXTINF:-1`, entries without `#EXTINF`;
+   - parse handles a BOM, CRLF, unknown `#` lines, blank lines, relative paths, `..` and `.` entries (normalized, never written back), `#EXTINF:-1`, entries without `#EXTINF`, `#EXTART` (empty, before `#EXTINF`, album-artist style), labels containing ` - ` and paths with leading or trailing spaces;
    - an artist containing ` - ` keeps the path correct.
 2. **Names**: each rejection rule; trimming; case-insensitive duplicates on create and rename; case-only rename allowed.
 3. **Store**

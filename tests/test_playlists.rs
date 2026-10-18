@@ -51,8 +51,10 @@ fn test_to_m3u8_writes_extended_m3u() {
         "#EXTM3U\n\
          #PLAYLIST:Road Trip\n\
          #EXTINF:284,Radiohead - Airbag\n\
+         #EXTART:Radiohead\n\
          /Volumes/Music/Radiohead/OK Computer/01 Airbag.flac\n\
          #EXTINF:-1,track\n\
+         #EXTART:\n\
          /Volumes/Music/Untagged/track.mp3\n"
     );
     assert!(!text.starts_with('\u{feff}'));
@@ -93,7 +95,7 @@ fn test_to_m3u8_keeps_control_characters_out_of_info_lines() {
     let mut playlist = Playlist::new("Tags");
     playlist.entries.push(entry("/m/a.flac", 10, "Art\nist", "Ti\r\ntle"));
     let text = playlist.to_m3u8();
-    assert_eq!(text.lines().count(), 4, "{:?}", text);
+    assert_eq!(text.lines().count(), 5, "{:?}", text);
     let parsed = parse_m3u8("Tags", &text, Path::new("/unused"));
     assert_eq!(parsed.entries.len(), 1);
     assert_eq!(parsed.entries[0].path, PathBuf::from("/m/a.flac"));
@@ -315,10 +317,156 @@ fn test_artist_containing_separator_keeps_path() {
     let parsed = parse_m3u8("p", &playlist.to_m3u8(), Path::new("/pl"));
     assert_eq!(parsed.entries.len(), 1);
     let got = &parsed.entries[0];
-    // The path line is the source of truth; the split only affects display.
+    // The path line is the source of truth, and `#EXTART` keeps the artist whole (issue #52).
     assert_eq!(got.path, PathBuf::from("/m/Simon - Garfunkel/The Boxer.flac"));
     assert_eq!(got.duration_secs, 308);
-    assert_eq!(got.display_label(), "Simon - Garfunkel - The Boxer");
+    assert_eq!(got.artist, "Simon - Garfunkel");
+    assert_eq!(got.title, "The Boxer");
+}
+
+#[test]
+fn test_labels_containing_separator_round_trip() {
+    common::isolate();
+    // Issue #52: without `#EXTART` these reloaded as artist `01`, title `Intro` and so on.
+    let original = Playlist {
+        name: "p".to_string(),
+        entries: vec![
+            entry("/m/Untagged/01 - Intro.flac", -1, "", "01 - Intro"),
+            entry("/m/Live/a.flac", 241, "", "Intro - Live"),
+            entry("/m/b.flac", 200, "Artist", "Title - Remix"),
+            entry("/m/c.flac", 100, "A - B", "C - D"),
+            entry("/m/d.flac", 90, "Same", "Same - Same"),
+        ],
+    };
+    let text = original.to_m3u8();
+    assert_eq!(parse_m3u8("p", &text, Path::new("/unused")), original);
+    // A second round trip writes the same text.
+    assert_eq!(parse_m3u8("p", &text, Path::new("/unused")).to_m3u8(), text);
+}
+
+#[test]
+fn test_to_m3u8_trims_tag_whitespace_so_labels_round_trip() {
+    common::isolate();
+    let mut playlist = Playlist::new("p");
+    playlist
+        .entries
+        .push(entry("/m/a.flac", 10, " AC/DC ", " Back In Black "));
+    let parsed = parse_m3u8("p", &playlist.to_m3u8(), Path::new("/unused"));
+    assert_eq!(parsed.entries, vec![entry("/m/a.flac", 10, "AC/DC", "Back In Black")]);
+}
+
+#[test]
+fn test_parse_without_extart_splits_label_at_first_separator() {
+    common::isolate();
+    // Files from other players have no `#EXTART`: the text splits at the first ` - ` as before.
+    let text = "#EXTM3U
+                #EXTINF:200,Artist - Title - Remix
+                /m/a.flac
+                #EXTINF:12,01 - Intro
+                /m/b.flac
+";
+    let parsed = parse_m3u8("p", text, Path::new("/pl"));
+    assert_eq!(
+        parsed.entries,
+        vec![
+            entry("/m/a.flac", 200, "Artist", "Title - Remix"),
+            entry("/m/b.flac", 12, "01", "Intro"),
+        ]
+    );
+}
+
+#[test]
+fn test_parse_extart_rules() {
+    common::isolate();
+    let text = "#EXTM3U
+                #EXTART:Before
+                #EXTINF:10,Before - Song
+                /m/a.flac
+                #extart:
+                #EXTINF:11,01 - Intro
+                /m/b.flac
+                #EXTINF:12,X - Y
+                /m/c.flac
+                #EXTINF:13,Daft Punk - One More Time
+                #EXTART:Various Artists
+                /m/d.flac
+                #EXTINF:14,Band -
+                #EXTART:Band
+                /m/Band/05 Untitled.flac
+";
+    let parsed = parse_m3u8("p", text, Path::new("/pl"));
+    assert_eq!(
+        parsed.entries,
+        vec![
+            // `#EXTART` may come before `#EXTINF`, and the tag is matched case-insensitively.
+            entry("/m/a.flac", 10, "Before", "Song"),
+            // An empty `#EXTART` means no artist: the whole text is the title.
+            entry("/m/b.flac", 11, "", "01 - Intro"),
+            // `#EXTART` belongs to one entry only; the next one splits as usual.
+            entry("/m/c.flac", 12, "X", "Y"),
+            // Other players use `#EXTART` for the album artist. When the text does not start with
+            // `<artist> - `, the `#EXTART` line is ignored and the text splits as before.
+            entry("/m/d.flac", 13, "Daft Punk", "One More Time"),
+            // Artist with no title: the title falls back to the file stem.
+            entry("/m/Band/05 Untitled.flac", 14, "Band", "05 Untitled"),
+        ]
+    );
+}
+
+#[test]
+fn test_path_with_surrounding_spaces_round_trips() {
+    common::isolate();
+    // Issue #52: path lines were trimmed, so these files were lost on reload.
+    let original = Playlist {
+        name: "p".to_string(),
+        entries: vec![
+            entry("/m/Album /01 Intro.flac", 10, "A", "Intro"),
+            entry("/m/a/track ", -1, "", "track"),
+            entry("/m/a/ lead.flac", 20, "B", "Lead"),
+        ],
+    };
+    let text = original.to_m3u8();
+    assert!(text.contains("\n/m/a/track \n"), "{:?}", text);
+    assert_eq!(parse_m3u8("p", &text, Path::new("/unused")), original);
+}
+
+#[test]
+fn test_parse_path_lines_keep_trailing_spaces_and_drop_leading_ones() {
+    common::isolate();
+    let text = "#EXTM3U
+  	/m/indented.flac
+/m/trailing.flac  
+   
+	
+/m/last.flac";
+    let parsed = parse_m3u8("p", text, Path::new("/pl"));
+    let paths: Vec<PathBuf> = parsed.entries.iter().map(|e| e.path.clone()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            PathBuf::from("/m/indented.flac"),
+            PathBuf::from("/m/trailing.flac  "),
+            PathBuf::from("/m/last.flac"),
+        ]
+    );
+}
+
+#[test]
+fn test_parse_crlf_file_with_extart_and_trailing_space() {
+    common::isolate();
+    let original = Playlist {
+        name: "p".to_string(),
+        entries: vec![
+            entry("/m/Album /01 - Intro .flac", 61, "", "01 - Intro"),
+            entry("/m/b.flac", 200, "Artist", "Title - Remix"),
+        ],
+    };
+    // The same file saved by an editor that writes CRLF line endings.
+    let crlf = original.to_m3u8().replace('\n', "\r\n");
+    assert_eq!(parse_m3u8("p", &crlf, Path::new("/unused")), original);
+    // A stray CR before the CRLF is a line ending too, not part of the path.
+    let parsed = parse_m3u8("p", "/m/a.flac \r\r\n", Path::new("/pl"));
+    assert_eq!(parsed.entries[0].path, PathBuf::from("/m/a.flac "));
 }
 
 #[test]
