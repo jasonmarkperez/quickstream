@@ -437,6 +437,29 @@ fn test_a_appends_playlist_from_either_pane_without_touching_playback() {
 }
 
 #[test]
+fn test_all_missing_single_entry_says_track() {
+    common::isolate();
+    let dir = temp_dir("all_missing_one");
+    write_playlist(vec![entry(
+        Path::new("/nonexistent-qs-volume/Music/Album/1.flac"),
+        "A",
+        "One",
+    )]);
+    let mut app = app_with_playlist(&dir);
+    install_recording_player(&mut app);
+    app.active_tab = 4;
+    app.playlists.tracks_focus = true;
+    app.playlists.track_cursor = 0;
+    press(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(poll_until(&mut app, |app| app.status_message.starts_with("None of")));
+    assert_eq!(
+        app.status_message,
+        "None of Road Trip's 1 track found. Is /nonexistent-qs-volume/Music mounted?"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_all_missing_leaves_queue_unchanged() {
     common::isolate();
     let dir = temp_dir("all_missing");
@@ -556,7 +579,7 @@ fn test_symlink_to_a_non_audio_file_is_not_queued() {
         app.status_message
     );
     assert_eq!(queue_paths(&app), vec![good.clone()]);
-    assert_eq!(app.status_message, "Queued 1 tracks from Road Trip, 1 missing");
+    assert_eq!(app.status_message, "Queued 1 track from Road Trip, 1 missing");
     assert!(app.playlists.is_missing(&link));
     let _ = std::fs::remove_dir_all(&dir);
 }

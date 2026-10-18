@@ -147,8 +147,8 @@ pub struct PlaylistsUi {
     pub exists: HashMap<PathBuf, bool>,
     checks: PlaylistChecks,
     /// Folder listings for folder adds (`L` on a folder), sent by `playlist-folder` workers.
-    folder_tx: mpsc::Sender<FolderListing>,
-    folder_rx: mpsc::Receiver<FolderListing>,
+    folder_tx: mpsc::Sender<FolderUpdate>,
+    folder_rx: mpsc::Receiver<FolderUpdate>,
     /// Result of the startup load (playlists, stems of skipped files); `None` once applied.
     load_rx: Option<mpsc::Receiver<(Vec<Playlist>, Vec<String>)>>,
     /// The load worker died without sending; the store stays unloaded so no edit can overwrite
@@ -776,6 +776,19 @@ struct FolderListing {
     result: std::io::Result<Vec<PathBuf>>,
 }
 
+/// What a `playlist-folder` worker sends: tag-reading progress, then the listing.
+#[derive(Debug)]
+enum FolderUpdate {
+    Progress { dir: PathBuf, done: usize, total: usize },
+    Listing(FolderListing),
+}
+
+/// A cached entry with no duration is a placeholder (a failed or skipped tag read), so it is
+/// read again, the same rule the queue's metadata fetch uses.
+fn needs_tag_read(cache: &crate::library::MetadataCache, path: &Path) -> bool {
+    cache.get(path).is_none_or(|meta| meta.duration_seconds <= 0.0)
+}
+
 impl PendingAdd {
     /// What the add picker's header shows: the track title, or `<folder> (folder)`.
     pub fn label(&self) -> &str {
@@ -962,21 +975,57 @@ impl super::AppUI {
         }
     }
 
-    /// List `dir` on a worker (it may be on a slow or unmounted share);
-    /// `poll_playlist_folder_adds` adds the files when the listing arrives.
+    /// List `dir` and read the tags of files the metadata cache has no real entry for, on a
+    /// worker (it may be on a slow or unmounted share). Tags go through the shared metadata
+    /// pipeline: saved to the on-disk index and sent on `metadata_tx`, so browser labels and
+    /// queue rows refresh. They are also put in the cache directly, so
+    /// `poll_playlist_folder_adds` builds the entries from them when the listing arrives. The
+    /// worker stops, adding nothing, once shutdown is signalled.
     fn start_folder_add(&mut self, playlist: &str, dir: PathBuf) {
         self.status_message = format!("Reading {}…", folder_display_name(&dir));
         let tx = self.playlists.folder_tx.clone();
+        let metadata_tx = self.metadata_tx.clone();
+        let cache = self.metadata_cache.clone();
+        let stop = self.playlists.checks.stop.clone();
         let playlist = playlist.to_string();
         self.workers.spawn("playlist-folder", move || {
+            let stopped = || stop.load(std::sync::atomic::Ordering::Relaxed);
             let result = list_folder_audio_files(&dir);
-            let _ = tx.send(FolderListing { playlist, dir, result });
+            if let Ok(files) = &result {
+                let to_read: Vec<&PathBuf> = files.iter().filter(|path| needs_tag_read(&cache, path)).collect();
+                let total = to_read.len();
+                for (done, path) in to_read.into_iter().enumerate() {
+                    if stopped() {
+                        return;
+                    }
+                    let _ = tx.send(FolderUpdate::Progress {
+                        dir: dir.clone(),
+                        done,
+                        total,
+                    });
+                    if let Ok(meta) = crate::metadata::extract_metadata(path) {
+                        crate::library::LibraryManager::append_to_cache(&meta);
+                        cache.insert(meta.clone());
+                        let _ = metadata_tx.send(meta);
+                    }
+                }
+            }
+            if !stopped() {
+                let _ = tx.send(FolderUpdate::Listing(FolderListing { playlist, dir, result }));
+            }
         });
     }
 
     /// Apply finished folder listings from `start_folder_add`.
     fn poll_playlist_folder_adds(&mut self) {
-        while let Ok(listing) = self.playlists.folder_rx.try_recv() {
+        while let Ok(update) = self.playlists.folder_rx.try_recv() {
+            let listing = match update {
+                FolderUpdate::Progress { dir, done, total } => {
+                    self.status_message = format!("Reading tags in {}… {}/{}", folder_display_name(&dir), done, total);
+                    continue;
+                }
+                FolderUpdate::Listing(listing) => listing,
+            };
             let folder = folder_display_name(&listing.dir);
             match listing.result {
                 Ok(files) if files.is_empty() => {
@@ -1234,9 +1283,9 @@ impl AppUI {
         if tracks.is_empty() {
             let hint = result.entries.first().map(|e| mount_hint(&e.path)).unwrap_or_default();
             self.status_message = format!(
-                "None of {}'s {} tracks found. Is {} mounted?",
+                "None of {}'s {} found. Is {} mounted?",
                 result.name,
-                result.entries.len(),
+                track_count_label(result.entries.len()),
                 hint
             );
             return;
@@ -1260,9 +1309,14 @@ impl AppUI {
             }
         };
         let summary = if missing == 0 {
-            format!("Queued {} tracks from {}", queued, result.name)
+            format!("Queued {} from {}", track_count_label(queued), result.name)
         } else {
-            format!("Queued {} tracks from {}, {} missing", queued, result.name, missing)
+            format!(
+                "Queued {} from {}, {} missing",
+                track_count_label(queued),
+                result.name,
+                missing
+            )
         };
         self.status_message = match playback_error {
             Some(err) => format!("{}. {}", err, summary),
