@@ -13,10 +13,13 @@ use ratatui::widgets::*;
 use super::AppUI;
 use crate::paths;
 use crate::playlist::{Playlist, PlaylistEntry};
-use crate::playlist_store::PlaylistStore;
+use crate::playlist_store::{LoadResult, PlaylistStore};
 
 /// Last row of the add picker: create a playlist and add to it.
 pub const NEW_PLAYLIST_ROW: &str = "+ New playlist…";
+
+/// Status after the startup load failed. Edits stay refused for the session.
+const LOAD_FAILED: &str = "Couldn't load playlists";
 
 /// What the name prompt's name is for.
 #[derive(Debug, Clone)]
@@ -150,9 +153,9 @@ pub struct PlaylistsUi {
     folder_tx: mpsc::Sender<FolderUpdate>,
     folder_rx: mpsc::Receiver<FolderUpdate>,
     /// Result of the startup load (playlists, stems of skipped files); `None` once applied.
-    load_rx: Option<mpsc::Receiver<(Vec<Playlist>, Vec<String>)>>,
-    /// The load worker died without sending; the store stays unloaded so no edit can overwrite
-    /// a file that was never read.
+    load_rx: Option<mpsc::Receiver<LoadResult>>,
+    /// The playlists folder couldn't be listed, or the load worker died without sending; the
+    /// store stays unloaded so no edit can overwrite a file that was never read.
     load_failed: bool,
     list_state: ListState,
     tracks_state: ListState,
@@ -186,6 +189,20 @@ impl PlaylistsUi {
     /// Name of the playlist under the left-pane cursor.
     pub fn selected_name(&self) -> Option<String> {
         self.selected_playlist().map(|p| p.name.clone())
+    }
+
+    /// True when the startup load failed; edits stay refused for the session.
+    pub fn load_failed(&self) -> bool {
+        self.load_failed
+    }
+
+    /// Why an edit is refused before the store is loaded: still loading, or the load failed.
+    pub fn not_loaded_message(&self) -> String {
+        if self.load_failed {
+            LOAD_FAILED.to_string()
+        } else {
+            crate::playlist_store::StoreError::NotLoaded.to_string()
+        }
     }
 
     /// Keep both cursors inside their lists after playlists or tracks went away.
@@ -281,7 +298,7 @@ impl AppUI {
     pub fn poll_playlists(&mut self) {
         if let Some(rx) = self.playlists.load_rx.as_ref() {
             match rx.try_recv() {
-                Ok((playlists, skipped)) => {
+                Ok(Ok((playlists, skipped))) => {
                     crate::log_info!(
                         "playlists",
                         "Loaded {} playlists ({} skipped files keep their names reserved)",
@@ -292,12 +309,19 @@ impl AppUI {
                     self.playlists.store.reserve_names(skipped);
                     self.playlists.load_rx = None;
                 }
+                // The store stays not loaded, so no edit can write over files it never read.
+                Ok(Err(e)) => {
+                    crate::log_error!("playlists", "Couldn't list the playlists folder: {}", e);
+                    self.playlists.load_rx = None;
+                    self.playlists.load_failed = true;
+                    self.status_message = LOAD_FAILED.to_string();
+                }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
                     crate::log_error!("playlists", "Playlist load worker exited without a result");
                     self.playlists.load_rx = None;
                     self.playlists.load_failed = true;
-                    self.status_message = "Couldn't load playlists".to_string();
+                    self.status_message = LOAD_FAILED.to_string();
                 }
             }
         }
@@ -538,7 +562,7 @@ impl AppUI {
     fn open_create_prompt(&mut self) {
         // Creating before the startup load arrives would let it overwrite the files on disk.
         if !self.playlists.store.is_loaded() {
-            self.status_message = crate::playlist_store::StoreError::NotLoaded.to_string();
+            self.status_message = self.playlists.not_loaded_message();
             return;
         }
         self.playlists.modal = Some(PlaylistModal::NamePrompt {
@@ -839,7 +863,7 @@ impl super::AppUI {
     /// now-playing track.
     pub fn open_add_picker(&mut self) {
         if !self.playlists.store.is_loaded() {
-            self.status_message = crate::playlist_store::StoreError::NotLoaded.to_string();
+            self.status_message = self.playlists.not_loaded_message();
             return;
         }
         let pending = match self.pending_add_for_selection() {
@@ -1196,7 +1220,7 @@ impl AppUI {
     /// selected playlist's files on a worker, then replace the queue and play, or append.
     pub fn queue_selected_playlist(&mut self, play_from: Option<usize>) {
         if !self.playlists.store.is_loaded() {
-            self.status_message = crate::playlist_store::StoreError::NotLoaded.to_string();
+            self.status_message = self.playlists.not_loaded_message();
             return;
         }
         let Some(playlist) = self.playlists.store.playlists().get(self.playlists.list_cursor) else {

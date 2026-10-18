@@ -47,3 +47,5 @@ anyhow = "1.0"
 ctrlc = { version = "3.4", features = ["termination"] }
 chrono = "0.4"
 libc = "0.2"
+unicode-normalization = "0.1"
+caseless = "0.2"

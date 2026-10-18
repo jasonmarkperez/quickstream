@@ -252,10 +252,19 @@ pub fn validate_name(name: &str) -> Result<String, NameError> {
     Ok(name.to_string())
 }
 
-/// Playlist names compare case-insensitively (Unicode lower case), because the default macOS
-/// file system does: `road trip.m3u8` and `Road Trip.m3u8` are the same file there.
+/// Playlist names compare the way the default macOS file system (APFS) compares file names:
+/// ignoring case (full Unicode case folding, so `Straße` matches `Strasse`) and Unicode
+/// normalization (`Zoë` typed as NFC matches `Zoë` pasted from a Finder file name as NFD). Two
+/// names that open the same file there must compare equal, or a create would overwrite it.
 pub fn names_equal(a: &str, b: &str) -> bool {
-    a.to_lowercase() == b.to_lowercase()
+    name_key(a) == name_key(b)
+}
+
+/// The form [`names_equal`] compares: Unicode's canonical caseless key, NFD(casefold(NFD)).
+pub fn name_key(name: &str) -> String {
+    use caseless::Caseless;
+    use unicode_normalization::UnicodeNormalization;
+    name.nfd().default_case_fold().nfd().collect()
 }
 
 /// `<dir>/<name>.m3u8`, or `None` when that file would not sit directly in `dir`. Every playlist
