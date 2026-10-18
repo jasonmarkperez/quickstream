@@ -1959,10 +1959,6 @@ pub fn serve_continuous_stream(
         return Ok(());
     }
 
-    let wav_hdr = make_continuous_wav_header();
-    stream.write_all(&wav_hdr)?;
-    stream.flush()?;
-
     let cid = conn_id.unwrap_or(0);
     let controller = stream_state.continuous.clone();
     controller.active_conn_id.store(cid, Ordering::SeqCst);
@@ -1996,6 +1992,12 @@ pub fn serve_continuous_stream(
         controller: controller.clone(),
         conn_id: cid,
     };
+
+    // Mark the session active before the client can read any body bytes, so a client that has
+    // the WAV header always sees `is_active`; the guard clears it if this write fails.
+    let wav_hdr = make_continuous_wav_header();
+    stream.write_all(&wav_hdr)?;
+    stream.flush()?;
 
     while controller.is_active.load(Ordering::SeqCst) {
         if !controller.is_session(session) {
