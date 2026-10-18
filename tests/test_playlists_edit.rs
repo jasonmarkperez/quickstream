@@ -802,3 +802,95 @@ fn test_name_prompt_scrolls_by_display_width() {
     drop(app);
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_failed_create_puts_the_cursor_back_on_the_playlist_selected_before() {
+    common::isolate();
+    // Batch e2e: after a refused create the cursor stayed on the row where the new playlist
+    // would have sorted, which by then held another playlist.
+    let (mut app, temp_dir) = app_on_playlists_tab("create_collision_cursor");
+    for name in ["Big", "Hand", "Rel", "TitleOnly"] {
+        seed(&mut app, name, &[]);
+    }
+    settle(&mut app);
+    let path = foreign_playlist_file("Late.m3u8", "EXTERNAL LATE");
+    app.playlists.list_cursor = app.playlists.store.index_of("Big").unwrap();
+
+    press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+    type_text(&mut app, "Late");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.playlists.selected_name().as_deref(), Some("Late"));
+    settle(&mut app);
+
+    assert_eq!(
+        app.status_message,
+        "Couldn't create \"Late\": a file with that name already exists"
+    );
+    assert_eq!(playlist_names(&app), vec!["Big", "Hand", "Rel", "TitleOnly"]);
+    assert_eq!(app.playlists.selected_name().as_deref(), Some("Big"));
+    assert_eq!(fs::read_to_string(&path).unwrap(), "EXTERNAL LATE");
+
+    // Moving off the new playlist before the failure arrives keeps the row moved to.
+    press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+    type_text(&mut app, "Later");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    foreign_playlist_file("Later.m3u8", "EXTERNAL LATER");
+    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+    assert_eq!(app.playlists.selected_name().as_deref(), Some("Rel"));
+    settle(&mut app);
+    assert_eq!(playlist_names(&app), vec!["Big", "Hand", "Rel", "TitleOnly"]);
+    assert_eq!(app.playlists.selected_name().as_deref(), Some("Rel"));
+
+    drop(app);
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+/// The bottom bar's second row (state badge, device, volume, status) as drawn at `width` x 40,
+/// read from the buffer cells (the backend's text form escapes quotes).
+fn status_row(app: &mut AppUI, width: u16) -> String {
+    let backend = ratatui::backend::TestBackend::new(width, 40);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| app.render(f)).unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..40)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .find(|row| {
+            ["⏹ STOPPED", "▶ PLAYING", "⏸ PAUSED"]
+                .iter()
+                .any(|badge| row.contains(badge))
+        })
+        .expect("no playback state row")
+}
+
+#[test]
+fn test_rename_collision_status_is_not_cut_off_at_120_columns() {
+    common::isolate();
+    // Batch e2e: at 120 columns the bar showed `...: a file with that name already exist…`.
+    let (mut app, temp_dir) = app_on_playlists_tab("rename_collision_width");
+    seed(&mut app, "TitleOnly", &[]);
+    settle(&mut app);
+    foreign_playlist_file("Late2.m3u8", "EXTERNAL LATE2");
+    app.playlists.list_cursor = app.playlists.store.index_of("TitleOnly").unwrap();
+
+    rename_selected(&mut app, "TitleOnly", "Late2");
+    settle(&mut app);
+
+    let message = "Couldn't rename \"TitleOnly\" to \"Late2\": a file with that name already exists";
+    assert_eq!(app.status_message, message);
+    let row = status_row(&mut app, 120);
+    assert!(row.contains(message), "{row}");
+
+    // A status that fits leaves the rest of the row as it was.
+    app.status_message = "Kept \"TitleOnly\"".to_string();
+    let row = status_row(&mut app, 120);
+    assert!(row.contains("Local Audio"), "{row}");
+    assert!(row.contains("Vol: "), "{row}");
+    assert!(row.contains("Kept \"TitleOnly\""), "{row}");
+
+    drop(app);
+    let _ = fs::remove_dir_all(&temp_dir);
+}

@@ -4659,31 +4659,29 @@ impl AppUI {
             ));
         }
 
-        // Output Device (without "Out:" prefix)
+        // Output device (without "Out:" prefix), volume and web server badge, each after a
+        // separator. Kept apart so a long status can take their room (see below).
+        let separator = || Span::styled("  │  ", Style::default().fg(Color::DarkGray));
         let active_dev_name = self
             .device_manager
             .get_active_device()
             .map(|d| d.friendly_name)
             .unwrap_or_else(|| "Local Audio".to_string());
-        row2_spans.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
-        row2_spans.push(Span::styled(active_dev_name, Style::default().fg(Color::White)));
-
-        // Volume
+        let device = vec![
+            separator(),
+            Span::styled(active_dev_name, Style::default().fg(Color::White)),
+        ];
         let vol = self.player.volume();
-        row2_spans.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
-        row2_spans.push(Span::styled(
-            format!("Vol: {}%", vol),
-            Style::default().fg(Color::White),
-        ));
-
-        // Web server badge
-        if let Some(ref s) = self.web_server {
-            row2_spans.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
-            row2_spans.push(Span::styled(
-                format!("🌐 :{}", s.port),
-                Style::default().fg(Color::Cyan),
-            ));
-        }
+        let volume = vec![
+            separator(),
+            Span::styled(format!("Vol: {}%", vol), Style::default().fg(Color::White)),
+        ];
+        let web = self.web_server.as_ref().map(|s| {
+            vec![
+                separator(),
+                Span::styled(format!("🌐 :{}", s.port), Style::default().fg(Color::Cyan)),
+            ]
+        });
 
         // Transient non-redundant notices
         let is_redundant = self.status_message.is_empty()
@@ -4693,16 +4691,34 @@ impl AppUI {
             || self.status_message == "Stopped"
             || self.status_message.starts_with("Welcome to Quickstream");
 
-        if !is_redundant {
-            row2_spans.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
+        let status = (!is_redundant).then(|| {
             let msg_lower = self.status_message.to_lowercase();
             let msg_style = if msg_lower.contains("error") || msg_lower.contains("failed") {
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Magenta)
             };
-            row2_spans.push(Span::styled(&self.status_message, msg_style));
+            vec![separator(), Span::styled(self.status_message.as_str(), msg_style)]
+        });
+
+        // A status that would be cut off at the right edge (an error naming two playlists, say)
+        // takes the room of the device name, then the web badge, then the volume: the status
+        // is the one part that changes, and the rest come back with the next shorter status.
+        let width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
+        let available = inner[1].width as usize;
+        let mut info = [Some(device), web, Some(volume)];
+        if let Some(status) = &status {
+            let needed = width(&row2_spans) + width(status);
+            for slot in 0..info.len() {
+                let shown: usize = info.iter().flatten().map(|spans| width(spans)).sum();
+                if needed + shown <= available {
+                    break;
+                }
+                info[slot] = None;
+            }
         }
+        let [device, web, volume] = info;
+        row2_spans.extend(device.into_iter().chain(volume).chain(web).chain(status).flatten());
 
         f.render_widget(Paragraph::new(Line::from(row2_spans)), inner[1]);
 

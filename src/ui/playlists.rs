@@ -200,6 +200,10 @@ pub struct PlaylistsUi {
     /// Rows each pane showed at the last render: how far PageUp / PageDown move.
     pub list_page_height: usize,
     pub tracks_page_height: usize,
+    /// The playlist last created from the name prompt, and the one selected before it: if the
+    /// writer then reports the create failed, the cursor goes back there instead of staying on
+    /// the row the new playlist had sorted into.
+    created_from: Option<(String, Option<String>)>,
 }
 
 impl PlaylistsUi {
@@ -223,6 +227,7 @@ impl PlaylistsUi {
             tracks_state: ListState::default(),
             list_page_height: 10,
             tracks_page_height: 10,
+            created_from: None,
         }
     }
 
@@ -418,7 +423,8 @@ impl AppUI {
     /// Show what the background writer couldn't do (a create that found a file in its way, a
     /// rename that failed) once the store has undone it in memory. The cursor stays on the
     /// playlist it was on, under its restored name after a failed rename, and `last_playlist`
-    /// follows the same way.
+    /// follows the same way. When the cursor was on a playlist whose create failed, it goes back
+    /// to the playlist selected before the create.
     fn apply_playlist_write_failures(&mut self) {
         if !self.playlists.store.has_write_failures() {
             return;
@@ -428,7 +434,15 @@ impl AppUI {
         let failures = self.playlists.store.poll_write_failures();
         for failure in failures {
             match &failure {
-                WriteFailure::CreateUndone { name, .. } => self.follow_last_playlist(name, None),
+                WriteFailure::CreateUndone { name, .. } => {
+                    self.follow_last_playlist(name, None);
+                    let created_from = self.playlists.created_from.take_if(|(created, _)| created == name);
+                    if let Some((_, before)) = created_from {
+                        if selected.as_deref() == Some(name.as_str()) {
+                            selected = before;
+                        }
+                    }
+                }
                 WriteFailure::RenameUndone {
                     attempted, restored, ..
                 } => {
@@ -717,6 +731,7 @@ impl AppUI {
     /// "+ New playlist…") create and then add. An invalid or duplicate name puts the prompt back
     /// with the error so the user can fix it.
     fn submit_name_prompt(&mut self, purpose: NamePurpose, input: String) {
+        let selected_before = self.playlists.selected_name();
         let result = match &purpose {
             NamePurpose::Rename { old } => self.rename_playlist(old, &input),
             NamePurpose::Create | NamePurpose::CreateAndAdd(_) => self.playlists.store.create(&input),
@@ -735,6 +750,9 @@ impl AppUI {
         // The store re-sorts on create and rename: keep the cursor on the playlist just named.
         if let Some(index) = self.playlists.store.index_of(&name) {
             self.playlists.list_cursor = index;
+        }
+        if !matches!(purpose, NamePurpose::Rename { .. }) {
+            self.playlists.created_from = Some((name.clone(), selected_before));
         }
         match purpose {
             NamePurpose::Rename { old } => self.status_message = renamed_message(&old, &name),
