@@ -913,3 +913,43 @@ fn chrome_renders_without_panicking_down_to_40x12() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn spotlight_hint_is_cleared_when_spotlight_closes() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("spotlight_hint");
+    app.active_tab = 1;
+    app.open_spotlight();
+    assert!(app.status_message.starts_with("Spotlight:"), "{:?}", app.status_message);
+    app.close_spotlight();
+    assert!(
+        !app.status_message.starts_with("Spotlight:"),
+        "the hint goes with the spotlight: {:?}",
+        app.status_message
+    );
+
+    // It no longer hides keys on other tabs.
+    app.active_tab = 2;
+    let buffer = tui::render(&mut app, 100, 30);
+    let row = tui::row(&buffer, key_row_index(&buffer));
+    assert!(!row.contains("Spotlight"), "{row:?}");
+    assert!(row.contains(" R  RESCAN"), "{row:?}");
+
+    // A status set while the spotlight was open stays.
+    app.active_tab = 1;
+    app.open_spotlight();
+    app.status_message = "Added to queue: Halcyon Drift".to_string();
+    app.close_spotlight();
+    assert_eq!(app.status_message, "Added to queue: Halcyon Drift");
+
+    // Leaving the folder closes the spotlight and its hint too.
+    app.open_spotlight();
+    app.navigate_browser(dir.clone());
+    assert!(app.browser_spotlight.is_none());
+    assert!(
+        !app.status_message.starts_with("Spotlight:"),
+        "{:?}",
+        app.status_message
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

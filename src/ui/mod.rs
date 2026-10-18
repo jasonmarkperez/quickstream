@@ -1312,7 +1312,7 @@ impl AppUI {
     }
 
     pub fn navigate_browser(&mut self, path: PathBuf) {
-        self.browser_spotlight = None;
+        self.close_spotlight();
 
         if path.to_string_lossy() == "___MUSIC_HOMES___" {
             self.in_bookmarks_view = true;
@@ -1354,11 +1354,16 @@ impl AppUI {
 
     pub fn open_spotlight(&mut self) {
         self.browser_spotlight = Some(String::new());
-        self.status_message = "Spotlight: type to jump to subfolder (Esc to exit, Enter to open)".to_string();
+        self.status_message = SPOTLIGHT_HINT.to_string();
     }
 
+    /// Close the spotlight, and its hint in the status line if nothing has replaced it, so the
+    /// hint does not hide keys on other tabs.
     pub fn close_spotlight(&mut self) {
         self.browser_spotlight = None;
+        if self.status_message == SPOTLIGHT_HINT {
+            self.status_message.clear();
+        }
     }
 
     pub fn spotlight_matches(&self) -> Vec<usize> {
@@ -4768,6 +4773,9 @@ fn modal_rect_with_height(r: Rect, height: u16) -> Rect {
     let y = r.y + (r.height.saturating_sub(target_height)) / 2;
     Rect::new(x, y, target_width, target_height)
 }
+
+/// Status line while the browser spotlight is open.
+const SPOTLIGHT_HINT: &str = "Spotlight: type to jump to subfolder (Esc to exit, Enter to open)";
 
 fn format_time(seconds: f64) -> String {
     let total = seconds.round().max(0.0) as u64;
