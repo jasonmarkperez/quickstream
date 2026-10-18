@@ -6,15 +6,23 @@
 //! which applies saves, deletes and renames in the order they were sent. Every path is built by
 //! [`playlist_file_path`], so no playlist operation can write outside the playlists folder.
 //! Files skipped at load keep their names reserved, so no edit ever writes over one.
+//!
+//! A new playlist's file is created without replacing anything, and renames never replace
+//! another file, so a file the name checks can't see (an HFS+, SMB or exFAT name match) is left
+//! alone. The writer reports such failures back on a channel; [`PlaylistStore::poll_write_failures`]
+//! (called by the UI every tick) then removes the playlist that couldn't be created, or puts a
+//! playlist that couldn't be renamed back under its file's name (issues #62, #52).
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
-use crate::persist::PersistHandle;
+use crate::persist::{PersistFailure, PersistHandle, Reporter};
 use crate::playlist::{
     name_key, names_equal, normalize_path, parse_m3u8, playlist_file_path, validate_name, NameError, Playlist,
     PlaylistEntry, PLAYLIST_EXT,
@@ -58,6 +66,30 @@ pub enum MoveDir {
     Down,
 }
 
+/// A create or rename the background writer couldn't do, after the store undid it in memory.
+/// The UI shows `message` as the status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteFailure {
+    /// The playlist's file couldn't be created (a file was already there, or the disk refused),
+    /// so the playlist, now called `name`, was removed.
+    CreateUndone { name: String, message: String },
+    /// The rename didn't happen, so the playlist called `attempted` is called `restored` again:
+    /// the name its file still has.
+    RenameUndone {
+        attempted: String,
+        restored: String,
+        message: String,
+    },
+}
+
+impl WriteFailure {
+    pub fn message(&self) -> &str {
+        match self {
+            WriteFailure::CreateUndone { message, .. } | WriteFailure::RenameUndone { message, .. } => message,
+        }
+    }
+}
+
 /// What [`PlaylistStore::load_dir_reserving`] returns: the playlists and the stems of the
 /// files it skipped, or the error that kept it from listing the folder.
 pub type LoadResult = io::Result<(Vec<Playlist>, Vec<String>)>;
@@ -70,17 +102,33 @@ pub struct PlaylistStore {
     reserved: Vec<String>,
     loaded: bool,
     persist: PersistHandle,
+    /// Id of each playlist that has been created or renamed this session, by its current name.
+    /// The writer's failure reports carry the id, so a report finds its playlist even after
+    /// later renames.
+    ids: HashMap<String, u64>,
+    next_id: u64,
+    failures_tx: mpsc::Sender<PersistFailure>,
+    failures_rx: mpsc::Receiver<PersistFailure>,
+    /// Reports taken off `failures_rx` by [`has_write_failures`](Self::has_write_failures) and
+    /// not yet applied.
+    unapplied: Vec<PersistFailure>,
 }
 
 impl PlaylistStore {
     /// An empty store over `dir` that refuses edits until [`set_loaded`](Self::set_loaded).
     pub fn new(dir: PathBuf, persist: PersistHandle) -> Self {
+        let (failures_tx, failures_rx) = mpsc::channel();
         Self {
             dir,
             playlists: Vec::new(),
             reserved: Vec::new(),
             loaded: false,
             persist,
+            ids: HashMap::new(),
+            next_id: 0,
+            failures_tx,
+            failures_rx,
+            unapplied: Vec::new(),
         }
     }
 
@@ -210,7 +258,9 @@ impl PlaylistStore {
         self.playlists.iter().position(|p| names_equal(&p.name, name))
     }
 
-    /// Create an empty playlist and write its file. Returns the stored (trimmed) name.
+    /// Create an empty playlist and write its file. Returns the stored (trimmed) name. The file
+    /// is created without replacing anything: if one is already there, the writer leaves it
+    /// alone and [`poll_write_failures`](Self::poll_write_failures) removes the playlist again.
     pub fn create(&mut self, name: &str) -> Result<String, StoreError> {
         self.ensure_loaded()?;
         let name = validate_name(name).map_err(StoreError::Name)?;
@@ -223,7 +273,8 @@ impl PlaylistStore {
         let bytes = playlist.to_m3u8().into_bytes();
         self.playlists.push(playlist);
         sort_by_name(&mut self.playlists);
-        self.persist.save(path, bytes);
+        let reporter = self.reporter_for(&name);
+        self.persist.create(path, bytes, reporter);
         Ok(name)
     }
 
@@ -297,7 +348,9 @@ impl PlaylistStore {
     /// Rename playlist `old` to `new` and return the stored (trimmed) new name. The duplicate
     /// check ignores the playlist being renamed, so a case-only rename is allowed. A name
     /// reserved by a file skipped at load is refused, and so is a case-only rename onto a
-    /// reserved name with exactly the same bytes.
+    /// reserved name with exactly the same bytes. If the writer can't move the file (another file
+    /// is at the new name, or the disk refuses), [`poll_write_failures`](Self::poll_write_failures)
+    /// puts the old name back.
     pub fn rename(&mut self, old: &str, new: &str) -> Result<String, StoreError> {
         let (slot, old_path) = self.locate(old)?;
         let new_name = validate_name(new).map_err(StoreError::Name)?;
@@ -327,13 +380,17 @@ impl PlaylistStore {
             return Err(StoreError::Name(NameError::Duplicate(r.clone())));
         }
         let new_path = self.file_for(&new_name)?;
-        self.playlists[slot].name = new_name.clone();
+        let old_name = std::mem::replace(&mut self.playlists[slot].name, new_name.clone());
+        let reporter = self.reporter_for(&old_name);
+        if let Some(id) = self.ids.remove(&old_name) {
+            self.ids.insert(new_name.clone(), id);
+        }
         let bytes = self.playlists[slot].to_m3u8().into_bytes();
         sort_by_name(&mut self.playlists);
         // Move with the OS rename, never "write the new file, delete the old one": on a
         // case-insensitive disk `road trip.m3u8` and `Road Trip.m3u8` are one file, so the
         // delete would remove the playlist just written.
-        self.persist.rename(old_path, new_path.clone());
+        self.persist.rename_reporting(old_path, new_path.clone(), reporter);
         // Save again so the `#PLAYLIST` line carries the new name.
         self.persist.save(new_path, bytes);
         Ok(new_name)
@@ -342,9 +399,120 @@ impl PlaylistStore {
     /// Delete playlist `name` and its file.
     pub fn delete(&mut self, name: &str) -> Result<(), StoreError> {
         let (slot, path) = self.locate(name)?;
-        self.playlists.remove(slot);
+        let removed = self.playlists.remove(slot);
+        self.ids.remove(&removed.name);
         self.persist.delete(path);
         Ok(())
+    }
+
+    /// Undo, in memory, every create or rename the writer has reported failing since the last
+    /// call, and say what was undone. Never blocks: call it from the UI tick.
+    ///
+    /// - A failed create removes the playlist (whatever it is called now). When a file was in
+    ///   the way, its name is reserved like a file skipped at load, so a second create is refused
+    ///   with `"Mix" already exists` instead of failing the same way. A report for a playlist
+    ///   already deleted changes nothing.
+    /// - A failed rename gives the playlist back the name its file still has and saves it there,
+    ///   so edits made in the meantime (which the writer dropped) reach the real file.
+    pub fn poll_write_failures(&mut self) -> Vec<WriteFailure> {
+        self.has_write_failures();
+        let reports = std::mem::take(&mut self.unapplied);
+        reports.into_iter().filter_map(|report| self.undo(report)).collect()
+    }
+
+    /// Whether the writer has reported failures that [`poll_write_failures`](Self::poll_write_failures)
+    /// would apply. Cheap enough for every UI tick; no playlist changes until that call.
+    pub fn has_write_failures(&mut self) -> bool {
+        self.unapplied.extend(self.failures_rx.try_iter());
+        !self.unapplied.is_empty()
+    }
+
+    fn undo(&mut self, report: PersistFailure) -> Option<WriteFailure> {
+        match report {
+            PersistFailure::Create { tag, path, kind, error } => {
+                let created = file_stem(&path)?;
+                // Deleted already: nothing left to undo.
+                let name = self.name_with_id(tag)?;
+                if kind == io::ErrorKind::AlreadyExists {
+                    self.reserved.push(created.clone());
+                }
+                self.ids.remove(&name);
+                self.playlists.retain(|p| p.name != name);
+                log_warn(&format!("removed playlist \"{}\": its file couldn't be created", name));
+                Some(WriteFailure::CreateUndone {
+                    name,
+                    message: format!("Couldn't create \"{}\": {}", created, failure_reason(kind, &error)),
+                })
+            }
+            PersistFailure::Rename {
+                tag,
+                from,
+                to,
+                kind,
+                error,
+            } => {
+                let restored = file_stem(&from)?;
+                let attempted = self.name_with_id(tag)?;
+                // A playlist created or renamed onto the old name in the meantime can't have
+                // its own file there (the writer never replaces one), so it gives way.
+                if let Some(other) = self
+                    .playlists
+                    .iter()
+                    .find(|p| p.name != attempted && names_equal(&p.name, &restored))
+                    .map(|p| p.name.clone())
+                {
+                    log_warn(&format!(
+                        "dropping playlist \"{}\": \"{}\" keeps its file after a failed rename",
+                        other, restored
+                    ));
+                    self.ids.remove(&other);
+                    self.playlists.retain(|p| p.name != other);
+                }
+                let slot = self.playlists.iter().position(|p| p.name == attempted)?;
+                self.playlists[slot].name = restored.clone();
+                self.ids.remove(&attempted);
+                self.ids.insert(restored.clone(), tag);
+                sort_by_name(&mut self.playlists);
+                let slot = self.playlists.iter().position(|p| p.name == restored)?;
+                if let Ok(path) = self.file_for(&restored) {
+                    self.write_through(slot, path);
+                }
+                log_warn(&format!(
+                    "playlist \"{}\" is \"{}\" again: its file couldn't be renamed",
+                    attempted, restored
+                ));
+                let target = file_stem(&to).unwrap_or_else(|| attempted.clone());
+                Some(WriteFailure::RenameUndone {
+                    attempted,
+                    restored: restored.clone(),
+                    message: format!(
+                        "Couldn't rename \"{}\" to \"{}\": {}",
+                        restored,
+                        target,
+                        failure_reason(kind, &error)
+                    ),
+                })
+            }
+        }
+    }
+
+    /// The reporter for writes of the playlist called exactly `name`, giving it an id first if
+    /// it has none.
+    fn reporter_for(&mut self, name: &str) -> Reporter {
+        let id = match self.ids.get(name) {
+            Some(id) => *id,
+            None => {
+                self.next_id += 1;
+                self.ids.insert(name.to_string(), self.next_id);
+                self.next_id
+            }
+        };
+        Reporter::new(id, self.failures_tx.clone())
+    }
+
+    /// Current name of the playlist with id `id`.
+    fn name_with_id(&self, id: u64) -> Option<String> {
+        self.ids.iter().find(|(_, v)| **v == id).map(|(name, _)| name.clone())
     }
 
     fn ensure_loaded(&self) -> Result<(), StoreError> {
@@ -405,6 +573,20 @@ fn read_playlist_text(path: &Path) -> Result<String, String> {
     }
     let bytes = fs::read(path).map_err(|e| format!("could not read it: {}", e))?;
     String::from_utf8(bytes).map_err(|_| "not valid UTF-8".to_string())
+}
+
+/// The playlist name a playlist file path stands for (its stem).
+fn file_stem(path: &Path) -> Option<String> {
+    path.file_stem().and_then(|s| s.to_str()).map(str::to_string)
+}
+
+/// Why a create or rename failed, for the status line.
+fn failure_reason(kind: io::ErrorKind, error: &str) -> String {
+    if kind == io::ErrorKind::AlreadyExists {
+        "a file with that name already exists".to_string()
+    } else {
+        error.to_string()
+    }
 }
 
 /// Name order ignoring case; the exact name breaks ties so the order is deterministic.

@@ -21,7 +21,7 @@ This guide is intended for AI coding agents and automated development tools work
    - All persistent application data strictly complies with the XDG Base Directory specification:
      - Configuration: `~/.config/quickstream/config.json` (includes `last_playlist`, the playlist the add picker preselects)
      - Bookmarks: `~/.config/quickstream/bookmarks.json`
-     - Playlists: `~/.config/quickstream/playlists/<name>.m3u8` (`paths::get_playlists_dir()`; extended M3U8, UTF-8, LF, absolute track paths, one file per playlist). Track paths are normalized lexically with `playlist::normalize_path` (no `.` or `..`, no disk access, symlinks not followed) when a file is parsed and before `PlaylistStore::add`'s duplicate check. Every write, rename and delete goes through `PlaylistStore` and `playlist::playlist_file_path`, which refuses any path whose parent is not the playlists folder. Missing-file checks never prune a playlist, and a file that fails to load is skipped and never rewritten.
+     - Playlists: `~/.config/quickstream/playlists/<name>.m3u8` (`paths::get_playlists_dir()`; extended M3U8, UTF-8, LF, absolute track paths, one file per playlist). Track paths are normalized lexically with `playlist::normalize_path` (no `.` or `..`, no disk access, symlinks not followed) when a file is parsed and before `PlaylistStore::add`'s duplicate check. Every write, rename and delete goes through `PlaylistStore` and `playlist::playlist_file_path`, which refuses any path whose parent is not the playlists folder. A new playlist's file is created with `persist::create_new_file` (temp file, then a hard link, which never replaces), and a rename never replaces another file. The writer reports a failed create or rename back to the store over an mpsc channel (`persist::Reporter`); `AppUI::poll_playlists` then removes the playlist that couldn't be created (`Couldn't create "Mix": a file with that name already exists`, and the name is reserved) or restores the name a failed rename left the file under (`Couldn't rename "Old" to "New": …`). Until then the writer drops saves to that path, so it never overwrites the other file or leaves `New.m3u8` next to `Old.m3u8`. Missing-file checks never prune a playlist, and a file that fails to load is skipped and never rewritten.
      - Track Analysis Database: `~/.cache/quickstream/track_analysis.db` (SQLite)
      - Cache Indexes: `~/.cache/quickstream/music_index.jsonl`
      - Logs: `~/.local/share/quickstream/quickstream.log`
@@ -82,7 +82,7 @@ quickstream/
 │   ├── metadata.rs       # Lofty audio metadata extraction, cover art decoding, path heuristics
 │   ├── playlist.rs       # Pure M3U8 playlist model: parse/write, name validation, safe file paths, queue plan
 │   ├── playlist_store.rs # In-memory PlaylistStore (sorted), write-through to disk via PersistHandle
-│   ├── persist.rs        # Background atomic writer: ordered save / delete / rename (PersistHandle)
+│   ├── persist.rs        # Background atomic writer: ordered save / create / delete / rename (PersistHandle), failures reported back
 │   ├── queue.rs          # PlaybackQueue, FastRng (SplitMix64 deterministic PRNG), shuffle & loop
 │   ├── web.rs            # Embedded HTTP byte-range server, continuous WAV streaming, REST API, Web UI
 │   ├── web_access.rs     # Web access control: pairing token, Host/Origin/Content-Type checks, allowed folders
@@ -109,7 +109,7 @@ quickstream/
     └── test_web.rs           # Embedded web server, byte ranges, REST API, and command dispatch
 ```
 
-The background writer's delete and rename tests (used by `PlaylistStore`) are in the existing `tests/test_persistence_worker.rs`, which the map above does not list.
+The background writer's create, delete and rename tests (used by `PlaylistStore`), including the failure reports, are in the existing `tests/test_persistence_worker.rs`, which the map above does not list.
 
 ---
 

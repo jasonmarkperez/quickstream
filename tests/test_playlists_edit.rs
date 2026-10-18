@@ -630,3 +630,110 @@ fn test_unlistable_playlists_folder_refuses_edits_and_keeps_files() {
     drop(app);
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+/// Write a file the store never read into the playlists folder (issues #62, #52).
+fn foreign_playlist_file(file: &str, text: &str) -> PathBuf {
+    let dir = paths::get_playlists_dir();
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(file);
+    fs::write(&path, text).unwrap();
+    path
+}
+
+/// Let the writer finish and the UI apply what it reported, as the next ticks would.
+fn settle(app: &mut AppUI) {
+    assert!(app.persistence.flush());
+    app.poll_playlists();
+}
+
+#[test]
+fn test_create_onto_an_unseen_file_shows_an_error_and_removes_the_playlist() {
+    common::isolate();
+    // Issue #62: a file the name check can't see must survive a create, and the UI must say so.
+    let (mut app, temp_dir) = app_on_playlists_tab("create_collision");
+    seed(&mut app, "Alpha", &[]);
+    let theirs = "#EXTM3U\n#PLAYLIST:Mix\n/user/own.flac\n";
+    let path = foreign_playlist_file("Mix.m3u8", theirs);
+
+    press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+    type_text(&mut app, "Mix");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.status_message, "Created \"Mix\"");
+    app.settings_mgr.settings.last_playlist = Some("Mix".to_string());
+    settle(&mut app);
+
+    assert_eq!(
+        app.status_message,
+        "Couldn't create \"Mix\": a file with that name already exists"
+    );
+    assert_eq!(playlist_names(&app), vec!["Alpha"]);
+    assert_eq!(app.playlists.list_cursor, 0);
+    assert_eq!(app.settings_mgr.settings.last_playlist, None);
+    assert_eq!(fs::read_to_string(&path).unwrap(), theirs);
+    let view = render_view(&mut app, 100, 30);
+    assert!(!view.contains("Mix  ("), "{}", view);
+
+    // Trying again is refused in the prompt instead.
+    press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+    type_text(&mut app, "Mix");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        matches!(&app.playlists.modal, Some(PlaylistModal::NamePrompt { error: Some(e), .. }) if e == "\"Mix\" already exists"),
+        "{:?}",
+        app.playlists.modal
+    );
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    settle(&mut app);
+    assert_eq!(fs::read_to_string(&path).unwrap(), theirs);
+
+    drop(app);
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_failed_rename_shows_an_error_and_restores_the_name() {
+    common::isolate();
+    // Issue #52: a rename the writer couldn't do must not leave the new name in memory, or
+    // later edits would write New.m3u8 next to Old.m3u8.
+    let (mut app, temp_dir) = app_on_playlists_tab("rename_failure");
+    let track = temp_dir.join("a.flac");
+    seed(&mut app, "Beta", &[]);
+    seed(&mut app, "Old", &[track]);
+    settle(&mut app);
+    let path = foreign_playlist_file("Able.m3u8", "theirs");
+    app.settings_mgr.settings.last_playlist = Some("Old".to_string());
+    app.playlists.list_cursor = app.playlists.store.index_of("Old").unwrap();
+
+    rename_selected(&mut app, "Old", "Able");
+    assert_eq!(playlist_names(&app), vec!["Able", "Beta"]);
+    settle(&mut app);
+
+    assert_eq!(
+        app.status_message,
+        "Couldn't rename \"Old\" to \"Able\": a file with that name already exists"
+    );
+    assert_eq!(playlist_names(&app), vec!["Beta", "Old"]);
+    assert_eq!(
+        app.playlists.selected_name().as_deref(),
+        Some("Old"),
+        "cursor stays on the playlist"
+    );
+    assert_eq!(app.settings_mgr.settings.last_playlist.as_deref(), Some("Old"));
+    assert_eq!(fs::read_to_string(&path).unwrap(), "theirs");
+
+    // Later edits go to the file that exists.
+    app.playlists.tracks_focus = true;
+    press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+    settle(&mut app);
+    assert_eq!(playlist_files(), vec!["Able.m3u8", "Beta.m3u8", "Old.m3u8"]);
+    let old = fs::read_to_string(paths::get_playlists_dir().join("Old.m3u8")).unwrap();
+    assert!(
+        parse_m3u8("Old", &old, &paths::get_playlists_dir()).entries.is_empty(),
+        "{}",
+        old
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), "theirs");
+
+    drop(app);
+    let _ = fs::remove_dir_all(&temp_dir);
+}

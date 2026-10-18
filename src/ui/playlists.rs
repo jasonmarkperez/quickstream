@@ -13,7 +13,7 @@ use ratatui::widgets::*;
 use super::AppUI;
 use crate::paths;
 use crate::playlist::{Playlist, PlaylistEntry};
-use crate::playlist_store::{LoadResult, PlaylistStore};
+use crate::playlist_store::{LoadResult, PlaylistStore, WriteFailure};
 
 /// Last row of the add picker: create a playlist and add to it.
 pub const NEW_PLAYLIST_ROW: &str = "+ New playlist…";
@@ -325,9 +325,40 @@ impl AppUI {
                 }
             }
         }
+        self.apply_playlist_write_failures();
         self.playlists.clamp_cursors();
         self.poll_playlist_folder_adds();
         self.poll_playlist_checks();
+    }
+
+    /// Show what the background writer couldn't do (a create that found a file in its way, a
+    /// rename that failed) once the store has undone it in memory. The cursor stays on the
+    /// playlist it was on, under its restored name after a failed rename, and `last_playlist`
+    /// follows the same way.
+    fn apply_playlist_write_failures(&mut self) {
+        if !self.playlists.store.has_write_failures() {
+            return;
+        }
+        // Before the store re-sorts: afterwards the cursor's row may hold another playlist.
+        let mut selected = self.playlists.selected_name();
+        let failures = self.playlists.store.poll_write_failures();
+        for failure in failures {
+            match &failure {
+                WriteFailure::CreateUndone { name, .. } => self.follow_last_playlist(name, None),
+                WriteFailure::RenameUndone {
+                    attempted, restored, ..
+                } => {
+                    self.follow_last_playlist(attempted, Some(restored));
+                    if selected.as_deref() == Some(attempted.as_str()) {
+                        selected = Some(restored.clone());
+                    }
+                }
+            }
+            self.status_message = failure.message().to_string();
+        }
+        if let Some(index) = selected.and_then(|name| self.playlists.store.index_of(&name)) {
+            self.playlists.list_cursor = index;
+        }
     }
 
     /// Keys while a playlist modal is open. Returns true when the app should quit.
