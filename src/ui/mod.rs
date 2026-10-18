@@ -3577,6 +3577,11 @@ impl AppUI {
             return;
         }
 
+        // `[n]` comes first so it still shows when a narrow terminal clips the footer
+        let footer = format!(
+            " [n] Queue & Library   [Space] Play/Pause   [←/→] Prev/Next Track   [[/]] Seek {}s   [+/-] Vol ",
+            self.settings_mgr.settings.seek_step_seconds
+        );
         let outer_block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
@@ -3584,10 +3589,7 @@ impl AppUI {
                 " [1] NOW PLAYING ",
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ))
-            .title_bottom(Span::styled(
-                " [Space] Play/Pause   [←/→] Prev/Next Track   [[/]] Seek 10s   [+/-] Vol   [n] Queue & Library ",
-                Style::default().fg(Color::DarkGray),
-            ));
+            .title_bottom(Span::styled(footer, Style::default().fg(Color::DarkGray)));
 
         let inner = outer_block.inner(area);
         f.render_widget(outer_block, area);

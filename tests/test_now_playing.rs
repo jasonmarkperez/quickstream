@@ -36,10 +36,6 @@ fn test_now_playing_tab_key_navigation() {
     let _ = app.handle_input_key(crossterm::event::KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
     assert_eq!(app.active_tab, 0);
 
-    // Press 'n': back to Queue & Library (tab 1)
-    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-    assert_eq!(app.active_tab, 1);
-
     // Numeric keys 2, 3, 4
     let _ = app.handle_input_key(crossterm::event::KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
     assert_eq!(app.active_tab, 2); // Devices
@@ -51,6 +47,15 @@ fn test_now_playing_tab_key_navigation() {
     // Tab cycling
     let _ = app.handle_input_key(crossterm::event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     assert_eq!(app.active_tab, 2);
+
+    // Esc is the global quit key, also on Now Playing (#57)
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+    assert_eq!(app.active_tab, 0);
+    app.browser_loading = false;
+    let quit = app
+        .handle_input_key(crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(quit, "Esc on Now Playing should quit");
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
@@ -75,12 +80,6 @@ fn test_render_now_playing_tab_empty_and_populated() {
 
     let view = terminal.backend().to_string();
     assert!(view.contains("NOW PLAYING"), "Should render NOW PLAYING title in view");
-    // Esc is the global quit key, so the footer must not offer it for switching tabs (#57).
-    assert!(
-        view.contains("[n] Queue & Library"),
-        "Footer should name n for Queue & Library"
-    );
-    assert!(!view.contains("Esc"), "Footer should not mention Esc");
     assert!(
         view.contains("No Track Loaded"),
         "Should render No Track Loaded when queue is empty"
@@ -142,6 +141,50 @@ fn test_render_now_playing_tab_empty_and_populated() {
         "Table header TIME should appear in filename mode"
     );
     assert!(view3.contains("song2.flac"), "Filename should appear in table");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+fn now_playing_footer(app: &mut AppUI, width: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+    app.active_tab = 0;
+    terminal.draw(|f| app.render(f)).unwrap();
+    let view = terminal.backend().to_string();
+    view.lines()
+        .find(|line| line.contains("Play/Pause"))
+        .expect("Now Playing footer row")
+        .to_string()
+}
+
+#[test]
+fn test_now_playing_footer_names_n_not_esc_at_80_columns() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_np_footer_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let settings_mgr = SettingsManager::with_path(temp_dir.join("config.json"));
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    // Esc is the global quit key, so the footer must not offer it for switching tabs (#57)
+    let footer = now_playing_footer(&mut app, 80);
+    assert!(footer.contains("[n] Queue & Library"), "footer at 80 columns: {footer}");
+    assert!(!footer.contains("Esc"), "footer: {footer}");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_now_playing_footer_shows_the_seek_step_setting() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_np_seek_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let settings_mgr = SettingsManager::with_path(temp_dir.join("config.json"));
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+
+    app.settings_mgr.settings.seek_step_seconds = 30.0;
+    let footer = now_playing_footer(&mut app, 120);
+    assert!(footer.contains("Seek 30s"), "footer: {footer}");
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
