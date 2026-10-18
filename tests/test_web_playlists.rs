@@ -1046,6 +1046,64 @@ fn test_web_create_and_rename_onto_a_name_still_saving_are_refused() {
     let _ = fs::remove_dir_all(&music);
 }
 
+/// PR #65 review (after the race fix): three quick dashboard renames of one playlist, the first
+/// of which fails. Renaming back and then on used to be accepted, and the undo then called the
+/// playlist by its old name while its file had moved on, so a delete left that file behind. The
+/// second and third renames are refused until the first is settled.
+#[test]
+fn test_web_rename_of_a_playlist_whose_rename_is_still_saving_is_refused() {
+    common::isolate();
+    let music = temp_dir("edit_pending_again");
+    write_playlists(&[(PLAYLIST, vec![]), ("Mix", vec![])]);
+    let mut app = web_app(&music);
+    assert!(app.persistence.flush());
+    fs::write(playlist_file("Summer"), "theirs").unwrap();
+    let rename = |name: &str, new_name: &str| PlaylistEdit::Rename {
+        name: name.to_string(),
+        new_name: new_name.to_string(),
+    };
+
+    assert_eq!(
+        edit(&mut app, rename(PLAYLIST, "Summer")),
+        Ok("Renamed \"Road Trip\" to \"Summer\"".to_string())
+    );
+    let busy = "Still renaming \"Road Trip\" to \"Summer\", try again".to_string();
+    assert_eq!(edit(&mut app, rename("Summer", PLAYLIST)), Err(busy.clone()));
+    assert_eq!(app.status_message, busy);
+    assert_eq!(edit(&mut app, rename("Summer", "Winter")), Err(busy));
+
+    assert!(app.persistence.flush());
+    assert!(poll_until(&mut app, |app| app
+        .status_message
+        .starts_with("Couldn't rename")));
+    assert_eq!(names(&app), vec!["Mix".to_string(), PLAYLIST.to_string()]);
+    assert_eq!(
+        edit(&mut app, rename(PLAYLIST, "Winter")),
+        Ok("Renamed \"Road Trip\" to \"Winter\"".to_string())
+    );
+    assert!(app.persistence.flush());
+    app.poll_playlists();
+    assert_eq!(names(&app), vec!["Mix".to_string(), "Winter".to_string()]);
+    assert_eq!(
+        edit(
+            &mut app,
+            PlaylistEdit::Delete {
+                name: "Winter".to_string()
+            }
+        ),
+        Ok("Deleted \"Winter\"".to_string())
+    );
+    assert!(app.persistence.flush());
+    let mut files: Vec<String> = fs::read_dir(quickstream::paths::get_playlists_dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    files.sort();
+    assert_eq!(files, vec!["Mix.m3u8".to_string(), "Summer.m3u8".to_string()]);
+    assert_eq!(fs::read_to_string(playlist_file("Summer")).unwrap(), "theirs");
+    let _ = fs::remove_dir_all(&music);
+}
+
 #[test]
 fn test_web_names_get_the_same_checks_and_messages_as_the_terminal() {
     common::isolate();

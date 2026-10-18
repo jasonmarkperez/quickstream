@@ -1013,8 +1013,9 @@ fn test_failed_rename_reverts_the_name_and_later_edits_write_the_real_file() {
         .contains("#PLAYLIST:Old\n"));
 }
 
-/// A second rename sent before the first one's failure arrived is refused by the writer too;
-/// the playlist goes back to the name its file really has.
+/// A second rename sent before the first one's failure arrived is refused (PR #65 review; the
+/// writer would refuse the chain too, see `test_persistence_worker.rs`); the playlist goes back
+/// to the name its file really has.
 #[test]
 fn test_rename_chain_after_a_failed_rename_reverts_to_the_real_file() {
     common::isolate();
@@ -1025,15 +1026,21 @@ fn test_rename_chain_after_a_failed_rename_reverts_to_the_real_file() {
     foreign_file(&dir, "New.m3u8", "theirs");
 
     store.rename("Old", "New").unwrap();
-    store.rename("New", "Newer").unwrap();
-    store.add("Newer", vec![entry("a")]).unwrap();
+    assert_eq!(
+        store.rename("New", "Newer"),
+        Err(StoreError::StillRenaming {
+            from: "Old".to_string(),
+            to: "New".to_string(),
+        })
+    );
+    store.add("New", vec![entry("a")]).unwrap();
     assert!(worker.flush());
     let failures = store.poll_write_failures();
 
     assert_eq!(failures.len(), 1, "{:?}", failures);
     assert!(
         matches!(&failures[0], WriteFailure::RenameUndone { attempted, restored, .. }
-        if attempted == "Newer" && restored == "Old")
+        if attempted == "New" && restored == "Old")
     );
     assert_eq!(names(&store), vec!["Old"]);
     assert!(worker.flush());
@@ -1199,10 +1206,11 @@ fn test_create_onto_the_old_name_of_a_rename_still_saving_is_refused() {
 
 /// CC2: renaming a playlist straight back to its old name before the failure of the rename away
 /// from it is heard used to leave that name marked as not ours in the writer, so every later save
-/// was dropped. Renaming back is the playlist's own business, so it isn't refused: the writer
-/// sees it lands on the real file, saves reach that file again, and the failure is still reported.
+/// was dropped. The writer now handles that (see `test_persistence_worker.rs`), but the store
+/// refuses the rename back anyway: a rename back and then on to a third name moved the file
+/// under the undo (PR #65 review). The failure is reported, and saves reach the real file.
 #[test]
-fn test_rename_back_while_the_rename_away_is_still_saving_keeps_saving() {
+fn test_rename_back_while_the_rename_away_is_still_saving_is_refused() {
     common::isolate();
     let dir = scratch("pending_rename_back");
     let (worker, mut store) = open_store(&dir);
@@ -1212,15 +1220,18 @@ fn test_rename_back_while_the_rename_away_is_still_saving_keeps_saving() {
     foreign_file(&dir, "B.m3u8", "theirs");
 
     store.rename("A", "B").unwrap();
-    assert_eq!(store.rename("B", "A"), Ok("A".to_string()));
-    store.add("A", vec![entry("b")]).unwrap();
+    assert_eq!(
+        refusal(store.rename("B", "A")),
+        "Still renaming \"A\" to \"B\", try again"
+    );
+    store.add("B", vec![entry("b")]).unwrap();
     assert!(worker.flush());
     let failures = store.poll_write_failures();
 
     assert_eq!(
         failures,
         vec![WriteFailure::RenameUndone {
-            attempted: "A".to_string(),
+            attempted: "B".to_string(),
             restored: "A".to_string(),
             message: "Couldn't rename \"A\" to \"B\": a file with that name already exists".to_string(),
         }]
@@ -1234,6 +1245,109 @@ fn test_rename_back_while_the_rename_away_is_still_saving_keeps_saving() {
     );
     assert_eq!(fs::read_to_string(dir.join("B.m3u8")).unwrap(), "theirs");
     assert_eq!(file_names(&dir), vec!["A.m3u8".to_string(), "B.m3u8".to_string()]);
+}
+
+/// PR #65 review (after the race fix): rename A -> B will fail, then, before that failure is
+/// heard, the same playlist is renamed back to A (which the writer lands on the real file) and
+/// on to C (a real move of A.m3u8 to C.m3u8). The undo then put the name back to "A" while the
+/// file was C.m3u8: later saves made a second A.m3u8, a delete left C.m3u8 behind, and the
+/// playlist came back as "C" at the next launch. A playlist's second rename now waits until its
+/// first is settled, so the undo always restores the name its file really has.
+#[test]
+fn test_rename_of_a_playlist_whose_rename_is_still_saving_is_refused() {
+    common::isolate();
+    let dir = scratch("pending_rename_again");
+    let (worker, mut store) = open_store(&dir);
+    store.create("A").unwrap();
+    store.add("A", vec![entry("a")]).unwrap();
+    assert!(worker.flush());
+    assert!(store.poll_write_failures().is_empty());
+    let theirs = foreign_file(&dir, "B.m3u8", "theirs");
+
+    store.rename("A", "B").unwrap();
+    let busy = "Still renaming \"A\" to \"B\", try again";
+    assert_eq!(refusal(store.rename("B", "A")), busy, "renaming straight back");
+    assert_eq!(refusal(store.rename("B", "C")), busy, "renaming on");
+    assert_eq!(names(&store), vec!["B"], "the refused renames changed nothing");
+    store.add("B", vec![entry("b")]).unwrap();
+    assert!(worker.flush());
+    let failures = store.poll_write_failures();
+
+    assert_eq!(
+        failures,
+        vec![WriteFailure::RenameUndone {
+            attempted: "B".to_string(),
+            restored: "A".to_string(),
+            message: "Couldn't rename \"A\" to \"B\": a file with that name already exists".to_string(),
+        }]
+    );
+    assert_eq!(names(&store), vec!["A"]);
+    // Settled: the rename the user wanted now goes through and moves the real file.
+    assert_eq!(store.rename("A", "C"), Ok("C".to_string()));
+    store.add("C", vec![entry("c")]).unwrap();
+    assert!(worker.flush());
+    assert!(store.poll_write_failures().is_empty());
+    assert_eq!(names(&store), vec!["C"]);
+    assert_eq!(file_names(&dir), vec!["B.m3u8".to_string(), "C.m3u8".to_string()]);
+    assert_eq!(
+        paths(&on_disk(&dir, "C").entries),
+        paths(&[entry("a"), entry("b"), entry("c")])
+    );
+
+    // Deleting the playlist removes its real file; nothing brings it back at the next launch.
+    store.delete("C").unwrap();
+    assert!(worker.flush());
+    assert_eq!(file_names(&dir), vec!["B.m3u8".to_string()]);
+    assert_eq!(fs::read_to_string(&theirs).unwrap(), "theirs");
+    let next_launch = PlaylistStore::load_dir(&dir).unwrap();
+    assert!(
+        next_launch.iter().all(|p| p.name != "A" && p.name != "C"),
+        "{:?}",
+        next_launch.iter().map(|p| &p.name).collect::<Vec<_>>()
+    );
+}
+
+/// The case variant on a case-insensitive disk: A -> B will fail, then B -> a before the failure
+/// is heard. The writer found A.m3u8 and a.m3u8 to be one file and renamed it to a.m3u8, and the
+/// undo then called the playlist "A" again while the disk said "a". Refused the same way; once
+/// settled, the case-only rename goes through and memory and disk agree.
+#[test]
+fn test_case_only_rename_of_a_playlist_whose_rename_is_still_saving_is_refused() {
+    common::isolate();
+    let dir = scratch("pending_rename_case");
+    let (worker, mut store) = open_store(&dir);
+    store.create("A").unwrap();
+    store.add("A", vec![entry("a")]).unwrap();
+    assert!(worker.flush());
+    foreign_file(&dir, "B.m3u8", "theirs");
+
+    store.rename("A", "B").unwrap();
+    assert_eq!(
+        refusal(store.rename("B", "a")),
+        "Still renaming \"A\" to \"B\", try again"
+    );
+    assert!(worker.flush());
+    let failures = store.poll_write_failures();
+
+    assert!(
+        matches!(failures.as_slice(), [WriteFailure::RenameUndone { attempted, restored, .. }]
+        if attempted == "B" && restored == "A"),
+        "{:?}",
+        failures
+    );
+    assert_eq!(names(&store), vec!["A"]);
+    assert_eq!(file_names(&dir), vec!["A.m3u8".to_string(), "B.m3u8".to_string()]);
+
+    assert_eq!(store.rename("A", "a"), Ok("a".to_string()));
+    store.add("a", vec![entry("b")]).unwrap();
+    assert!(worker.flush());
+    assert!(store.poll_write_failures().is_empty());
+    assert_eq!(names(&store), vec!["a"]);
+    assert_eq!(file_names(&dir), vec!["B.m3u8".to_string(), "a.m3u8".to_string()]);
+    assert_eq!(paths(&on_disk(&dir, "a").entries), paths(&[entry("a"), entry("b")]));
+    store.delete("a").unwrap();
+    assert!(worker.flush());
+    assert_eq!(file_names(&dir), vec!["B.m3u8".to_string()]);
 }
 
 /// Once the playlist with a pending rename is deleted, its names are free: the delete removed
@@ -1316,6 +1430,9 @@ fn test_without_failures_creates_and_renames_are_not_held_up() {
     store.add("B", vec![entry("b")]).unwrap();
     store.create("C").unwrap();
     store.rename("C", "D").unwrap();
+    // A playlist's next rename waits for its last one to be settled; the writer's
+    // acknowledgement settles it.
+    assert!(worker.flush());
     store.rename("D", "E").unwrap();
     store.add("E", vec![entry("e")]).unwrap();
     assert!(worker.flush());

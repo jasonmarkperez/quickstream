@@ -18,8 +18,11 @@
 //! from or goes to, or renaming another playlist onto one, is refused
 //! ([`StoreError::StillCreating`], [`StoreError::StillRenaming`]): the file that name stands for
 //! may still belong to the pending playlist, and if the pending operation fails, the undo puts
-//! that playlist back under that very name (PR #65 review). The pending playlist itself may
-//! keep renaming (the writer follows the chain), and once it is deleted its names are free.
+//! that playlist back under that very name (PR #65 review). A playlist whose own rename is still
+//! pending can't be renamed again either: if that rename fails, the undo restores the name it
+//! started from, which is only the file's real name while no later rename has moved the file.
+//! The playlist may still be renamed while its create is pending, and once it is deleted its
+//! names are free.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -438,8 +441,10 @@ impl PlaylistStore {
     /// reserved name with exactly the same bytes. If the writer can't move the file (another file
     /// is at the new name, or the disk refuses), [`poll_write_failures`](Self::poll_write_failures)
     /// puts the old name back. A new name that another playlist's unsettled create or rename
-    /// starts from or goes to is refused like in [`create`](Self::create). The playlist's own
-    /// pending create or rename never holds it up, even renaming straight back.
+    /// starts from or goes to is refused like in [`create`](Self::create). So is any rename of a
+    /// playlist whose own previous rename is still pending ([`StoreError::StillRenaming`]), even
+    /// straight back: the undo of a failed rename would otherwise restore a name the file no
+    /// longer has. The playlist's own pending create doesn't hold it up.
     pub fn rename(&mut self, old: &str, new: &str) -> Result<String, StoreError> {
         let (slot, old_path) = self.locate(old)?;
         let new_name = validate_name(new).map_err(StoreError::Name)?;
@@ -637,8 +642,13 @@ impl PlaylistStore {
     /// claiming the name would then share its file, so deleting one would delete the other's
     /// file and the undo would drop saves (PR #65 review).
     ///
-    /// Not refused: the playlist's own pending operations (the writer follows a chain of renames
-    /// of one playlist, including one straight back), and those of a playlist deleted since (the
+    /// Also refused: any rename of the playlist `renaming` while a rename of its own is pending.
+    /// If that rename fails, the undo gives the playlist back the name it was renamed from; once a
+    /// second rename has gone through (straight back, then on to a third name, or a case-only
+    /// rename back), the file is no longer there and the restored name would be wrong.
+    ///
+    /// Not refused: the playlist's own pending create (its undo removes the playlist by id,
+    /// whatever it is called by then), and the operations of a playlist deleted since (the
     /// writer's delete removed the file the operation left behind, or left alone a file that was
     /// never ours, so a later create or rename of the name gets its own report). Reports already
     /// received are settled first, so a finished operation never holds anything up.
@@ -647,7 +657,14 @@ impl PlaylistStore {
         let blocking = self
             .pending
             .iter()
-            .filter(|(_, p)| p.involves(name) && Some(p.playlist) != renaming && self.name_of(p.playlist).is_some())
+            .filter(|(_, p)| {
+                // The playlist being renamed has a rename of its own still unsettled. If that one
+                // fails, the undo puts back the name it started from, which is only right while
+                // the file hasn't moved since; a rename back and on would move it (PR #65 review).
+                let own_rename = Some(p.playlist) == renaming && p.from.is_some();
+                let others = p.involves(name) && Some(p.playlist) != renaming && self.name_of(p.playlist).is_some();
+                own_rename || others
+            })
             // The earliest such operation, so the message doesn't depend on hash order.
             .min_by_key(|(tag, _)| **tag);
         match blocking {
