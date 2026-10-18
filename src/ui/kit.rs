@@ -420,6 +420,8 @@ pub struct Col<'a> {
     pub text: Cow<'a, str>,
     pub width: ColWidth,
     pub style: Style,
+    /// Characters of `text` (char indices) drawn underlined, e.g. a spotlight match.
+    pub underline: Option<Range<usize>>,
 }
 
 impl<'a> Col<'a> {
@@ -428,6 +430,7 @@ impl<'a> Col<'a> {
             text: text.into(),
             width: ColWidth::Fixed(width),
             style,
+            underline: None,
         }
     }
 
@@ -436,6 +439,7 @@ impl<'a> Col<'a> {
             text: text.into(),
             width: ColWidth::Flex,
             style,
+            underline: None,
         }
     }
 
@@ -444,7 +448,15 @@ impl<'a> Col<'a> {
             text: text.into(),
             width: ColWidth::Auto,
             style,
+            underline: None,
         }
+    }
+
+    /// Underline the characters `range` (char indices into the text). Characters cut off by the
+    /// column's `…` are not drawn, so neither is their underline.
+    pub fn underline(mut self, range: Range<usize>) -> Self {
+        self.underline = Some(range);
+        self
     }
 }
 
@@ -487,18 +499,47 @@ pub fn list_row(f: &mut Frame, area: Rect, cols: &[Col], mark: RowMark) {
             col.text.as_ref()
         };
         let is_last = i + 1 == cols.len();
-        let text = if is_last || width < 2 {
+        let budget = if is_last || width < 2 { width } else { width - 1 };
+        let shown = if is_last || width < 2 {
             fit(text, width)
         } else {
             format!("{} ", fit(text, width - 1))
         };
-        buf.set_stringn(x, area.y, text, width, col.style);
+        buf.set_stringn(x, area.y, shown, width, col.style);
+        if let (Some(range), false) = (&col.underline, i == 0 && mark == RowMark::Marker) {
+            underline_chars(buf, x, area.y, text, budget, range);
+        }
         x += width as u16;
     }
     if mark == RowMark::Cursor {
         let left = area.x.saturating_sub(1);
         let right = (area.right() + 1).min(screen.right());
         buf.set_style(Rect::new(left, area.y, right - left, 1), theme::cursor());
+    }
+}
+
+/// Underline, in the row at (`x`, `y`), the characters `range` of `text` as [`fit`] draws it in
+/// `budget` columns: only the characters kept before a `…`.
+fn underline_chars(buf: &mut Buffer, x: u16, y: u16, text: &str, budget: usize, range: &Range<usize>) {
+    let kept = if text_width(text) <= budget {
+        usize::MAX
+    } else {
+        cut(text, budget.saturating_sub(1)).0.chars().count()
+    };
+    let mut cx = x;
+    for (i, c) in text.chars().enumerate() {
+        if i >= kept || i >= range.end {
+            break;
+        }
+        let w = char_width(c) as u16;
+        if i >= range.start {
+            for dx in 0..w.max(1) {
+                if let Some(cell) = buf.cell_mut((cx + dx, y)) {
+                    cell.modifier.insert(Modifier::UNDERLINED);
+                }
+            }
+        }
+        cx += w;
     }
 }
 

@@ -413,3 +413,34 @@ fn marker_row_puts_a_triangle_in_the_first_column_without_reverse_video() {
     assert_eq!(buf[(1, 1)].symbol(), "▶", "unmarked rows keep their first column");
     assert_eq!(tui::find_text(&buf, "06:02"), Some((24, 0)));
 }
+
+#[test]
+fn list_row_underlines_the_marked_characters_and_never_the_ellipsis() {
+    common::isolate();
+    let area = Rect::new(0, 0, 36, 2);
+    let buf = draw(36, 2, |f| {
+        let row = |title: &'static str, range| {
+            vec![
+                Col::fixed("01", 4, Style::new()),
+                Col::fixed(title, 12, Style::new()).underline(range),
+                Col::flex("Artist", Style::new()),
+            ]
+        };
+        kit::list_row(f, area, &row("Slow Low", 1..4), RowMark::Cursor);
+        kit::list_row(
+            f,
+            Rect::new(0, 1, 36, 1),
+            &row("Northbound, slowly", 8..14),
+            RowMark::Plain,
+        );
+    });
+    let underlined = |x: u16, y: u16| tui::cell_style(&buf, x, y).add_modifier.contains(Modifier::UNDERLINED);
+    // Row 0: `low` in `Slow Low`, kept under the cursor bar.
+    assert!(!underlined(4, 0));
+    assert!((5..8).all(|x| underlined(x, 0)));
+    assert!(!underlined(8, 0));
+    // Row 1: cut to `Northbound…`; only the kept characters of the range are underlined.
+    assert_eq!(tui::row(&buf, 1).trim_end(), "01  Northbound… Artist");
+    assert!((12..14).all(|x| underlined(x, 1)), "`nd` of the range is underlined");
+    assert!(!underlined(14, 1), "the ellipsis is not");
+}

@@ -739,7 +739,11 @@ fn strip_marks_a_pending_skip_as_queued() {
     app.pending_track_skip = true;
     app.active_tab = 1;
     let buffer = tui::render(&mut app, 120, 40);
-    let y = tui::find_row(&buffer, "TWO").expect("strip names the skip target");
+    // The strip is the last row naming the track (tab 2's queue rows name it too).
+    let y = (0..buffer.area.height)
+        .rev()
+        .find(|&y| tui::row(&buffer, y).contains("TWO"))
+        .expect("strip names the skip target");
     let row = tui::row(&buffer, y);
     assert!(row.contains("QUEUED"), "{row:?}");
     assert!(row.contains("00:00"), "{row:?}");
@@ -1200,7 +1204,11 @@ fn strip_names_the_mix_profile_while_autopilot_runs_when_there_is_room() {
     app.active_tab = 1;
     let strip = |app: &mut AppUI, width: u16| {
         let buffer = tui::render(app, width, 30);
-        let y = tui::find_row(&buffer, "HALCYON").unwrap_or_else(|| panic!("no strip at {width}"));
+        // The last row naming the track: tab 2's queue rows name it too.
+        let y = (0..buffer.area.height)
+            .rev()
+            .find(|&y| tui::row(&buffer, y).contains("HALCYON"))
+            .unwrap_or_else(|| panic!("no strip at {width}"));
         tui::row(&buffer, y)
     };
 

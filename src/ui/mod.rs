@@ -13,6 +13,7 @@ use ratatui::widgets::*;
 mod chrome;
 pub mod kit;
 pub mod playlists;
+mod queue_tab;
 pub mod screen;
 pub mod search;
 pub mod tag_reads;
@@ -278,6 +279,8 @@ pub struct AppUI {
     pub playlists: playlists::PlaylistsUi,
     /// The header clock, read at most once a second.
     clock: kit::ClockCache,
+    /// Tab 2 values cached per queue / metadata revision (queued paths, total lengths).
+    queue_tab: queue_tab::QueueTabCache,
 }
 
 impl Drop for AppUI {
@@ -417,6 +420,7 @@ impl AppUI {
             persistence,
             playlists,
             clock: kit::ClockCache::new(),
+            queue_tab: queue_tab::QueueTabCache::new(),
         };
         app.refresh_browser();
         app.start_playlist_load();
@@ -4026,191 +4030,6 @@ impl AppUI {
                 }
             }
         }
-    }
-
-    fn render_queue_tab(&mut self, f: &mut Frame, area: Rect) {
-        let split = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(area);
-
-        // Left Pane: File Browser (with optional inline Spotlight Search bar)
-        let spotlight_matches = self.spotlight_matches();
-        let (browser_area, spotlight_area) = if self.browser_spotlight.is_some() {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(1)])
-                .split(split[0]);
-            (chunks[1], Some(chunks[0]))
-        } else {
-            (split[0], None)
-        };
-
-        let inner_browser_h = browser_area.height.saturating_sub(2) as usize;
-        self.browser_page_height = inner_browser_h.max(1);
-
-        let inner_queue_h = split[1].height.saturating_sub(2) as usize;
-        self.queue_page_height = inner_queue_h.max(1);
-
-        if let Some(s_area) = spotlight_area {
-            let query = self.browser_spotlight.as_deref().unwrap_or("");
-            let match_text = if query.is_empty() {
-                let subfolder_count = self
-                    .browser_entries
-                    .iter()
-                    .filter(|(_, p, is_dir)| *is_dir && p.to_string_lossy() != "___MUSIC_HOMES___")
-                    .count();
-                format!("Type to jump ({} subfolders)", subfolder_count)
-            } else if spotlight_matches.is_empty() {
-                "No matching subfolders".to_string()
-            } else {
-                let current_match_pos = spotlight_matches
-                    .iter()
-                    .position(|&i| i == self.browser_cursor)
-                    .map(|p| p + 1)
-                    .unwrap_or(1);
-                format!(
-                    "{} of {} matching subfolders",
-                    current_match_pos,
-                    spotlight_matches.len()
-                )
-            };
-
-            let spotlight_block = Block::default()
-                .borders(Borders::ALL)
-                .title(" 🔍 SPOTLIGHT SUBFOLDER JUMP (Esc exit, Enter open) ")
-                .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
-
-            let status_style = if spotlight_matches.is_empty() && !query.is_empty() {
-                Style::default().fg(Color::Red)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-
-            let spotlight_text = Line::from(vec![
-                Span::styled(" > ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(query, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                Span::styled("█", Style::default().fg(Color::Yellow)),
-                Span::raw("   "),
-                Span::styled(format!("[{}]", match_text), status_style),
-            ]);
-            let spotlight_widget = Paragraph::new(spotlight_text).block(spotlight_block);
-            f.render_widget(spotlight_widget, s_area);
-        }
-
-        let mode_tag = if self.settings_mgr.settings.metadata_view {
-            "[TAGS]"
-        } else {
-            "[FILES]"
-        };
-        let count_tag = if self.browser_entries.is_empty() {
-            String::new()
-        } else {
-            format!(" ({}/{})", self.browser_cursor + 1, self.browser_entries.len())
-        };
-        let loading_tag = if self.browser_loading { " [LOADING...]" } else { "" };
-        let browser_title = if self.in_bookmarks_view {
-            format!(" BROWSER [★ Music Homes]{}{} {} ", count_tag, loading_tag, mode_tag)
-        } else {
-            format!(" BROWSER [File System]{}{} {} ", count_tag, loading_tag, mode_tag)
-        };
-        let browser_block = Block::default()
-            .borders(Borders::ALL)
-            .title(browser_title.as_str())
-            .border_style(if !self.queue_focus {
-                if self.browser_spotlight.is_some() {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                }
-            } else {
-                Style::default().fg(Color::DarkGray)
-            });
-
-        let match_set: std::collections::HashSet<usize> = if self.browser_spotlight.is_some() {
-            spotlight_matches.iter().copied().collect()
-        } else {
-            std::collections::HashSet::new()
-        };
-
-        let mut browser_items: Vec<ListItem> = self
-            .browser_entries
-            .iter()
-            .enumerate()
-            .map(|(idx, (name, _, is_dir))| {
-                let is_selected = idx == self.browser_cursor && !self.queue_focus;
-                let is_spotlight_match = match_set.contains(&idx);
-
-                let style = if is_selected {
-                    theme::cursor()
-                } else if is_spotlight_match {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                } else if *is_dir {
-                    Style::default().fg(Color::Cyan)
-                } else {
-                    Style::default().fg(Color::Green)
-                };
-                ListItem::new(name.clone()).style(style)
-            })
-            .collect();
-
-        if self.browser_loading {
-            let header_count = if self.browser_dir.parent().is_some() { 2 } else { 1 };
-            let content_count = self.browser_entries.len().saturating_sub(header_count);
-            let loading_text = if content_count > 0 {
-                format!("  ⏳ Reading directory contents... ({} items loaded)", content_count)
-            } else {
-                "  ⏳ Reading directory contents...".to_string()
-            };
-            browser_items.push(
-                ListItem::new(loading_text).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC)),
-            );
-        }
-
-        self.browser_state.select(Some(self.browser_cursor));
-        let browser_list = List::new(browser_items).block(browser_block);
-        f.render_stateful_widget(browser_list, browser_area, &mut self.browser_state);
-
-        // Right Pane: Queue
-        let queue_title = if self.queue.is_empty() {
-            " QUEUE (0 tracks) ".to_string()
-        } else {
-            format!(" QUEUE ({}/{} tracks) ", self.queue_cursor + 1, self.queue.len())
-        };
-        let queue_block = Block::default()
-            .borders(Borders::ALL)
-            .title(queue_title.as_str())
-            .border_style(if self.queue_focus {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            });
-
-        let metadata_view = self.settings_mgr.settings.metadata_view;
-        let queue_items: Vec<ListItem> = self
-            .queue
-            .tracks()
-            .iter()
-            .enumerate()
-            .map(|(idx, track)| {
-                let prefix = if idx == self.queue.current_index() {
-                    "▶ "
-                } else {
-                    "  "
-                };
-                let text = format!("{}{}. {}", prefix, idx + 1, track.format_queue_label(metadata_view));
-                let style = if idx == self.queue_cursor && self.queue_focus {
-                    theme::cursor()
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                ListItem::new(text).style(style)
-            })
-            .collect();
-
-        self.queue_state.select(Some(self.queue_cursor));
-        let queue_list = List::new(queue_items).block(queue_block);
-        f.render_stateful_widget(queue_list, split[1], &mut self.queue_state);
     }
 
     fn render_devices_tab(&mut self, f: &mut Frame, area: Rect) {

@@ -1254,12 +1254,17 @@ fn test_queue_rendering_without_file_type_and_file_list_display_swap() {
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
 
-    // 1. In metadata_view = true, Queue displays "Test Artist - Test Track (01:00)" without [WAV]
+    // 1. In metadata_view = true, the queue row shows the title and artist in their own
+    //    columns (UPPERCASE) and the length, without a [WAV] badge.
     app.active_tab = 1;
     terminal.draw(|f| app.render(f)).unwrap();
     let view1 = terminal.backend().to_string();
-    assert!(view1.contains("Test Artist - Test Track"));
-    assert!(!view1.contains("[WAV] Test Artist"));
+    let queue_row = view1
+        .lines()
+        .find(|line| line.contains("TEST TRACK") && line.contains("01:00"))
+        .unwrap_or_else(|| panic!("no queue row with title and length:\n{view1}"));
+    assert!(queue_row.contains("TEST ARTIST"), "{queue_row:?}");
+    assert!(!view1.contains("[WAV]"));
 
     // 2. Toggle via 'v' hotkey -> metadata_view = false (Filename mode)
     let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
@@ -1268,11 +1273,17 @@ fn test_queue_rendering_without_file_type_and_file_list_display_swap() {
     ));
     assert!(!app.settings_mgr.settings.metadata_view);
 
-    // In Filename mode, Queue displays "01_test_song.wav (01:00)" without [WAV]
+    // In Filename mode, the queue row shows the file name as it is on disk and the length,
+    // without [WAV].
     terminal.draw(|f| app.render(f)).unwrap();
     let view2 = terminal.backend().to_string();
-    assert!(view2.contains("01_test_song.wav"));
-    assert!(!view2.contains("[WAV] 01_test_song.wav (01:00)"));
+    assert!(
+        view2
+            .lines()
+            .any(|line| line.contains("01_test_song.wav") && line.contains("01:00")),
+        "{view2}"
+    );
+    assert!(!view2.contains("[WAV]"));
 
     // Browser entries also show clean filename
     let browser_entry = app

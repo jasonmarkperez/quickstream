@@ -116,3 +116,24 @@ fn test_autopilot_scanner_reads_shared_cache() {
         .collect();
     assert_eq!(titles, vec!["From Shared Cache".to_string()]);
 }
+
+#[test]
+fn revision_changes_on_every_insert_and_is_shared_by_clones() {
+    common::isolate();
+    let cache = MetadataCache::default();
+    let clone = cache.clone();
+    let before = cache.revision();
+    clone.insert(AudioMetadata {
+        filepath: PathBuf::from("/tmp/a.flac"),
+        ..Default::default()
+    });
+    assert_ne!(
+        cache.revision(),
+        before,
+        "an insert through a clone bumps the shared revision"
+    );
+    let after_one = cache.revision();
+    let _ = cache.get(&PathBuf::from("/tmp/a.flac"));
+    let _ = cache.contains(&PathBuf::from("/tmp/a.flac"));
+    assert_eq!(cache.revision(), after_one, "reads leave it alone");
+}
