@@ -950,6 +950,72 @@ fn test_web_create_rename_and_delete_go_through_the_store() {
     let _ = fs::remove_dir_all(&music);
 }
 
+/// PR #65 review: two quick dashboard calls can't race the writer. While a rename that will
+/// fail is still being saved, a rename or create onto the name it started from is refused with
+/// the terminal's message, so no two playlists ever claim one file.
+#[test]
+fn test_web_create_and_rename_onto_a_name_still_saving_are_refused() {
+    common::isolate();
+    let music = temp_dir("edit_pending");
+    write_playlists(&[(PLAYLIST, vec![]), ("Mix", vec![])]);
+    let mut app = web_app(&music);
+    assert!(app.persistence.flush());
+    // A file the store never read is in the way of the first rename.
+    fs::write(playlist_file("Summer"), "theirs").unwrap();
+
+    assert_eq!(
+        edit(
+            &mut app,
+            PlaylistEdit::Rename {
+                name: PLAYLIST.to_string(),
+                new_name: "Summer".to_string(),
+            }
+        ),
+        Ok("Renamed \"Road Trip\" to \"Summer\"".to_string())
+    );
+    let busy = "Still renaming \"Road Trip\" to \"Summer\", try again".to_string();
+    assert_eq!(
+        edit(
+            &mut app,
+            PlaylistEdit::Rename {
+                name: "Mix".to_string(),
+                new_name: PLAYLIST.to_string(),
+            }
+        ),
+        Err(busy.clone())
+    );
+    assert_eq!(app.status_message, busy);
+    assert_eq!(
+        edit(
+            &mut app,
+            PlaylistEdit::Create {
+                name: PLAYLIST.to_string()
+            }
+        ),
+        Err(busy)
+    );
+
+    assert!(app.persistence.flush());
+    assert!(poll_until(&mut app, |app| app
+        .status_message
+        .starts_with("Couldn't rename")));
+    assert_eq!(names(&app), vec!["Mix".to_string(), PLAYLIST.to_string()]);
+    assert_eq!(
+        edit(
+            &mut app,
+            PlaylistEdit::Delete {
+                name: PLAYLIST.to_string()
+            }
+        ),
+        Ok("Deleted \"Road Trip\"".to_string())
+    );
+    assert!(app.persistence.flush());
+    assert!(!playlist_file(PLAYLIST).exists());
+    assert!(playlist_file("Mix").is_file());
+    assert_eq!(fs::read_to_string(playlist_file("Summer")).unwrap(), "theirs");
+    let _ = fs::remove_dir_all(&music);
+}
+
 #[test]
 fn test_web_names_get_the_same_checks_and_messages_as_the_terminal() {
     common::isolate();

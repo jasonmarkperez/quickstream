@@ -456,12 +456,52 @@ fn test_save_after_a_rename_of_a_missing_file_still_writes() {
 
 // ---------- creates that never replace, and failures reported back (issues #62, #52) ----------
 
-use quickstream::persist::{PersistFailure, Reporter};
+use quickstream::persist::{PersistFailure, PersistReport, Reporter};
 use std::sync::mpsc;
 
-/// Failures reported on `rx` so far.
-fn reported(rx: &mpsc::Receiver<PersistFailure>) -> Vec<PersistFailure> {
-    rx.try_iter().collect()
+/// Failures reported on `rx` so far (the acknowledgements of operations that worked are dropped).
+fn reported(rx: &mpsc::Receiver<PersistReport>) -> Vec<PersistFailure> {
+    rx.try_iter()
+        .filter_map(|report| match report {
+            PersistReport::Failed(failure) => Some(failure),
+            PersistReport::Done { .. } => None,
+        })
+        .collect()
+}
+
+/// PR #65 review: every create and rename queued with a reporter answers exactly once, so the
+/// store knows which names the writer is still working on. One that worked, a rename of a file
+/// that is already gone and a rename from a path whose own rename failed each say `Done`.
+#[test]
+fn test_every_reported_create_and_rename_answers_once() {
+    common::isolate();
+    let dir = scratch("acks");
+    let (tx, rx) = mpsc::channel();
+    let worker = PersistenceWorker::spawn();
+    let handle = worker.handle();
+    let path = |name: &str| dir.join(format!("{}.m3u8", name));
+    std::fs::write(path("Theirs"), b"theirs").unwrap();
+
+    handle.create(path("A"), b"a".to_vec(), Reporter::new(1, tx.clone()));
+    handle.rename_reporting(path("A"), path("B"), Reporter::new(2, tx.clone()));
+    handle.rename_reporting(path("Gone"), path("C"), Reporter::new(3, tx.clone()));
+    handle.rename_reporting(path("B"), path("Theirs"), Reporter::new(4, tx.clone()));
+    handle.rename_reporting(path("Theirs"), path("D"), Reporter::new(5, tx.clone()));
+    handle.create(path("Theirs"), b"x".to_vec(), Reporter::new(6, tx));
+    assert!(worker.flush());
+
+    let reports: Vec<PersistReport> = rx.try_iter().collect();
+    let tags: Vec<u64> = reports.iter().map(PersistReport::tag).collect();
+    assert_eq!(tags, vec![1, 2, 3, 4, 5, 6], "{:?}", reports);
+    let failed: Vec<u64> = reports
+        .iter()
+        .filter(|r| matches!(r, PersistReport::Failed(_)))
+        .map(PersistReport::tag)
+        .collect();
+    assert_eq!(failed, vec![4, 6]);
+    assert_eq!(std::fs::read(path("Theirs")).unwrap(), b"theirs");
+    assert_eq!(std::fs::read(path("B")).unwrap(), b"a");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -675,6 +715,43 @@ fn test_rename_never_replaces_another_file() {
     assert!(worker.flush());
     assert!(!old.exists(), "deleting the playlist removes its real file");
     assert_eq!(std::fs::read(&new).unwrap(), b"theirs");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PR #65 review (CC2): after a rename A -> B failed, renaming B back to A lands on the file that
+/// really is A, so A is ours again: later saves of A write it instead of being dropped.
+#[test]
+fn test_renaming_back_onto_the_real_file_after_a_failed_rename_keeps_saving() {
+    common::isolate();
+    let dir = scratch("rename_back");
+    let a = dir.join("A.m3u8");
+    let b = dir.join("B.m3u8");
+    std::fs::write(&a, b"ours").unwrap();
+    std::fs::write(&b, b"theirs").unwrap();
+    let (tx, rx) = mpsc::channel();
+    let worker = PersistenceWorker::spawn();
+
+    worker
+        .handle()
+        .rename_reporting(a.clone(), b.clone(), Reporter::new(1, tx));
+    worker.rename(b.clone(), a.clone());
+    worker.save(a.clone(), b"ours v2".to_vec());
+    assert!(worker.flush());
+    worker.save(a.clone(), b"ours v3".to_vec());
+    assert!(worker.flush());
+
+    assert_eq!(std::fs::read(&a).unwrap(), b"ours v3");
+    assert_eq!(std::fs::read(&b).unwrap(), b"theirs");
+    assert!(matches!(
+        reported(&rx).as_slice(),
+        [PersistFailure::Rename { tag: 1, .. }]
+    ));
+
+    // And deleting A removes A, not the file that was in the way.
+    worker.delete(a.clone());
+    assert!(worker.flush());
+    assert!(!a.exists());
+    assert_eq!(std::fs::read(&b).unwrap(), b"theirs");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

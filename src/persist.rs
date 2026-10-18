@@ -9,7 +9,8 @@
 //! - [`PersistenceWorker`] performs those writes, and creates, deletes and renames of the same
 //!   files (playlists), on one background thread so the UI thread never waits on disk. It
 //!   applies them in the order they were queued, coalesces rapid saves and flushes on drop. A
-//!   create or rename that fails is reported back on the caller's channel ([`Reporter`]).
+//!   create or rename queued with a [`Reporter`] reports back on the caller's channel when it is
+//!   done: [`PersistReport::Failed`] when it failed, [`PersistReport::Done`] otherwise.
 
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
@@ -254,17 +255,39 @@ pub enum PersistFailure {
     },
 }
 
-/// Where a create or rename reports that it failed: the caller's `tag` for the thing being
-/// written (the playlist store's id for a playlist) and a channel the caller polls, so the UI
-/// thread learns about the failure without waiting on the disk.
+/// What a create or rename queued with a [`Reporter`] came to. Exactly one report is sent per
+/// operation, so the caller knows which of its operations the writer has not finished yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersistReport {
+    /// The operation tagged `tag` is finished and nothing about it needs undoing: it worked, its
+    /// source was already gone (nothing moved, nothing in the way), or its source was a path
+    /// whose own create or rename failed, which that operation's report already covers.
+    Done { tag: u64 },
+    /// The operation failed; see [`PersistFailure`].
+    Failed(PersistFailure),
+}
+
+impl PersistReport {
+    pub fn tag(&self) -> u64 {
+        match self {
+            PersistReport::Done { tag }
+            | PersistReport::Failed(PersistFailure::Create { tag, .. })
+            | PersistReport::Failed(PersistFailure::Rename { tag, .. }) => *tag,
+        }
+    }
+}
+
+/// Where a create or rename reports how it went: the caller's `tag` for the operation (the
+/// playlist store numbers each create and rename) and a channel the caller polls, so the UI
+/// thread learns the outcome without waiting on the disk.
 #[derive(Debug, Clone)]
 pub struct Reporter {
     tag: u64,
-    tx: mpsc::Sender<PersistFailure>,
+    tx: mpsc::Sender<PersistReport>,
 }
 
 impl Reporter {
-    pub fn new(tag: u64, tx: mpsc::Sender<PersistFailure>) -> Self {
+    pub fn new(tag: u64, tx: mpsc::Sender<PersistReport>) -> Self {
         Self { tag, tx }
     }
 
@@ -274,7 +297,11 @@ impl Reporter {
 
     /// A receiver that was dropped (its store replaced) has nobody left to tell.
     fn send(&self, failure: PersistFailure) {
-        let _ = self.tx.send(failure);
+        let _ = self.tx.send(PersistReport::Failed(failure));
+    }
+
+    fn done(&self) {
+        let _ = self.tx.send(PersistReport::Done { tag: self.tag });
     }
 }
 
@@ -283,7 +310,8 @@ impl Reporter {
 /// `Some(old path)` after a failed rename, `None` after a failed create (any file at the path is
 /// someone else's). Saves to such a path are dropped, so they can neither overwrite a file that
 /// isn't the caller's nor create a second copy next to the real one; the caller saves again once
-/// it has heard about the failure. A later create or rename that lands on the path clears it.
+/// it has heard about the failure. A later create or rename that lands on the path clears it,
+/// and a rename that moves a real file updates the entries pointing at it.
 /// Shared by the worker and its handles, so a handle that outlives the worker honours it too.
 type Stranded = Arc<Mutex<HashMap<PathBuf, Option<PathBuf>>>>;
 
@@ -331,7 +359,8 @@ impl PersistHandle {
     /// Queue writing `bytes` to a new file at `path` with [`create_new_file`], after everything
     /// queued before it. Returns immediately. A file already at `path` is never replaced: the
     /// create fails, `reporter` hears about it, and later saves and deletes of `path` leave that
-    /// file alone. If the worker has already shut down, the create happens on the calling thread.
+    /// file alone. `reporter` gets one [`PersistReport`] either way. If the worker has already
+    /// shut down, the create happens on the calling thread.
     pub fn create(&self, path: PathBuf, bytes: Vec<u8>, reporter: Reporter) {
         self.queue(Op::Create(path, bytes, reporter));
     }
@@ -359,7 +388,7 @@ impl PersistHandle {
         self.queue(Op::Rename(from, to, None));
     }
 
-    /// [`rename`](Self::rename), and tell `reporter` if it fails.
+    /// [`rename`](Self::rename), and tell `reporter` how it went (one [`PersistReport`]).
     pub fn rename_reporting(&self, from: PathBuf, to: PathBuf, reporter: Reporter) {
         self.queue(Op::Rename(from, to, Some(reporter)));
     }
@@ -489,6 +518,7 @@ fn apply_op(op: &Op, writer: &Writer, stranded: &mut HashMap<PathBuf, Option<Pat
         Op::Create(path, bytes, reporter) => match create_new_file(path, bytes) {
             Ok(()) => {
                 stranded.remove(path);
+                reporter.done();
             }
             Err(e) => {
                 log_warn(&format!("failed to create '{}': {}", path.display(), e));
@@ -514,19 +544,41 @@ fn apply_op(op: &Op, writer: &Writer, stranded: &mut HashMap<PathBuf, Option<Pat
             None => delete_logged(path),
         },
         Op::Rename(from, to, reporter) => {
+            let done = || {
+                if let Some(reporter) = reporter {
+                    reporter.done();
+                }
+            };
             if let Some(real) = stranded.get(from).cloned() {
+                // Renaming back onto the file that really holds the content (PR #65 review):
+                // that file is ours again under `to`, so saves to `to` must reach it.
+                if let Some(real) = real.clone().filter(|real| is_same_path(real, to)) {
+                    stranded.remove(from);
+                    match rename_no_replace(&real, to) {
+                        Ok(()) => moved(stranded, &real, to),
+                        Err(e) => log_warn(&format!(
+                            "failed to rename '{}' to '{}': {}",
+                            real.display(),
+                            to.display(),
+                            e
+                        )),
+                    }
+                    done();
+                    return;
+                }
                 // Nothing of ours is at `from`; `to` now stands for the same file `from` did.
                 log_warn(&format!(
                     "not renaming '{}': creating or renaming onto it failed",
                     from.display()
                 ));
                 stranded.insert(to.clone(), real);
+                done();
                 return;
             }
             match rename_no_replace(from, to) {
                 Ok(()) => {
-                    sync_parent_dir(to);
-                    stranded.remove(to);
+                    moved(stranded, from, to);
+                    done();
                 }
                 Err(e) => {
                     log_warn(&format!(
@@ -538,6 +590,7 @@ fn apply_op(op: &Op, writer: &Writer, stranded: &mut HashMap<PathBuf, Option<Pat
                     // With `from` gone nothing moved and nothing is in the way: a save to `to`
                     // just writes the file fresh.
                     if e.kind() == io::ErrorKind::NotFound {
+                        done();
                         return;
                     }
                     stranded.insert(to.clone(), Some(from.clone()));
@@ -553,6 +606,30 @@ fn apply_op(op: &Op, writer: &Writer, stranded: &mut HashMap<PathBuf, Option<Pat
                 }
             }
         }
+    }
+}
+
+/// `from` was just moved to `to`: `to` is ours, and an entry that pointed at the file under its
+/// old name follows it, so the map keeps naming where each playlist's content really is.
+fn moved(stranded: &mut HashMap<PathBuf, Option<PathBuf>>, from: &Path, to: &Path) {
+    sync_parent_dir(to);
+    stranded.remove(to);
+    for real in stranded.values_mut().flatten() {
+        if real == from {
+            *real = to.to_path_buf();
+        }
+    }
+}
+
+/// Whether `a` and `b` name one file: the same path, or (on a disk that ignores case or Unicode
+/// form) two spellings of one existing file.
+fn is_same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
+        (Ok(ma), Ok(mb)) => same_file(&ma, &mb, a, b),
+        _ => false,
     }
 }
 

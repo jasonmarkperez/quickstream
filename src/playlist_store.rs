@@ -12,6 +12,14 @@
 //! alone. The writer reports such failures back on a channel; [`PlaylistStore::poll_write_failures`]
 //! (called by the UI every tick) then removes the playlist that couldn't be created, or puts a
 //! playlist that couldn't be renamed back under its file's name (issues #62, #52).
+//!
+//! The writer also acknowledges every create and rename that worked, so the store knows which
+//! are still pending. Until one is settled, creating another playlist under a name it starts
+//! from or goes to, or renaming another playlist onto one, is refused
+//! ([`StoreError::StillCreating`], [`StoreError::StillRenaming`]): the file that name stands for
+//! may still belong to the pending playlist, and if the pending operation fails, the undo puts
+//! that playlist back under that very name (PR #65 review). The pending playlist itself may
+//! keep renaming (the writer follows the chain), and once it is deleted its names are free.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -22,7 +30,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use crate::persist::{PersistFailure, PersistHandle, Reporter};
+use crate::persist::{PersistFailure, PersistHandle, PersistReport, Reporter};
 use crate::playlist::{
     name_key, names_equal, normalize_path, parse_m3u8, playlist_file_path, validate_name, NameError, Playlist,
     PlaylistEntry, PLAYLIST_EXT,
@@ -37,6 +45,13 @@ pub enum StoreError {
     IndexOutOfRange,
     /// The playlist's file would land outside the playlists folder.
     UnsafePath,
+    /// A create of this name has not been settled by the writer yet.
+    StillCreating(String),
+    /// A rename from `from` to `to` has not been settled by the writer yet.
+    StillRenaming {
+        from: String,
+        to: String,
+    },
 }
 
 impl fmt::Display for StoreError {
@@ -47,6 +62,10 @@ impl fmt::Display for StoreError {
             StoreError::Name(e) => write!(f, "{}", e),
             StoreError::IndexOutOfRange => write!(f, "No such track"),
             StoreError::UnsafePath => write!(f, "Refusing to write outside the playlists folder"),
+            StoreError::StillCreating(name) => write!(f, "Still creating \"{}\", try again", name),
+            StoreError::StillRenaming { from, to } => {
+                write!(f, "Still renaming \"{}\" to \"{}\", try again", from, to)
+            }
         }
     }
 }
@@ -94,6 +113,32 @@ impl WriteFailure {
 /// files it skipped, or the error that kept it from listing the folder.
 pub type LoadResult = io::Result<(Vec<Playlist>, Vec<String>)>;
 
+/// A create or rename handed to the writer that it hasn't settled yet, by the operation's tag.
+struct PendingWrite {
+    /// Id of the playlist it is for.
+    playlist: u64,
+    /// The name renamed from; `None` for a create.
+    from: Option<String>,
+    /// The name created or renamed to.
+    to: String,
+}
+
+impl PendingWrite {
+    fn involves(&self, name: &str) -> bool {
+        names_equal(&self.to, name) || self.from.as_deref().is_some_and(|from| names_equal(from, name))
+    }
+
+    fn refusal(&self) -> StoreError {
+        match &self.from {
+            None => StoreError::StillCreating(self.to.clone()),
+            Some(from) => StoreError::StillRenaming {
+                from: from.clone(),
+                to: self.to.clone(),
+            },
+        }
+    }
+}
+
 pub struct PlaylistStore {
     dir: PathBuf,
     /// Sorted by [`name_key`]; no two names are equal under [`names_equal`].
@@ -107,9 +152,14 @@ pub struct PlaylistStore {
     /// folder adds carry the id, so they find their playlist even after later renames.
     ids: HashMap<String, u64>,
     next_id: u64,
-    failures_tx: mpsc::Sender<PersistFailure>,
-    failures_rx: mpsc::Receiver<PersistFailure>,
-    /// Reports taken off `failures_rx` by [`has_write_failures`](Self::has_write_failures) and
+    /// Creates and renames the writer hasn't settled, by operation tag; see
+    /// [`ensure_not_pending`](Self::ensure_not_pending). An entry stays until its failure has been
+    /// undone, not just received.
+    pending: HashMap<u64, PendingWrite>,
+    next_op: u64,
+    reports_tx: mpsc::Sender<PersistReport>,
+    reports_rx: mpsc::Receiver<PersistReport>,
+    /// Failures taken off `reports_rx` by [`has_write_failures`](Self::has_write_failures) and
     /// not yet applied.
     unapplied: Vec<PersistFailure>,
     /// Bumped by every change to the playlists; see [`revision`](Self::revision).
@@ -119,7 +169,7 @@ pub struct PlaylistStore {
 impl PlaylistStore {
     /// An empty store over `dir` that refuses edits until [`set_loaded`](Self::set_loaded).
     pub fn new(dir: PathBuf, persist: PersistHandle) -> Self {
-        let (failures_tx, failures_rx) = mpsc::channel();
+        let (reports_tx, reports_rx) = mpsc::channel();
         Self {
             dir,
             playlists: Vec::new(),
@@ -128,8 +178,10 @@ impl PlaylistStore {
             persist,
             ids: HashMap::new(),
             next_id: 0,
-            failures_tx,
-            failures_rx,
+            pending: HashMap::new(),
+            next_op: 0,
+            reports_tx,
+            reports_rx,
             unapplied: Vec::new(),
             revision: 0,
         }
@@ -288,6 +340,9 @@ impl PlaylistStore {
     /// Create an empty playlist and write its file. Returns the stored (trimmed) name. The file
     /// is created without replacing anything: if one is already there, the writer leaves it
     /// alone and [`poll_write_failures`](Self::poll_write_failures) removes the playlist again.
+    /// A name that a create or rename the writer hasn't settled starts from or goes to is refused
+    /// with [`StoreError::StillCreating`] or [`StoreError::StillRenaming`] while that playlist
+    /// still exists.
     pub fn create(&mut self, name: &str) -> Result<String, StoreError> {
         self.ensure_loaded()?;
         let name = validate_name(name).map_err(StoreError::Name)?;
@@ -295,12 +350,13 @@ impl PlaylistStore {
             return Err(StoreError::Name(NameError::Duplicate(existing.name.clone())));
         }
         self.ensure_not_reserved(&name)?;
+        self.ensure_not_pending(&name, None)?;
         let path = self.file_for(&name)?;
         let playlist = Playlist::new(&name);
         let bytes = playlist.to_m3u8().into_bytes();
         self.playlists.push(playlist);
         sort_by_name(&mut self.playlists);
-        let reporter = self.reporter_for(&name);
+        let reporter = self.reporter_for(&name, None);
         self.persist.create(path, bytes, reporter);
         self.changed();
         Ok(name)
@@ -381,7 +437,9 @@ impl PlaylistStore {
     /// reserved by a file skipped at load is refused, and so is a case-only rename onto a
     /// reserved name with exactly the same bytes. If the writer can't move the file (another file
     /// is at the new name, or the disk refuses), [`poll_write_failures`](Self::poll_write_failures)
-    /// puts the old name back.
+    /// puts the old name back. A new name that another playlist's unsettled create or rename
+    /// starts from or goes to is refused like in [`create`](Self::create). The playlist's own
+    /// pending create or rename never holds it up, even renaming straight back.
     pub fn rename(&mut self, old: &str, new: &str) -> Result<String, StoreError> {
         let (slot, old_path) = self.locate(old)?;
         let new_name = validate_name(new).map_err(StoreError::Name)?;
@@ -410,9 +468,11 @@ impl PlaylistStore {
         if let Some(r) = self.reserved.iter().find(|r| same_canonical(r, &new_name)) {
             return Err(StoreError::Name(NameError::Reserved(r.clone())));
         }
+        let renaming = self.ids.get(&self.playlists[slot].name).copied();
+        self.ensure_not_pending(&new_name, renaming)?;
         let new_path = self.file_for(&new_name)?;
         let old_name = std::mem::replace(&mut self.playlists[slot].name, new_name.clone());
-        let reporter = self.reporter_for(&old_name);
+        let reporter = self.reporter_for(&old_name, Some(&new_name));
         if let Some(id) = self.ids.remove(&old_name) {
             self.ids.insert(new_name.clone(), id);
         }
@@ -446,7 +506,11 @@ impl PlaylistStore {
     ///   with `A playlist file named "Mix" exists but couldn't be loaded` instead of failing the
     ///   same way. A report for a playlist already deleted changes nothing.
     /// - A failed rename gives the playlist back the name its file still has and saves it there,
-    ///   so edits made in the meantime (which the writer dropped) reach the real file.
+    ///   so edits made in the meantime (which the writer dropped) reach the real file. No other
+    ///   playlist can hold that name: creating or renaming onto it was refused while the rename
+    ///   was pending.
+    ///
+    /// Each undone operation stops being pending, so its names can be used again.
     pub fn poll_write_failures(&mut self) -> Vec<WriteFailure> {
         self.has_write_failures();
         let reports = std::mem::take(&mut self.unapplied);
@@ -458,21 +522,31 @@ impl PlaylistStore {
     }
 
     /// Whether the writer has reported failures that [`poll_write_failures`](Self::poll_write_failures)
-    /// would apply. Cheap enough for every UI tick; no playlist changes until that call.
+    /// would apply. Cheap enough for every UI tick; no playlist changes until that call. Creates
+    /// and renames the writer reports done stop being pending here.
     pub fn has_write_failures(&mut self) -> bool {
-        self.unapplied.extend(self.failures_rx.try_iter());
+        for report in self.reports_rx.try_iter() {
+            match report {
+                PersistReport::Done { tag } => {
+                    self.pending.remove(&tag);
+                }
+                PersistReport::Failed(failure) => self.unapplied.push(failure),
+            }
+        }
         !self.unapplied.is_empty()
     }
 
     fn undo(&mut self, report: PersistFailure) -> Option<WriteFailure> {
         match report {
             PersistFailure::Create { tag, path, kind, error } => {
+                let playlist = self.pending.remove(&tag)?.playlist;
                 let created = file_stem(&path)?;
-                // Deleted already: nothing left to undo.
-                let name = self.name_with_id(tag)?;
-                if kind == io::ErrorKind::AlreadyExists {
+                // The file in the way stays, whether or not the playlist is still here.
+                if kind == io::ErrorKind::AlreadyExists && !self.reserved.contains(&created) {
                     self.reserved.push(created.clone());
                 }
+                // Deleted already: nothing left to undo.
+                let name = self.name_with_id(playlist)?;
                 self.ids.remove(&name);
                 self.playlists.retain(|p| p.name != name);
                 log_warn(&format!("removed playlist \"{}\": its file couldn't be created", name));
@@ -488,27 +562,28 @@ impl PlaylistStore {
                 kind,
                 error,
             } => {
+                let playlist = self.pending.remove(&tag)?.playlist;
                 let restored = file_stem(&from)?;
-                let attempted = self.name_with_id(tag)?;
-                // A playlist created or renamed onto the old name in the meantime can't have
-                // its own file there (the writer never replaces one), so it gives way.
+                // Deleted already: the delete removed the file still at the old name.
+                let attempted = self.name_with_id(playlist)?;
+                // Creating or renaming onto the old name was refused while the rename was
+                // pending, so only this playlist can hold it.
                 if let Some(other) = self
                     .playlists
                     .iter()
                     .find(|p| p.name != attempted && names_equal(&p.name, &restored))
-                    .map(|p| p.name.clone())
                 {
+                    debug_assert!(false, "\"{}\" took the name of a pending rename", other.name);
                     log_warn(&format!(
-                        "dropping playlist \"{}\": \"{}\" keeps its file after a failed rename",
-                        other, restored
+                        "not restoring \"{}\" to \"{}\": another playlist has that name",
+                        attempted, restored
                     ));
-                    self.ids.remove(&other);
-                    self.playlists.retain(|p| p.name != other);
+                    return None;
                 }
                 let slot = self.playlists.iter().position(|p| p.name == attempted)?;
                 self.playlists[slot].name = restored.clone();
                 self.ids.remove(&attempted);
-                self.ids.insert(restored.clone(), tag);
+                self.ids.insert(restored.clone(), playlist);
                 sort_by_name(&mut self.playlists);
                 let slot = self.playlists.iter().position(|p| p.name == restored)?;
                 if let Ok(path) = self.file_for(&restored) {
@@ -533,11 +608,52 @@ impl PlaylistStore {
         }
     }
 
-    /// The reporter for writes of the playlist called exactly `name`, giving it an id first if
-    /// it has none.
-    fn reporter_for(&mut self, name: &str) -> Reporter {
-        let id = self.id_for(name);
-        Reporter::new(id, self.failures_tx.clone())
+    /// The reporter for a create of the playlist called exactly `name` (`to` is `None`), or a
+    /// rename of it to `to`, giving the playlist an id first if it has none. The operation is
+    /// pending until the writer settles it.
+    fn reporter_for(&mut self, name: &str, to: Option<&str>) -> Reporter {
+        let playlist = self.id_for(name);
+        self.next_op += 1;
+        let pending = match to {
+            None => PendingWrite {
+                playlist,
+                from: None,
+                to: name.to_string(),
+            },
+            Some(to) => PendingWrite {
+                playlist,
+                from: Some(name.to_string()),
+                to: to.to_string(),
+            },
+        };
+        self.pending.insert(self.next_op, pending);
+        Reporter::new(self.next_op, self.reports_tx.clone())
+    }
+
+    /// Refuse to create a playlist under `name`, or rename the playlist with id `renaming` onto
+    /// it, while another playlist's create or rename that the writer hasn't settled starts from or
+    /// goes to it (ignoring case, like the disk). That playlist's file may still be at the name,
+    /// or its operation may fail and the undo put it back under the name; a second playlist
+    /// claiming the name would then share its file, so deleting one would delete the other's
+    /// file and the undo would drop saves (PR #65 review).
+    ///
+    /// Not refused: the playlist's own pending operations (the writer follows a chain of renames
+    /// of one playlist, including one straight back), and those of a playlist deleted since (the
+    /// writer's delete removed the file the operation left behind, or left alone a file that was
+    /// never ours, so a later create or rename of the name gets its own report). Reports already
+    /// received are settled first, so a finished operation never holds anything up.
+    fn ensure_not_pending(&mut self, name: &str, renaming: Option<u64>) -> Result<(), StoreError> {
+        self.has_write_failures();
+        let blocking = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.involves(name) && Some(p.playlist) != renaming && self.name_of(p.playlist).is_some())
+            // The earliest such operation, so the message doesn't depend on hash order.
+            .min_by_key(|(tag, _)| **tag);
+        match blocking {
+            Some((_, pending)) => Err(pending.refusal()),
+            None => Ok(()),
+        }
     }
 
     /// Id of the playlist called exactly `name`, giving it one if it has none.
