@@ -60,7 +60,7 @@ fn test_removing_row_before_current_keeps_current_track() {
     common::isolate();
     let dir = temp_dir("remove_before");
     let mut app = app_with_queue(&dir, 4);
-    app.queue.current_index = 2; // Song 3
+    app.queue.set_current_index(2); // Song 3
     app.queue_cursor = 0;
     app.handle_tab_key(KeyCode::Char('d'));
     assert_eq!(app.queue.current_track().unwrap().title, "Song 3");
@@ -82,7 +82,7 @@ fn test_reshuffle_truncation_clamps_cursor() {
     common::isolate();
     let dir = temp_dir("reshuffle");
     let mut app = app_with_queue(&dir, 5);
-    app.queue.current_index = 1;
+    app.queue.set_current_index(1);
     app.queue_cursor = 4;
     app.reshuffle_autopilot(dir.clone());
     assert_eq!(app.queue.len(), 2);
@@ -101,16 +101,17 @@ fn test_inserting_tracks_keeps_the_current_track() {
     let mut queue = quickstream::queue::PlaybackQueue::new();
     queue.insert_tracks(0, vec![track(2)]);
     assert_eq!(
-        queue.current_index, 0,
+        queue.current_index(),
+        0,
         "inserting into an empty queue starts at the top"
     );
     queue.insert_tracks(1, vec![track(3), track(4)]);
-    assert_eq!(queue.current_index, 0, "tracks after the current one leave it alone");
+    assert_eq!(queue.current_index(), 0, "tracks after the current one leave it alone");
     queue.insert_tracks(0, vec![track(1)]);
-    assert_eq!(queue.current_index, 1, "tracks before the current one shift it along");
+    assert_eq!(queue.current_index(), 1, "tracks before the current one shift it along");
     assert_eq!(queue.current_track().unwrap().title, "Song 2");
     queue.insert_tracks(99, vec![track(5)]);
-    let titles: Vec<&str> = queue.tracks.iter().map(|t| t.title.as_str()).collect();
+    let titles: Vec<&str> = queue.tracks().iter().map(|t| t.title.as_str()).collect();
     assert_eq!(titles, ["Song 1", "Song 2", "Song 3", "Song 4", "Song 5"]);
-    assert_eq!(queue.current_index, 1);
+    assert_eq!(queue.current_index(), 1);
 }

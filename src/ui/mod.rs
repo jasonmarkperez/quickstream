@@ -1009,7 +1009,7 @@ impl AppUI {
     pub fn start_queue_metadata_fetch(&mut self) {
         let candidates: Vec<PathBuf> = self
             .queue
-            .tracks
+            .tracks()
             .iter()
             .filter(|t| t.duration_seconds <= 0.0 || t.artist.is_empty() || t.sample_rate_hz == 0)
             .map(|t| t.filepath.clone())
@@ -1109,11 +1109,8 @@ impl AppUI {
             self.metadata_cache.insert(meta.clone());
 
             // 1. Update matching tracks in queue
-            for track in &mut self.queue.tracks {
-                if track.filepath == path {
-                    *track = meta.clone();
-                    queue_updated = true;
-                }
+            if self.queue.update_metadata(&meta) {
+                queue_updated = true;
             }
 
             // 2. Update browser entries if active
@@ -1220,7 +1217,7 @@ impl AppUI {
         }
 
         if was_empty && !self.queue.is_empty() {
-            self.queue.current_index = 0;
+            self.queue.set_current_index(0);
             self.queue_cursor = 0;
 
             let _ = self.ensure_web_server_started();
@@ -1626,8 +1623,8 @@ impl AppUI {
                     .load(std::sync::atomic::Ordering::SeqCst)
                 {
                     let cur_idx = *ws.stream_state().continuous.current_track_index.lock().unwrap();
-                    if cur_idx != self.queue.current_index && cur_idx < self.queue.len() {
-                        self.queue.current_index = cur_idx;
+                    if cur_idx != self.queue.current_index() && cur_idx < self.queue.len() {
+                        self.queue.set_current_index(cur_idx);
                         self.queue_cursor = cur_idx;
                     }
                 }
@@ -1898,7 +1895,7 @@ impl AppUI {
         let mode = if raw_mode == "repeat_one" { "loop" } else { &raw_mode };
         if let Some(track) = self.queue.next_track(mode) {
             let track_title = track.display_title().to_string();
-            self.queue_cursor = self.queue.current_index;
+            self.queue_cursor = self.queue.current_index();
 
             if !self.pending_track_skip && self.player.is_playing() {
                 let _ = self.player.stop();
@@ -1923,7 +1920,7 @@ impl AppUI {
 
         if let Some(track) = self.queue.prev_track() {
             let track_title = track.display_title().to_string();
-            self.queue_cursor = self.queue.current_index;
+            self.queue_cursor = self.queue.current_index();
 
             if !self.pending_track_skip && self.player.is_playing() {
                 let _ = self.player.stop();
@@ -2457,7 +2454,7 @@ impl AppUI {
                     (KeyCode::Enter, KeyModifiers::NONE) => {
                         if self.queue_focus {
                             self.supersede_playlist_queue();
-                            self.queue.current_index = self.queue_cursor;
+                            self.queue.set_current_index(self.queue_cursor);
                             self.play_current_track();
                         } else if self.browser_cursor < self.browser_entries.len() {
                             let (_, path, is_dir) = self.browser_entries[self.browser_cursor].clone();
@@ -2540,7 +2537,7 @@ impl AppUI {
                     }
                     (KeyCode::Char('r'), KeyModifiers::NONE) if self.queue_focus => {
                         if self.queue_cursor < self.queue.len() {
-                            let seed = self.queue.tracks[self.queue_cursor].filepath.clone();
+                            let seed = self.queue.tracks()[self.queue_cursor].filepath.clone();
                             self.start_seed_radio(seed);
                         } else if let Some(current) = self.queue.current_track() {
                             self.start_seed_radio(current.filepath.clone());
@@ -2762,7 +2759,7 @@ impl AppUI {
                 .is_active
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
-                ws.stream_state().continuous.skip_to_index(self.queue.current_index);
+                ws.stream_state().continuous.skip_to_index(self.queue.current_index());
                 self.update_web_state();
                 return None;
             }
@@ -2818,8 +2815,8 @@ impl AppUI {
                 .load(std::sync::atomic::Ordering::SeqCst)
                 && !self.queue.is_empty()
             {
-                let next_idx = (self.queue.current_index + 1) % self.queue.len();
-                self.queue.current_index = next_idx;
+                let next_idx = (self.queue.current_index() + 1) % self.queue.len();
+                self.queue.set_current_index(next_idx);
                 self.queue_cursor = next_idx;
                 ws.stream_state().continuous.skip_to_index(next_idx);
                 self.update_web_state();
@@ -2862,12 +2859,12 @@ impl AppUI {
                 .load(std::sync::atomic::Ordering::SeqCst)
                 && !self.queue.is_empty()
             {
-                let prev_idx = if self.queue.current_index > 0 {
-                    self.queue.current_index - 1
+                let prev_idx = if self.queue.current_index() > 0 {
+                    self.queue.current_index() - 1
                 } else {
                     self.queue.len().saturating_sub(1)
                 };
-                self.queue.current_index = prev_idx;
+                self.queue.set_current_index(prev_idx);
                 self.queue_cursor = prev_idx;
                 ws.stream_state().continuous.skip_to_index(prev_idx);
                 self.update_web_state();
@@ -2978,9 +2975,7 @@ impl AppUI {
             }
             AutopilotRunMode::Reshuffle => {
                 // Keep tracks 0..=current_index uninterrupted; truncate everything after current_index
-                if self.queue.current_index < self.queue.len() {
-                    self.queue.tracks.truncate(self.queue.current_index + 1);
-                }
+                self.queue.truncate_after(self.queue.current_index());
                 self.clamp_queue_cursor();
                 self.status_message = format!(
                     "🎲 Autopilot: Reshuffling mix from next track forward (from '{}')...",
@@ -3063,7 +3058,7 @@ impl AppUI {
         if self.active_tab == 1 {
             if self.queue_focus {
                 if self.queue_cursor < self.queue.len() {
-                    return Some(self.queue.tracks[self.queue_cursor].filepath.clone());
+                    return Some(self.queue.tracks()[self.queue_cursor].filepath.clone());
                 }
             } else if self.browser_cursor < self.browser_entries.len() {
                 let (_, p, is_dir) = &self.browser_entries[self.browser_cursor];
@@ -3121,7 +3116,7 @@ impl AppUI {
         match crate::web::WebServer::start_with_bind(bind, port, self.web_state.clone(), tx) {
             Ok(handle) => {
                 let actual_port = handle.port;
-                for track in &self.queue.tracks {
+                for track in self.queue.tracks() {
                     handle.register_stream_file(&track.filepath);
                 }
                 self.web_server = Some(handle);
@@ -3202,7 +3197,7 @@ impl AppUI {
         let _ = self.player.stop();
         if let Some(ref ws) = self.web_server {
             ws.close_active_streams();
-            for track in &self.queue.tracks {
+            for track in self.queue.tracks() {
                 ws.register_stream_file(&track.filepath);
             }
         }
@@ -3330,7 +3325,7 @@ impl AppUI {
                 crate::web::WebCommand::PlayIndex(idx) => {
                     if idx < self.queue.len() {
                         self.supersede_playlist_queue();
-                        self.queue.current_index = idx;
+                        self.queue.set_current_index(idx);
                         self.queue_cursor = idx;
                         self.play_current_track();
                         self.update_web_state();
@@ -3532,7 +3527,7 @@ impl AppUI {
                 .get_active_device()
                 .map(|d| d.friendly_name)
                 .unwrap_or_else(|| "Local Audio".to_string());
-            state.queue_index = self.queue.current_index;
+            state.queue_index = self.queue.current_index();
             state.queue_total = self.queue.len();
             state.queue_mode = self.settings_mgr.settings.queue_mode.clone();
             state.is_scanning = self.device_manager.is_scanning();
@@ -3545,7 +3540,7 @@ impl AppUI {
 
             state.queue = self
                 .queue
-                .tracks
+                .tracks()
                 .iter()
                 .enumerate()
                 .map(|(idx, track)| crate::web::WebQueueItem {
@@ -3555,7 +3550,7 @@ impl AppUI {
                     album: track.album.clone(),
                     duration_seconds: track.duration_seconds,
                     filepath: track.filepath.to_string_lossy().to_string(),
-                    is_current: idx == self.queue.current_index,
+                    is_current: idx == self.queue.current_index(),
                 })
                 .collect();
 
@@ -3611,14 +3606,14 @@ impl AppUI {
                 state.key = None;
             }
 
-            if self.queue.len() > 1 && self.queue.current_index + 1 < self.queue.len() {
+            if self.queue.len() > 1 && self.queue.current_index() + 1 < self.queue.len() {
                 state.next_track_title = self
                     .queue
-                    .tracks
-                    .get(self.queue.current_index + 1)
+                    .tracks()
+                    .get(self.queue.current_index() + 1)
                     .map(|t| t.display_title().to_string());
             } else if !self.queue.is_empty() && self.settings_mgr.settings.queue_mode == "loop" {
-                state.next_track_title = self.queue.tracks.first().map(|t| t.display_title().to_string());
+                state.next_track_title = self.queue.tracks().first().map(|t| t.display_title().to_string());
             } else {
                 state.next_track_title = None;
             }
@@ -3745,7 +3740,7 @@ impl AppUI {
         if !self.queue.is_empty() {
             row1.push(Span::raw("  "));
             row1.push(Span::styled(
-                format!("Track {} of {}", self.queue.current_index + 1, self.queue.len()),
+                format!("Track {} of {}", self.queue.current_index() + 1, self.queue.len()),
                 Style::default().fg(Color::Yellow),
             ));
         }
@@ -3916,12 +3911,12 @@ impl AppUI {
                 )])];
                 f.render_widget(Paragraph::new(up_lines), up_inner);
             } else {
-                let current_idx = self.queue.current_index;
+                let current_idx = self.queue.current_index();
                 let next_idx = current_idx + 1;
                 let max_items = (up_inner.height as usize).saturating_sub(1).max(1);
                 let upcoming: Vec<_> = self
                     .queue
-                    .tracks
+                    .tracks()
                     .iter()
                     .enumerate()
                     .skip(next_idx)
@@ -3931,7 +3926,7 @@ impl AppUI {
                 if upcoming.is_empty() {
                     let loop_mode = self.settings_mgr.settings.queue_mode == "loop";
                     if loop_mode && self.queue.len() > 1 {
-                        let first = &self.queue.tracks[0];
+                        let first = &self.queue.tracks()[0];
                         let up_lines = vec![Line::from(vec![
                             Span::styled(
                                 "↺ End of queue reached. Loops to #1: ",
@@ -4194,11 +4189,15 @@ impl AppUI {
         let metadata_view = self.settings_mgr.settings.metadata_view;
         let queue_items: Vec<ListItem> = self
             .queue
-            .tracks
+            .tracks()
             .iter()
             .enumerate()
             .map(|(idx, track)| {
-                let prefix = if idx == self.queue.current_index { "▶ " } else { "  " };
+                let prefix = if idx == self.queue.current_index() {
+                    "▶ "
+                } else {
+                    "  "
+                };
                 let text = format!("{}{}. {}", prefix, idx + 1, track.format_queue_label(metadata_view));
                 let style = if idx == self.queue_cursor && self.queue_focus {
                     theme::cursor()

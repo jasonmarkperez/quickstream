@@ -179,10 +179,10 @@ fn test_queue_and_browser_reads_skip_a_file_a_folder_add_is_reading() {
 
     gate.open();
     wait_until(&mut app, "the folder add and the queue row", |a| {
-        a.playlists.store.get("Skip Mix").is_some_and(|p| p.entries.len() == 1) && a.queue.tracks[0].title == "Tagged"
+        a.playlists.store.get("Skip Mix").is_some_and(|p| p.entries.len() == 1) && a.queue.tracks()[0].title == "Tagged"
     });
     // The queue row got the folder add's tags without a read of its own.
-    assert_eq!(app.queue.tracks[0].duration_seconds, 2.0);
+    assert_eq!(app.queue.tracks()[0].duration_seconds, 2.0);
     assert_eq!(reads.of(&track), 1);
     assert_eq!(app.tag_reads_in_flight(), 0);
     let _ = fs::remove_dir_all(&dir);

@@ -735,7 +735,7 @@ fn strip_marks_a_pending_skip_as_queued() {
     let (mut app, dir) = chrome_app("strip_skip");
     app.queue.add_track(track(&dir, "One", "A"));
     app.queue.add_track(track(&dir, "Two", "B"));
-    app.queue.current_index = 1;
+    app.queue.set_current_index(1);
     app.pending_track_skip = true;
     app.active_tab = 1;
     let buffer = tui::render(&mut app, 120, 40);

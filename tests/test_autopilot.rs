@@ -104,7 +104,7 @@ fn test_autopilot_recursive_scan_and_queue() {
     assert!(app.status_message.contains("Autopilot"));
 
     // Verify all 3 files are present in the queue
-    let queue_paths: Vec<PathBuf> = app.queue.tracks.iter().map(|t| t.filepath.clone()).collect();
+    let queue_paths: Vec<PathBuf> = app.queue.tracks().iter().map(|t| t.filepath.clone()).collect();
     assert!(queue_paths.contains(&track1));
     assert!(queue_paths.contains(&track2));
     assert!(queue_paths.contains(&track3));
@@ -318,10 +318,10 @@ fn test_queue_background_metadata_update() {
     assert_eq!(app.queue.len(), 1);
 
     // Initial heuristic state: artist derived from filename or folder
-    assert_eq!(app.queue.tracks[0].title, "Come Un Fiore");
+    assert_eq!(app.queue.tracks()[0].title, "Come Un Fiore");
 
     // Simulate background metadata reception
-    let mut updated_meta = app.queue.tracks[0].clone();
+    let mut updated_meta = app.queue.tracks()[0].clone();
     updated_meta.artist = "Ludovico Einaudi (Official)".to_string();
     updated_meta.duration_seconds = 234.0;
     app.metadata_tx.send(updated_meta).unwrap();
@@ -329,8 +329,8 @@ fn test_queue_background_metadata_update() {
     // Poll background metadata - must update queue tracks in-place
     app.poll_background_metadata();
 
-    assert_eq!(app.queue.tracks[0].artist, "Ludovico Einaudi (Official)");
-    assert_eq!(app.queue.tracks[0].duration_seconds, 234.0);
+    assert_eq!(app.queue.tracks()[0].artist, "Ludovico Einaudi (Official)");
+    assert_eq!(app.queue.tracks()[0].duration_seconds, 234.0);
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
@@ -415,7 +415,7 @@ fn test_autopilot_append_mode_does_not_interrupt_playback() {
         };
         app.queue.add_track(meta);
     }
-    app.queue.current_index = 1; // "Existing 2" is playing
+    app.queue.set_current_index(1); // "Existing 2" is playing
     assert_eq!(app.queue.len(), 2);
 
     // Trigger autopilot via start_autopilot (must detect non-empty queue and select Append mode)
@@ -423,18 +423,18 @@ fn test_autopilot_append_mode_does_not_interrupt_playback() {
     assert_eq!(app.autopilot_run_mode, quickstream::ui::AutopilotRunMode::Append);
 
     // Initial tracks must NOT be wiped
-    assert_eq!(app.queue.tracks[0].title, "Existing 1");
-    assert_eq!(app.queue.tracks[1].title, "Existing 2");
-    assert_eq!(app.queue.current_index, 1);
+    assert_eq!(app.queue.tracks()[0].title, "Existing 1");
+    assert_eq!(app.queue.tracks()[1].title, "Existing 2");
+    assert_eq!(app.queue.current_index(), 1);
 
     // Wait for progressive scan to complete
     app.wait_for_autopilot_scan(Duration::from_secs(3));
 
     // Queue must now have original 2 tracks + newly appended tracks
     assert_eq!(app.queue.len(), 6);
-    assert_eq!(app.queue.tracks[0].title, "Existing 1");
-    assert_eq!(app.queue.tracks[1].title, "Existing 2");
-    assert_eq!(app.queue.current_index, 1);
+    assert_eq!(app.queue.tracks()[0].title, "Existing 1");
+    assert_eq!(app.queue.tracks()[1].title, "Existing 2");
+    assert_eq!(app.queue.current_index(), 1);
     assert!(app.status_message.contains("Appended"));
 
     let _ = fs::remove_dir_all(&temp_dir);
@@ -466,7 +466,7 @@ fn test_autopilot_reshuffle_from_next_track_forward() {
         };
         app.queue.add_track(meta);
     }
-    app.queue.current_index = 1; // "Original Track 2" is playing
+    app.queue.set_current_index(1); // "Original Track 2" is playing
 
     // Trigger reshuffle from next track forward
     app.reshuffle_autopilot(temp_dir.clone());
@@ -474,18 +474,18 @@ fn test_autopilot_reshuffle_from_next_track_forward() {
 
     // Tracks 0 and 1 must be preserved; tracks 2 and 3 must be truncated immediately
     assert_eq!(app.queue.len(), 2);
-    assert_eq!(app.queue.tracks[0].title, "Original Track 1");
-    assert_eq!(app.queue.tracks[1].title, "Original Track 2");
-    assert_eq!(app.queue.current_index, 1);
+    assert_eq!(app.queue.tracks()[0].title, "Original Track 1");
+    assert_eq!(app.queue.tracks()[1].title, "Original Track 2");
+    assert_eq!(app.queue.current_index(), 1);
 
     // Wait for scan to stream new seed into queue
     app.wait_for_autopilot_scan(Duration::from_secs(3));
 
     // Queue must now have 2 original tracks + 5 newly seeded tracks
     assert_eq!(app.queue.len(), 7);
-    assert_eq!(app.queue.tracks[0].title, "Original Track 1");
-    assert_eq!(app.queue.tracks[1].title, "Original Track 2");
-    assert_eq!(app.queue.current_index, 1);
+    assert_eq!(app.queue.tracks()[0].title, "Original Track 1");
+    assert_eq!(app.queue.tracks()[1].title, "Original Track 2");
+    assert_eq!(app.queue.current_index(), 1);
     assert!(app.status_message.contains("Reshuffled"));
 
     let _ = fs::remove_dir_all(&temp_dir);
@@ -521,7 +521,7 @@ fn test_web_autopilot_reshuffle_action() {
         };
         app.queue.add_track(meta);
     }
-    app.queue.current_index = 0;
+    app.queue.set_current_index(0);
 
     // Send WebCommand::AutopilotReshuffle
     tx.send(WebCommand::AutopilotReshuffle(Some(temp_dir.clone()))).unwrap();
@@ -529,11 +529,11 @@ fn test_web_autopilot_reshuffle_action() {
     app.handle_web_commands();
     assert_eq!(app.autopilot_run_mode, quickstream::ui::AutopilotRunMode::Reshuffle);
     assert_eq!(app.queue.len(), 1); // Truncated after index 0
-    assert_eq!(app.queue.tracks[0].title, "Song 1");
+    assert_eq!(app.queue.tracks()[0].title, "Song 1");
 
     app.wait_for_autopilot_scan(Duration::from_secs(3));
     assert_eq!(app.queue.len(), 4); // 1 + 3 new
-    assert_eq!(app.queue.tracks[0].title, "Song 1");
+    assert_eq!(app.queue.tracks()[0].title, "Song 1");
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
@@ -594,7 +594,7 @@ fn test_autopilot_bpm_flow_and_mood_vibe() {
 
     // The 3 high tempo tracks (126, 128, 130) should be selected
     assert!(!app.queue.is_empty());
-    for track in &app.queue.tracks {
+    for track in app.queue.tracks() {
         let feat = app.analysis_db.get_track(&track.filepath).unwrap();
         assert!(feat.bpm.unwrap() >= 100.0);
     }
@@ -606,7 +606,7 @@ fn test_autopilot_bpm_flow_and_mood_vibe() {
     app.wait_for_autopilot_scan(Duration::from_secs(3));
 
     assert!(!app.queue.is_empty());
-    for track in &app.queue.tracks {
+    for track in app.queue.tracks() {
         let feat = app.analysis_db.get_track(&track.filepath).unwrap();
         assert!(feat.bpm.unwrap() <= 98.0);
     }
@@ -702,7 +702,7 @@ fn test_autopilot_mood_vibe_diverse_artist_sampling_no_single_artist_loop() {
 
     assert!(!app.queue.is_empty());
     let mut artists_in_mix = std::collections::HashSet::new();
-    for track in &app.queue.tracks {
+    for track in app.queue.tracks() {
         artists_in_mix.insert(track.artist.clone());
     }
 
@@ -716,8 +716,8 @@ fn test_autopilot_mood_vibe_diverse_artist_sampling_no_single_artist_loop() {
     // Verify consecutive tracks are never by the same artist
     for i in 1..app.queue.len() {
         assert_ne!(
-            app.queue.tracks[i].artist,
-            app.queue.tracks[i - 1].artist,
+            app.queue.tracks()[i].artist,
+            app.queue.tracks()[i - 1].artist,
             "Consecutive tracks must not be by the same artist at index {} and {}",
             i - 1,
             i
@@ -732,7 +732,7 @@ fn test_autopilot_mood_vibe_diverse_artist_sampling_no_single_artist_loop() {
 
     assert!(!app.queue.is_empty());
     let mut groove_artists = std::collections::HashSet::new();
-    for track in &app.queue.tracks {
+    for track in app.queue.tracks() {
         groove_artists.insert(track.artist.clone());
     }
 

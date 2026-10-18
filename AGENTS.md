@@ -67,7 +67,7 @@ quickstream/
 │   │   ├── tag_reads.rs  # SharedTagReads: tag reads shared by browser/queue/folder-add workers, in-flight path set
 │   │   ├── search.rs     # SearchModalState, streaming fuzzy search (fuzzy-matcher / SkimMatcherV2)
 │   │   ├── theme.rs      # Telemetry colour tokens: ColorDepth (COLORTERM), Palette, style constructors
-│   │   ├── kit.rs        # Key row, volume meter, progress bar, width-aware fit / visible_tail, ClockCache
+│   │   ├── kit.rs        # Key row, volume meter, progress bar, panel header (panel/PanelSpec), visible_window, list_row columns, width-aware fit / visible_tail, ClockCache
 │   │   ├── chrome.rs     # Screen chrome: ChromeLayout rows, header, tab row (tab_titles), strip, key row (tab_key_hints)
 │   │   └── screen.rs     # WidthTier (<80 / 80–89 / 90–109 / ≥110) and Screen (tier, short) per frame
 │   │
@@ -89,7 +89,7 @@ quickstream/
 │   ├── playlist.rs       # Pure M3U8 playlist model: parse/write, name validation, safe file paths, queue plan
 │   ├── playlist_store.rs # In-memory PlaylistStore (sorted), write-through to disk via PersistHandle
 │   ├── persist.rs        # Background atomic writer: ordered save / create / delete / rename (PersistHandle), failures reported back
-│   ├── queue.rs          # PlaybackQueue, FastRng (SplitMix64 deterministic PRNG), shuffle & loop
+│   ├── queue.rs          # PlaybackQueue (private fields, revision() bumped by every mutation), FastRng (SplitMix64 deterministic PRNG), shuffle & loop
 │   ├── web.rs            # Embedded HTTP byte-range server, continuous WAV streaming, REST API (incl. playlists), Web UI
 │   ├── web_access.rs     # Web access control: pairing token, Host/Origin/Content-Type checks, allowed folders
 │   ├── discovery.rs      # SSDP UDP multicast discovery (239.255.255.250:1900), XML device parsing
@@ -112,6 +112,8 @@ quickstream/
     ├── test_playlists_play.rs # Missing-file checks, Enter replace+play, a append, all-missing
     ├── test_search.rs        # Multi-threaded fuzzy search, scoped scan, and modal navigation
     ├── test_ui_chrome.rs     # Theme palettes, key row trimming, meters, text fitting, width tiers; rendered chrome
+    ├── test_ui_panels.rs     # Panel header rows/colours, compact footnote, visible_window vs ratatui List, list_row columns, cursor, ▸
+    ├── test_queue_revision.rs # PlaybackQueue::revision bumps on every mutation, not on reads or no-ops; truncate_after
     ├── test_shared_tag_reads.rs # No concurrent duplicate tag reads; skipped/waiting requests still get tags
     ├── test_upnp.rs          # UPnP SOAP XML generation, AVTransport state machine, continuous stream
     ├── test_web.rs           # Embedded web server, byte ranges, REST API, and command dispatch

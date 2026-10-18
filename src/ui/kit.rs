@@ -1,14 +1,18 @@
 //! Small drawing pieces shared by the Telemetry screens: key row, volume meter, progress bar,
-//! display-width-aware text fitting and a cached clock.
+//! panel headers, list rows in columns, display-width-aware text fitting and a cached clock.
 //!
 //! Everything here is pure (no I/O) and cheap enough to call on every frame.
 
+use std::borrow::Cow;
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::ListState;
+use ratatui::Frame;
 
 use super::theme;
 
@@ -17,6 +21,16 @@ const KEY_GAP: usize = 4;
 
 /// Cells in the volume meter.
 const VOLUME_CELLS: usize = 11;
+
+/// Columns at the right of a panel kept clear of text: the rule's ` ▪` sits there, and the cursor
+/// bar reaches one column into it.
+const PANEL_RIGHT_PAD: u16 = 2;
+
+/// Columns between a panel label and its right note.
+const LABEL_GAP: usize = 2;
+
+/// How much of a label is kept, at least, before its right note is dropped instead.
+const LABEL_MIN_KEPT: usize = 8;
 
 /// One entry of a key row: a keycap (` SPC `) followed by what it does (` PAUSE`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -233,6 +247,282 @@ pub fn progress_bar(inner_width: usize, ratio: f64) -> Vec<Span<'static>> {
     }
     spans.push(Span::styled("▏", theme::ink()));
     spans
+}
+
+/// What [`panel`] draws above a panel's content.
+#[derive(Clone, Debug, Default)]
+pub struct PanelSpec<'a> {
+    /// Shown in UPPERCASE at the left of the label row.
+    pub label: &'a str,
+    /// A short note at the right end of the label row (UPPERCASE, DIM), e.g. `TAGS` or `LOOP`.
+    pub right: Option<&'a str>,
+    /// The panel has keyboard focus: label and rule in INK.
+    pub focused: bool,
+    /// A DIM row under the rule (a path, a position, the spotlight query). Its text is drawn as
+    /// given, so paths keep their case; span styles are applied over DIM.
+    pub footnote: Option<Line<'a>>,
+    /// Narrow (80–89 columns) or short terminals: the footnote goes to the right end of the label
+    /// row, in place of the right note, and takes no row of its own.
+    pub compact: bool,
+}
+
+/// Draw a panel header in `area` and return the area left for the content.
+///
+/// Rows: the label row (label, right note), the rule (`─` then ` ▪`), the footnote if any (not
+/// when compact), a blank row, then the content. Focused: label bold INK, rule and `▪` INK.
+/// Unfocused: label MID, rule RULE, `▪` DIM. No borders. The returned area is the text area:
+/// it stops 2 columns short of `area`'s right edge, under the ` ▪`, so text lines up with the
+/// right note and a cursor bar ([`list_row`]) can reach one column past it on each side.
+pub fn panel(f: &mut Frame, area: Rect, spec: PanelSpec) -> Rect {
+    let area = area.intersection(f.area());
+    let buf = f.buffer_mut();
+    let text_width = area.width.saturating_sub(PANEL_RIGHT_PAD);
+    let mut y = area.y;
+    let bottom = area.bottom();
+
+    let footnote_row = !spec.compact && spec.footnote.is_some();
+    let right: Option<Vec<Span>> = if spec.compact && spec.footnote.is_some() {
+        spec.footnote.as_ref().map(|line| styled_over(line, theme::dim()))
+    } else {
+        spec.right.map(|note| vec![Span::styled(upper(note), theme::dim())])
+    };
+
+    if y < bottom {
+        draw_label_row(
+            buf,
+            Rect::new(area.x, y, text_width, 1),
+            spec.label,
+            spec.focused,
+            right,
+        );
+        y += 1;
+    }
+    if y < bottom {
+        let (rule_style, tick_style) = if spec.focused {
+            (theme::ink(), theme::ink())
+        } else {
+            (theme::rule(), theme::dim())
+        };
+        buf.set_stringn(
+            area.x,
+            y,
+            "─".repeat(text_width as usize),
+            text_width as usize,
+            rule_style,
+        );
+        buf.set_stringn(
+            area.x + text_width,
+            y,
+            " ▪",
+            (area.width - text_width) as usize,
+            tick_style,
+        );
+        y += 1;
+    }
+    if footnote_row && y < bottom {
+        if let Some(line) = &spec.footnote {
+            let spans = styled_over(line, theme::dim());
+            let spans = if spans_width(&spans) > text_width as usize {
+                truncate_spans(spans, text_width as usize)
+            } else {
+                spans
+            };
+            buf.set_line(area.x, y, &Line::from(spans), text_width);
+        }
+        y += 1;
+    }
+    // The blank row before the content.
+    y = (y + 1).min(bottom);
+    Rect::new(area.x, y, text_width, bottom - y)
+}
+
+/// `line`'s spans with each span's style applied over `base`.
+fn styled_over<'a>(line: &Line<'a>, base: Style) -> Vec<Span<'a>> {
+    line.spans
+        .iter()
+        .map(|span| Span::styled(span.content.clone(), base.patch(line.style).patch(span.style)))
+        .collect()
+}
+
+/// The label at the left of `area` and `right` against its right edge. When both do not fit,
+/// the label is cut to make room for `right` while it keeps at least [`LABEL_MIN_KEPT`] columns;
+/// otherwise `right` is dropped and the label cut to the row.
+fn draw_label_row(buf: &mut Buffer, area: Rect, label: &str, focused: bool, right: Option<Vec<Span>>) {
+    let width = area.width as usize;
+    let label = upper(label);
+    let label_width = text_width(&label);
+    let right = right.filter(|spans| {
+        let right_width = spans_width(spans);
+        right_width > 0 && right_width + LABEL_GAP + label_width.min(LABEL_MIN_KEPT) <= width
+    });
+    let label_room = match &right {
+        Some(spans) => width - spans_width(spans) - LABEL_GAP,
+        None => width,
+    };
+    buf.set_stringn(
+        area.x,
+        area.y,
+        clip(&label, label_room),
+        label_room,
+        theme::label(focused),
+    );
+    if let Some(spans) = right {
+        let right_width = spans_width(&spans) as u16;
+        buf.set_line(area.right() - right_width, area.y, &Line::from(spans), right_width);
+    }
+}
+
+/// The rows of a `len`-row list shown `height` rows tall, scrolled the way a ratatui `List` of
+/// one-row items scrolls `state`: the offset moves only as far as needed to show the selected
+/// row, is clamped to the last row, and is written back to `state`. A selection past the end
+/// moves to the last row; an empty list clears it. A zero height leaves `state` alone.
+pub fn visible_window(state: &mut ListState, len: usize, height: usize) -> Range<usize> {
+    if height == 0 {
+        return 0..0;
+    }
+    if len == 0 {
+        state.select(None);
+        return 0..0;
+    }
+    if state.selected().is_some_and(|s| s >= len) {
+        state.select(Some(len - 1));
+    }
+    let offset = state.offset().min(len - 1);
+    let mut first = offset;
+    let mut last = (offset + height).min(len);
+    let shown = state.selected().unwrap_or(offset);
+    if shown >= last {
+        last = shown + 1;
+        first = first.max(last.saturating_sub(height));
+    }
+    if shown < first {
+        first = shown;
+        last = last.min(first + height);
+    }
+    *state.offset_mut() = first;
+    first..last
+}
+
+/// How wide a [`Col`] of a list row is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColWidth {
+    /// Exactly this many columns.
+    Fixed(u16),
+    /// Whatever the other columns leave (shared equally if there are several).
+    Flex,
+    /// The text's own width, e.g. a duration at the right end after a [`ColWidth::Flex`] column.
+    Auto,
+}
+
+/// One column of a list row.
+#[derive(Clone, Debug)]
+pub struct Col<'a> {
+    pub text: Cow<'a, str>,
+    pub width: ColWidth,
+    pub style: Style,
+}
+
+impl<'a> Col<'a> {
+    pub fn fixed(text: impl Into<Cow<'a, str>>, width: u16, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            width: ColWidth::Fixed(width),
+            style,
+        }
+    }
+
+    pub fn flex(text: impl Into<Cow<'a, str>>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            width: ColWidth::Flex,
+            style,
+        }
+    }
+
+    pub fn auto(text: impl Into<Cow<'a, str>>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            width: ColWidth::Auto,
+            style,
+        }
+    }
+}
+
+/// How a list row shows that it is selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowMark {
+    /// Not selected.
+    Plain,
+    /// Selected in the focused pane: the cursor bar ([`theme::cursor`]), one column wider than
+    /// the row's area on each side.
+    Cursor,
+    /// Selected in an unfocused pane: `▸` replaces the first column's text (the row's marker
+    /// column), in that column's style.
+    Marker,
+}
+
+/// Draw one list row on the first line of `area`, its columns left to right.
+///
+/// Each column but the last is cut (with `…`, by display width, so CJK text stays aligned) to
+/// leave at least one space before the next. Flex columns share what the fixed and auto columns
+/// leave; when even those do not fit, the flex columns get nothing and the row is cut at the
+/// right edge of `area`.
+pub fn list_row(f: &mut Frame, area: Rect, cols: &[Col], mark: RowMark) {
+    let screen = f.area();
+    let area = Rect::new(area.x, area.y, area.width, area.height.min(1)).intersection(screen);
+    if area.is_empty() {
+        return;
+    }
+    let buf = f.buffer_mut();
+    let widths = column_widths(cols, area.width as usize);
+    let mut x = area.x;
+    for (i, (col, width)) in cols.iter().zip(widths).enumerate() {
+        let width = width.min((area.right() - x) as usize);
+        if width == 0 {
+            continue;
+        }
+        let text = if i == 0 && mark == RowMark::Marker {
+            "▸"
+        } else {
+            col.text.as_ref()
+        };
+        let is_last = i + 1 == cols.len();
+        let text = if is_last || width < 2 {
+            fit(text, width)
+        } else {
+            format!("{} ", fit(text, width - 1))
+        };
+        buf.set_stringn(x, area.y, text, width, col.style);
+        x += width as u16;
+    }
+    if mark == RowMark::Cursor {
+        let left = area.x.saturating_sub(1);
+        let right = (area.right() + 1).min(screen.right());
+        buf.set_style(Rect::new(left, area.y, right - left, 1), theme::cursor());
+    }
+}
+
+/// Widths of `cols` laid out in `width` columns: fixed as given, auto as wide as their text (plus
+/// the one-column gap when not last), flex sharing the rest.
+fn column_widths(cols: &[Col], width: usize) -> Vec<usize> {
+    let last = cols.len().saturating_sub(1);
+    let mut widths: Vec<usize> = cols
+        .iter()
+        .enumerate()
+        .map(|(i, col)| match col.width {
+            ColWidth::Fixed(n) => n as usize,
+            ColWidth::Auto => text_width(&col.text) + usize::from(i != last),
+            ColWidth::Flex => 0,
+        })
+        .collect();
+    let flex: Vec<usize> = (0..cols.len()).filter(|&i| cols[i].width == ColWidth::Flex).collect();
+    if !flex.is_empty() {
+        let rest = width.saturating_sub(widths.iter().sum());
+        for (n, &i) in flex.iter().enumerate() {
+            widths[i] = rest / flex.len() + usize::from(n < rest % flex.len());
+        }
+    }
+    widths
 }
 
 /// Uppercase with full Unicode case mapping (`ß` becomes `SS`, so the result can be longer).

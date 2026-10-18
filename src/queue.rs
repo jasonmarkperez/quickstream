@@ -2,10 +2,15 @@
 
 use crate::metadata::AudioMetadata;
 
+/// The tracks to play and which one is current.
+///
+/// The fields are private so every change goes through a method that bumps [`Self::revision`];
+/// caches built from the queue (the IN QUEUE path set, totals) rebuild when it moves.
 #[derive(Debug, Clone, Default)]
 pub struct PlaybackQueue {
-    pub tracks: Vec<AudioMetadata>,
-    pub current_index: usize,
+    tracks: Vec<AudioMetadata>,
+    current_index: usize,
+    revision: u64,
 }
 
 /// A track taken out of the queue by [`PlaybackQueue::remove`].
@@ -19,10 +24,17 @@ pub struct RemovedTrack {
 
 impl PlaybackQueue {
     pub fn new() -> Self {
-        Self {
-            tracks: Vec::new(),
-            current_index: 0,
-        }
+        Self::default()
+    }
+
+    /// A number that changes whenever the tracks, their order, their metadata or the current
+    /// index change. Reads and calls that change nothing leave it as it is.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn bump(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -33,17 +45,42 @@ impl PlaybackQueue {
         self.tracks.len()
     }
 
+    pub fn tracks(&self) -> &[AudioMetadata] {
+        &self.tracks
+    }
+
+    /// Index of the current track. It may be past the end while the queue is empty.
+    pub fn current_index(&self) -> usize {
+        self.current_index
+    }
+
+    /// Make the track at `index` the current one (not clamped).
+    pub fn set_current_index(&mut self, index: usize) {
+        if self.current_index != index {
+            self.current_index = index;
+            self.bump();
+        }
+    }
+
     pub fn add_track(&mut self, track: AudioMetadata) {
         self.tracks.push(track);
+        self.bump();
     }
 
     pub fn add_tracks(&mut self, tracks: Vec<AudioMetadata>) {
+        if tracks.is_empty() {
+            return;
+        }
         self.tracks.extend(tracks);
+        self.bump();
     }
 
     /// Insert `tracks` before position `index` (clamped to the end). `current_index` keeps naming
     /// the same track, so tracks inserted at or before it shift it along.
     pub fn insert_tracks(&mut self, index: usize, tracks: Vec<AudioMetadata>) {
+        if tracks.is_empty() {
+            return;
+        }
         let index = index.min(self.tracks.len());
         let count = tracks.len();
         let had_tracks = !self.tracks.is_empty();
@@ -51,6 +88,7 @@ impl PlaybackQueue {
         if had_tracks && index <= self.current_index {
             self.current_index += count;
         }
+        self.bump();
     }
 
     /// Remove the track at `index`, keeping `current_index` on the same track. See [`Self::remove`].
@@ -73,20 +111,58 @@ impl PlaybackQueue {
         if self.current_index >= self.tracks.len() {
             self.current_index = self.tracks.len().saturating_sub(1);
         }
+        self.bump();
         Some(RemovedTrack { track, was_current })
     }
 
+    /// Drop every track after position `index`, keeping tracks `0..=index`.
+    pub fn truncate_after(&mut self, index: usize) {
+        let keep = index.saturating_add(1);
+        if keep < self.tracks.len() {
+            self.tracks.truncate(keep);
+            self.bump();
+        }
+    }
+
     pub fn clear(&mut self) {
+        if self.tracks.is_empty() && self.current_index == 0 {
+            return;
+        }
         self.tracks.clear();
         self.current_index = 0;
+        self.bump();
+    }
+
+    /// Replace every queued track whose path is `meta.filepath` with `meta`. Returns whether any
+    /// track matched.
+    pub fn update_metadata(&mut self, meta: &AudioMetadata) -> bool {
+        let mut updated = false;
+        for track in self.tracks.iter_mut().filter(|t| t.filepath == meta.filepath) {
+            *track = meta.clone();
+            updated = true;
+        }
+        if updated {
+            self.bump();
+        }
+        updated
     }
 
     pub fn current_track(&self) -> Option<&AudioMetadata> {
         self.tracks.get(self.current_index)
     }
 
+    /// The current track for editing. Bumps the revision whether or not it is then changed.
     pub fn current_track_mut(&mut self) -> Option<&mut AudioMetadata> {
-        self.tracks.get_mut(self.current_index)
+        self.track_mut(self.current_index)
+    }
+
+    /// The track at `index` for editing. Bumps the revision whether or not it is then changed.
+    pub fn track_mut(&mut self, index: usize) -> Option<&mut AudioMetadata> {
+        if index >= self.tracks.len() {
+            return None;
+        }
+        self.bump();
+        self.tracks.get_mut(index)
     }
 
     pub fn next_track(&mut self, mode: &str) -> Option<&AudioMetadata> {
@@ -99,10 +175,10 @@ impl PlaybackQueue {
         }
 
         if self.current_index + 1 < self.tracks.len() {
-            self.current_index += 1;
+            self.set_current_index(self.current_index + 1);
             self.current_track()
         } else if mode == "loop" {
-            self.current_index = 0;
+            self.set_current_index(0);
             self.current_track()
         } else {
             // "stop" mode
@@ -116,9 +192,9 @@ impl PlaybackQueue {
         }
 
         if self.current_index > 0 {
-            self.current_index -= 1;
+            self.set_current_index(self.current_index - 1);
         } else {
-            self.current_index = self.tracks.len() - 1;
+            self.set_current_index(self.tracks.len() - 1);
         }
         self.current_track()
     }
@@ -128,6 +204,9 @@ impl PlaybackQueue {
     pub fn reorder_track(&mut self, from: usize, to: usize) -> bool {
         if from >= self.tracks.len() || to >= self.tracks.len() {
             return false;
+        }
+        if from == to {
+            return true;
         }
         let track = self.tracks.remove(from);
         self.tracks.insert(to, track);
@@ -139,6 +218,7 @@ impl PlaybackQueue {
         } else if from > cur && to <= cur {
             self.current_index += 1;
         }
+        self.bump();
         true
     }
 
@@ -161,16 +241,19 @@ impl PlaybackQueue {
             rng.shuffle(&mut self.tracks);
             self.current_index = 0;
         }
+        self.bump();
     }
 
     /// Shuffle only upcoming tracks in the queue from current_index + 1 forward.
     /// Preserves tracks 0..=current_index in place and does not alter current_index.
     pub fn shuffle_from_next(&mut self) {
-        if self.current_index + 1 >= self.tracks.len() {
+        // Fewer than two upcoming tracks: nothing can move.
+        if self.current_index.saturating_add(2) >= self.tracks.len() {
             return;
         }
         let mut rng = FastRng::new();
         rng.shuffle(&mut self.tracks[self.current_index + 1..]);
+        self.bump();
     }
 }
 

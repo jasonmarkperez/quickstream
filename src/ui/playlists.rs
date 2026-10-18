@@ -1140,7 +1140,7 @@ impl super::AppUI {
     /// What `L` would add, or the status message explaining why nothing can be added.
     fn pending_add_for_selection(&self) -> Result<PendingAdd, String> {
         if self.active_tab == 1 && self.queue_focus {
-            return match self.queue.tracks.get(self.queue_cursor) {
+            return match self.queue.tracks().get(self.queue_cursor) {
                 Some(track) => Ok(pending_track(PlaylistEntry::from_metadata(track))),
                 None => Err("Queue is empty".to_string()),
             };
@@ -1703,7 +1703,7 @@ impl AppUI {
         // Stop any autopilot scan and continuous stream, then the queue is this one track.
         self.reset_playback_session();
         self.enqueue_tracks(plan.tracks);
-        self.queue.current_index = 0;
+        self.queue.set_current_index(0);
         self.queue_cursor = 0;
         let playback_error = self.play_current_track();
         self.status_message = match &playback_error {
@@ -1725,9 +1725,9 @@ impl AppUI {
     /// the first queued track with that path, or `None` once it has left the queue.
     fn started_queue_position(&self, started: &StartedPlay) -> Option<usize> {
         if self.queue.current_track().is_some_and(|t| t.filepath == started.path) {
-            return Some(self.queue.current_index);
+            return Some(self.queue.current_index());
         }
-        self.queue.tracks.iter().position(|t| t.filepath == started.path)
+        self.queue.tracks().iter().position(|t| t.filepath == started.path)
     }
 
     /// Whether the track `Enter` started is the current track and the rest of its playlist is
@@ -1850,7 +1850,7 @@ impl AppUI {
             (Some(_), Some(start), None) => {
                 self.reset_playback_session();
                 self.enqueue_tracks(tracks);
-                self.queue.current_index = start;
+                self.queue.set_current_index(start);
                 self.queue_cursor = start;
                 self.play_current_track()
             }
@@ -1879,7 +1879,7 @@ impl AppUI {
                     PlaylistSkip::Ended | PlaylistSkip::Next => self.play_next_track(),
                     PlaylistSkip::Previous => self.play_prev_track(),
                 }
-                self.queue_cursor = self.queue.current_index;
+                self.queue_cursor = self.queue.current_index();
                 (!self.status_message.is_empty()).then(|| self.status_message.clone())
             }
             None => playback_error,
@@ -2132,7 +2132,7 @@ impl AppUI {
     /// queue row for that file (the now-playing track), else the metadata cache, else the file
     /// name. Never reads the file.
     fn playlist_entry_for_web_add(&self, path: &Path) -> PlaylistEntry {
-        match self.queue.tracks.iter().find(|track| track.filepath == path) {
+        match self.queue.tracks().iter().find(|track| track.filepath == path) {
             Some(track) => PlaylistEntry::from_metadata(track),
             None => self.playlist_entry_for_path(path),
         }

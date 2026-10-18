@@ -114,7 +114,7 @@ fn send(app: &mut AppUI, cmd: WebCommand) {
 }
 
 fn queue_paths(app: &AppUI) -> Vec<PathBuf> {
-    app.queue.tracks.iter().map(|t| t.filepath.clone()).collect()
+    app.queue.tracks().iter().map(|t| t.filepath.clone()).collect()
 }
 
 /// A player that records calls and never starts a real backend.
@@ -750,7 +750,7 @@ fn test_web_play_replaces_the_queue_and_plays_from_the_track() {
         app.status_message
     );
     assert_eq!(queue_paths(&app), vec![a.clone(), c.clone()]);
-    assert_eq!(app.queue.current_index, 1);
+    assert_eq!(app.queue.current_index(), 1);
     assert!(app.player.is_playing());
     assert_eq!(app.autopilot_dir, None, "replace ends the autopilot session");
     // The status names the playlist, as tab 5 does.
@@ -889,7 +889,7 @@ fn test_dashboard_play_request_plays_the_playlist() {
     assert_eq!(json["message"], "Checking 2 tracks in Road Trip…");
     assert!(poll_until(&mut app, |app| app.status_message.starts_with("Queued")));
     assert_eq!(queue_paths(&app), vec![a, b]);
-    assert_eq!(app.queue.current_index, 1);
+    assert_eq!(app.queue.current_index(), 1);
     let _ = fs::remove_dir_all(&music);
 }
 

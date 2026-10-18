@@ -242,7 +242,7 @@ fn test_now_playing_shows_a_pending_skip_as_queued_from_its_start() {
 
     // Right was pressed: the queue moved to Two, the player still plays One until the debounce
     // fires. The hero shows Two from its start, marked queued, as the strip does.
-    app.queue.current_index = 1;
+    app.queue.set_current_index(1);
     app.pending_track_skip = true;
     let rows = common::tui::rows(&common::tui::render(&mut app, 120, 40));
     let screen = rows.join("\n");
@@ -266,11 +266,11 @@ fn test_now_playing_pending_skip_never_shows_the_old_tracks_duration() {
     common::isolate();
     // Two's duration isn't known yet (e.g. added from the browser before its tags were read).
     let (mut app, dir) = hero_app("skip_nodur", &["One", "Two"]);
-    app.queue.tracks[1].duration_seconds = 0.0;
+    app.queue.track_mut(1).unwrap().duration_seconds = 0.0;
     app.player = Box::new(common::fake_player::FakePlayer::playing_at(125.0, 300.0));
 
     // Right was pressed: the player still holds One (5:00) until the debounce fires.
-    app.queue.current_index = 1;
+    app.queue.set_current_index(1);
     app.pending_track_skip = true;
     let rows = common::tui::rows(&common::tui::render(&mut app, 120, 40));
     let screen = rows.join("\n");
