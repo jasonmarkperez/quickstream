@@ -33,7 +33,7 @@ This guide is intended for AI coding agents and automated development tools work
 
 5. **Dual Playback Architecture**:
    - Quickstream abstracts playback through the unified `AudioPlayer` trait (`src/player/mod.rs`):
-     - `play(path, offset)` / `pause()` / `resume()` / `stop()` / `seek(seconds)` / `set_volume(level)` / `get_position()` / `get_state()`.
+     - `play(path, offset)` / `pause()` / `resume()` / `stop()` / `seek(seconds)` / `set_volume(level)` / `get_position()` / `get_state()` / `backend_name()` (the local backend actually playing, `mpv` or `ffplay` after a fallback; `None` for DLNA).
    - **Local Playback**: Implemented by `LocalPlayer` (`src/player/local.rs`) utilizing an `mpv` JSON-RPC IPC Unix domain socket with a dedicated listener thread, falling back to `ffplay` subprocess.
    - **DLNA / UPnP Streaming**: Implemented by `UPnPPlayer` (`src/player/upnp.rs`) sending SOAP XML payloads (`AVTransport` / `RenderingControl`) to discovered network renderers, while `WebServer` (`src/web.rs`) serves audio over HTTP with Byte-Range support (`206 Partial Content`) and continuous streaming (`/stream/continuous-<nonce>.wav`, armed per UPnP continuous session via `StreamServerState::arm_continuous_session()`; other continuous paths return 404).
 
@@ -65,7 +65,11 @@ quickstream/
 │   │   ├── mod.rs        # AppUI state machine, 60 FPS render passes, tab switching, hotkey router
 │   │   ├── playlists.rs  # Tab 5 Playlists: PlaylistsUi, name prompt / delete confirm / add picker, L key, play & queue
 │   │   ├── tag_reads.rs  # SharedTagReads: tag reads shared by browser/queue/folder-add workers, in-flight path set
-│   │   └── search.rs     # SearchModalState, streaming fuzzy search (fuzzy-matcher / SkimMatcherV2)
+│   │   ├── search.rs     # SearchModalState, streaming fuzzy search (fuzzy-matcher / SkimMatcherV2)
+│   │   ├── theme.rs      # Telemetry colour tokens: ColorDepth (COLORTERM), Palette, style constructors
+│   │   ├── kit.rs        # Key row, volume meter, progress bar, width-aware fit / visible_tail, ClockCache
+│   │   ├── chrome.rs     # Screen chrome: ChromeLayout rows, header, tab row (tab_titles), strip, key row (tab_key_hints)
+│   │   └── screen.rs     # WidthTier (<80 / 80–89 / 90–109 / ≥110) and Screen (tier, short) per frame
 │   │
 │   ├── player/           # Audio playback abstraction layer
 │   │   ├── mod.rs        # AudioPlayer trait and PlaybackState enum
@@ -107,11 +111,14 @@ quickstream/
     ├── test_playlists_add.rs  # L key, add picker, folder adds, last_playlist
     ├── test_playlists_play.rs # Missing-file checks, Enter replace+play, a append, all-missing
     ├── test_search.rs        # Multi-threaded fuzzy search, scoped scan, and modal navigation
+    ├── test_ui_chrome.rs     # Theme palettes, key row trimming, meters, text fitting, width tiers; rendered chrome
     ├── test_shared_tag_reads.rs # No concurrent duplicate tag reads; skipped/waiting requests still get tags
     ├── test_upnp.rs          # UPnP SOAP XML generation, AVTransport state machine, continuous stream
     ├── test_web.rs           # Embedded web server, byte ranges, REST API, and command dispatch
     └── test_web_playlists.rs # Web playlists: snapshot, GET /api/playlists, play/append, edits, path checks
 ```
+
+TUI tests render through the shared helpers in `tests/common/tui.rs` (`render`, `rows`, `find_row`, `find_text`, `cell_style`, `text_styles`): find chrome rows by their text, not by row number. `tests/common/fake_player.rs` (`FakePlayer`) stands in for the player when a test needs a given position, play state or backend.
 
 The background writer's create, delete and rename tests (used by `PlaylistStore`), including the failure reports, are in the existing `tests/test_persistence_worker.rs`, which the map above does not list.
 
@@ -120,9 +127,12 @@ The background writer's create, delete and rename tests (used by `PlaylistStore`
 ## 3. Terminal UI Architecture & Ratatui Guidelines
 
 ### 5-Tab Layout Structure
-- **Header**: Tab bar (`[1] Now Playing` | `[2] Queue & Library` | `[3] Devices` | `[4] Settings` | `[5] Playlists`), 79 columns. Narrower terminals get short labels (`[1] Now` | `[2] Library` | `[3] Devices` | `[4] Settings` | `[5] Playlists`, 58 columns), then only the numbers plus the active tab's short label, so the active tab stays visible (`tab_titles` in `src/ui/mod.rs`).
+- **Screen chrome** (`src/ui/chrome.rs`, Telemetry style 2a, colours from `ui::theme`; the tab bodies keep their own widgets and foreground colours until they are restyled, with selection rows in `theme::cursor()`): `render` first fills every cell with `theme::base()` (INK on GROUND), then draws, with 2-column gutters on both sides: top margin, **header**, blank row, **tab row**, a gap (2 rows from 30 rows tall, else 1), the tab body, blank row, **rule** and **strip** (not on Now Playing), blank row, **key row**, bottom margin. Under 24 rows: tab row (with the header's right-hand part folded in), body, strip, key row (`ChromeLayout`).
+  - **Header**: `QUICKSTREAM ▪ <version>` on the left; on the right the output (`LOCAL/<BACKEND>` or `DLNA/<RENDERER>`; the backend is the one actually playing, from `AudioPlayer::backend_name`, so `LOCAL/FFPLAY` once mpv is missing or failed, and the `player_backend` setting until the player has reported), `WEB :<port>` (only while the web server runs) and the clock (`HH:MM`, `kit::ClockCache`), 4 columns apart. When narrow, `WEB` goes first, then the output.
+  - **Tab row**: `1 NOW PLAYING` `2 QUEUE & LIBRARY` `3 DEVICES` `4 SETTINGS` `5 PLAYLISTS` from 110 columns; `2 QUEUE` at 90–109; `1 NOW` … under 90; when even those don't fit, only the numbers plus the active tab's short label (#59); under about 37 columns the numbers farthest from the active tab go too, and an active label too wide on its own is cut with `…`, so the active tab is always shown and never clipped (`tab_titles`). The active tab is a chip in `theme::cursor()` (GROUND on INK, bold); the others are MID.
+  - **Key row**: keycaps (` SPC ` in `theme::keycap()`) and MID labels, 4 columns apart, per tab and focused pane (`AppUI::tab_key_hints`; only keys the handlers act on, e.g. tab 5 shows `C ⇧R ⇧D` in the list pane and `⇧J ⇧K MOVE TRACK` / `D REMOVE` in the tracks pane). `? KEYS` is always kept on a tab (except while spotlight or the startup home editor takes typed text, where `?` is text). While a modal is open the row shows that modal's keys instead of the tab's, and no `? KEYS` (`AppUI::modal_key_hints`): help `ESC CLOSE`; search `↑↓ SELECT` `ENTER ADD & CLOSE` `TAB ADD` `⇧TAB ADD ALL` `ESC CLOSE`; mix picker `J K SELECT` `ENTER START` `1-5 PROFILE` `ESC CLOSE`; name prompt `ENTER SAVE` `ESC CANCEL`; delete confirmation `Y DELETE` `ANY KEY CANCEL`; add picker `J K SELECT` `ENTER ADD` `ESC CANCEL`. Now Playing: `SPC PLAY/PAUSE`, `←→ TRACK`, `[ ] SEEK <seek_step_seconds>S`, `+− VOL`, `N QUEUE`, `? KEYS`, then the volume meter; `N QUEUE` stays at every width and Esc is never offered (#57). At 80–89 columns at most 5 keys. The status message sits at the right end (ERROR colour when it contains error/failed/couldn't, else MID; messages that repeat the screen, such as `Welcome to Quickstream…` or `Playing:`, are not shown). A long status drops the least important keys first, then is cut with `…`.
 - **Main View Area**:
-  - **Tab 0 (`[1] Now Playing`)**: Hero view with large typography (Title, Artist, Album), technical codec/format badges, timeline, and upcoming queue preview.
+  - **Tab 0 (`[1] Now Playing`)**: Hero view with large typography (Title, Artist, Album), technical codec/format badges, timeline, and upcoming queue preview. While autopilot runs, its badge names the mix profile (`[⚡ AUTOPILOT · BPM FLOW]`, from `MixProfile::short_name`). While a debounced skip is pending (`pending_track_skip`), the state pill reads `» QUEUED` and the timeline shows the target track from `00:00` of its own duration (`00:00` while that is unknown; never the old track's, which the player still holds), as the strip does on the other tabs.
   - **Tab 1 (`[2] Queue & Library`)**: Split-pane layout.
     - **Left Pane (`browser`)**: Bounded `FileBrowser` showing directory tree, bookmarked Music Homes (`~/.config/quickstream/bookmarks.json`), and metadata tag view toggle (`[v]`).
     - **Right Pane (`queue`)**: `PlaybackQueue` showing queued songs, duration, status badges, and track index. Focus toggled with `h` and `l`.
@@ -137,11 +147,8 @@ The background writer's create, delete and rename tests (used by `PlaylistStore`
   - Play / append: `/api/action` `playlist_play` (`name`, optional `index`, which requires `revision`) and `playlist_append` (`name`). The web thread checks every entry of the snapshot's playlist: one whose file resolves outside the allowed folders, or a missing one whose path lies outside them, refuses the whole request with 403 and `WebCommand::PathRejected`, like `add_file`. Entries are checked with `web_access::AllowedRoots`, which canonicalizes the allowed folders once per request (and once per play on the worker), with the same answers as `resolve_allowed_path`. Otherwise it sends `WebCommand::QueuePlaylist` with the checked entries and a `WebReply`, waits up to 5 s, and returns the UI's answer: 200 with `Checking <n> tracks in <name>…`, or 409 with its refusal (`Still checking <name>…`). The UI queues them with tab 5's worker code (`queue_playlist_entries`: same `plan_queue`, reset of autopilot scan and continuous stream on replace, same status messages, which name the playlist instead of saying `(web)`). For web requests the worker also requires each checked file to resolve inside the allowed folders. Refusals (JSON `{"ok":false,"error":…}`): not loaded (409, `Playlists are still loading` / `Couldn't load playlists`), unknown name (404), empty playlist (409), bad index (400), `index` without `revision` (400, `Missing revision: reload the playlists and try again`), stale `revision` (409, `Playlists changed; try again`).
   - Edit: `playlist_create` (`name`), `playlist_rename` (`name`, `new_name`), `playlist_delete`, `playlist_add` (`name`, `path`: checked like `add_file` on the canonical path, 403 + `PathRejected` outside the allowed folders, 400 if not an audio file; stored as `playlist::normalize_path` of the requested path, the form a terminal add stores, and `Already in <name>` if the playlist holds either form), `playlist_remove` (`name`, `index`, `revision`), `playlist_move` (`name`, `index`, `direction` `up`/`down`, `revision`); `revision` is required for remove and move (400 without it). The web thread sends `WebCommand::EditPlaylist(PlaylistEdit, WebReply)` and waits up to 5 s for the UI's answer; `AppUI::apply_web_playlist_edit` applies it through `PlaylistStore` only (same `validate_name` rules, duplicate and reserved-name checks and messages as the name prompt), shows it in the status line, republishes the snapshot and answers. 200 `{"ok":true,"message":…}`, 409 with the store's message, 503 if the UI didn't answer. Tab 5 keeps its playlist selected (following a web rename).
   - All of these share the `web_access` checks (pairing token, Host, Origin, JSON Content-Type). The dashboard builds every row from text and `dataset` only (see `tests/support/dashboard_dom_harness.js`).
-- **Persistent Bottom Playback Bar**:
-  - Rendered across all tabs.
-  - Displays: State badge (`▶`, `⏸`, `⏹`), track title, artist, format badge (`[FLAC] [24b/96k]`), volume/mute, interactive progress bar, elapsed/total time, and active mix profile badge.
-  - Its second row reads state badge, device, volume, web badge (`🌐 :<port>`), then the status message. A status too long for the row takes the room of the device name, then the web badge, then the volume, which come back with the next status that fits.
-- **Overlay Modals**:
+- **Mini player strip** (tabs `[2]`–`[5]`, under a RULE-coloured rule): state glyph (`▶` playing, `‖` paused, `■` stopped, `»` while a debounced skip is pending, with `QUEUED`) and the title in bold INK, the artist in MID from 90 columns; on the right elapsed time, progress bar (`▕╱╱╱▏`, elapsed INK, rest RULE), duration and `VOL <n>`. While autopilot runs, the mix profile (`⚡ BPM FLOW`, `MixProfile::short_name` uppercased, MID) comes first on the right; it has the lowest priority and shows only when the title and artist still fit whole beside it. With no track: `■ NO TRACK LOADED`. Now Playing has no strip; its volume is the meter at the end of the key row.
+- **Overlay Modals** (drawn on GROUND: each clears its area with `kit::clear`, never ratatui's `Clear`, which leaves the terminal's default background; borders and titles keep their colours until the modals are restyled):
   - **Help Modal (`?`)**: Full keyboard shortcut cheat-sheet.
   - **Fuzzy Search Modal (`f`)**: Streaming fuzzy finder with real-time preview card.
   - **Mix Profile Modal (`M`)**: Interactive autopilot mix profile selector (`[1]` Diverse Shuffle, `[2]` BPM Flow, `[3]` Chill & Ambient, `[4]` Workout, `[5]` Late Night Groove).

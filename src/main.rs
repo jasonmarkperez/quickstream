@@ -172,7 +172,8 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Launch full interactive TUI
+    // Launch full interactive TUI. The colour depth is decided once, before anything is drawn.
+    quickstream::ui::theme::init(quickstream::ui::theme::ColorDepth::detect());
     let mut settings_mgr = SettingsManager::new();
     if cli.web {
         settings_mgr.settings.web_server_enabled = true;

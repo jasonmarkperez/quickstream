@@ -224,6 +224,20 @@ impl MixProfile {
             }
         }
     }
+
+    /// The profile's name without details, for badges: `Diverse Shuffle`, `BPM Flow`,
+    /// `Chill & Ambient`, `Workout`, `Focus`, `Late Night Groove`, `Seed Radio`.
+    pub fn short_name(&self) -> &'static str {
+        match self {
+            MixProfile::DiverseShuffle => "Diverse Shuffle",
+            MixProfile::BpmFlow { .. } => "BPM Flow",
+            MixProfile::MoodVibe(MoodType::Chill) => "Chill & Ambient",
+            MixProfile::MoodVibe(MoodType::Workout) => "Workout",
+            MixProfile::MoodVibe(MoodType::Focus) => "Focus",
+            MixProfile::MoodVibe(MoodType::Groove) => "Late Night Groove",
+            MixProfile::SeedRadio(_) => "Seed Radio",
+        }
+    }
 }
 
 /// DJ sequencing engine that applies artist separation and tempo continuity.

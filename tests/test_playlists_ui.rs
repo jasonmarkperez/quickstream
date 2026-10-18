@@ -107,7 +107,7 @@ fn test_playlists_tab_shows_loading_then_empty_state() {
 
     // Nothing has been polled yet, so the store is still loading.
     let view = render(&mut app, 120, 30);
-    assert!(view.contains("[5] Playlists"), "tab bar should list tab 5:\n{}", view);
+    assert!(view.contains("5 PLAYLISTS"), "tab row should list tab 5:\n{}", view);
     assert!(view.contains("Loading playlists…"), "{}", view);
 
     wait_loaded(&mut app);
@@ -393,33 +393,80 @@ fn test_help_modal_fits_tab_5_keys_at_80x24() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+/// The tab row: the first row naming tab 5 (`5 PLAYLISTS`, or just `5` when narrow, so look for
+/// the active tab's label).
+fn tab_row(buffer: &ratatui::buffer::Buffer, active_label: &str) -> u16 {
+    common::tui::find_row(buffer, active_label)
+        .unwrap_or_else(|| panic!("{active_label:?} not drawn:\n{}", common::tui::rows(buffer).join("\n")))
+}
+
 #[test]
-fn test_tab_bar_shows_all_five_labels_at_80_columns() {
+fn test_tab_row_shows_all_five_labels_at_80_columns() {
     common::isolate();
     let temp_dir = fresh_dirs("tabbar80");
     let mut app = new_app(&temp_dir);
 
-    // Every tab selection renders the full bar at a standard 80-column width.
+    // Every tab selection renders every label at a standard 80-column width (the short set).
     for tab in 0..5 {
         app.active_tab = tab;
-        let out = render(&mut app, 80, 30);
-        let first_line = out.lines().next().unwrap_or("").to_string();
-        println!("tab {tab} bar: {first_line}");
-        for label in [
-            "[1] Now Playing",
-            "[2] Queue & Library",
-            "[3] Devices",
-            "[4] Settings",
-            "[5] Playlists",
-        ] {
-            assert!(
-                first_line.contains(label),
-                "missing {label:?} in tab bar (tab {tab}): {first_line:?}"
-            );
+        let buffer = common::tui::render(&mut app, 80, 30);
+        let row = common::tui::row(&buffer, tab_row(&buffer, "5 PLAYLISTS"));
+        println!("tab {tab} row: {row}");
+        for label in ["1 NOW", "2 QUEUE", "3 DEVICES", "4 SETTINGS", "5 PLAYLISTS"] {
+            assert!(row.contains(label), "missing {label:?} in tab row (tab {tab}): {row:?}");
         }
     }
 
+    // The label set follows the width: full from 110 columns, `QUEUE` from 90.
+    let buffer = common::tui::render(&mut app, 120, 30);
+    let row = common::tui::row(&buffer, tab_row(&buffer, "5 PLAYLISTS"));
+    for label in [
+        "1 NOW PLAYING",
+        "2 QUEUE & LIBRARY",
+        "3 DEVICES",
+        "4 SETTINGS",
+        "5 PLAYLISTS",
+    ] {
+        assert!(row.contains(label), "missing {label:?} at 120 columns: {row:?}");
+    }
+    let buffer = common::tui::render(&mut app, 100, 30);
+    let row = common::tui::row(&buffer, tab_row(&buffer, "5 PLAYLISTS"));
+    assert!(row.contains("1 NOW PLAYING") && row.contains("2 QUEUE    "), "{row:?}");
+    assert!(!row.contains("LIBRARY"), "{row:?}");
+
     let _ = fs::remove_dir_all(&temp_dir);
+}
+
+/// Render at `width` x 30 and check `label` sits whole on the tab row, drawn as the active tab
+/// chip (the cursor style, padded by one cell on each side). Returns the tab row.
+fn assert_active_tab_label(app: &mut AppUI, width: u16, label: &str) -> String {
+    let buffer = common::tui::render(app, width, 30);
+    let y = tab_row(&buffer, label);
+    let row = common::tui::row(&buffer, y);
+    let chip = format!(" {label} ");
+    let (x, _) = common::tui::find_text(&buffer, &chip)
+        .unwrap_or_else(|| panic!("{chip:?} not on the {width}-column tab row: {row:?}"));
+    let cursor = quickstream::ui::theme::cursor();
+    for cx in x..x + chip.chars().count() as u16 {
+        let cell = &buffer[(cx, y)];
+        assert!(cx < width, "{label:?} clipped at {width} columns: {row:?}");
+        assert_eq!(
+            cell.fg,
+            cursor.fg.unwrap(),
+            "column {cx} of {chip:?} at {width} columns: {row:?}"
+        );
+        assert_eq!(
+            cell.bg,
+            cursor.bg.unwrap(),
+            "column {cx} of {chip:?} at {width} columns: {row:?}"
+        );
+        assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
+    }
+    // Only the active tab is a chip.
+    let ink = cursor.bg.unwrap();
+    let chip_cells = (0..width).filter(|&cx| buffer[(cx, y)].bg == ink).count();
+    assert_eq!(chip_cells, chip.chars().count(), "one chip on the tab row: {row:?}");
+    row
 }
 
 #[test]
@@ -430,94 +477,43 @@ fn test_tab_5_label_is_highlighted_at_80_columns_after_pressing_5() {
 
     press(&mut app, KeyCode::Char('5'));
     assert_eq!(app.active_tab, 4);
-
-    let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
-    terminal.draw(|f| app.render(f)).unwrap();
-    let buffer = terminal.backend().buffer();
-
-    let row: String = (0..80).map(|x| buffer[(x, 0)].symbol().to_string()).collect();
-    let label = "[5] Playlists";
-    let start = row
-        .chars()
-        .collect::<Vec<_>>()
-        .windows(label.chars().count())
-        .position(|w| w.iter().collect::<String>() == label)
-        .unwrap_or_else(|| panic!("{label:?} not on the 80-column tab bar: {row:?}"));
-    let end = start + label.chars().count();
-    assert!(end <= 80, "{label:?} clipped at the right edge: {row:?}");
-
-    for x in start..end {
-        let cell = &buffer[(x as u16, 0)];
-        assert_eq!(
-            cell.fg,
-            ratatui::style::Color::Cyan,
-            "column {x} of {label:?} is not highlighted"
-        );
-        assert!(
-            cell.modifier.contains(ratatui::style::Modifier::BOLD),
-            "column {x} of {label:?} is not bold"
-        );
-    }
+    assert_active_tab_label(&mut app, 80, "5 PLAYLISTS");
+    assert_active_tab_label(&mut app, 120, "5 PLAYLISTS");
 
     let _ = fs::remove_dir_all(&temp_dir);
-}
-
-/// Render at `width` x 30 and check `label` sits whole on the tab bar, highlighted as the
-/// active tab. Returns the tab bar row.
-fn assert_active_tab_label(app: &mut AppUI, width: u16, label: &str) -> String {
-    let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
-    terminal.draw(|f| app.render(f)).unwrap();
-    let buffer = terminal.backend().buffer();
-    let cells: Vec<String> = (0..width).map(|x| buffer[(x, 0)].symbol().to_string()).collect();
-    let row: String = cells.concat();
-    let len = label.chars().count();
-    let start = (0..cells.len().saturating_sub(len - 1))
-        .find(|&x| cells[x..x + len].concat() == label)
-        .unwrap_or_else(|| panic!("{label:?} not on the {width}-column tab bar: {row:?}"));
-    for x in start..start + len {
-        let cell = &buffer[(x as u16, 0)];
-        assert_eq!(
-            cell.fg,
-            ratatui::style::Color::Cyan,
-            "column {x} of {label:?} is not highlighted at {width} columns: {row:?}"
-        );
-        assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
-    }
-    row
 }
 
 #[test]
 fn test_active_tab_label_stays_visible_below_79_columns() {
     common::isolate();
-    // Issue #59: below 79 columns the full labels don't fit and `[5] Playlists` was clipped, so
-    // tab 5 had no visible active tab.
+    // Issue #59: in a narrow terminal the active tab's label must stay whole and highlighted.
     let temp_dir = fresh_dirs("tabbar_narrow");
     let mut app = new_app(&temp_dir);
     press(&mut app, KeyCode::Char('5'));
     assert_eq!(app.active_tab, 4);
 
-    // 79 columns still fits every full label.
-    let row = assert_active_tab_label(&mut app, 79, "[5] Playlists");
-    assert!(row.contains("[2] Queue & Library"), "{row:?}");
-
-    // Narrower, the labels shorten but every tab is still named.
-    for width in [78, 60] {
-        let row = assert_active_tab_label(&mut app, width, "[5] Playlists");
-        for label in ["[1] Now", "[2] Library", "[3] Devices", "[4] Settings"] {
+    // 79 and 78 columns still name every tab.
+    for width in [79, 78] {
+        let row = assert_active_tab_label(&mut app, width, "5 PLAYLISTS");
+        for label in ["1 NOW", "2 QUEUE", "3 DEVICES", "4 SETTINGS"] {
             assert!(row.contains(label), "missing {label:?} at {width} columns: {row:?}");
         }
     }
 
-    // Narrower still, the other tabs show only their numbers.
-    let row = assert_active_tab_label(&mut app, 40, "[5] Playlists");
-    for label in ["[1]", "[2]", "[3]", "[4]"] {
-        assert!(row.contains(label), "missing {label:?} at 40 columns: {row:?}");
+    // Narrower, the other tabs show only their numbers.
+    for width in [60, 40] {
+        let row = assert_active_tab_label(&mut app, width, "5 PLAYLISTS");
+        for label in [" 1 ", " 2 ", " 3 ", " 4 "] {
+            assert!(row.contains(label), "missing {label:?} at {width} columns: {row:?}");
+        }
+        assert!(!row.contains("SETTINGS"), "{row:?}");
     }
 
     // Any tab can be the active one.
     app.active_tab = 1;
-    assert_active_tab_label(&mut app, 60, "[2] Library");
-    assert_active_tab_label(&mut app, 40, "[2] Library");
+    assert_active_tab_label(&mut app, 79, "2 QUEUE");
+    assert_active_tab_label(&mut app, 60, "2 QUEUE");
+    assert_active_tab_label(&mut app, 40, "2 QUEUE");
 
     let _ = fs::remove_dir_all(&temp_dir);
 }

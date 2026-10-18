@@ -6,6 +6,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
+use quickstream::analysis::{MixProfile, MoodType};
 use quickstream::metadata::AudioMetadata;
 use quickstream::settings::SettingsManager;
 use quickstream::ui::AppUI;
@@ -145,15 +146,17 @@ fn test_render_now_playing_tab_empty_and_populated() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+/// The Now Playing key row (the row holding the `N` keycap) at `width` x 30.
 fn now_playing_footer(app: &mut AppUI, width: u16) -> String {
-    let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
     app.active_tab = 0;
-    terminal.draw(|f| app.render(f)).unwrap();
-    let view = terminal.backend().to_string();
-    view.lines()
-        .find(|line| line.contains("Play/Pause"))
-        .expect("Now Playing footer row")
-        .to_string()
+    let buffer = common::tui::render(app, width, 30);
+    let y = common::tui::find_row(&buffer, " N  QUEUE").unwrap_or_else(|| {
+        panic!(
+            "Now Playing key row at {width} columns:\n{}",
+            common::tui::rows(&buffer).join("\n")
+        )
+    });
+    common::tui::row(&buffer, y)
 }
 
 #[test]
@@ -165,10 +168,17 @@ fn test_now_playing_footer_names_n_not_esc_at_80_columns() {
     let settings_mgr = SettingsManager::with_path(temp_dir.join("config.json"));
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
 
-    // Esc is the global quit key, so the footer must not offer it for switching tabs (#57)
-    let footer = now_playing_footer(&mut app, 80);
-    assert!(footer.contains("[n] Queue & Library"), "footer at 80 columns: {footer}");
-    assert!(!footer.contains("Esc"), "footer: {footer}");
+    // Esc is the global quit key, so the key row must not offer it for switching tabs (#57),
+    // and `N QUEUE` stays at every width.
+    for width in [120, 100, 85, 80, 70, 40] {
+        let footer = now_playing_footer(&mut app, width);
+        assert!(footer.contains(" N  QUEUE"), "key row at {width} columns: {footer}");
+        assert!(footer.contains(" ?  KEYS"), "key row at {width} columns: {footer}");
+        assert!(
+            !footer.to_uppercase().contains("ESC"),
+            "key row at {width} columns: {footer}"
+        );
+    }
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
@@ -184,7 +194,128 @@ fn test_now_playing_footer_shows_the_seek_step_setting() {
 
     app.settings_mgr.settings.seek_step_seconds = 30.0;
     let footer = now_playing_footer(&mut app, 120);
-    assert!(footer.contains("Seek 30s"), "footer: {footer}");
+    assert!(footer.contains(" [ ]  SEEK 30S"), "footer: {footer}");
+    let footer = now_playing_footer(&mut app, 100);
+    assert!(footer.contains("SEEK 30S"), "footer: {footer}");
 
     let _ = fs::remove_dir_all(&temp_dir);
+}
+
+/// A fresh app browsing a temp dir of its own, with `titles` queued (5:00, 5:52, ...).
+fn hero_app(tag: &str, titles: &[&str]) -> (AppUI, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("quickstream_np_{}_{}", tag, std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let settings_mgr = SettingsManager::with_path(dir.join("config.json"));
+    let mut app = AppUI::new(Some(dir.clone()), settings_mgr);
+    for (i, title) in titles.iter().enumerate() {
+        app.queue.add_track(AudioMetadata {
+            filepath: dir.join(format!("{title}.flac")),
+            title: title.to_string(),
+            artist: "Mira Lenz".to_string(),
+            duration_seconds: 300.0 + 52.0 * i as f64,
+            ..Default::default()
+        });
+    }
+    app.active_tab = 0;
+    (app, dir)
+}
+
+/// The hero timeline: the row with the bar (`█` or `░`).
+fn timeline_row(rows: &[String]) -> String {
+    rows.iter()
+        .find(|r| r.contains('░') || r.contains('█'))
+        .cloned()
+        .unwrap_or_else(|| panic!("no timeline:\n{}", rows.join("\n")))
+}
+
+#[test]
+fn test_now_playing_shows_a_pending_skip_as_queued_from_its_start() {
+    common::isolate();
+    let (mut app, dir) = hero_app("skip", &["One", "Two"]);
+    app.player = Box::new(common::fake_player::FakePlayer::playing_at(125.0, 300.0));
+
+    let rows = common::tui::rows(&common::tui::render(&mut app, 120, 40));
+    let screen = rows.join("\n");
+    assert!(screen.contains("▶ PLAYING"), "{screen}");
+    assert!(timeline_row(&rows).contains("02:05"), "{screen}");
+
+    // Right was pressed: the queue moved to Two, the player still plays One until the debounce
+    // fires. The hero shows Two from its start, marked queued, as the strip does.
+    app.queue.current_index = 1;
+    app.pending_track_skip = true;
+    let rows = common::tui::rows(&common::tui::render(&mut app, 120, 40));
+    let screen = rows.join("\n");
+    assert!(screen.contains("» QUEUED"), "{screen}");
+    assert!(
+        !screen.contains("▶ PLAYING"),
+        "the pill no longer says PLAYING: {screen}"
+    );
+    assert!(screen.contains("Two"), "{screen}");
+    let timeline = timeline_row(&rows);
+    assert!(
+        timeline.contains("00:00") && timeline.contains("05:52"),
+        "Two from 00:00 of 05:52: {timeline:?}"
+    );
+    assert!(!screen.contains("02:05"), "One's position is gone: {screen}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_now_playing_pending_skip_never_shows_the_old_tracks_duration() {
+    common::isolate();
+    // Two's duration isn't known yet (e.g. added from the browser before its tags were read).
+    let (mut app, dir) = hero_app("skip_nodur", &["One", "Two"]);
+    app.queue.tracks[1].duration_seconds = 0.0;
+    app.player = Box::new(common::fake_player::FakePlayer::playing_at(125.0, 300.0));
+
+    // Right was pressed: the player still holds One (5:00) until the debounce fires.
+    app.queue.current_index = 1;
+    app.pending_track_skip = true;
+    let rows = common::tui::rows(&common::tui::render(&mut app, 120, 40));
+    let screen = rows.join("\n");
+    assert!(screen.contains("» QUEUED"), "{screen}");
+    let timeline = timeline_row(&rows);
+    assert!(timeline.contains("00:00"), "Two from 00:00: {timeline:?}");
+    assert!(
+        !screen.contains("05:00"),
+        "One's duration is not shown for Two: {screen}"
+    );
+
+    // The strip on tab 2 shows the same: Two from 00:00, no 05:00.
+    app.active_tab = 1;
+    let buffer = common::tui::render(&mut app, 120, 40);
+    let y = common::tui::find_row(&buffer, "QUEUED").expect("strip");
+    let strip = common::tui::row(&buffer, y);
+    assert!(strip.contains("00:00") && !strip.contains("05:00"), "{strip:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_now_playing_autopilot_badge_names_the_mix_profile() {
+    common::isolate();
+    let (mut app, dir) = hero_app("profile", &["One", "Two"]);
+    let screen = common::tui::render_text(&mut app, 120, 40);
+    assert!(!screen.contains("AUTOPILOT"), "no badge without autopilot: {screen}");
+
+    app.autopilot_dir = Some(dir.clone());
+    for (profile, name) in [
+        (MixProfile::DiverseShuffle, "AUTOPILOT · DIVERSE SHUFFLE"),
+        (
+            MixProfile::BpmFlow {
+                target_bpm: 120.0,
+                tolerance: 0.15,
+            },
+            "AUTOPILOT · BPM FLOW",
+        ),
+        (MixProfile::MoodVibe(MoodType::Chill), "AUTOPILOT · CHILL & AMBIENT"),
+        (MixProfile::MoodVibe(MoodType::Workout), "AUTOPILOT · WORKOUT"),
+        (MixProfile::MoodVibe(MoodType::Groove), "AUTOPILOT · LATE NIGHT GROOVE"),
+        (MixProfile::SeedRadio(dir.join("One.flac")), "AUTOPILOT · SEED RADIO"),
+    ] {
+        app.active_mix_profile = profile;
+        let screen = common::tui::render_text(&mut app, 120, 40);
+        assert!(screen.contains(name), "{name:?} missing:\n{screen}");
+    }
+    let _ = fs::remove_dir_all(&dir);
 }

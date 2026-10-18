@@ -452,3 +452,22 @@ fn test_reselecting_active_renderer_keeps_current_player() {
         "re-selecting the active renderer must not restart playback on it"
     );
 }
+
+#[test]
+fn test_async_player_reports_its_players_backend() {
+    common::isolate();
+    let player = AsyncPlayer::spawn(
+        || {
+            Box::new(common::fake_player::FakePlayer {
+                backend: Some("ffplay"),
+                ..Default::default()
+            })
+        },
+        50,
+    );
+    assert!(
+        wait_until(Duration::from_secs(2), || player.backend_name() == Some("ffplay")),
+        "backend not reported: {:?}",
+        player.backend_name()
+    );
+}

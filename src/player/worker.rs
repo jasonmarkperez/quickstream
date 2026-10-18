@@ -40,6 +40,9 @@ struct Snapshot {
     position: f64,
     duration: f64,
     finished: bool,
+    /// The backend the player reports (`AudioPlayer::backend_name`), refreshed with the rest but
+    /// never optimistic.
+    backend: Option<&'static str>,
     /// Commands sent but not yet applied by the worker. While non-zero the worker does not
     /// overwrite the optimistic snapshot with backend state.
     pending: usize,
@@ -187,10 +190,12 @@ fn refresh(player: &mut dyn AudioPlayer, shared: &Shared) {
         position: player.position_seconds(),
         duration: player.duration_seconds(),
         finished: player.is_track_finished(),
+        backend: player.backend_name(),
         pending: 0,
         volume_pending: 0,
     };
     let mut state = shared.state.lock().unwrap();
+    state.backend = fresh.backend;
     if state.pending == 0 {
         *state = fresh;
     } else if state.volume_pending == 0 {
@@ -306,6 +311,10 @@ impl AudioPlayer for AsyncPlayer {
 
     fn detach_stream_state(&mut self) {
         let _ = self.send(Command::DetachStreamState, |_| {});
+    }
+
+    fn backend_name(&self) -> Option<&'static str> {
+        self.shared.state.lock().unwrap().backend
     }
 
     fn take_error(&mut self) -> Option<String> {

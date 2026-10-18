@@ -161,3 +161,19 @@ fn test_ffplay_backend_lifecycle() {
     assert!(player.stop().is_ok());
     assert!(!player.is_playing());
 }
+
+#[test]
+fn test_local_player_reports_the_backend_it_runs() {
+    common::isolate();
+    assert_eq!(LocalPlayer::new("ffplay").backend_name(), Some("ffplay"));
+
+    // mpv configured but missing: the configured backend until a track plays, then ffplay.
+    let mut player = LocalPlayer::with_mpv_binary("mpv", "/nonexistent/quickstream-test-mpv");
+    assert_eq!(player.backend_name(), Some("mpv"));
+    let test_file = ensure_test_file();
+    assert!(test_file.exists(), "test file must exist");
+    let res = player.play(&test_file);
+    assert!(res.is_ok(), "ffplay fallback failed: {:?}", res);
+    assert_eq!(player.backend_name(), Some("ffplay"), "mpv is missing, so ffplay plays");
+    let _ = player.stop();
+}
