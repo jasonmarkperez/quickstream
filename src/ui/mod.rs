@@ -3426,6 +3426,12 @@ impl AppUI {
                     play_from,
                 } => self.queue_web_playlist(name, entries, play_from),
                 crate::web::WebCommand::CheckPlaylists => self.check_playlists_for_web(),
+                crate::web::WebCommand::EditPlaylist(edit, reply) => {
+                    let result = self.apply_web_playlist_edit(edit);
+                    // Publish first, so the dashboard's reload after the answer sees the edit.
+                    self.update_web_state();
+                    reply.send(result);
+                }
             }
         }
     }

@@ -718,7 +718,7 @@ impl AppUI {
     /// with the error so the user can fix it.
     fn submit_name_prompt(&mut self, purpose: NamePurpose, input: String) {
         let result = match &purpose {
-            NamePurpose::Rename { old } => self.playlists.store.rename(old, &input),
+            NamePurpose::Rename { old } => self.rename_playlist(old, &input),
             NamePurpose::Create | NamePurpose::CreateAndAdd(_) => self.playlists.store.create(&input),
         };
         let name = match result {
@@ -737,23 +737,53 @@ impl AppUI {
             self.playlists.list_cursor = index;
         }
         match purpose {
-            NamePurpose::Rename { old } => {
-                self.follow_last_playlist(&old, Some(&name));
-                self.status_message = if old == name {
-                    "Name unchanged".to_string()
-                } else {
-                    format!("Renamed \"{}\" to \"{}\"", old, name)
-                };
-            }
+            NamePurpose::Rename { old } => self.status_message = renamed_message(&old, &name),
             NamePurpose::Create => {
                 self.playlists.track_cursor = 0;
-                self.status_message = format!("Created \"{}\"", name);
+                self.status_message = created_message(&name);
             }
             NamePurpose::CreateAndAdd(pending) => {
                 self.playlists.track_cursor = 0;
                 self.apply_pending_add(&name, pending, true);
             }
         }
+    }
+
+    /// Rename playlist `old` (its stored name) to `new` and keep `last_playlist` on it. Returns
+    /// the stored new name.
+    fn rename_playlist(&mut self, old: &str, new: &str) -> Result<String, crate::playlist_store::StoreError> {
+        let name = self.playlists.store.rename(old, new)?;
+        self.follow_last_playlist(old, Some(&name));
+        Ok(name)
+    }
+
+    /// Delete playlist `name` (matched ignoring case) and its file, and clear `last_playlist`
+    /// if it named it. Returns the status message.
+    fn delete_playlist_named(&mut self, name: &str) -> Result<String, crate::playlist_store::StoreError> {
+        let stored = self.stored_playlist_name(name)?;
+        self.playlists.store.delete(&stored)?;
+        self.follow_last_playlist(&stored, None);
+        Ok(format!("Deleted \"{}\"", stored))
+    }
+
+    /// Remove track `index` of playlist `name`. Returns the status message.
+    fn remove_playlist_track(&mut self, name: &str, index: usize) -> Result<String, crate::playlist_store::StoreError> {
+        let stored = self.stored_playlist_name(name)?;
+        let entry = self.playlists.store.remove(&stored, index)?;
+        Ok(format!("Removed \"{}\" from {}", entry.display_label(), stored))
+    }
+
+    /// The name playlist `name` (matched ignoring case) is stored under.
+    fn stored_playlist_name(&self, name: &str) -> Result<String, crate::playlist_store::StoreError> {
+        use crate::playlist_store::StoreError;
+        if !self.playlists.store.is_loaded() {
+            return Err(StoreError::NotLoaded);
+        }
+        self.playlists
+            .store
+            .get(name)
+            .map(|playlist| playlist.name.clone())
+            .ok_or_else(|| StoreError::NotFound(name.to_string()))
     }
 
     /// Keep `last_playlist` (the add picker's start row) pointing at a playlist that exists:
@@ -772,14 +802,13 @@ impl AppUI {
     }
 
     fn delete_playlist(&mut self, name: &str) {
-        match self.playlists.store.delete(name) {
-            Ok(()) => {
-                self.follow_last_playlist(name, None);
+        match self.delete_playlist_named(name) {
+            Ok(message) => {
                 // Stay on the same row, or move up to the new last row when the last one went.
                 let len = self.playlists.store.playlists().len();
                 self.playlists.list_cursor = self.playlists.list_cursor.min(len.saturating_sub(1));
                 self.playlists.track_cursor = 0;
-                self.status_message = format!("Deleted \"{}\"", name);
+                self.status_message = message;
             }
             Err(e) => self.status_message = e.to_string(),
         }
@@ -808,14 +837,28 @@ impl AppUI {
         if self.playlists.track_cursor >= len {
             return;
         }
-        match self.playlists.store.remove(&name, self.playlists.track_cursor) {
-            Ok(entry) => {
+        match self.remove_playlist_track(&name, self.playlists.track_cursor) {
+            Ok(message) => {
                 let remaining = len - 1;
                 self.playlists.track_cursor = self.playlists.track_cursor.min(remaining.saturating_sub(1));
-                self.status_message = format!("Removed \"{}\" from {}", entry.display_label(), name);
+                self.status_message = message;
             }
             Err(e) => self.status_message = e.to_string(),
         }
+    }
+}
+
+/// Status after a create.
+fn created_message(name: &str) -> String {
+    format!("Created \"{}\"", name)
+}
+
+/// Status after a rename from `old` to `new`.
+fn renamed_message(old: &str, new: &str) -> String {
+    if old == new {
+        "Name unchanged".to_string()
+    } else {
+        format!("Renamed \"{}\" to \"{}\"", old, new)
     }
 }
 
@@ -1144,18 +1187,22 @@ impl super::AppUI {
     /// playlist for this add, so a folder that adds nothing still reports the new playlist.
     fn apply_pending_add(&mut self, playlist: &str, pending: PendingAdd, created: bool) {
         match pending {
-            PendingAdd::Entries { entries, .. } => self.add_entries_to_playlist(playlist, entries),
+            // The status shows the outcome.
+            PendingAdd::Entries { entries, .. } => {
+                let _ = self.add_entries_to_playlist(playlist, entries);
+            }
             PendingAdd::Folder { dir, .. } => self.start_folder_add(playlist, dir, created),
         }
     }
 
     /// Add `entries` to `playlist`, report the result and remember the playlist for the picker.
-    fn add_entries_to_playlist(&mut self, playlist: &str, entries: Vec<PlaylistEntry>) {
+    /// Returns the status message it set, as `Err` when nothing could be added.
+    fn add_entries_to_playlist(&mut self, playlist: &str, entries: Vec<PlaylistEntry>) -> Result<String, String> {
         let single_title = match entries.as_slice() {
             [only] => Some(only.title.clone()),
             _ => None,
         };
-        match self.playlists.store.add(playlist, entries) {
+        let result = match self.playlists.store.add(playlist, entries) {
             Ok(crate::playlist_store::AddResult { added, skipped, .. }) => {
                 let (stored, total) = self
                     .playlists
@@ -1163,12 +1210,17 @@ impl super::AppUI {
                     .get(playlist)
                     .map(|p| (p.name.clone(), p.entries.len()))
                     .unwrap_or_else(|| (playlist.to_string(), 0));
-                self.status_message = add_result_message(&stored, single_title.as_deref(), added, skipped, total);
+                let message = add_result_message(&stored, single_title.as_deref(), added, skipped, total);
                 self.settings_mgr.settings.last_playlist = Some(stored);
                 self.settings_mgr.save();
+                Ok(message)
             }
-            Err(e) => self.status_message = e.to_string(),
-        }
+            Err(e) => Err(e.to_string()),
+        };
+        self.status_message = match &result {
+            Ok(message) | Err(message) => message.clone(),
+        };
+        result
     }
 
     /// List `dir` and read the tags of files the metadata cache has no real entry for, on a
@@ -1241,7 +1293,7 @@ impl super::AppUI {
                 Ok(files) if files.is_empty() => format!("no audio files in {}", folder),
                 Ok(files) => {
                     let entries = files.iter().map(|path| self.playlist_entry_for_path(path)).collect();
-                    self.add_entries_to_playlist(&playlist, entries);
+                    let _ = self.add_entries_to_playlist(&playlist, entries);
                     continue;
                 }
                 Err(e) => {
@@ -1799,5 +1851,107 @@ impl AppUI {
         }
         let roots = self.web_allowed_roots();
         self.queue_playlist_entries(name, entries, play_from, Some(roots));
+    }
+
+    /// Apply a playlist edit from the dashboard with the same store calls, rules and messages
+    /// as tab 5, show the outcome in the status line and return it for the web request. Edits
+    /// are refused while the store is loading or after its load failed, and an index-based
+    /// edit made against an older revision is refused. Tab 5 stays on the playlist it showed.
+    pub(super) fn apply_web_playlist_edit(&mut self, edit: crate::web::PlaylistEdit) -> Result<String, String> {
+        use crate::web::PlaylistEdit;
+        let result = if self.playlists.store.is_loaded() {
+            let mut selected = self.playlists.selected_name();
+            let result = match edit {
+                PlaylistEdit::Create { name } => self
+                    .playlists
+                    .store
+                    .create(&name)
+                    .map(|name| created_message(&name))
+                    .map_err(|e| e.to_string()),
+                PlaylistEdit::Rename { name, new_name } => self.web_rename(&name, &new_name, &mut selected),
+                PlaylistEdit::Delete { name } => self.delete_playlist_named(&name).map_err(|e| e.to_string()),
+                PlaylistEdit::Add { name, path } => {
+                    let entry = self.playlist_entry_for_web_add(&path);
+                    self.add_entries_to_playlist(&name, vec![entry])
+                }
+                PlaylistEdit::Remove { name, index, revision } => self
+                    .check_web_revision(revision)
+                    .and_then(|()| self.remove_playlist_track(&name, index).map_err(|e| e.to_string())),
+                PlaylistEdit::Move {
+                    name,
+                    index,
+                    dir,
+                    revision,
+                } => self
+                    .check_web_revision(revision)
+                    .and_then(|()| self.web_move(&name, index, dir)),
+            };
+            if let Some(index) = selected.and_then(|name| self.playlists.store.index_of(&name)) {
+                self.playlists.list_cursor = index;
+            }
+            self.playlists.clamp_cursors();
+            result
+        } else {
+            Err(self.playlists.not_loaded_message())
+        };
+        self.status_message = match &result {
+            Ok(message) | Err(message) => message.clone(),
+        };
+        result
+    }
+
+    /// Refuse an index-based edit made against a list that has changed since.
+    fn check_web_revision(&self, revision: Option<u64>) -> Result<(), String> {
+        match revision {
+            Some(r) if r != self.playlists.store.revision() => Err(crate::web::PLAYLISTS_CHANGED.to_string()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Rename for the dashboard; `selected` (tab 5's playlist) follows the rename.
+    fn web_rename(&mut self, name: &str, new_name: &str, selected: &mut Option<String>) -> Result<String, String> {
+        let old = self.stored_playlist_name(name).map_err(|e| e.to_string())?;
+        let new = self.rename_playlist(&old, new_name).map_err(|e| e.to_string())?;
+        if selected.as_deref() == Some(old.as_str()) {
+            *selected = Some(new.clone());
+        }
+        Ok(renamed_message(&old, &new))
+    }
+
+    /// Move for the dashboard. Tab 5 shows no message for a move; the dashboard says where the
+    /// track went.
+    fn web_move(&mut self, name: &str, index: usize, dir: crate::playlist_store::MoveDir) -> Result<String, String> {
+        let stored = self.stored_playlist_name(name).map_err(|e| e.to_string())?;
+        let moved = self
+            .playlists
+            .store
+            .move_entry(&stored, index, dir)
+            .map_err(|e| e.to_string())?;
+        let label = self
+            .playlists
+            .store
+            .get(&stored)
+            .and_then(|p| p.entries.get(moved))
+            .map(PlaylistEntry::display_label)
+            .unwrap_or_default();
+        Ok(if moved == index {
+            let edge = match dir {
+                crate::playlist_store::MoveDir::Up => "top",
+                crate::playlist_store::MoveDir::Down => "bottom",
+            };
+            format!("\"{}\" is already at the {}", label, edge)
+        } else {
+            format!("Moved \"{}\" to {}", label, moved + 1)
+        })
+    }
+
+    /// Playlist entry for a file the dashboard adds, from metadata the app already holds: the
+    /// queue row for that file (the now-playing track), else the metadata cache, else the file
+    /// name. Never reads the file.
+    fn playlist_entry_for_web_add(&self, path: &Path) -> PlaylistEntry {
+        match self.queue.tracks.iter().find(|track| track.filepath == path) {
+            Some(track) => PlaylistEntry::from_metadata(track),
+            None => self.playlist_entry_for_path(path),
+        }
     }
 }

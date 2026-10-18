@@ -3,7 +3,9 @@
 //! The UI thread publishes a snapshot of the playlists in the shared web state; `GET
 //! /api/playlists` serves it without reading the playlists folder. Play and append go through
 //! `/api/action` as `WebCommand::QueuePlaylist`, after the web thread checked every entry's path
-//! against the allowed folders, and the UI thread queues them with the code tab 5 uses.
+//! against the allowed folders, and the UI thread queues them with the code tab 5 uses. Edits
+//! go through `/api/action` as `WebCommand::EditPlaylist`; the UI thread applies them through
+//! `PlaylistStore` and answers on the command's reply channel, which the web thread returns.
 //!
 //! Run with `--test-threads=1`: the tests share one playlists folder.
 
@@ -18,9 +20,11 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use quickstream::playlist::{Playlist, PlaylistEntry};
+use quickstream::playlist_store::MoveDir;
 use quickstream::ui::AppUI;
 use quickstream::web::{
-    NowPlayingState, WebCommand, WebPlaylist, WebPlaylistEntry, WebPlaylists, WebPlaylistsState, WebServer,
+    NowPlayingState, PlaylistEdit, WebCommand, WebPlaylist, WebPlaylistEntry, WebPlaylists, WebPlaylistsState,
+    WebReply, WebServer,
 };
 
 const PLAYLIST: &str = "Road Trip";
@@ -856,5 +860,598 @@ fn test_dashboard_play_request_plays_the_playlist() {
     assert!(poll_until(&mut app, |app| app.status_message.starts_with("Queued")));
     assert_eq!(queue_paths(&app), vec![a, b]);
     assert_eq!(app.queue.current_index, 1);
+    let _ = fs::remove_dir_all(&music);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Edits: the UI applies EditPlaylist through PlaylistStore and answers on the reply channel
+// ---------------------------------------------------------------------------------------------
+
+/// Apply `edit` as the web server would send it and return the UI's answer.
+fn edit(app: &mut AppUI, edit: PlaylistEdit) -> Result<String, String> {
+    let (reply, rx) = WebReply::channel();
+    send(app, WebCommand::EditPlaylist(edit, reply));
+    rx.recv_timeout(Duration::from_secs(1))
+        .expect("the UI answers every edit")
+}
+
+fn playlist_file(name: &str) -> PathBuf {
+    quickstream::paths::get_playlists_dir().join(format!("{}.m3u8", name))
+}
+
+fn names(app: &AppUI) -> Vec<String> {
+    app.playlists.store.playlists().iter().map(|p| p.name.clone()).collect()
+}
+
+fn titles(app: &AppUI, playlist: &str) -> Vec<String> {
+    app.playlists
+        .store
+        .get(playlist)
+        .unwrap()
+        .entries
+        .iter()
+        .map(|e| e.title.clone())
+        .collect()
+}
+
+#[test]
+fn test_web_create_rename_and_delete_go_through_the_store() {
+    common::isolate();
+    let music = temp_dir("edit_crd");
+    write_playlists(&[(PLAYLIST, vec![])]);
+    let mut app = web_app(&music);
+    app.settings_mgr.settings.last_playlist = Some(PLAYLIST.to_string());
+
+    assert_eq!(
+        edit(
+            &mut app,
+            PlaylistEdit::Create {
+                name: "  Mix ".to_string()
+            }
+        ),
+        Ok("Created \"Mix\"".to_string())
+    );
+    assert_eq!(
+        app.status_message, "Created \"Mix\"",
+        "the terminal shows the same status"
+    );
+    assert!(app.persistence.flush());
+    assert!(playlist_file("Mix").is_file());
+
+    // Rename names the playlist ignoring case, and last_playlist follows it.
+    assert_eq!(
+        edit(
+            &mut app,
+            PlaylistEdit::Rename {
+                name: "road trip".to_string(),
+                new_name: "Summer".to_string(),
+            }
+        ),
+        Ok("Renamed \"Road Trip\" to \"Summer\"".to_string())
+    );
+    assert_eq!(app.settings_mgr.settings.last_playlist.as_deref(), Some("Summer"));
+    assert!(app.persistence.flush());
+    assert!(playlist_file("Summer").is_file());
+    assert!(!playlist_file(PLAYLIST).exists());
+
+    assert_eq!(
+        edit(
+            &mut app,
+            PlaylistEdit::Delete {
+                name: "summer".to_string()
+            }
+        ),
+        Ok("Deleted \"Summer\"".to_string())
+    );
+    assert_eq!(app.settings_mgr.settings.last_playlist, None);
+    assert!(app.persistence.flush());
+    assert!(!playlist_file("Summer").exists());
+    assert_eq!(names(&app), vec!["Mix".to_string()]);
+    let _ = fs::remove_dir_all(&music);
+}
+
+#[test]
+fn test_web_names_get_the_same_checks_and_messages_as_the_terminal() {
+    common::isolate();
+    let music = temp_dir("edit_names");
+    write_playlists(&[(PLAYLIST, vec![]), ("Mix", vec![])]);
+    let mut app = web_app(&music);
+    app.playlists.store.reserve_names(vec!["Latin".to_string()]);
+    let create = |name: &str| PlaylistEdit::Create { name: name.to_string() };
+    let rename = |new_name: &str| PlaylistEdit::Rename {
+        name: "Mix".to_string(),
+        new_name: new_name.to_string(),
+    };
+    let cases = [
+        (create("a/b"), "Name can't contain /"),
+        (create("a\\b"), "Name can't contain \\"),
+        (create("   "), "Name can't be empty"),
+        (create(".hidden"), "Name can't start with ."),
+        (create("ROAD TRIP"), "\"Road Trip\" already exists"),
+        (
+            create("latin"),
+            "A playlist file named \"Latin\" exists but couldn't be loaded",
+        ),
+        (rename("road trip"), "\"Road Trip\" already exists"),
+        (rename("x/y"), "Name can't contain /"),
+        (
+            rename("Latin"),
+            "A playlist file named \"Latin\" exists but couldn't be loaded",
+        ),
+        (
+            PlaylistEdit::Rename {
+                name: "Nope".to_string(),
+                new_name: "Other".to_string(),
+            },
+            "No playlist named \"Nope\"",
+        ),
+        (
+            PlaylistEdit::Delete {
+                name: "Nope".to_string(),
+            },
+            "No playlist named \"Nope\"",
+        ),
+    ];
+    let revision = app.playlists.store.revision();
+    for (request, message) in cases {
+        let shown = format!("{:?}", request);
+        assert_eq!(edit(&mut app, request), Err(message.to_string()), "{}", shown);
+        assert_eq!(app.status_message, message);
+    }
+    assert_eq!(app.playlists.store.revision(), revision, "nothing changed");
+    assert_eq!(names(&app), vec!["Mix".to_string(), PLAYLIST.to_string()]);
+    let _ = fs::remove_dir_all(&music);
+}
+
+#[test]
+fn test_web_add_remove_and_move_tracks() {
+    common::isolate();
+    let music = temp_dir("edit_tracks");
+    let a = music.join("a.mp3");
+    let b = music.join("b.mp3");
+    let c = music.join("c.flac");
+    touch(&c);
+    write_playlists(&[(PLAYLIST, vec![entry(&a, "A", "One", 100), entry(&b, "B", "Two", 100)])]);
+    let mut app = web_app(&music);
+    // The now-playing track's tags come from the queue.
+    app.queue.add_track(quickstream::metadata::AudioMetadata {
+        filepath: c.clone(),
+        title: "Three".to_string(),
+        artist: "C".to_string(),
+        duration_seconds: 61.0,
+        ..Default::default()
+    });
+
+    let add = PlaylistEdit::Add {
+        name: PLAYLIST.to_string(),
+        path: c.clone(),
+    };
+    assert_eq!(
+        edit(&mut app, add.clone()),
+        Ok("Added \"Three\" to Road Trip (3 tracks)".to_string())
+    );
+    assert_eq!(app.settings_mgr.settings.last_playlist.as_deref(), Some(PLAYLIST));
+    let added = &app.playlists.store.get(PLAYLIST).unwrap().entries[2];
+    assert_eq!((added.artist.as_str(), added.duration_secs), ("C", 61));
+    assert_eq!(edit(&mut app, add), Ok("Already in Road Trip".to_string()));
+
+    let revision = app.playlists.store.revision();
+    assert_eq!(
+        edit(
+            &mut app,
+            PlaylistEdit::Move {
+                name: PLAYLIST.to_string(),
+                index: 2,
+                dir: MoveDir::Up,
+                revision: Some(revision),
+            }
+        ),
+        Ok("Moved \"C - Three\" to 2".to_string())
+    );
+    assert_eq!(titles(&app, PLAYLIST), vec!["One", "Three", "Two"]);
+
+    // An index from before that move is refused: the list changed.
+    assert_eq!(
+        edit(
+            &mut app,
+            PlaylistEdit::Remove {
+                name: PLAYLIST.to_string(),
+                index: 2,
+                revision: Some(revision),
+            }
+        ),
+        Err("Playlists changed; try again".to_string())
+    );
+    assert_eq!(titles(&app, PLAYLIST), vec!["One", "Three", "Two"]);
+
+    let revision = app.playlists.store.revision();
+    assert_eq!(
+        edit(
+            &mut app,
+            PlaylistEdit::Remove {
+                name: PLAYLIST.to_string(),
+                index: 0,
+                revision: Some(revision),
+            }
+        ),
+        Ok("Removed \"A - One\" from Road Trip".to_string())
+    );
+    assert_eq!(titles(&app, PLAYLIST), vec!["Three", "Two"]);
+    let revision = app.playlists.store.revision();
+    assert_eq!(
+        edit(
+            &mut app,
+            PlaylistEdit::Remove {
+                name: PLAYLIST.to_string(),
+                index: 5,
+                revision: Some(revision),
+            }
+        ),
+        Err("No such track".to_string())
+    );
+
+    // Every edit reached the file through the writer.
+    assert!(app.persistence.flush());
+    let text = fs::read_to_string(playlist_file(PLAYLIST)).unwrap();
+    let on_disk = quickstream::playlist::parse_m3u8(PLAYLIST, &text, Path::new("/"));
+    assert_eq!(
+        on_disk.entries.iter().map(|e| e.title.as_str()).collect::<Vec<_>>(),
+        vec!["Three", "Two"]
+    );
+    let _ = fs::remove_dir_all(&music);
+}
+
+#[test]
+fn test_web_edits_are_refused_until_the_playlists_load() {
+    common::isolate();
+    let music = temp_dir("edit_not_loaded");
+    write_playlists(&[(PLAYLIST, vec![])]);
+    let mut app = web_app(&music);
+    app.playlists.store = quickstream::playlist_store::PlaylistStore::new(
+        quickstream::paths::get_playlists_dir(),
+        app.persistence.handle(),
+    );
+    for request in [
+        PlaylistEdit::Create {
+            name: "Mix".to_string(),
+        },
+        PlaylistEdit::Delete {
+            name: PLAYLIST.to_string(),
+        },
+        PlaylistEdit::Add {
+            name: PLAYLIST.to_string(),
+            path: music.join("a.mp3"),
+        },
+    ] {
+        assert_eq!(edit(&mut app, request), Err("Playlists are still loading".to_string()));
+    }
+    assert!(app.persistence.flush());
+    assert!(!playlist_file("Mix").exists());
+    assert!(playlist_file(PLAYLIST).exists());
+    let _ = fs::remove_dir_all(&music);
+}
+
+#[test]
+fn test_web_edits_are_refused_after_a_failed_load() {
+    common::isolate();
+    use std::os::unix::fs::PermissionsExt;
+    let music = temp_dir("edit_load_failed");
+    write_playlists(&[(PLAYLIST, vec![])]);
+    let dir = quickstream::paths::get_playlists_dir();
+    let mut app = web_app(&music);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+    let listable = fs::read_dir(&dir).is_ok();
+    app.playlists.store = quickstream::playlist_store::PlaylistStore::new(dir.clone(), app.persistence.handle());
+    app.start_playlist_load();
+    let failed = poll_until(&mut app, |app| app.playlists.load_failed());
+    let answer = edit(
+        &mut app,
+        PlaylistEdit::Create {
+            name: "Mix".to_string(),
+        },
+    );
+    let flushed = app.persistence.flush();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    if listable {
+        return;
+    }
+    assert!(failed && flushed);
+    assert_eq!(answer, Err("Couldn't load playlists".to_string()));
+    assert!(!playlist_file("Mix").exists());
+    let _ = fs::remove_dir_all(&music);
+}
+
+#[test]
+fn test_web_edits_keep_the_terminal_on_its_playlist() {
+    common::isolate();
+    let music = temp_dir("edit_cursor");
+    write_playlists(&[("Middle", vec![]), ("Zed", vec![])]);
+    let mut app = web_app(&music);
+    app.playlists.list_cursor = app.playlists.store.index_of("Zed").unwrap();
+
+    edit(
+        &mut app,
+        PlaylistEdit::Create {
+            name: "Alpha".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(app.playlists.selected_name().as_deref(), Some("Zed"));
+    edit(
+        &mut app,
+        PlaylistEdit::Rename {
+            name: "Zed".to_string(),
+            new_name: "Beta".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        app.playlists.selected_name().as_deref(),
+        Some("Beta"),
+        "follows its rename"
+    );
+    edit(
+        &mut app,
+        PlaylistEdit::Delete {
+            name: "Alpha".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(app.playlists.selected_name().as_deref(), Some("Beta"));
+    assert!(app.persistence.flush());
+    let _ = fs::remove_dir_all(&music);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Edits over HTTP: the web thread waits for the UI's answer
+// ---------------------------------------------------------------------------------------------
+
+/// Answer every edit the server sends with `answer`, and hand the edits back on the returned
+/// channel. Other commands are passed on too.
+fn answer_edits(rx: mpsc::Receiver<WebCommand>, answer: Result<String, String>) -> mpsc::Receiver<WebCommand> {
+    let (out_tx, out_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for cmd in rx {
+            if let WebCommand::EditPlaylist(_, ref reply) = cmd {
+                reply.send(answer.clone());
+            }
+            if out_tx.send(cmd).is_err() {
+                break;
+            }
+        }
+    });
+    out_rx
+}
+
+fn edits(rx: &mpsc::Receiver<WebCommand>) -> Vec<PlaylistEdit> {
+    drain(rx)
+        .into_iter()
+        .filter_map(|cmd| match cmd {
+            WebCommand::EditPlaylist(edit, _) => Some(edit),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn test_edit_requests_reach_the_ui_and_return_its_answer() {
+    common::isolate();
+    let music = temp_dir("http_edits");
+    let state = state_with(&music, 5, vec![web_playlist(PLAYLIST, vec![])]);
+    let (handle, rx) = start_server(state);
+    let rx = answer_edits(rx, Ok("Created \"Mix\"".to_string()));
+    let requests = [
+        (
+            serde_json::json!({"action": "playlist_create", "name": "Mix"}),
+            PlaylistEdit::Create {
+                name: "Mix".to_string(),
+            },
+        ),
+        (
+            serde_json::json!({"action": "playlist_rename", "name": PLAYLIST, "new_name": "Summer"}),
+            PlaylistEdit::Rename {
+                name: PLAYLIST.to_string(),
+                new_name: "Summer".to_string(),
+            },
+        ),
+        (
+            serde_json::json!({"action": "playlist_delete", "name": PLAYLIST}),
+            PlaylistEdit::Delete {
+                name: PLAYLIST.to_string(),
+            },
+        ),
+        (
+            serde_json::json!({"action": "playlist_remove", "name": PLAYLIST, "index": 3, "revision": 5}),
+            PlaylistEdit::Remove {
+                name: PLAYLIST.to_string(),
+                index: 3,
+                revision: Some(5),
+            },
+        ),
+        (
+            serde_json::json!({"action": "playlist_move", "name": PLAYLIST, "index": 1, "direction": "down", "revision": 5}),
+            PlaylistEdit::Move {
+                name: PLAYLIST.to_string(),
+                index: 1,
+                dir: MoveDir::Down,
+                revision: Some(5),
+            },
+        ),
+        (
+            serde_json::json!({"action": "playlist_move", "name": PLAYLIST, "index": 1, "direction": "up"}),
+            PlaylistEdit::Move {
+                name: PLAYLIST.to_string(),
+                index: 1,
+                dir: MoveDir::Up,
+                revision: None,
+            },
+        ),
+    ];
+    for (body, expected) in requests {
+        let (status, json) = post(handle.port, &body);
+        assert_eq!(status, 200, "{}: {}", body, json);
+        assert_eq!(json, serde_json::json!({"ok": true, "message": "Created \"Mix\""}));
+        assert_eq!(edits(&rx), vec![expected], "{}", body);
+    }
+    handle.stop();
+
+    // A refusal comes back as 409 with the UI's message.
+    let state = state_with(&music, 5, vec![]);
+    let (handle, rx) = start_server(state);
+    let _rx = answer_edits(rx, Err("Name can't contain /".to_string()));
+    let (status, json) = post(
+        handle.port,
+        &serde_json::json!({"action": "playlist_create", "name": "a/b"}),
+    );
+    assert_eq!(status, 409);
+    assert_eq!(json, serde_json::json!({"ok": false, "error": "Name can't contain /"}));
+    handle.stop();
+    let _ = fs::remove_dir_all(&music);
+}
+
+#[test]
+fn test_malformed_edit_requests_are_refused_before_the_ui() {
+    common::isolate();
+    let music = temp_dir("http_malformed");
+    let state = state_with(&music, 5, vec![]);
+    let (handle, rx) = start_server(state);
+    let rx = answer_edits(rx, Ok("unexpected".to_string()));
+    for body in [
+        serde_json::json!({"action": "playlist_create"}),
+        serde_json::json!({"action": "playlist_rename", "name": PLAYLIST}),
+        serde_json::json!({"action": "playlist_delete"}),
+        serde_json::json!({"action": "playlist_add", "name": PLAYLIST}),
+        serde_json::json!({"action": "playlist_remove", "name": PLAYLIST}),
+        serde_json::json!({"action": "playlist_move", "name": PLAYLIST, "index": 0}),
+        serde_json::json!({"action": "playlist_move", "name": PLAYLIST, "index": 0, "direction": "sideways"}),
+    ] {
+        let (status, json) = post(handle.port, &body);
+        assert_eq!(status, 400, "{}: {}", body, json);
+        assert_eq!(json["ok"], false, "{}", body);
+    }
+    assert!(edits(&rx).is_empty());
+    handle.stop();
+    let _ = fs::remove_dir_all(&music);
+}
+
+#[test]
+fn test_adding_a_file_checks_its_path_like_add_file() {
+    common::isolate();
+    let dir = temp_dir("http_add");
+    let music = dir.join("Music");
+    let private = dir.join("Private");
+    let inside = music.join("in.mp3");
+    let secret = private.join("secret.mp3");
+    let notes = music.join("notes.txt");
+    touch(&inside);
+    touch(&secret);
+    touch(&notes);
+    let link = music.join("link.mp3");
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+    let state = state_with(&music, 1, vec![web_playlist(PLAYLIST, vec![])]);
+    let (handle, rx) = start_server(state);
+    let rx = answer_edits(rx, Ok("Added".to_string()));
+
+    for bad in [&secret, &link, &private.join("ghost.mp3")] {
+        let (status, json) = post(
+            handle.port,
+            &serde_json::json!({"action": "playlist_add", "name": PLAYLIST, "path": bad}),
+        );
+        assert_eq!(status, 403, "{}: {}", bad.display(), json);
+        assert_eq!(drain(&rx), vec![WebCommand::PathRejected(bad.to_path_buf())]);
+    }
+    // A relative path (the dashboard shows only a file name for tracks outside the folders).
+    let (status, _) = post(
+        handle.port,
+        &serde_json::json!({"action": "playlist_add", "name": PLAYLIST, "path": "secret.mp3"}),
+    );
+    assert_eq!(status, 403);
+    assert_eq!(drain(&rx), vec![WebCommand::PathRejected(PathBuf::from("secret.mp3"))]);
+
+    let (status, json) = post(
+        handle.port,
+        &serde_json::json!({"action": "playlist_add", "name": PLAYLIST, "path": notes}),
+    );
+    assert_eq!(status, 400);
+    assert_eq!(json["error"], "Not an audio file");
+    assert!(drain(&rx).is_empty());
+
+    // Inside: the UI gets the resolved path.
+    fs::create_dir_all(music.join("sub")).unwrap();
+    let spelled = music.join("sub/../in.mp3");
+    let (status, json) = post(
+        handle.port,
+        &serde_json::json!({"action": "playlist_add", "name": PLAYLIST, "path": spelled}),
+    );
+    assert_eq!(status, 200, "{}", json);
+    assert_eq!(
+        edits(&rx),
+        vec![PlaylistEdit::Add {
+            name: PLAYLIST.to_string(),
+            path: inside.clone(),
+        }]
+    );
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_edit_without_an_answer_reports_it() {
+    common::isolate();
+    let music = temp_dir("http_no_answer");
+    let state = state_with(&music, 1, vec![]);
+    let (handle, rx) = start_server(state);
+    // The UI went away: the command (and its reply channel) is dropped unanswered.
+    drop(rx);
+    let (status, json) = post(
+        handle.port,
+        &serde_json::json!({"action": "playlist_create", "name": "Mix"}),
+    );
+    assert_eq!(status, 503, "{}", json);
+    assert_eq!(json["ok"], false);
+    handle.stop();
+    let _ = fs::remove_dir_all(&music);
+}
+
+/// End to end: a dashboard edit waits for the app's next tick and returns its answer.
+#[test]
+fn test_dashboard_edit_requests_change_the_store() {
+    common::isolate();
+    let music = temp_dir("e2e_edit");
+    let a = music.join("a.mp3");
+    touch(&a);
+    write_playlists(&[(PLAYLIST, vec![])]);
+    let mut app = web_app(&music);
+    let port = app.web_server.as_ref().unwrap().port;
+
+    let request = |body: serde_json::Value, app: &mut AppUI| {
+        let worker = std::thread::spawn(move || post(port, &body));
+        while !worker.is_finished() {
+            app.handle_web_commands();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        worker.join().unwrap()
+    };
+    let (status, json) = request(
+        serde_json::json!({"action": "playlist_create", "name": "Mix"}),
+        &mut app,
+    );
+    assert_eq!((status, json["message"].as_str()), (200, Some("Created \"Mix\"")));
+    let (status, json) = request(
+        serde_json::json!({"action": "playlist_create", "name": "road trip"}),
+        &mut app,
+    );
+    assert_eq!(
+        (status, json["error"].as_str()),
+        (409, Some("\"Road Trip\" already exists"))
+    );
+    let (status, json) = request(
+        serde_json::json!({"action": "playlist_add", "name": "Mix", "path": a}),
+        &mut app,
+    );
+    assert_eq!(status, 200, "{}", json);
+    assert_eq!(app.playlists.store.get("Mix").unwrap().entries[0].path, a);
+    assert!(app.persistence.flush());
+    assert!(playlist_file("Mix").is_file());
     let _ = fs::remove_dir_all(&music);
 }

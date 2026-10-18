@@ -260,7 +260,84 @@ pub enum WebCommand {
     /// The dashboard fetched the playlists: check their files on workers so missing ones are
     /// marked in the snapshot.
     CheckPlaylists,
+    /// Change a playlist (issue #50). The UI applies it through `PlaylistStore` and answers on
+    /// the reply channel; the web request returns that answer.
+    EditPlaylist(PlaylistEdit, WebReply),
 }
+
+/// A playlist edit from the web dashboard. Names are matched ignoring case, like the TUI's.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlaylistEdit {
+    Create {
+        name: String,
+    },
+    Rename {
+        name: String,
+        new_name: String,
+    },
+    Delete {
+        name: String,
+    },
+    /// Add the audio file at `path`, already resolved inside the allowed folders.
+    Add {
+        name: String,
+        path: PathBuf,
+    },
+    /// Remove track `index`. `revision` is the snapshot revision the index came from; the edit
+    /// is refused when the playlists changed since.
+    Remove {
+        name: String,
+        index: usize,
+        revision: Option<u64>,
+    },
+    /// Move track `index` one row (no wraparound). `revision` as for `Remove`.
+    Move {
+        name: String,
+        index: usize,
+        dir: crate::playlist_store::MoveDir,
+        revision: Option<u64>,
+    },
+}
+
+/// What the UI answers to a [`PlaylistEdit`]: the status message, or why it was refused.
+pub type PlaylistReply = Result<String, String>;
+
+/// Where the UI thread sends its answer to a web request that waits for one.
+#[derive(Clone, Default)]
+pub struct WebReply(Option<mpsc::Sender<PlaylistReply>>);
+
+impl WebReply {
+    /// A reply slot and the receiver its answer arrives on.
+    pub fn channel() -> (Self, mpsc::Receiver<PlaylistReply>) {
+        let (tx, rx) = mpsc::channel();
+        (Self(Some(tx)), rx)
+    }
+
+    /// Answer the request; a no-op when nobody waits any more.
+    pub fn send(&self, reply: PlaylistReply) {
+        if let Some(tx) = &self.0 {
+            let _ = tx.send(reply);
+        }
+    }
+}
+
+impl std::fmt::Debug for WebReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WebReply")
+    }
+}
+
+/// The reply channel is not part of what a command asks for: commands that differ only in it
+/// are equal.
+impl PartialEq for WebReply {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+/// How long a web request waits for the UI thread's answer to a playlist edit. The UI handles
+/// web commands every tick, so this only runs out when it is stuck.
+const EDIT_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 struct ActionPayload {
@@ -281,6 +358,12 @@ struct ActionPayload {
     /// [`WebPlaylists::revision`] the request was made against (playlist actions with an index).
     #[serde(default)]
     revision: Option<u64>,
+    /// New name (`playlist_rename`).
+    #[serde(default)]
+    new_name: Option<String>,
+    /// `up` or `down` (`playlist_move`).
+    #[serde(default)]
+    direction: Option<String>,
 }
 
 /// A JSON response for `/api/action`: status line and body.
@@ -297,6 +380,13 @@ impl ActionResponse {
         }
     }
 
+    fn done(message: String) -> Self {
+        Self {
+            status: "200 OK",
+            body: serde_json::json!({ "ok": true, "message": message }),
+        }
+    }
+
     fn refused(status: &'static str, error: impl Into<String>) -> Self {
         Self {
             status,
@@ -304,6 +394,81 @@ impl ActionResponse {
         }
     }
 }
+
+/// `playlist_create` / `_rename` / `_delete` / `_add` / `_remove` / `_move`: build the edit,
+/// hand it to the UI thread and return its answer. A file to add is checked like `add_file`
+/// (`allow` records a path outside the allowed folders and the request is refused with 403).
+/// Name rules, duplicates and the loaded check are the store's, applied on the UI thread.
+fn edit_playlist_action(
+    payload: &ActionPayload,
+    cmd_tx: &mpsc::Sender<WebCommand>,
+    allow: &mut dyn FnMut(String) -> Option<PathBuf>,
+) -> ActionResponse {
+    let bad = |error: &str| ActionResponse::refused("400 Bad Request", error);
+    let Some(name) = payload.name.clone() else {
+        return bad(MISSING_NAME);
+    };
+    let index = || payload.index.ok_or_else(|| bad("Missing track index"));
+    let edit = match payload.action.as_str() {
+        "playlist_create" => PlaylistEdit::Create { name },
+        "playlist_rename" => match payload.new_name.clone() {
+            Some(new_name) => PlaylistEdit::Rename { name, new_name },
+            None => return bad("Missing new name"),
+        },
+        "playlist_delete" => PlaylistEdit::Delete { name },
+        "playlist_add" => {
+            let Some(requested) = payload.path.clone() else {
+                return bad("Missing path");
+            };
+            let Some(path) = allow(requested) else {
+                // Refused with 403 by the caller.
+                return ActionResponse::ok();
+            };
+            if !path.is_file() || !crate::metadata::is_supported_audio_file(&path) {
+                return bad("Not an audio file");
+            }
+            PlaylistEdit::Add { name, path }
+        }
+        "playlist_remove" => match index() {
+            Ok(index) => PlaylistEdit::Remove {
+                name,
+                index,
+                revision: payload.revision,
+            },
+            Err(response) => return response,
+        },
+        "playlist_move" => {
+            let index = match index() {
+                Ok(index) => index,
+                Err(response) => return response,
+            };
+            let dir = match payload.direction.as_deref() {
+                Some("up") => crate::playlist_store::MoveDir::Up,
+                Some("down") => crate::playlist_store::MoveDir::Down,
+                _ => return bad("Direction must be up or down"),
+            };
+            PlaylistEdit::Move {
+                name,
+                index,
+                dir,
+                revision: payload.revision,
+            }
+        }
+        _ => return bad("Unknown playlist action"),
+    };
+    let (reply, answer) = WebReply::channel();
+    if cmd_tx.send(WebCommand::EditPlaylist(edit, reply)).is_err() {
+        return ActionResponse::refused("503 Service Unavailable", NO_ANSWER);
+    }
+    match answer.recv_timeout(EDIT_REPLY_TIMEOUT) {
+        Ok(Ok(message)) => ActionResponse::done(message),
+        Ok(Err(error)) => ActionResponse::refused("409 Conflict", error),
+        Err(_) => ActionResponse::refused("503 Service Unavailable", NO_ANSWER),
+    }
+}
+
+/// Error when the UI thread did not answer an edit in time (or has gone away).
+const NO_ANSWER: &str = "Quickstream didn't answer; try again";
 
 /// Status for a playlist request whose index refers to a list that changed meanwhile.
 pub const PLAYLISTS_CHANGED: &str = "Playlists changed; try again";
@@ -1584,6 +1749,10 @@ fn handle_client(
                 "playlist_play" | "playlist_append" => {
                     let play = payload.action == "playlist_play";
                     response = queue_playlist_action(&payload, play, state, cmd_tx, &mut rejected);
+                }
+                "playlist_create" | "playlist_rename" | "playlist_delete" | "playlist_add" | "playlist_remove"
+                | "playlist_move" => {
+                    response = edit_playlist_action(&payload, cmd_tx, &mut allow);
                 }
                 _ => {}
             }
@@ -3376,6 +3545,70 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       text-align: center;
       padding: 2rem 0;
     }
+    .picker-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 90;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+      background: rgba(0, 0, 0, 0.55);
+    }
+    .picker-backdrop.show {
+      display: flex;
+    }
+    .picker {
+      width: 340px;
+      max-width: 100%;
+      max-height: 70vh;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      padding: 1rem;
+      border-radius: 18px;
+      background: rgba(15, 20, 28, 0.97);
+      border: 1px solid var(--card-border);
+      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
+    }
+    .picker-title {
+      font-weight: 700;
+      color: var(--text);
+    }
+    .picker-label {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .picker-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+      min-height: 0;
+      overflow-y: auto;
+    }
+    .picker-row {
+      text-align: left;
+      padding: 0.5rem 0.7rem;
+      border-radius: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--text);
+      font-size: 0.85rem;
+      cursor: pointer;
+    }
+    .picker-row:hover {
+      background: rgba(255, 255, 255, 0.08);
+    }
+    .picker-row.last {
+      border-color: rgba(0, 210, 255, 0.4);
+      background: rgba(0, 210, 255, 0.08);
+    }
+    .picker-row.new {
+      color: #00e676;
+    }
 
     /* Empty States */
     .empty-state {
@@ -3715,6 +3948,16 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
           <span class="panel-title">Playlists</span>
           <span class="panel-subtitle" id="playlistsSummaryText"></span>
         </div>
+        <div style="display:flex;gap:0.5rem;align-items:center;">
+          <button class="btn-sm" id="btnPlaylistAddCurrent" title="Add the now-playing track to a playlist">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle></svg>
+            Add Playing
+          </button>
+          <button class="btn-sm accent" id="btnPlaylistCreate" title="Create a playlist">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+            New
+          </button>
+        </div>
       </div>
 
       <div class="queue-list" id="playlistsList"></div>
@@ -3723,11 +3966,22 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
 
   <div class="toast" id="toast"></div>
 
+  <!-- Add-to-playlist picker (issue #50) -->
+  <div class="picker-backdrop" id="playlistPicker">
+    <div class="picker" role="dialog" aria-label="Add to playlist">
+      <div class="picker-title">Add to playlist</div>
+      <div class="picker-label" id="playlistPickerLabel"></div>
+      <div class="picker-list" id="playlistPickerList"></div>
+      <button class="btn-text" id="btnPlaylistPickerCancel">Cancel</button>
+    </div>
+  </div>
+
   <script>
     let localPosition = 0;
     let localDuration = 0;
     let isPlaying = false;
     let lastPollTime = Date.now();
+    let lastStatus = null;
     let currentTrackPath = "";
     let isScrubbing = false;
     let scrubPosition = 0;
@@ -3752,6 +4006,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     const ICON_SEED_RADIO = '<span style="font-size:12px;">📻</span>';
     const ICON_REMOVE = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>';
     const ICON_ADD = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>';
+    const ICON_PLAYLIST_ADD = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="3" y1="6" x2="15" y2="6"></line><line x1="3" y1="12" x2="15" y2="12"></line><line x1="3" y1="18" x2="11" y2="18"></line><line x1="18" y1="13" x2="18" y2="21"></line><line x1="14" y1="17" x2="22" y2="17"></line></svg>';
 
     function el(tag, className, text) {
       const node = document.createElement(tag);
@@ -3830,6 +4085,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     }
 
     function renderStatus(data) {
+      lastStatus = data;
       // 1. Now Playing interpolation
       if (!isScrubbing) {
         isPlaying = data.is_playing && !data.is_paused;
@@ -4261,6 +4517,10 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
           const seedBtn = iconButton('btn-icon-sm', 'Seed Radio station from this track', 'seed', ICON_SEED_RADIO);
           seedBtn.dataset.path = path;
           actions.appendChild(seedBtn);
+          const playlistBtn = iconButton('btn-icon-sm', 'Add to playlist', 'to-playlist', ICON_PLAYLIST_ADD);
+          playlistBtn.dataset.path = path;
+          playlistBtn.dataset.name = item.name || '';
+          actions.appendChild(playlistBtn);
           const addBtn = iconButton('btn-icon-sm add-btn', 'Add to queue', 'add', ICON_ADD);
           addBtn.dataset.path = path;
           actions.appendChild(addBtn);
@@ -4274,6 +4534,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       browse: (d) => browseTo(d.path),
       add: (d) => addFile(d.path),
       seed: (d) => seedRadio(d.path),
+      'to-playlist': (d) => openPlaylistPicker(d.name, d.path),
     };
     delegateClicks('browserList', browserClickHandlers);
     delegateClicks('bookmarksRow', browserClickHandlers);
@@ -4423,6 +4684,9 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     let playlistsVersion = null;
     const openPlaylists = new Set();
     const ICON_PLAY = '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 4 20 12 6 20 6 4"></polygon></svg>';
+    const ICON_RENAME = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 20h9"></path><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"></path></svg>';
+    const ICON_UP = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 15 12 9 6 15"></polyline></svg>';
+    const ICON_DOWN = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"></polyline></svg>';
 
     // m:ss, or h:mm:ss from one hour; -:-- when unknown (as in the terminal).
     function playlistDuration(seconds) {
@@ -4454,6 +4718,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
 
     function renderPlaylists(data) {
       playlistsData = data;
+      if (pickerOpen()) renderPlaylistPicker(data);
       const list = document.getElementById('playlistsList');
       const summary = document.getElementById('playlistsSummaryText');
       clearChildren(list);
@@ -4490,6 +4755,13 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
         const appendBtn = iconButton('btn-icon-sm', 'Append playlist to the queue', 'append', ICON_ADD);
         appendBtn.dataset.name = name;
         head.appendChild(appendBtn);
+        const renameBtn = iconButton('btn-icon-sm', 'Rename playlist', 'rename', ICON_RENAME);
+        renameBtn.dataset.name = name;
+        head.appendChild(renameBtn);
+        const deleteBtn = iconButton('btn-icon-sm danger-hover', 'Delete playlist', 'delete', ICON_REMOVE);
+        deleteBtn.dataset.name = name;
+        deleteBtn.dataset.count = String(playlist.track_count);
+        head.appendChild(deleteBtn);
         card.appendChild(head);
 
         if (open) {
@@ -4527,6 +4799,16 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
         main.appendChild(meta);
         row.appendChild(main);
         row.appendChild(el('span', 'queue-item-dur', missing ? '----' : playlistDuration(entry.duration_seconds)));
+        for (const [title, action, icon] of [
+          ['Move up', 'move-up', ICON_UP],
+          ['Move down', 'move-down', ICON_DOWN],
+          ['Remove from playlist', 'remove', ICON_REMOVE],
+        ]) {
+          const btn = iconButton(action === 'remove' ? 'btn-icon-sm danger-hover' : 'btn-icon-sm', title, action, icon);
+          btn.dataset.name = playlist.name || '';
+          btn.dataset.index = String(entry.index);
+          row.appendChild(btn);
+        }
         tracks.appendChild(row);
       }
       return tracks;
@@ -4582,11 +4864,118 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       playlistAction('playlist_append', { name }, `Appending ${name}`);
     }
 
+    function renamePlaylist(name) {
+      const newName = prompt(`Rename "${name}" to:`, name);
+      if (newName === null) return;
+      playlistAction('playlist_rename', { name, new_name: newName });
+    }
+
+    function deletePlaylist(name, count) {
+      if (!confirm(`Delete "${name}" (${trackCountLabel(count)})?`)) return;
+      playlistAction('playlist_delete', { name });
+    }
+
+    function moveTrack(name, index, direction) {
+      playlistAction('playlist_move', { name, index, direction, revision: playlistRevision() });
+    }
+
+    function removeTrack(name, index) {
+      playlistAction('playlist_remove', { name, index, revision: playlistRevision() });
+    }
+
     delegateClicks('playlistsList', {
       toggle: (d) => togglePlaylist(d.name),
       play: (d) => playPlaylist(d.name, 0),
       'play-from': (d) => playPlaylist(d.name, Number(d.index)),
       append: (d) => appendPlaylist(d.name),
+      rename: (d) => renamePlaylist(d.name),
+      delete: (d) => deletePlaylist(d.name, Number(d.count)),
+      'move-up': (d) => moveTrack(d.name, Number(d.index), 'up'),
+      'move-down': (d) => moveTrack(d.name, Number(d.index), 'down'),
+      remove: (d) => removeTrack(d.name, Number(d.index)),
+    });
+
+    document.getElementById('btnPlaylistCreate').addEventListener('click', () => {
+      const name = prompt('New playlist name:');
+      if (name === null) return;
+      playlistAction('playlist_create', { name });
+    });
+
+    // The track the terminal plays, if any. Quickstream refuses a path outside the allowed
+    // folders (the status then holds only its file name).
+    document.getElementById('btnPlaylistAddCurrent').addEventListener('click', () => {
+      const playing = lastStatus && (lastStatus.is_playing || lastStatus.is_paused) && lastStatus.filepath;
+      if (!playing) {
+        showToast('Nothing is playing');
+        return;
+      }
+      openPlaylistPicker(lastStatus.title || lastStatus.filepath, lastStatus.filepath);
+    });
+
+    // --- ADD-TO-PLAYLIST PICKER ---
+    // Lists the playlists with the last one added to highlighted, then "+ New playlist…".
+    let pickerPath = null;
+
+    function pickerOpen() {
+      return document.getElementById('playlistPicker').classList.contains('show');
+    }
+
+    function openPlaylistPicker(label, path) {
+      if (!path) return;
+      pickerPath = path;
+      document.getElementById('playlistPickerLabel').textContent = label || path;
+      document.getElementById('playlistPicker').classList.add('show');
+      renderPlaylistPicker(playlistsData);
+      loadPlaylists();
+    }
+
+    function closePlaylistPicker() {
+      document.getElementById('playlistPicker').classList.remove('show');
+    }
+
+    function renderPlaylistPicker(data) {
+      const list = document.getElementById('playlistPickerList');
+      clearChildren(list);
+      if (!data || data.state !== 'ready') {
+        list.appendChild(el('div', 'empty-sub', (data && data.message) || 'Loading playlists…'));
+        return;
+      }
+      for (const playlist of data.playlists || []) {
+        const row = el('button', playlist.name === data.last_playlist ? 'picker-row last' : 'picker-row',
+          `${playlist.name} (${trackCountLabel(playlist.track_count)})`);
+        row.dataset.action = 'pick';
+        row.dataset.name = playlist.name || '';
+        list.appendChild(row);
+      }
+      const newRow = el('button', 'picker-row new', '+ New playlist…');
+      newRow.dataset.action = 'new';
+      list.appendChild(newRow);
+    }
+
+    function addToPlaylist(name) {
+      const path = pickerPath;
+      closePlaylistPicker();
+      playlistAction('playlist_add', { name, path });
+    }
+
+    async function newPlaylistAndAdd() {
+      const path = pickerPath;
+      closePlaylistPicker();
+      const input = prompt('New playlist name:');
+      if (input === null) return;
+      const name = input.trim();
+      if (await playlistAction('playlist_create', { name })) {
+        playlistAction('playlist_add', { name, path });
+      }
+    }
+
+    delegateClicks('playlistPickerList', {
+      pick: (d) => addToPlaylist(d.name),
+      new: () => newPlaylistAndAdd(),
+    });
+    document.getElementById('btnPlaylistPickerCancel').addEventListener('click', closePlaylistPicker);
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && pickerOpen()) closePlaylistPicker();
     });
 
     // Keyboard shortcuts

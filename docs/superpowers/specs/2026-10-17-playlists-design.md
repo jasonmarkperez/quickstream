@@ -22,7 +22,7 @@ Let the user hand-curate playlists in the terminal UI: build a list track by tra
 3. Adding opens a picker with the last-used playlist highlighted and a `+ New playlist…` row.
 4. Viewing and editing happen in a new tab `[5] Playlists`.
 5. Storage: M3U8 files with absolute paths.
-6. TUI only in v1. Web dashboard support is a follow-up issue.
+6. TUI only in v1. Web dashboard support is a follow-up issue (#50, now done: see Section 5).
 7. Edits save automatically; there is no save key.
 8. Adding a folder adds the audio files directly inside it, in name order, not recursive.
 9. Adding a track that is already in the playlist is skipped with a status message.
@@ -32,7 +32,7 @@ Let the user hand-curate playlists in the terminal UI: build a list track by tra
 
 ### Out of scope for v1
 
-- Web dashboard playlists (list, play, edit). File a follow-up issue.
+- Web dashboard playlists (list, play, edit). Filed as #50 and since added (Section 5).
 - Opening or importing `.m3u`/`.pls`/`.xspf` files that live on the share.
 - XSPF or PLS output.
 - Rewriting path prefixes when the share mounts at a different path (for example `/Volumes/Music-1`) or for other servers. This affects bookmarks and caches too and should be solved once for all of them.
@@ -196,6 +196,31 @@ Tests are written before the code they cover. New file `tests/test_playlists.rs`
    - the help modal lists `L` and the tab 5 keys.
 
 Before the PR: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test -- --test-threads=1`.
+
+## Section 5: Web dashboard (issue #50)
+
+The dashboard gets a `Playlists` tab that lists, plays and edits playlists with the same store and code as tab 5.
+
+### Reading
+
+- The UI thread publishes a `WebPlaylists` snapshot in the shared web state (`NowPlayingState::playlists`, an `Arc` left out of `/api/status`). It is rebuilt only when something it shows changed: `PlaylistStore::revision()` (bumped by every load, create, add, remove, move, rename, delete and undone write), the missing-file cache, the load state, or `last_playlist`. `/api/status` carries `playlists_version`, so the page fetches again only after a change.
+- `GET /api/playlists` serves the snapshot. The playlists folder is never read per request. Entries outside the allowed web folders lose their path and are flagged `outside`, as `/api/status` does for queue entries.
+- Serving it asks the UI (`WebCommand::CheckPlaylists`) to check every playlist's unchecked files on one worker, using the session cache tab 5 uses. Results show as `missing: true/false`; unchecked entries are `null`. A check never changes a playlist.
+
+### Playing and appending
+
+- `playlist_play` (`name`, optional `index`, `revision`) and `playlist_append` (`name`) go through `/api/action`.
+- The web thread checks every entry of the snapshot's playlist against the allowed folders, even though the playlist file itself is trusted: an entry whose file resolves outside them (including a symlink leading out), or a missing entry whose path lies outside them, refuses the whole request with 403 and `WebCommand::PathRejected`, like `add_file`. Missing entries inside the folders pass and are skipped by the queue as in tab 5. Refusing the whole request (rather than dropping the outside entries) keeps the rule identical to `add_file`; the dashboard marks such entries so the reason is visible.
+- The UI gets `WebCommand::QueuePlaylist` with the checked entries (not the store's current list, so it never queues an entry the web thread didn't check) and runs tab 5's code: the worker checks, `plan_queue`, the session reset on replace, and the same status messages. For web requests the worker also requires each checked file to resolve inside the allowed folders, so a symlink changed after the web thread's check can't reach another file.
+- The status names the playlist (`Queued 22 tracks from Road Trip, 2 missing`) rather than saying `(web)`: the message already says where the tracks came from, and it is the same text tab 5 shows.
+
+### Editing
+
+- `playlist_create`, `playlist_rename` (`new_name`), `playlist_delete`, `playlist_add` (`path`), `playlist_remove` (`index`) and `playlist_move` (`index`, `direction`). The web thread sends `WebCommand::EditPlaylist(edit, reply)` and waits (up to 5 seconds) for the UI's answer, so name errors reach the browser with the TUI's exact text.
+- The UI applies edits through `PlaylistStore` only, so every write stays behind `playlist_file_path` and the ordered writer. Names go through `validate_name` and the store's duplicate (case-insensitive, normalization-insensitive) and reserved-name checks. Edits are refused while the store is loading (`Playlists are still loading`) or after a failed load (`Couldn't load playlists`).
+- A file to add is checked like `add_file` (403 and `PathRejected` outside the allowed folders; 400 if it isn't an audio file). Its entry comes from the queue row for that file, else the metadata cache, else the file name; the file is never read.
+- Index-based requests (play from a track, remove, move) carry the snapshot's `revision`; if the playlists changed since, they are refused with `Playlists changed; try again` and the page reloads.
+- Tab 5 stays on the playlist it showed, following a web rename.
 
 ## Files touched
 

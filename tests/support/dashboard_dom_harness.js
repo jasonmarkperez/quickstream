@@ -172,8 +172,10 @@ const sandbox = {
   setInterval() { return 0; },
   clearInterval() {},
   confirm() { return true; },
+  prompt() { return promptAnswer; },
   console,
 };
+let promptAnswer = null;
 vm.createContext(sandbox);
 vm.runInContext(source, sandbox, { filename: 'dashboard.js' });
 
@@ -449,10 +451,75 @@ for (let i = 0; i < all.length; i++) {
   click(playlistsList, byClass(rows[1], 'queue-item-title')[0]);
   assert.deepStrictEqual(lastAction(), { action: 'playlist_play', value: null, name: all[i], index: 1, revision: 9 });
 
+  // Track edits name the playlist, the index and the snapshot's revision.
+  const trackButton = (title) => walk(rows[1]).find(n => n.tagName === 'BUTTON' && n.title === title);
+  click(playlistsList, trackButton('Move up'));
+  assert.deepStrictEqual(lastAction(),
+    { action: 'playlist_move', value: null, name: all[i], index: 1, direction: 'up', revision: 9 });
+  click(playlistsList, trackButton('Move down'));
+  assert.deepStrictEqual(lastAction(),
+    { action: 'playlist_move', value: null, name: all[i], index: 1, direction: 'down', revision: 9 });
+  click(playlistsList, trackButton('Remove from playlist'));
+  assert.deepStrictEqual(lastAction(), { action: 'playlist_remove', value: null, name: all[i], index: 1, revision: 9 });
+
+  // Rename sends the typed name as is (the app validates it); Delete asks first.
+  const headButton = (title) => walk(card()).find(n => n.tagName === 'BUTTON' && n.title === title);
+  promptAnswer = H.img;
+  click(playlistsList, headButton('Rename playlist'));
+  assert.deepStrictEqual(lastAction(), { action: 'playlist_rename', value: null, name: all[i], new_name: H.img });
+  promptAnswer = null;
+  const beforeRename = fetchCalls.length;
+  click(playlistsList, headButton('Rename playlist'));
+  assert.strictEqual(fetchCalls.length, beforeRename, 'a cancelled rename sends nothing');
+  click(playlistsList, headButton('Delete playlist'));
+  assert.deepStrictEqual(lastAction(), { action: 'playlist_delete', value: null, name: all[i] });
+  assertNoMarkupFromData();
+
   // Close it again.
   click(playlistsList, byClass(card(), 'playlist-name')[0]);
   assert.strictEqual(byClass(card(), 'playlist-track').length, 0);
 }
+
+// New playlist: the typed name goes to the app.
+function fire(id) {
+  for (const fn of document.getElementById(id).listeners.click || []) fn({ preventDefault() {} });
+}
+promptAnswer = H.dquote;
+fire('btnPlaylistCreate');
+assert.deepStrictEqual(lastAction(), { action: 'playlist_create', value: null, name: H.dquote });
+
+// Add to playlist from a browser file: the picker lists the playlists as text, the last one
+// added to marked, and a click adds the file's exact path.
+sandbox.renderBrowser(browserData, '');
+const pickerList = document.getElementById('playlistPickerList');
+for (let i = 0; i < all.length; i++) {
+  const fileRow = byClass(browserList, 'file')[i];
+  const toPlaylist = walk(fileRow).find(n => n.tagName === 'BUTTON' && n.title === 'Add to playlist');
+  assert.ok(toPlaylist, 'browser file row has no Add to playlist button');
+  click(browserList, toPlaylist);
+  assert.ok(document.getElementById('playlistPicker').classList.contains('show'), 'picker did not open');
+  assert.strictEqual(document.getElementById('playlistPickerLabel').textContent, 'f' + all[i]);
+  const pickRows = byClass(pickerList, 'picker-row');
+  assert.strictEqual(pickRows.length, all.length + 1);
+  assert.deepStrictEqual(pickRows.slice(0, all.length).map(r => r.textContent), all.map(v => v + ' (2 tracks)'));
+  assert.strictEqual(pickRows[all.length].textContent, '+ New playlist…');
+  assert.deepStrictEqual(pickRows.filter(r => r.classList.contains('last')).map(r => r.dataset.name), [H.img]);
+  for (const node of walk(pickerList)) {
+    for (const name of Object.keys(node.attributes)) {
+      assert.ok(!name.startsWith('on'), `picker row has inline handler attribute ${name}`);
+    }
+  }
+  click(pickerList, pickRows[(i + 1) % all.length]);
+  assert.deepStrictEqual(lastAction(),
+    { action: 'playlist_add', value: null, name: all[(i + 1) % all.length], path: '/music/f' + all[i] });
+  assert.ok(!document.getElementById('playlistPicker').classList.contains('show'), 'picker did not close');
+}
+// "+ New playlist…" creates first (the add follows once the app accepts the name).
+click(browserList, walk(byClass(browserList, 'file')[0]).find(n => n.title === 'Add to playlist'));
+promptAnswer = '  ' + H.quote + ' ';
+click(pickerList, byClass(pickerList, 'picker-row').find(r => r.dataset.action === 'new'));
+assert.deepStrictEqual(lastAction(), { action: 'playlist_create', value: null, name: H.quote });
+assertNoMarkupFromData();
 
 // Not loaded: the app's message is shown as text.
 sandbox.renderPlaylists({ state: 'failed', message: H.scriptTag, revision: 0, last_playlist: null, playlists: [] });
