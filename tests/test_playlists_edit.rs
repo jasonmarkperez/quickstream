@@ -671,7 +671,8 @@ fn test_create_onto_an_unseen_file_shows_an_error_and_removes_the_playlist() {
     assert_eq!(app.settings_mgr.settings.last_playlist, None);
     assert_eq!(fs::read_to_string(&path).unwrap(), theirs);
     let view = render_view(&mut app, 100, 30);
-    assert!(!view.contains("Mix  ("), "{}", view);
+    // No row for it (names are drawn UPPERCASE; the status line keeps "Mix" as typed).
+    assert!(!view.contains("MIX"), "{}", view);
 
     // Trying again is refused in the prompt instead.
     press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);

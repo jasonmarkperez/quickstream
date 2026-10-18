@@ -13,7 +13,7 @@ use quickstream::metadata::AudioMetadata;
 use quickstream::player::AudioPlayer;
 use quickstream::playlist::{Playlist, PlaylistEntry};
 use quickstream::settings::SettingsManager;
-use quickstream::ui::playlists::{missing_row_text, mount_hint, ExistsChecker};
+use quickstream::ui::playlists::{mount_hint, ExistsChecker};
 use quickstream::ui::AppUI;
 
 const PLAYLIST: &str = "Road Trip";
@@ -91,6 +91,15 @@ fn render(app: &mut AppUI, width: u16, height: u16) -> String {
     terminal.backend().to_string()
 }
 
+/// The first line of `view` containing `text`, without the quotes the test backend puts
+/// around each line.
+fn row_with<'a>(view: &'a str, text: &str) -> &'a str {
+    view.lines()
+        .find(|line| line.contains(text))
+        .map(|line| line.trim_matches('"'))
+        .unwrap_or_else(|| panic!("{text:?} not drawn:\n{view}"))
+}
+
 #[test]
 fn test_mount_hint_is_the_first_two_folders() {
     common::isolate();
@@ -136,13 +145,6 @@ fn test_all_missing_without_a_mount_hint_leaves_out_the_question() {
 }
 
 #[test]
-fn test_missing_row_text_marks_the_entry() {
-    common::isolate();
-    let ghost = entry(Path::new("/music/gone.flac"), "Ghost", "Gone");
-    assert_eq!(missing_row_text(1, &ghost), "2. ✗ missing: Ghost - Gone  ----");
-}
-
-#[test]
 fn test_missing_entries_render_as_missing_and_playlist_is_untouched() {
     common::isolate();
     let dir = temp_dir("missing_rows");
@@ -161,10 +163,24 @@ fn test_missing_entries_render_as_missing_and_playlist_is_untouched() {
     assert!(app.playlists.is_missing(&ghost));
     assert!(!app.playlists.is_missing(&present));
 
+    // The missing entry keeps its number and title, and reads MISSING FILE with no length in
+    // place of its artist and length; the entry that exists is not marked.
     let view = render(&mut app, 120, 30);
-    assert!(view.contains("✗ missing: Ghost - Gone  ----"), "{}", view);
-    assert!(view.contains("Alpha - One"), "{}", view);
-    assert!(!view.contains("✗ missing: Alpha"), "{}", view);
+    let ghost_row = row_with(&view, "GONE");
+    assert!(ghost_row.contains("02   GONE"), "{}", view);
+    assert!(
+        ghost_row.contains("MISSING FILE") && ghost_row.trim_end().ends_with("--:--"),
+        "{}",
+        view
+    );
+    assert!(!ghost_row.contains("GHOST"), "{}", view);
+    let present_row = row_with(&view, "ONE");
+    assert!(
+        present_row.contains("01   ONE") && present_row.contains("ALPHA"),
+        "{}",
+        view
+    );
+    assert!(!present_row.contains("MISSING FILE"), "{}", view);
 
     // A missing file never changes the playlist or its file.
     app.persistence.flush();
@@ -207,8 +223,8 @@ fn test_hung_existence_check_does_not_block_ui() {
 
     // Rows not checked yet render normally.
     let view = render(&mut app, 120, 30);
-    assert!(view.contains("Ghost - Gone"), "{}", view);
-    assert!(!view.contains("✗ missing"), "{}", view);
+    assert!(row_with(&view, "GONE").contains("GHOST"), "{}", view);
+    assert!(!view.contains("MISSING FILE"), "{}", view);
 
     // Polling again neither blocks nor checks the same paths a second time.
     let start = Instant::now();
@@ -230,7 +246,7 @@ fn test_hung_existence_check_does_not_block_ui() {
     app.poll_playlists();
     assert_eq!(app.playlists.checks_in_flight(), 0);
     let view = render(&mut app, 120, 30);
-    assert!(view.contains("✗ missing: Ghost - Gone"), "{}", view);
+    assert!(row_with(&view, "GONE").contains("MISSING FILE"), "{}", view);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

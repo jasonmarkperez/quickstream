@@ -1,6 +1,7 @@
 //! Tab 2 Queue & Library in the Telemetry style (mockups 2c, 3a, 3g): the LIBRARY and QUEUE
 //! panels, their columns, the IN QUEUE / `▪` markers, the cursor, the spotlight, the folder
-//! duration and the width rules.
+//! duration and the width rules. Tab 5 Playlists (2f): the PLAYLISTS and tracks panels, the
+//! MISSING FILE rows, the file path footnote and the same width rules.
 
 mod common;
 
@@ -617,5 +618,323 @@ fn file_names_keep_their_case_in_filenames_mode() {
     assert!(lib(&buf, "FILES").is_some(), "label note: {shown}");
     // Folder names are still UPPERCASE.
     assert!(lib(&buf, "LOW TIDE ATLAS/").is_some(), "{shown}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tab 5 Playlists (2f)
+// ---------------------------------------------------------------------------------------------
+
+/// At 120 columns the PLAYLISTS panel is 46 columns (text 44) and the tracks panel, 4 columns
+/// after it, 66 (text 64), as in 2f.
+const PL_X: u16 = 2;
+const PL_TEXT_W: u16 = 44;
+const TR_X: u16 = 52;
+const TR_TEXT_W: u16 = 64;
+
+fn pl_entry(dir: &Path, file: &str, artist: &str, title: &str, secs: i64) -> quickstream::playlist::PlaylistEntry {
+    quickstream::playlist::PlaylistEntry {
+        path: dir.join(file),
+        duration_secs: secs,
+        artist: artist.to_string(),
+        title: title.to_string(),
+    }
+}
+
+/// Replace the playlists folder with `Late Drives` (a tagged track, a missing one, one of
+/// unknown length) and `Sunday Slow` (two tracks), and return an app on tab 5 whose existence
+/// checks have finished: every file but `salt.flac` exists.
+fn playlists_app(tag: &str) -> (AppUI, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("quickstream_pl_lists_{}_{}", tag, std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let playlists_dir = quickstream::paths::get_playlists_dir();
+    let _ = fs::remove_dir_all(&playlists_dir);
+    fs::create_dir_all(&playlists_dir).unwrap();
+    let write = |name: &str, entries| {
+        let playlist = quickstream::playlist::Playlist {
+            name: name.to_string(),
+            entries,
+        };
+        fs::write(playlists_dir.join(format!("{name}.m3u8")), playlist.to_m3u8()).unwrap();
+    };
+    write(
+        "Late Drives",
+        vec![
+            pl_entry(&dir, "northbound.flac", "Oren Vasquez", "Northbound, Slowly", 362),
+            pl_entry(&dir, "salt.flac", "Ada Kowalczyk", "Salt Lines", 227),
+            pl_entry(&dir, "sodium.flac", "", "Sodium Light", -1),
+        ],
+    );
+    write(
+        "Sunday Slow",
+        vec![
+            pl_entry(&dir, "a.flac", "Mira Lenz", "Tidewater", 242),
+            pl_entry(&dir, "b.flac", "Mira Lenz", "Lanterns", 400),
+        ],
+    );
+    let settings = SettingsManager::with_path(dir.join("config.json"));
+    let mut app = AppUI::new(Some(dir.clone()), settings);
+    let checker: quickstream::ui::playlists::ExistsChecker =
+        std::sync::Arc::new(|p: &Path| (!p.ends_with("salt.flac")).then(|| p.to_path_buf()));
+    app.playlists.set_exists_checker(checker);
+    app.active_tab = 4;
+    let start = Instant::now();
+    while !(app.playlists.store.is_loaded() && app.playlists.exists.len() == 3) {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "playlists did not load and check"
+        );
+        app.poll_playlists();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    (app, dir)
+}
+
+fn press(app: &mut AppUI, code: KeyCode) {
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        code,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+}
+
+#[test]
+fn playlists_2f_layout_at_120_cols() {
+    common::isolate();
+    let (mut app, dir) = playlists_app("2f");
+    press(&mut app, KeyCode::Char('l'));
+    assert!(app.playlists.tracks_focus);
+    let buf = tui::render(&mut app, 120, 40);
+    let shown = screen(&buf);
+
+    // Label rows: PLAYLISTS (MID, unfocused) with the playlist count; the open playlist's name
+    // (bold INK, focused) with its track count and the total of the known lengths (362 + 227).
+    let (_, ly) = find_in(&buf, "PLAYLISTS", PL_X, PL_X + 1).unwrap_or_else(|| panic!("{shown}"));
+    assert_eq!(tui::cell_style(&buf, PL_X, ly).fg, Some(P.mid), "{shown}");
+    assert_eq!(
+        find_in(&buf, "2", PL_X + PL_TEXT_W - 1, PL_X + PL_TEXT_W),
+        Some((PL_X + PL_TEXT_W - 1, ly))
+    );
+    assert_eq!(tui::cell_style(&buf, PL_X + PL_TEXT_W - 1, ly).fg, Some(P.dim));
+    assert_eq!(
+        find_in(&buf, "LATE DRIVES", TR_X, TR_X + 1),
+        Some((TR_X, ly)),
+        "{shown}"
+    );
+    let label = tui::cell_style(&buf, TR_X, ly);
+    assert_eq!(label.fg, Some(P.ink));
+    assert!(label.add_modifier.contains(Modifier::BOLD));
+    let note = "3 TRACKS  ·  09:49";
+    let note_x = TR_X + TR_TEXT_W - note.chars().count() as u16;
+    assert_eq!(find_in(&buf, note, note_x, note_x + 1), Some((note_x, ly)), "{shown}");
+    assert_eq!(tui::cell_style(&buf, note_x, ly).fg, Some(P.dim));
+
+    // Rules: the focused one INK, the other RULE; no box borders.
+    assert_eq!(span_text(&buf, ly + 1, TR_X, TR_X + 3), "───");
+    assert_eq!(tui::cell_style(&buf, TR_X, ly + 1).fg, Some(P.ink));
+    assert_eq!(tui::cell_style(&buf, PL_X, ly + 1).fg, Some(P.rule));
+    assert!(!shown.contains('│') && !shown.contains('┌'), "{shown}");
+
+    // Playlist rows: name from column 2 of the panel, track count against the text edge (DIM);
+    // the open playlist keeps `▸` while the tracks pane has focus.
+    let (nx, ny) = find_in(&buf, "LATE DRIVES", PL_X, PL_X + 3).unwrap_or_else(|| panic!("{shown}"));
+    assert_eq!(
+        (nx, span_text(&buf, ny, PL_X, PL_X + 1)),
+        (PL_X + 2, "▸".to_string()),
+        "{shown}"
+    );
+    assert_eq!(span_text(&buf, ny, PL_X + PL_TEXT_W - 2, PL_X + PL_TEXT_W), " 3");
+    let (sx, sy) = find_in(&buf, "SUNDAY SLOW", PL_X, PL_X + 3).unwrap_or_else(|| panic!("{shown}"));
+    assert_eq!(sx, PL_X + 2);
+    assert_eq!(span_text(&buf, sy, PL_X + PL_TEXT_W - 1, PL_X + PL_TEXT_W), "2");
+    assert_eq!(tui::cell_style(&buf, PL_X + PL_TEXT_W - 1, sy).fg, Some(P.dim));
+    assert_eq!(tui::cell_style(&buf, sx, sy).fg, Some(P.ink));
+    assert_eq!(ny, sy - 1);
+
+    // Track rows: number (DIM), TITLE (INK, 30 columns), ARTIST (MID), length at the text edge.
+    let (tx, ty) = find_in(&buf, "NORTHBOUND, SLOWLY", TR_X, 120).unwrap_or_else(|| panic!("{shown}"));
+    assert_eq!(ty, ny, "track rows start on the playlist rows' row: {shown}");
+    assert_eq!(tx, TR_X + 5);
+    assert_eq!(span_text(&buf, ty, TR_X, TR_X + 5), "01   ");
+    assert_eq!(
+        find_in(&buf, "OREN VASQUEZ", TR_X, 120),
+        Some((TR_X + 5 + 30, ty)),
+        "{shown}"
+    );
+    assert_eq!(
+        find_in(&buf, "06:02", TR_X, 120),
+        Some((TR_X + TR_TEXT_W - 5, ty)),
+        "{shown}"
+    );
+    // The focused pane's cursor is the reverse-video bar, one column past the text each side.
+    for x in [TR_X - 1, TR_X, TR_X + TR_TEXT_W] {
+        let style = tui::cell_style(&buf, x, ty);
+        assert_eq!(
+            (style.fg, style.bg),
+            (Some(P.ground), Some(P.ink)),
+            "column {x}: {shown}"
+        );
+    }
+    let (_, uy) = find_in(&buf, "SODIUM LIGHT", TR_X, 120).unwrap();
+    assert_eq!(span_text(&buf, uy, TR_X, TR_X + 5), "03   ");
+    assert_eq!(tui::cell_style(&buf, TR_X, uy).fg, Some(P.dim), "number is DIM");
+    assert_eq!(tui::cell_style(&buf, TR_X + 5, uy).fg, Some(P.ink), "title is INK");
+    assert_eq!(
+        span_text(&buf, uy, TR_X + 5 + 30, TR_X + TR_TEXT_W).trim(),
+        "",
+        "no artist, unknown length left out: {shown}"
+    );
+
+    // The footnote names the playlist's file.
+    assert!(shown.contains("Late Drives.m3u8"), "{shown}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn missing_file_rows_read_missing_file_in_error_with_no_length() {
+    common::isolate();
+    let (mut app, dir) = playlists_app("missing");
+    let buf = tui::render(&mut app, 120, 40);
+    let shown = screen(&buf);
+    let (tx, ty) = find_in(&buf, "SALT LINES", TR_X, 120).unwrap_or_else(|| panic!("{shown}"));
+    assert_eq!(span_text(&buf, ty, TR_X, TR_X + 2), "02");
+    assert_eq!(tui::cell_style(&buf, tx, ty).fg, Some(P.dim), "missing title is DIM");
+    let (mx, my) = find_in(&buf, "MISSING FILE", TR_X, 120).unwrap_or_else(|| panic!("{shown}"));
+    assert_eq!((mx, my), (TR_X + 5 + 30, ty), "{shown}");
+    assert!(
+        (mx..mx + 12).all(|x| tui::cell_style(&buf, x, my).fg == Some(P.error)),
+        "MISSING FILE is ERROR"
+    );
+    assert_eq!(
+        find_in(&buf, "--:--", TR_X, 120),
+        Some((TR_X + TR_TEXT_W - 5, ty)),
+        "{shown}"
+    );
+    assert_eq!(tui::cell_style(&buf, TR_X + TR_TEXT_W - 1, ty).fg, Some(P.dim));
+    // The artist and length of a missing file are not shown; nor is the old marker.
+    assert!(!shown.contains("ADA KOWALCZYK"), "{shown}");
+    assert!(!shown.contains("03:47"), "{shown}");
+    assert!(!shown.contains("✗"), "{shown}");
+    // Existing files are not marked.
+    let (_, ny) = find_in(&buf, "NORTHBOUND, SLOWLY", TR_X, 120).unwrap();
+    assert!(!tui::row(&buf, ny).contains("MISSING"), "{shown}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn playlist_footnote_is_the_file_path_in_its_own_case() {
+    common::isolate();
+    let (mut app, dir) = playlists_app("footnote");
+    let buf = tui::render(&mut app, 120, 40);
+    let shown = screen(&buf);
+    let (fx, fy) = find_in(&buf, "Late Drives.m3u8", TR_X, 120).unwrap_or_else(|| panic!("{shown}"));
+    assert!(!shown.contains("LATE DRIVES.M3U8"), "{shown}");
+    assert_eq!(tui::cell_style(&buf, fx, fy).fg, Some(P.dim));
+    let (_, ly) = find_in(&buf, "LATE DRIVES", TR_X, TR_X + 1).unwrap();
+    assert_eq!(fy, ly + 2, "the row under the rule: {shown}");
+    // The whole path, from the panel's text edge, when it fits.
+    let path = quickstream::paths::get_playlists_dir().join("Late Drives.m3u8");
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let expected = match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    };
+    if expected.chars().count() <= TR_TEXT_W as usize {
+        assert_eq!(
+            span_text(&buf, fy, TR_X, TR_X + TR_TEXT_W).trim_end(),
+            expected,
+            "{shown}"
+        );
+    } else {
+        assert!(span_text(&buf, fy, TR_X, TR_X + 1) == "…", "{shown}");
+    }
+
+    // Another playlist: its own file.
+    press(&mut app, KeyCode::Down);
+    let buf = tui::render(&mut app, 120, 40);
+    assert!(
+        find_in(&buf, "Sunday Slow.m3u8", TR_X, 120).is_some(),
+        "{}",
+        screen(&buf)
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn playlists_page_heights_are_the_rows_each_list_shows() {
+    common::isolate();
+    let (mut app, dir) = playlists_app("pages");
+    for i in 0..40 {
+        let entry = pl_entry(&dir, &format!("t{i:02}.flac"), "", &format!("Song {i:02}"), 60);
+        app.playlists.store.add("Late Drives", vec![entry]).unwrap();
+    }
+    for (w, h) in [(120, 40), (120, 30), (100, 30), (85, 30)] {
+        let buf = tui::render(&mut app, w, h);
+        let shown = (0..h).filter(|&y| tui::row(&buf, y).contains("SONG ")).count()
+            + (0..h)
+                .filter(|&y| {
+                    let row = tui::row(&buf, y);
+                    ["NORTHBOUND", "SALT LINES", "SODIUM LIGHT"]
+                        .iter()
+                        .any(|t| row.contains(t))
+                })
+                .count();
+        assert_eq!(shown, app.playlists.tracks_page_height, "{w}x{h}:\n{}", screen(&buf));
+        assert_eq!(
+            app.playlists.list_page_height, app.playlists.tracks_page_height,
+            "{w}x{h}"
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn playlists_at_85_cols_drop_the_artist_column_and_the_path() {
+    common::isolate();
+    let (mut app, dir) = playlists_app("w85");
+    let buf = tui::render(&mut app, 85, 30);
+    let shown = screen(&buf);
+    // Both panels, label rows side by side.
+    let (_, ly) = find_in(&buf, "PLAYLISTS", PL_X, PL_X + 1).unwrap_or_else(|| panic!("{shown}"));
+    let (lx, lsy) = find_in(&buf, "LATE DRIVES", PL_X + 10, 85).unwrap_or_else(|| panic!("{shown}"));
+    assert_eq!(lsy, ly, "{shown}");
+    assert!(tui::row(&buf, ly).contains("3 TRACKS"), "{shown}");
+    assert!(lx > PL_X + 20);
+    // No artist column, no path footnote; titles keep their lengths and missing marks.
+    assert!(!shown.contains("OREN VASQUEZ"), "{shown}");
+    assert!(!shown.contains(".m3u8"), "{shown}");
+    let (_, ty) = find_in(&buf, "NORTHBOUND", lx, 85).unwrap_or_else(|| panic!("{shown}"));
+    assert!(tui::row(&buf, ty).contains("06:02"), "{shown}");
+    let (_, my) = find_in(&buf, "SALT LINES", lx, 85).unwrap();
+    let row = tui::row(&buf, my);
+    assert!(row.contains("MISSING FILE") && row.contains("--:--"), "{shown}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn playlists_under_80_cols_show_only_the_focused_pane() {
+    common::isolate();
+    let (mut app, dir) = playlists_app("w70");
+    let starts_with = |buf: &Buffer, text: &str| {
+        (0..buf.area.height).any(|y| span_text(buf, y, PL_X, buf.area.width).starts_with(text))
+    };
+
+    let buf = tui::render(&mut app, 70, 24);
+    assert!(starts_with(&buf, "PLAYLISTS"), "{}", screen(&buf));
+    assert!(tui::find_text(&buf, "SUNDAY SLOW").is_some(), "{}", screen(&buf));
+    assert!(tui::find_text(&buf, "NORTHBOUND").is_none(), "{}", screen(&buf));
+
+    press(&mut app, KeyCode::Char('l'));
+    let buf = tui::render(&mut app, 70, 24);
+    assert!(starts_with(&buf, "LATE DRIVES"), "{}", screen(&buf));
+    assert!(!starts_with(&buf, "PLAYLISTS"), "{}", screen(&buf));
+    assert!(tui::find_text(&buf, "NORTHBOUND").is_some(), "{}", screen(&buf));
+    assert!(tui::find_text(&buf, "SUNDAY SLOW").is_none(), "{}", screen(&buf));
+    // The hidden pane pages by the rows the shown one has.
+    assert_eq!(app.playlists.list_page_height, app.playlists.tracks_page_height);
+
+    press(&mut app, KeyCode::Char('h'));
+    let buf = tui::render(&mut app, 70, 24);
+    assert!(starts_with(&buf, "PLAYLISTS"), "{}", screen(&buf));
     let _ = fs::remove_dir_all(&dir);
 }

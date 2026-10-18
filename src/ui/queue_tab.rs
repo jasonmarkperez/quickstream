@@ -19,8 +19,8 @@ use super::{theme, AppUI};
 /// Path of the `★ Music Homes` row.
 const MUSIC_HOMES: &str = "___MUSIC_HOMES___";
 
-/// Separator between the fields of a footnote.
-const SEP: &str = "  ·  ";
+/// Separator between the fields of a footnote or a label note.
+pub(super) const SEP: &str = "  ·  ";
 
 /// Columns between the two panels: 4 from 90 columns, 2 below (3g).
 const GAP: u16 = 4;
@@ -49,8 +49,8 @@ pub(super) struct QueueTabCache {
     queue_total: Option<(u64, Option<f64>)>,
     /// Total length of the audio files in the browsed folder; `None` when a length is unknown.
     folder_total: Option<(FolderKey, Option<f64>)>,
-    /// The home folder, shown as `~` in the library footnote (read once).
-    home: Option<PathBuf>,
+    /// The home folder, shown as `~` in the library and playlist footnotes (read once).
+    pub(super) home: Option<PathBuf>,
 }
 
 /// What the folder total depends on: the folder, its listing and the tags in memory.
@@ -111,22 +111,29 @@ pub(super) fn clock(seconds: f64) -> String {
 }
 
 /// `text` right-aligned in `width` columns.
-fn right_aligned(text: &str, width: usize) -> String {
+pub(super) fn right_aligned(text: &str, width: usize) -> String {
     format!("{}{}", " ".repeat(width.saturating_sub(text_width(text))), text)
 }
 
-/// The library and queue areas: side by side with a gap, or (under 80 columns) only the focused
-/// pane across the whole width.
-fn split_panes(area: Rect, tier: WidthTier, queue_focus: bool) -> (Option<Rect>, Option<Rect>) {
+/// The left and right panes of a two-pane tab (2 and 5): side by side with a gap, the left one
+/// `share.0 / share.1` of the width the gap leaves, or (under 80 columns) only the focused pane
+/// across the whole width.
+pub(super) fn split_panes(
+    area: Rect,
+    tier: WidthTier,
+    right_focus: bool,
+    share: (u16, u16),
+) -> (Option<Rect>, Option<Rect>) {
     if tier == WidthTier::Narrow {
-        return if queue_focus {
+        return if right_focus {
             (None, Some(area))
         } else {
             (Some(area), None)
         };
     }
     let gap = if tier >= WidthTier::Medium { GAP } else { COMPACT_GAP };
-    let left = area.width.saturating_sub(gap) / 2;
+    let free = area.width.saturating_sub(gap);
+    let left = (u32::from(free) * u32::from(share.0) / u32::from(share.1.max(1))) as u16;
     let right = area.width.saturating_sub(gap + left);
     (
         Some(Rect { width: left, ..area }),
@@ -135,7 +142,7 @@ fn split_panes(area: Rect, tier: WidthTier, queue_focus: bool) -> (Option<Rect>,
 }
 
 /// `path` with the home folder shown as `~`, in its original case (resolution 2).
-fn display_path(path: &Path, home: Option<&Path>) -> String {
+pub(super) fn display_path(path: &Path, home: Option<&Path>) -> String {
     if let Some(rest) = home.and_then(|home| path.strip_prefix(home).ok()) {
         if rest.as_os_str().is_empty() {
             return "~".to_string();
@@ -240,7 +247,7 @@ impl AppUI {
     pub(super) fn render_queue_tab(&mut self, f: &mut Frame, area: Rect) {
         let screen = Screen::new(f.area());
         let compact = screen.tier < WidthTier::Medium || screen.short;
-        let (library_area, queue_area) = split_panes(area, screen.tier, self.queue_focus);
+        let (library_area, queue_area) = split_panes(area, screen.tier, self.queue_focus, (1, 2));
         let library_rows = library_area.map(|a| self.render_library_panel(f, a, screen.tier, compact));
         let queue_rows = queue_area.map(|a| self.render_queue_panel(f, a, screen.tier, compact));
         // A hidden pane pages by the rows the shown one has: the same panel, a pane-switch away.
