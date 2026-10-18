@@ -42,8 +42,29 @@ impl KeyHint {
 }
 
 /// Columns `text` takes in the terminal.
-fn text_width(text: &str) -> usize {
+pub(super) fn text_width(text: &str) -> usize {
     Span::raw(text).width()
+}
+
+/// Columns `spans` take together in the terminal.
+pub(super) fn spans_width(spans: &[Span]) -> usize {
+    spans.iter().map(Span::width).sum()
+}
+
+/// The longest start of `text` that fits in `budget` columns, and the columns it takes. A wide
+/// character that would straddle the cut is left out.
+fn cut(text: &str, budget: usize) -> (String, usize) {
+    let mut used = 0;
+    let mut out = String::new();
+    for c in text.chars() {
+        let w = char_width(c);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    (out, used)
 }
 
 /// Index of the hint to drop next among those still `kept`: the lowest priority, the rightmost
@@ -99,7 +120,6 @@ pub fn top_priority_width(hints: &[KeyHint]) -> usize {
 pub fn key_row<'a>(hints: &[KeyHint], width: u16, right: Option<Vec<Span<'a>>>) -> Line<'a> {
     let width = width as usize;
     let mut right = right.unwrap_or_default();
-    let right_width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
 
     let mut kept = vec![true; hints.len()];
     let hints_width = |kept: &[bool]| {
@@ -114,7 +134,7 @@ pub fn key_row<'a>(hints: &[KeyHint], width: u16, right: Option<Vec<Span<'a>>>) 
     let gap = |left: usize, right: usize| if left > 0 && right > 0 { KEY_GAP } else { 0 };
 
     let mut left = hints_width(&kept);
-    while left + gap(left, right_width(&right)) + right_width(&right) > width {
+    while left + gap(left, spans_width(&right)) + spans_width(&right) > width {
         match next_to_drop(hints, &kept, true) {
             Some(i) => {
                 kept[i] = false;
@@ -124,7 +144,7 @@ pub fn key_row<'a>(hints: &[KeyHint], width: u16, right: Option<Vec<Span<'a>>>) 
         }
     }
     let room = width.saturating_sub(left + gap(left, 1));
-    if right_width(&right) > room {
+    if spans_width(&right) > room {
         right = truncate_spans(right, room);
     }
 
@@ -136,7 +156,7 @@ pub fn key_row<'a>(hints: &[KeyHint], width: u16, right: Option<Vec<Span<'a>>>) 
         spans.push(Span::styled(format!(" {} ", hint.keys), theme::keycap()));
         spans.push(Span::styled(format!(" {}", hint.label), theme::mid()));
     }
-    let used = left + right_width(&right);
+    let used = left + spans_width(&right);
     if used < width {
         spans.push(Span::raw(" ".repeat(width - used)));
     }
@@ -159,15 +179,7 @@ fn truncate_spans(spans: Vec<Span<'_>>, width: usize) -> Vec<Span<'_>> {
             out.push(span);
             continue;
         }
-        let mut text = String::new();
-        for c in span.content.chars() {
-            let w = char_width(c);
-            if used + w > budget {
-                break;
-            }
-            used += w;
-            text.push(c);
-        }
+        let (mut text, _) = cut(&span.content, budget - used);
         text.push('…');
         out.push(Span::styled(text, span.style));
         return out;
@@ -224,16 +236,7 @@ pub fn fit(text: &str, width: usize) -> String {
         return String::new();
     }
     let budget = width - 1; // the `…`
-    let mut used = 0;
-    let mut out = String::new();
-    for c in text.chars() {
-        let w = char_width(c);
-        if used + w > budget {
-            break;
-        }
-        used += w;
-        out.push(c);
-    }
+    let (mut out, used) = cut(text, budget);
     out.push('…');
     out.push_str(&" ".repeat(budget - used));
     out

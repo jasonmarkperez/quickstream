@@ -6,7 +6,7 @@
 
 use ratatui::prelude::*;
 
-use super::kit::{self, KeyHint};
+use super::kit::{self, spans_width, text_width, KeyHint};
 use super::screen::{Screen, WidthTier};
 use super::{format_time, theme, AppUI};
 
@@ -133,11 +133,7 @@ pub(super) fn tab_titles(width: u16, active: usize) -> Vec<String> {
 
 /// Columns the tab row takes: each title padded by one column on each side, `TAB_GAP` apart.
 fn tab_row_width(titles: &[String]) -> usize {
-    titles.iter().map(|t| Span::raw(t.as_str()).width() + 2).sum::<usize>() + TAB_GAP * titles.len().saturating_sub(1)
-}
-
-fn spans_width(spans: &[Span]) -> usize {
-    spans.iter().map(Span::width).sum()
+    titles.iter().map(|t| text_width(t) + 2).sum::<usize>() + TAB_GAP * titles.len().saturating_sub(1)
 }
 
 /// `left` at the start of a `width`-column line and `right` against its end, with spaces between.
