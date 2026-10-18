@@ -845,25 +845,13 @@ fn test_failed_create_puts_the_cursor_back_on_the_playlist_selected_before() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
-/// The bottom bar's second row (state badge, device, volume, status) as drawn at `width` x 40,
-/// read from the buffer cells (the backend's text form escapes quotes).
-fn status_row(app: &mut AppUI, width: u16) -> String {
-    let backend = ratatui::backend::TestBackend::new(width, 40);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal.draw(|f| app.render(f)).unwrap();
-    let buffer = terminal.backend().buffer();
-    (0..40)
-        .map(|y| {
-            (0..width)
-                .map(|x| buffer[(x, y)].symbol().to_string())
-                .collect::<String>()
-        })
-        .find(|row| {
-            ["⏹ STOPPED", "▶ PLAYING", "⏸ PAUSED"]
-                .iter()
-                .any(|badge| row.contains(badge))
-        })
-        .expect("no playback state row")
+/// The row holding `text` as drawn at `width` x 40, read from the buffer cells (the backend's
+/// text form escapes quotes), with the frame's buffer for style checks.
+fn status_row(app: &mut AppUI, width: u16, text: &str) -> (String, ratatui::buffer::Buffer) {
+    let buffer = common::tui::render(app, width, 40);
+    let y = common::tui::find_row(&buffer, text)
+        .unwrap_or_else(|| panic!("{text:?} not drawn:\n{}", common::tui::rows(&buffer).join("\n")));
+    (common::tui::row(&buffer, y), buffer)
 }
 
 #[test]
@@ -881,15 +869,30 @@ fn test_rename_collision_status_is_not_cut_off_at_120_columns() {
 
     let message = "Couldn't rename \"TitleOnly\" to \"Late2\": a file with that name already exists";
     assert_eq!(app.status_message, message);
-    let row = status_row(&mut app, 120);
-    assert!(row.contains(message), "{row}");
+    // The whole message, at the right end of the key row, in the ERROR colour.
+    let (row, buffer) = status_row(&mut app, 120, message);
+    assert!(row.trim_end().ends_with(message), "{row}");
+    assert!(row.contains(" ?  KEYS"), "{row}");
+    let error = quickstream::ui::theme::palette().error;
+    let styles = common::tui::text_styles(&buffer, message).unwrap();
+    assert!(styles.iter().all(|s| s.fg == Some(error)), "{row}");
 
-    // A status that fits leaves the rest of the row as it was.
+    // Any message up to 79 characters shows whole at 120 columns.
+    let long = format!("Couldn't save {}", "x".repeat(65));
+    assert_eq!(long.chars().count(), 79);
+    app.status_message = long.clone();
+    let (row, _) = status_row(&mut app, 120, &long);
+    assert!(row.contains(" ?  KEYS"), "{row}");
+
+    // A status that fits leaves the rest of the chrome as it was.
     app.status_message = "Kept \"TitleOnly\"".to_string();
-    let row = status_row(&mut app, 120);
-    assert!(row.contains("Local Audio"), "{row}");
-    assert!(row.contains("Vol: "), "{row}");
-    assert!(row.contains("Kept \"TitleOnly\""), "{row}");
+    let (row, buffer) = status_row(&mut app, 120, "Kept \"TitleOnly\"");
+    assert!(row.contains(" ?  KEYS"), "{row}");
+    assert!(row.contains(" C ⇧R ⇧D  NEW / RENAME / DELETE"), "{row}");
+    let header = common::tui::row(&buffer, 1);
+    assert!(header.contains("LOCAL/MPV"), "{header}");
+    let strip = common::tui::find_row(&buffer, "NO TRACK LOADED").expect("strip");
+    assert!(common::tui::row(&buffer, strip).contains("VOL "), "volume in the strip");
 
     drop(app);
     let _ = fs::remove_dir_all(&temp_dir);

@@ -7,6 +7,8 @@
 
 #![allow(dead_code)]
 
+pub mod tui;
+
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 

@@ -10,6 +10,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScree
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
+mod chrome;
 pub mod kit;
 pub mod playlists;
 pub mod screen;
@@ -275,6 +276,8 @@ pub struct AppUI {
     pub persistence: crate::persist::PersistenceWorker,
     /// Tab 5: playlist store, cursors and the playlist modals.
     pub playlists: playlists::PlaylistsUi,
+    /// The header clock, read at most once a second.
+    clock: kit::ClockCache,
 }
 
 impl Drop for AppUI {
@@ -413,6 +416,7 @@ impl AppUI {
             mix_picker_cursor: 0,
             persistence,
             playlists,
+            clock: kit::ClockCache::new(),
         };
         app.refresh_browser();
         app.start_playlist_load();
@@ -3618,27 +3622,37 @@ impl AppUI {
     }
 
     pub fn render(&mut self, f: &mut Frame) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3), // Tab header
-                Constraint::Min(5),    // Main workspace
-                Constraint::Length(5), // Bottom playback bar
-            ])
-            .split(f.area());
+        // Every cell starts as INK on GROUND; widgets drawn later keep that background unless
+        // they set their own.
+        let area = f.area();
+        f.buffer_mut().set_style(area, theme::base());
+        let screen = screen::Screen::new(area);
+        let layout = chrome::ChromeLayout::new(&screen, self.active_tab != 0);
 
-        self.render_tabs(f, chunks[0]);
+        if let Some(header) = layout.header {
+            self.render_header(f, header);
+        }
+        self.render_tab_row(f, layout.tabs, &screen, layout.header.is_none());
 
-        match self.active_tab {
-            0 => self.render_now_playing_tab(f, chunks[1]),
-            1 => self.render_queue_tab(f, chunks[1]),
-            2 => self.render_devices_tab(f, chunks[1]),
-            3 => self.render_settings_tab(f, chunks[1]),
-            4 => self.render_playlists_tab(f, chunks[1]),
-            _ => {}
+        let content = layout.content;
+        if content.width > 0 && content.height > 0 {
+            match self.active_tab {
+                0 => self.render_now_playing_tab(f, content),
+                1 => self.render_queue_tab(f, content),
+                2 => self.render_devices_tab(f, content),
+                3 => self.render_settings_tab(f, content),
+                4 => self.render_playlists_tab(f, content),
+                _ => {}
+            }
         }
 
-        self.render_bottom_bar(f, chunks[2]);
+        if let Some(rule) = layout.rule {
+            self.render_rule(f, rule);
+        }
+        if let Some(strip) = layout.strip {
+            self.render_strip(f, strip, &screen);
+        }
+        self.render_key_row(f, layout.keys, &screen);
 
         if let Some(ref mut modal) = self.search_modal {
             Self::render_search_modal(modal, f);
@@ -3651,36 +3665,18 @@ impl AppUI {
         }
     }
 
-    fn render_tabs(&self, f: &mut Frame, area: Rect) {
-        let titles = tab_titles(area.width, self.active_tab);
-        // Zero padding keeps all five labels inside a standard 80-column terminal.
-        let tabs = Tabs::new(titles)
-            .padding("", "")
-            .select(self.active_tab)
-            .block(Block::default().borders(Borders::BOTTOM))
-            .style(Style::default().fg(Color::DarkGray))
-            .highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-        f.render_widget(tabs, area);
-    }
-
     fn render_now_playing_tab(&mut self, f: &mut Frame, area: Rect) {
         if area.width < 10 || area.height < 4 {
             return;
         }
 
-        // `[n]` comes first so it still shows when a narrow terminal clips the footer
-        let footer = format!(
-            " [n] Queue & Library   [Space] Play/Pause   [←/→] Prev/Next Track   [[/]] Seek {}s   [+/-] Vol ",
-            self.settings_mgr.settings.seek_step_seconds
-        );
         let outer_block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
             .title(Span::styled(
                 " [1] NOW PLAYING ",
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ))
-            .title_bottom(Span::styled(footer, Style::default().fg(Color::DarkGray)));
+            ));
 
         let inner = outer_block.inner(area);
         f.render_widget(outer_block, area);
@@ -3703,29 +3699,11 @@ impl AppUI {
         // Row 1: State Pill, Active Output, Volume, Mode Pill
         let mut row1 = Vec::new();
         if self.player.is_playing() {
-            row1.push(Span::styled(
-                " ▶ PLAYING ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            row1.push(Span::styled(" ▶ PLAYING ", theme::cursor()));
         } else if self.player.is_paused() {
-            row1.push(Span::styled(
-                " ⏸ PAUSED ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            row1.push(Span::styled(" ⏸ PAUSED ", theme::cursor()));
         } else {
-            row1.push(Span::styled(
-                " ⏹ STOPPED ",
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            row1.push(Span::styled(" ⏹ STOPPED ", theme::cursor()));
         }
 
         let active_dev_name = self
@@ -3795,38 +3773,23 @@ impl AppUI {
             // Row 4: Format Quality Badges
             let mut badge_spans = Vec::new();
             if self.autopilot_dir.is_some() {
-                badge_spans.push(Span::styled(
-                    "[⚡ AUTOPILOT]",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ));
+                badge_spans.push(Span::styled("[⚡ AUTOPILOT]", theme::cursor()));
                 badge_spans.push(Span::raw(" "));
             }
             if !track.format_name.is_empty() {
                 badge_spans.push(Span::styled(
                     format!("[{}]", track.format_name.to_uppercase()),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+                    theme::cursor(),
                 ));
                 badge_spans.push(Span::raw(" "));
             }
             if track.sample_rate_hz > 0 {
                 let khz = track.sample_rate_hz as f64 / 1000.0;
-                badge_spans.push(Span::styled(
-                    format!("[{:.1} kHz]", khz),
-                    Style::default().fg(Color::White).bg(Color::DarkGray),
-                ));
+                badge_spans.push(Span::styled(format!("[{:.1} kHz]", khz), theme::keycap()));
                 badge_spans.push(Span::raw(" "));
             }
             if track.bitrate_kbps > 0 {
-                badge_spans.push(Span::styled(
-                    format!("[{} kbps]", track.bitrate_kbps),
-                    Style::default().fg(Color::White).bg(Color::DarkGray),
-                ));
+                badge_spans.push(Span::styled(format!("[{} kbps]", track.bitrate_kbps), theme::keycap()));
                 badge_spans.push(Span::raw(" "));
             }
             if track.channels > 0 {
@@ -3837,10 +3800,7 @@ impl AppUI {
                 } else {
                     "Multi"
                 };
-                badge_spans.push(Span::styled(
-                    format!("[{}]", chan_label),
-                    Style::default().fg(Color::White).bg(Color::DarkGray),
-                ));
+                badge_spans.push(Span::styled(format!("[{}]", chan_label), theme::keycap()));
                 badge_spans.push(Span::raw(" "));
             }
             if !track.genre.is_empty() {
@@ -4170,17 +4130,7 @@ impl AppUI {
                 let is_spotlight_match = match_set.contains(&idx);
 
                 let style = if is_selected {
-                    if self.browser_spotlight.is_some() {
-                        Style::default()
-                            .bg(Color::Yellow)
-                            .fg(Color::Black)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                            .bg(Color::Blue)
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD)
-                    }
+                    theme::cursor()
                 } else if is_spotlight_match {
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
                 } else if *is_dir {
@@ -4234,10 +4184,7 @@ impl AppUI {
                 let prefix = if idx == self.queue.current_index { "▶ " } else { "  " };
                 let text = format!("{}{}. {}", prefix, idx + 1, track.format_queue_label(metadata_view));
                 let style = if idx == self.queue_cursor && self.queue_focus {
-                    Style::default()
-                        .bg(Color::Blue)
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD)
+                    theme::cursor()
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -4270,10 +4217,7 @@ impl AppUI {
         let local_status = if is_local_active { " (Active)" } else { "" };
         let local_text = format!("{} Local Audio (mpv/ffplay){}", local_bullet, local_status);
         let local_style = if self.devices_cursor == 0 {
-            Style::default()
-                .bg(Color::Blue)
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
+            theme::cursor()
         } else if is_local_active {
             Style::default().fg(Color::Green)
         } else {
@@ -4296,10 +4240,7 @@ impl AppUI {
                 status
             );
             let style = if self.devices_cursor == cursor_idx {
-                Style::default()
-                    .bg(Color::Blue)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
+                theme::cursor()
             } else if is_active {
                 Style::default().fg(Color::Green)
             } else {
@@ -4347,20 +4288,12 @@ impl AppUI {
                 if idx == 7 && self.editing_home_dir.is_some() {
                     let edit_val = self.editing_home_dir.as_deref().unwrap_or("");
                     let text = format!("{:<28} : [ {}█ ]", defn.label, edit_val);
-                    ListItem::new(text).style(
-                        Style::default()
-                            .bg(Color::Cyan)
-                            .fg(Color::Black)
-                            .add_modifier(Modifier::BOLD),
-                    )
+                    ListItem::new(text).style(theme::cursor())
                 } else {
                     let val_str = self.settings_mgr.get_display_value(idx);
                     let text = format!("{:<28} : {}", defn.label, val_str);
                     let style = if idx == self.settings_cursor {
-                        Style::default()
-                            .bg(Color::Blue)
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD)
+                        theme::cursor()
                     } else {
                         Style::default().fg(Color::White)
                     };
@@ -4436,10 +4369,7 @@ impl AppUI {
             .map(|(idx, (_, track))| {
                 let label = track.format_display_label(true);
                 let style = if idx == modal.selected_index {
-                    Style::default()
-                        .bg(Color::Blue)
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD)
+                    theme::cursor()
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -4561,212 +4491,6 @@ impl AppUI {
         let action_block = Block::default().borders(Borders::ALL);
         let action_p = Paragraph::new(Line::from(action_spans)).block(action_block);
         f.render_widget(action_p, vertical[2]);
-    }
-
-    fn render_bottom_bar(&self, f: &mut Frame, area: Rect) {
-        let block = Block::default().borders(Borders::ALL).title(Span::styled(
-            " NOW PLAYING ",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ));
-        f.render_widget(block, area);
-
-        let inner = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // Row 1: Music metadata
-                Constraint::Length(1), // Row 2: Status & Controls
-                Constraint::Length(1), // Row 3: Progress gauge
-            ])
-            .margin(1)
-            .split(area);
-
-        if inner.len() < 3 {
-            return;
-        }
-
-        // --- Row 1: Dedicated solely to music metadata (Title, Artist, Album, Format/Bitrate) ---
-        let row1_line = if let Some(track) = self.queue.current_track() {
-            let mut spans = Vec::new();
-
-            // Title (Bold Yellow)
-            spans.push(Span::styled(
-                track.display_title(),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ));
-
-            // Artist (Cyan)
-            if !track.artist.is_empty() {
-                spans.push(Span::styled("  —  ", Style::default().fg(Color::DarkGray)));
-                spans.push(Span::styled(
-                    &track.artist,
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ));
-            }
-
-            // Album (White)
-            if !track.album.is_empty() {
-                spans.push(Span::styled("  —  ", Style::default().fg(Color::DarkGray)));
-                spans.push(Span::styled(&track.album, Style::default().fg(Color::White)));
-            }
-
-            // Format / Bitrate (Gray)
-            let mut fmt_parts = Vec::new();
-            if !track.format_name.is_empty() {
-                fmt_parts.push(track.format_name.to_uppercase());
-            }
-            if track.bitrate_kbps > 0 {
-                fmt_parts.push(format!("{}kbps", track.bitrate_kbps));
-            }
-            if !fmt_parts.is_empty() {
-                spans.push(Span::styled(
-                    format!("  ({})", fmt_parts.join(" ")),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-
-            if let Some(feat) = self.analysis_db.get_features(&track.filepath) {
-                let mut feat_parts = Vec::new();
-                if let Some(bpm) = feat.bpm {
-                    feat_parts.push(format!("{:.0} BPM", bpm));
-                }
-                if let Some(ref key) = feat.display_key() {
-                    feat_parts.push(key.clone());
-                }
-                if !feat_parts.is_empty() {
-                    spans.push(Span::styled("  •  ", Style::default().fg(Color::DarkGray)));
-                    spans.push(Span::styled(
-                        feat_parts.join(" • "),
-                        Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-                    ));
-                }
-            }
-
-            Line::from(spans)
-        } else {
-            Line::from(vec![Span::styled(
-                "No Track Loaded",
-                Style::default().fg(Color::DarkGray),
-            )])
-        };
-        f.render_widget(Paragraph::new(row1_line), inner[0]);
-
-        // --- Row 2: State badge, Active Device, Volume, Web Server URL/Port, Notices ---
-        let mut row2_spans = Vec::new();
-
-        // State badge
-        if self.pending_track_skip {
-            row2_spans.push(Span::styled(
-                "⏳ QUEUED",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ));
-        } else if self.player.is_playing() {
-            row2_spans.push(Span::styled(
-                "▶ PLAYING",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ));
-        } else if self.player.is_paused() {
-            row2_spans.push(Span::styled(
-                "⏸ PAUSED",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ));
-        } else {
-            row2_spans.push(Span::styled(
-                "⏹ STOPPED",
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
-            ));
-        }
-
-        if self.autopilot_dir.is_some() {
-            row2_spans.push(Span::raw(" "));
-            row2_spans.push(Span::styled(
-                format!("[⚡ {}]", self.active_mix_profile.name()),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ));
-        }
-
-        // Output device (without "Out:" prefix), volume and web server badge, each after a
-        // separator. Kept apart so a long status can take their room (see below).
-        let separator = || Span::styled("  │  ", Style::default().fg(Color::DarkGray));
-        let active_dev_name = self
-            .device_manager
-            .get_active_device()
-            .map(|d| d.friendly_name)
-            .unwrap_or_else(|| "Local Audio".to_string());
-        let device = vec![
-            separator(),
-            Span::styled(active_dev_name, Style::default().fg(Color::White)),
-        ];
-        let vol = self.player.volume();
-        let volume = vec![
-            separator(),
-            Span::styled(format!("Vol: {}%", vol), Style::default().fg(Color::White)),
-        ];
-        let web = self.web_server.as_ref().map(|s| {
-            vec![
-                separator(),
-                Span::styled(format!("🌐 :{}", s.port), Style::default().fg(Color::Cyan)),
-            ]
-        });
-
-        // Transient non-redundant notices
-        let is_redundant = self.status_message.is_empty()
-            || self.status_message.starts_with("Playing:")
-            || self.status_message == "Playing"
-            || self.status_message == "Paused"
-            || self.status_message == "Stopped"
-            || self.status_message.starts_with("Welcome to Quickstream");
-
-        let status = (!is_redundant).then(|| {
-            let msg_lower = self.status_message.to_lowercase();
-            let msg_style = if msg_lower.contains("error") || msg_lower.contains("failed") {
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Magenta)
-            };
-            vec![separator(), Span::styled(self.status_message.as_str(), msg_style)]
-        });
-
-        // A status that would be cut off at the right edge (an error naming two playlists, say)
-        // takes the room of the device name, then the web badge, then the volume: the status
-        // is the one part that changes, and the rest come back with the next shorter status.
-        let width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
-        let available = inner[1].width as usize;
-        let mut info = [Some(device), web, Some(volume)];
-        if let Some(status) = &status {
-            let needed = width(&row2_spans) + width(status);
-            for slot in 0..info.len() {
-                let shown: usize = info.iter().flatten().map(|spans| width(spans)).sum();
-                if needed + shown <= available {
-                    break;
-                }
-                info[slot] = None;
-            }
-        }
-        let [device, web, volume] = info;
-        row2_spans.extend(device.into_iter().chain(volume).chain(web).chain(status).flatten());
-
-        f.render_widget(Paragraph::new(Line::from(row2_spans)), inner[1]);
-
-        // --- Row 3: Progress bar gauge with MM:SS / MM:SS ---
-        let (pos, dur) = if self.pending_track_skip {
-            let dur = self.queue.current_track().map(|t| t.duration_seconds).unwrap_or(0.0);
-            (0.0, dur)
-        } else {
-            let p = self
-                .pending_seek_target
-                .unwrap_or_else(|| self.player.position_seconds());
-            (p, self.player.duration_seconds())
-        };
-        let pct = if dur > 0.0 { (pos / dur).min(1.0) } else { 0.0 };
-
-        let pos_str = format_time(pos);
-        let dur_str = format_time(dur);
-
-        let gauge = Gauge::default()
-            .gauge_style(Style::default().fg(Color::Cyan))
-            .ratio(pct)
-            .label(format!("{} / {}", pos_str, dur_str));
-        f.render_widget(gauge, inner[2]);
     }
 
     fn render_help_modal(&self, f: &mut Frame) {
@@ -5025,45 +4749,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 fn help_modal_rect(r: Rect) -> Rect {
     modal_rect_with_height(r, 20)
-}
-
-/// Full tab labels: 79 columns with the dividers.
-const TAB_TITLES: [&str; 5] = [
-    " [1] Now Playing",
-    " [2] Queue & Library",
-    " [3] Devices",
-    " [4] Settings",
-    " [5] Playlists",
-];
-
-/// Short tab labels for terminals narrower than the full ones: 58 columns with the dividers.
-const SHORT_TAB_TITLES: [&str; 5] = ["[1] Now", "[2] Library", "[3] Devices", "[4] Settings", "[5] Playlists"];
-
-/// Tab bar labels that fit `width` columns, so the active tab stays visible: the full labels,
-/// else the short ones, else only the numbers with the active tab's short label.
-fn tab_titles(width: u16, active: usize) -> Vec<String> {
-    // Tabs draws a one-column divider between labels.
-    let fits = |titles: &[&str]| {
-        let text: usize = titles.iter().map(|t| t.chars().count()).sum();
-        text + titles.len() - 1 <= width as usize
-    };
-    if fits(&TAB_TITLES) {
-        return TAB_TITLES.iter().map(|t| t.to_string()).collect();
-    }
-    if fits(&SHORT_TAB_TITLES) {
-        return SHORT_TAB_TITLES.iter().map(|t| t.to_string()).collect();
-    }
-    SHORT_TAB_TITLES
-        .iter()
-        .enumerate()
-        .map(|(i, t)| {
-            if i == active {
-                t.to_string()
-            } else {
-                format!("[{}]", i + 1)
-            }
-        })
-        .collect()
 }
 
 /// Width of the help modal's key field: the longest key, `c / R / D`. A longer key would push

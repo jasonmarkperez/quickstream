@@ -80,6 +80,16 @@ pub fn top_hints(hints: &[KeyHint], max: usize) -> Vec<KeyHint> {
         .collect()
 }
 
+/// Columns the hints with the highest priority take with their gaps: the narrowest a key row of
+/// `hints` gets, since those are never dropped.
+pub fn top_priority_width(hints: &[KeyHint]) -> usize {
+    let Some(top) = hints.iter().map(|h| h.priority).max() else {
+        return 0;
+    };
+    let widths: Vec<usize> = hints.iter().filter(|h| h.priority == top).map(KeyHint::width).collect();
+    widths.iter().sum::<usize>() + KEY_GAP * widths.len().saturating_sub(1)
+}
+
 /// A key row `width` columns wide: the hints from the left, 4 columns apart, and `right` (a status
 /// message or the volume meter) against the right edge.
 ///
@@ -227,6 +237,15 @@ pub fn fit(text: &str, width: usize) -> String {
     out.push('…');
     out.push_str(&" ".repeat(budget - used));
     out
+}
+
+/// `text` if it fits in `width` columns, else cut to at most `width` columns ending in `…`
+/// (no padding, unlike [`fit`]).
+pub fn clip(text: &str, width: usize) -> String {
+    if text_width(text) <= width {
+        return text.to_string();
+    }
+    fit(text, width).trim_end_matches(' ').to_string()
 }
 
 /// Columns `c` takes in the terminal (2 for wide characters such as CJK).

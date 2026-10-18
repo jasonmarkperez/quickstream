@@ -145,15 +145,17 @@ fn test_render_now_playing_tab_empty_and_populated() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+/// The Now Playing key row (the row holding the `N` keycap) at `width` x 30.
 fn now_playing_footer(app: &mut AppUI, width: u16) -> String {
-    let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
     app.active_tab = 0;
-    terminal.draw(|f| app.render(f)).unwrap();
-    let view = terminal.backend().to_string();
-    view.lines()
-        .find(|line| line.contains("Play/Pause"))
-        .expect("Now Playing footer row")
-        .to_string()
+    let buffer = common::tui::render(app, width, 30);
+    let y = common::tui::find_row(&buffer, " N  QUEUE").unwrap_or_else(|| {
+        panic!(
+            "Now Playing key row at {width} columns:\n{}",
+            common::tui::rows(&buffer).join("\n")
+        )
+    });
+    common::tui::row(&buffer, y)
 }
 
 #[test]
@@ -165,10 +167,17 @@ fn test_now_playing_footer_names_n_not_esc_at_80_columns() {
     let settings_mgr = SettingsManager::with_path(temp_dir.join("config.json"));
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
 
-    // Esc is the global quit key, so the footer must not offer it for switching tabs (#57)
-    let footer = now_playing_footer(&mut app, 80);
-    assert!(footer.contains("[n] Queue & Library"), "footer at 80 columns: {footer}");
-    assert!(!footer.contains("Esc"), "footer: {footer}");
+    // Esc is the global quit key, so the key row must not offer it for switching tabs (#57),
+    // and `N QUEUE` stays at every width.
+    for width in [120, 100, 85, 80, 70, 40] {
+        let footer = now_playing_footer(&mut app, width);
+        assert!(footer.contains(" N  QUEUE"), "key row at {width} columns: {footer}");
+        assert!(footer.contains(" ?  KEYS"), "key row at {width} columns: {footer}");
+        assert!(
+            !footer.to_uppercase().contains("ESC"),
+            "key row at {width} columns: {footer}"
+        );
+    }
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
@@ -184,7 +193,9 @@ fn test_now_playing_footer_shows_the_seek_step_setting() {
 
     app.settings_mgr.settings.seek_step_seconds = 30.0;
     let footer = now_playing_footer(&mut app, 120);
-    assert!(footer.contains("Seek 30s"), "footer: {footer}");
+    assert!(footer.contains(" [ ]  SEEK 30S"), "footer: {footer}");
+    let footer = now_playing_footer(&mut app, 100);
+    assert!(footer.contains("SEEK 30S"), "footer: {footer}");
 
     let _ = fs::remove_dir_all(&temp_dir);
 }

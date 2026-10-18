@@ -593,10 +593,7 @@ impl AppUI {
             .split(area);
         let focused = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
         let unfocused = Style::default().fg(Color::DarkGray);
-        let selected = Style::default()
-            .bg(Color::Blue)
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD);
+        let selected = super::theme::cursor();
         let hint = Style::default().fg(Color::DarkGray);
         let empty_tracks = Block::default()
             .borders(Borders::ALL)

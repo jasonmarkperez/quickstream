@@ -1,8 +1,11 @@
-//! Building blocks of the Telemetry screen chrome: colour depth and palette (`ui::theme`), key
-//! row, volume meter, progress bar and text fitting (`ui::kit`), and width tiers (`ui::screen`).
+//! The Telemetry screen chrome: its building blocks (colour depth and palette in `ui::theme`; key
+//! row, volume meter, progress bar and text fitting in `ui::kit`; width tiers in `ui::screen`) and
+//! the chrome `AppUI::render` draws with them (background, header, tab row, strip, key row).
 
 mod common;
 
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -10,9 +13,13 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use common::tui;
+use quickstream::metadata::AudioMetadata;
+use quickstream::settings::SettingsManager;
 use quickstream::ui::kit::{self, ClockCache, KeyHint};
 use quickstream::ui::screen::{Screen, WidthTier};
 use quickstream::ui::theme::{self, ColorDepth, Palette};
+use quickstream::ui::AppUI;
 
 /// The text of a line, concatenated from its spans.
 fn line_text(line: &Line) -> String {
@@ -249,6 +256,29 @@ fn key_row_truncates_the_right_part_when_only_top_hints_remain() {
 }
 
 #[test]
+fn top_priority_width_measures_the_hints_never_dropped() {
+    common::isolate();
+    // ` N ` + ` QUEUE` (9), 4 columns, ` ? ` + ` KEYS` (8).
+    assert_eq!(kit::top_priority_width(&now_playing_hints()), 21);
+    assert_eq!(kit::top_priority_width(&[hint("?", "KEYS", 1)]), 8);
+    assert_eq!(kit::top_priority_width(&[]), 0);
+    // It is the width of the narrowest row those hints can make.
+    let line = kit::key_row(&now_playing_hints(), 0, None);
+    assert_eq!(line_width(&line), 21);
+}
+
+#[test]
+fn clip_cuts_without_padding() {
+    common::isolate();
+    assert_eq!(kit::clip("Halcyon", 10), "Halcyon");
+    assert_eq!(kit::clip("Halcyon", 7), "Halcyon");
+    assert_eq!(kit::clip("Halcyon Drift", 8), "Halcyon…");
+    assert_eq!(kit::clip("日本語", 4), "日…");
+    assert_eq!(kit::clip("日本語", 3), "日…");
+    assert_eq!(kit::clip("abc", 0), "");
+}
+
+#[test]
 fn top_hints_keeps_the_n_most_important_in_order() {
     common::isolate();
     let kept = kit::top_hints(&now_playing_hints(), 4);
@@ -435,4 +465,444 @@ fn screen_records_tier_height_and_area() {
     let screen = Screen::new(Rect::new(0, 0, 70, 23));
     assert_eq!(screen.tier, WidthTier::Narrow);
     assert!(screen.short);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The screen chrome drawn by `AppUI::render`: background, header, tab row, strip and key row.
+// ---------------------------------------------------------------------------------------------
+
+/// A fresh app with an empty queue, browsing a temp dir of its own.
+fn chrome_app(tag: &str) -> (AppUI, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("quickstream_chrome_{}_{}", tag, std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let settings_mgr = SettingsManager::with_path(dir.join("config.json"));
+    (AppUI::new(Some(dir.clone()), settings_mgr), dir)
+}
+
+fn track(dir: &Path, title: &str, artist: &str) -> AudioMetadata {
+    AudioMetadata {
+        filepath: dir.join(format!("{title}.flac")),
+        title: title.to_string(),
+        artist: artist.to_string(),
+        duration_seconds: 352.0,
+        format_name: "flac".to_string(),
+        ..Default::default()
+    }
+}
+
+/// The key row: the last row holding the `?` keycap.
+fn key_row_index(buffer: &ratatui::buffer::Buffer) -> u16 {
+    (0..buffer.area.height)
+        .rev()
+        .find(|&y| tui::row(buffer, y).contains(" ?  KEYS"))
+        .unwrap_or_else(|| panic!("no key row with ? KEYS:\n{}", tui::rows(buffer).join("\n")))
+}
+
+/// Number of keycaps (runs of cells with the keycap background) in row `y`.
+fn keycap_count(buffer: &ratatui::buffer::Buffer, y: u16) -> usize {
+    let rule = theme::palette().rule;
+    let mut count = 0;
+    let mut inside = false;
+    for x in 0..buffer.area.width {
+        let is_cap = buffer[(x, y)].bg == rule;
+        if is_cap && !inside {
+            count += 1;
+        }
+        inside = is_cap;
+    }
+    count
+}
+
+/// `HH:MM` at the end of `text` (ignoring trailing spaces).
+fn ends_with_clock(text: &str) -> bool {
+    let t: Vec<char> = text.trim_end().chars().collect();
+    t.len() >= 5
+        && t[t.len() - 5..]
+            .iter()
+            .enumerate()
+            .all(|(i, c)| if i == 2 { *c == ':' } else { c.is_ascii_digit() })
+}
+
+#[test]
+fn every_cell_is_drawn_on_ground_at_120x40() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("ground");
+    let p = theme::palette();
+    for tab in 0..5 {
+        app.active_tab = tab;
+        let buffer = tui::render(&mut app, 120, 40);
+        for y in 0..40 {
+            for x in 0..120 {
+                let bg = buffer[(x, y)].bg;
+                // GROUND everywhere, except keycaps (RULE) and the cursor / active tab chip (INK).
+                assert!(
+                    bg == p.ground || bg == p.rule || bg == p.ink,
+                    "tab {tab}: cell ({x}, {y}) has background {bg:?}\n{}",
+                    tui::rows(&buffer).join("\n")
+                );
+            }
+        }
+        // Margins, header, blank rows, rule and strip have nothing but GROUND.
+        for y in [0, 1, 2, 4, 5, 39] {
+            assert!(
+                (0..120).all(|x| buffer[(x, y)].bg == p.ground),
+                "tab {tab}: row {y} is not all GROUND: {:?}",
+                tui::row(&buffer, y)
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn header_shows_name_version_output_and_clock() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("header");
+    let buffer = tui::render(&mut app, 120, 40);
+    let header = tui::row(&buffer, 1);
+    let name = format!("  QUICKSTREAM ▪ {}", env!("CARGO_PKG_VERSION"));
+    assert!(header.starts_with(&name), "{header:?}");
+    assert!(header.contains("LOCAL/MPV"), "{header:?}");
+    assert!(!header.contains("WEB :"), "no web server, no WEB badge: {header:?}");
+    assert!(ends_with_clock(&header), "clock HH:MM at the right: {header:?}");
+    assert!(header.ends_with("  "), "2-column gutter on the right: {header:?}");
+
+    let styles = tui::text_styles(&buffer, "QUICKSTREAM").unwrap();
+    assert!(styles.iter().all(|s| s.fg == Some(theme::palette().ink)));
+    assert!(styles.iter().all(|s| s.add_modifier.contains(Modifier::BOLD)));
+    let styles = tui::text_styles(&buffer, env!("CARGO_PKG_VERSION")).unwrap();
+    assert!(styles.iter().all(|s| s.fg == Some(theme::palette().dim)));
+    let styles = tui::text_styles(&buffer, "LOCAL/MPV").unwrap();
+    assert!(styles.iter().all(|s| s.fg == Some(theme::palette().mid)));
+
+    // The backend setting names the local output.
+    app.settings_mgr.settings.player_backend = "ffplay".to_string();
+    let header = tui::row(&tui::render(&mut app, 120, 40), 1);
+    assert!(header.contains("LOCAL/FFPLAY"), "{header:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn header_shows_web_port_only_while_the_server_runs() {
+    common::isolate();
+    let mut settings_mgr = SettingsManager::new();
+    settings_mgr.settings.web_server_enabled = true;
+    settings_mgr.settings.web_server_port = 0;
+    let mut app = AppUI::new(None, settings_mgr);
+    let port = app.web_server.as_ref().expect("server running").port;
+
+    let header = tui::row(&tui::render(&mut app, 120, 40), 1);
+    assert!(header.contains(&format!("WEB :{port}")), "{header:?}");
+    assert!(ends_with_clock(&header), "{header:?}");
+
+    // Narrow: the WEB badge goes first, the clock stays.
+    let header = tui::row(&tui::render(&mut app, 40, 30), 1);
+    assert!(!header.contains("WEB :"), "{header:?}");
+    assert!(ends_with_clock(&header), "{header:?}");
+
+    app.web_server = None;
+    let header = tui::row(&tui::render(&mut app, 120, 40), 1);
+    assert!(!header.contains("WEB :"), "{header:?}");
+}
+
+#[test]
+fn tall_layout_rows_at_120x40_and_120x29() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("rows");
+    let width = 120usize;
+    let rule_row = format!("  {}  ", "─".repeat(width - 4));
+
+    app.active_tab = 1;
+    let buffer = tui::render(&mut app, 120, 40);
+    let rows = tui::rows(&buffer);
+    assert!(rows[0].trim().is_empty(), "top margin: {:?}", rows[0]);
+    assert!(rows[1].contains("QUICKSTREAM"));
+    assert!(rows[2].trim().is_empty());
+    assert!(rows[3].contains("2 QUEUE & LIBRARY"), "tab row: {:?}", rows[3]);
+    assert!(
+        rows[4].trim().is_empty() && rows[5].trim().is_empty(),
+        "2-row gap at 40 rows"
+    );
+    assert_eq!(rows[35], rule_row);
+    assert!(rows[36].contains("NO TRACK LOADED"), "strip: {:?}", rows[36]);
+    assert!(rows[37].trim().is_empty());
+    assert_eq!(key_row_index(&buffer), 38);
+    assert!(rows[39].trim().is_empty(), "bottom margin");
+    assert!(
+        (0..120).all(|x| buffer[(x, 35)].fg == theme::palette().rule || buffer[(x, 35)].symbol() == " "),
+        "rule in RULE"
+    );
+
+    // Under 30 rows the gap under the tab row is one row.
+    let rows = tui::rows(&tui::render(&mut app, 120, 29));
+    assert!(rows[3].contains("2 QUEUE & LIBRARY"));
+    assert!(rows[4].trim().is_empty());
+    assert!(!rows[5].trim().is_empty(), "content starts at row 5: {:?}", rows[5]);
+
+    // Now Playing has no rule and no strip.
+    app.active_tab = 0;
+    let buffer = tui::render(&mut app, 120, 40);
+    let rows = tui::rows(&buffer);
+    assert_eq!(key_row_index(&buffer), 38);
+    assert!(!rows.contains(&rule_row), "no rule on Now Playing");
+    assert!(
+        !rows.iter().any(|r| r.contains("NO TRACK LOADED")),
+        "no strip on Now Playing"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn short_terminal_folds_the_header_into_the_tab_row() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("short");
+    app.active_tab = 1;
+    let buffer = tui::render(&mut app, 100, 20);
+    let rows = tui::rows(&buffer);
+    assert!(
+        !rows.iter().any(|r| r.contains("QUICKSTREAM")),
+        "no header row under 24 rows"
+    );
+    assert!(rows[0].contains("2 QUEUE"), "tab row first: {:?}", rows[0]);
+    assert!(ends_with_clock(&rows[0]), "clock on the tab row: {:?}", rows[0]);
+    assert!(
+        rows[18].contains("NO TRACK LOADED"),
+        "strip above the key row: {:?}",
+        rows[18]
+    );
+    assert_eq!(key_row_index(&buffer), 19);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn strip_shows_on_tabs_2_to_5_but_not_on_now_playing() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("strip");
+    app.queue.add_track(track(&dir, "Halcyon Drift", "Mira Lenz"));
+    for tab in 0..5 {
+        app.active_tab = tab;
+        let buffer = tui::render(&mut app, 120, 40);
+        let strip = tui::find_row(&buffer, "■ HALCYON DRIFT");
+        if tab == 0 {
+            assert!(strip.is_none(), "Now Playing has no strip");
+            continue;
+        }
+        let y = strip.unwrap_or_else(|| panic!("tab {tab}: no strip\n{}", tui::rows(&buffer).join("\n")));
+        let row = tui::row(&buffer, y);
+        assert!(row.contains("MIRA LENZ"), "artist at 120 columns: {row:?}");
+        assert!(row.contains("00:00 ▕"), "elapsed time and bar: {row:?}");
+        assert!(row.contains("▏ 05:52"), "duration after the bar: {row:?}");
+        assert!(row.contains("VOL "), "volume: {row:?}");
+        let title = tui::text_styles(&buffer, "HALCYON DRIFT").unwrap();
+        assert!(title.iter().all(|s| s.add_modifier.contains(Modifier::BOLD)));
+    }
+
+    // Under 90 columns the strip shows the title only.
+    app.active_tab = 1;
+    let buffer = tui::render(&mut app, 85, 30);
+    let y = tui::find_row(&buffer, "■ HALCYON DRIFT").expect("strip at 85 columns");
+    assert!(!tui::row(&buffer, y).contains("MIRA LENZ"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn strip_marks_a_pending_skip_as_queued() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("strip_skip");
+    app.queue.add_track(track(&dir, "One", "A"));
+    app.queue.add_track(track(&dir, "Two", "B"));
+    app.queue.current_index = 1;
+    app.pending_track_skip = true;
+    app.active_tab = 1;
+    let buffer = tui::render(&mut app, 120, 40);
+    let y = tui::find_row(&buffer, "TWO").expect("strip names the skip target");
+    let row = tui::row(&buffer, y);
+    assert!(row.contains("QUEUED"), "{row:?}");
+    assert!(row.contains("00:00"), "{row:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn key_row_trims_with_width_and_always_keeps_help() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("keys");
+    app.status_message.clear();
+    for tab in 0..5 {
+        app.active_tab = tab;
+        for width in [120u16, 100, 85, 80, 70, 40] {
+            let buffer = tui::render(&mut app, width, 30);
+            let y = key_row_index(&buffer);
+            let row = tui::row(&buffer, y);
+            assert!(row.starts_with("   "), "2-column gutter, then a keycap: {row:?}");
+            if tab == 0 {
+                assert!(row.contains(" N  QUEUE"), "tab {tab} at {width}: {row:?}");
+                assert!(!row.to_uppercase().contains("ESC"), "tab {tab} at {width}: {row:?}");
+            }
+            if (80..90).contains(&width) {
+                assert!(keycap_count(&buffer, y) <= 5, "at most 5 keys at {width}: {row:?}");
+            }
+        }
+    }
+
+    // Wide enough for the whole Queue & Library row.
+    app.active_tab = 1;
+    app.queue_focus = false;
+    let buffer = tui::render(&mut app, 120, 30);
+    let row = tui::row(&buffer, key_row_index(&buffer));
+    for label in [
+        " H L  PANE",
+        " ENTER  OPEN / ADD",
+        " A  ADD ALL",
+        " /  SPOTLIGHT",
+        " F  SEARCH",
+        " V  TAGS/FILES",
+    ] {
+        assert!(row.contains(label), "{label:?} missing: {row:?}");
+    }
+    // Narrower rows drop the least important keys first.
+    let buffer = tui::render(&mut app, 70, 30);
+    let row = tui::row(&buffer, key_row_index(&buffer));
+    assert!(!row.contains("TAGS/FILES"), "{row:?}");
+    assert!(row.contains("ENTER"), "{row:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn now_playing_key_row_shows_play_state_seek_step_and_volume() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("np_keys");
+    app.active_tab = 0;
+    app.settings_mgr.settings.seek_step_seconds = 30.0;
+    let buffer = tui::render(&mut app, 120, 40);
+    let row = tui::row(&buffer, key_row_index(&buffer));
+    for label in [
+        " SPC  PLAY",
+        " ←→  TRACK",
+        " [ ]  SEEK 30S",
+        " +−  VOL",
+        " N  QUEUE",
+        " ?  KEYS",
+    ] {
+        assert!(row.contains(label), "{label:?} missing: {row:?}");
+    }
+    assert!(row.contains("VOL ▮") || row.contains("VOL ▯"), "volume meter: {row:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn playlists_key_row_follows_the_focused_pane() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("pl_keys");
+    for _ in 0..200 {
+        app.poll_playlists();
+        if app.playlists.store.is_loaded() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The tracks pane only takes focus with a playlist selected.
+    if app.playlists.store.index_of("Chrome Keys").is_none() {
+        app.playlists.store.create("Chrome Keys").unwrap();
+    }
+    app.active_tab = 4;
+    app.playlists.tracks_focus = false;
+    let buffer = tui::render(&mut app, 120, 40);
+    let row = tui::row(&buffer, key_row_index(&buffer));
+    assert!(row.contains(" C ⇧R ⇧D  NEW / RENAME / DELETE"), "{row:?}");
+    assert!(!row.contains("MOVE TRACK"), "{row:?}");
+
+    app.playlists.tracks_focus = true;
+    let buffer = tui::render(&mut app, 120, 40);
+    let row = tui::row(&buffer, key_row_index(&buffer));
+    assert!(row.contains(" ⇧J ⇧K  MOVE TRACK"), "{row:?}");
+    assert!(row.contains(" D  REMOVE"), "{row:?}");
+    assert!(row.contains(" ENTER  PLAY"), "{row:?}");
+    assert!(!row.contains("RENAME"), "c/R/D do nothing in the tracks pane: {row:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn status_message_sits_at_the_right_of_the_key_row() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("status");
+    app.active_tab = 2;
+    let p = theme::palette();
+
+    app.status_message = "Scanning for DLNA MediaRenderers...".to_string();
+    let buffer = tui::render(&mut app, 120, 40);
+    let y = key_row_index(&buffer);
+    let row = tui::row(&buffer, y);
+    assert!(
+        row.trim_end().ends_with("Scanning for DLNA MediaRenderers..."),
+        "{row:?}"
+    );
+    let styles = tui::text_styles(&buffer, "Scanning for DLNA").unwrap();
+    assert!(styles.iter().all(|s| s.fg == Some(p.mid)), "plain status in MID");
+
+    for message in [
+        "Playback error: broken pipe",
+        "Failed to start server: in use",
+        "Couldn't read Music",
+    ] {
+        app.status_message = message.to_string();
+        let buffer = tui::render(&mut app, 120, 40);
+        let styles = tui::text_styles(&buffer, message).unwrap_or_else(|| panic!("{message:?} not shown"));
+        assert!(styles.iter().all(|s| s.fg == Some(p.error)), "{message:?} in ERROR");
+    }
+
+    // Redundant messages are not repeated.
+    app.status_message = "Welcome to Quickstream (Rust)".to_string();
+    let buffer = tui::render(&mut app, 120, 40);
+    assert!(tui::find_row(&buffer, "Welcome").is_none());
+
+    // A long message takes the room of the least important keys, never `? KEYS`.
+    app.status_message = "x".repeat(150);
+    let buffer = tui::render(&mut app, 120, 40);
+    let row = tui::row(&buffer, key_row_index(&buffer));
+    assert!(row.contains(" ?  KEYS") && row.contains('…'), "{row:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn now_playing_status_shares_the_row_with_the_volume_meter() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("np_status");
+    app.active_tab = 0;
+    app.status_message = "Volume 65%".to_string();
+    let buffer = tui::render(&mut app, 120, 40);
+    let row = tui::row(&buffer, key_row_index(&buffer));
+    assert!(row.contains("Volume 65%"), "{row:?}");
+    assert!(row.contains("VOL ▮") || row.contains("VOL ▯"), "{row:?}");
+    assert!(row.find("Volume 65%") < row.find("VOL ▮").or(row.find("VOL ▯")));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn chrome_renders_without_panicking_down_to_40x12() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("sizes");
+    app.queue.add_track(track(&dir, "Halcyon Drift", "Mira Lenz"));
+    app.status_message = "Couldn't read a folder with a rather long name".to_string();
+    for tab in 0..5 {
+        app.active_tab = tab;
+        for (w, h) in [
+            (120, 40),
+            (100, 30),
+            (85, 30),
+            (80, 24),
+            (70, 24),
+            (80, 20),
+            (40, 12),
+            (12, 4),
+            (1, 1),
+        ] {
+            let buffer = tui::render(&mut app, w, h);
+            if w >= 40 {
+                let row = tui::row(&buffer, key_row_index(&buffer));
+                assert!(row.contains(" ?  KEYS"), "tab {tab} at {w}x{h}: {row:?}");
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
 }
