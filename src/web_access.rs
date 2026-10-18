@@ -475,16 +475,41 @@ pub fn home_dir() -> Option<PathBuf> {
 /// Canonicalize `path` and return it if it lies inside one of `roots` (also canonicalized).
 /// Relative paths, missing paths and symlinks leading out of the roots are refused, and so are
 /// roots that resolve to the filesystem root or the home folder (see [`is_acceptable_root`]).
+/// Canonicalizes every root on each call: to check many paths, build [`AllowedRoots`] once.
 pub fn resolve_allowed_path(path: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
-    if !path.is_absolute() {
-        return None;
+    AllowedRoots::new(roots).resolve(path)
+}
+
+/// The allowed folders canonicalized once, for checking many paths against them (a playlist's
+/// entries): [`AllowedRoots::resolve`] gives the same answer as [`resolve_allowed_path`] with the
+/// same roots, without reading the roots again. Touches the disk: never on the UI thread.
+#[derive(Debug, Clone, Default)]
+pub struct AllowedRoots(Vec<PathBuf>);
+
+impl AllowedRoots {
+    /// Canonicalize `roots`, dropping the ones that don't exist and the ones that resolve to the
+    /// filesystem root or the home folder.
+    pub fn new(roots: &[PathBuf]) -> Self {
+        let home = home_dir().map(|h| std::fs::canonicalize(&h).unwrap_or(h));
+        Self(
+            roots
+                .iter()
+                .filter_map(|r| std::fs::canonicalize(r).ok())
+                .filter(|root| is_acceptable_root(root, home.as_deref()))
+                .collect(),
+        )
     }
-    let canonical = std::fs::canonicalize(path).ok()?;
-    let home = home_dir().map(|h| std::fs::canonicalize(&h).unwrap_or(h));
-    roots
-        .iter()
-        .filter_map(|r| std::fs::canonicalize(r).ok())
-        .filter(|root| is_acceptable_root(root, home.as_deref()))
-        .any(|root| canonical.starts_with(&root))
-        .then_some(canonical)
+
+    /// Canonicalize `path` and return it if it lies inside one of the roots. Relative and
+    /// missing paths are refused, and so are symlinks leading out of the roots.
+    pub fn resolve(&self, path: &Path) -> Option<PathBuf> {
+        if !path.is_absolute() || self.0.is_empty() {
+            return None;
+        }
+        let canonical = std::fs::canonicalize(path).ok()?;
+        self.0
+            .iter()
+            .any(|root| canonical.starts_with(root))
+            .then_some(canonical)
+    }
 }

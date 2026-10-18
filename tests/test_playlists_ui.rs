@@ -138,11 +138,11 @@ fn test_startup_load_reserves_the_names_of_skipped_files() {
 
     assert_eq!(
         app.playlists.store.create("latin"),
-        Err(StoreError::Name(NameError::Duplicate("Latin".to_string())))
+        Err(StoreError::Name(NameError::Reserved("Latin".to_string())))
     );
     assert_eq!(
         app.playlists.store.create("MIX"),
-        Err(StoreError::Name(NameError::Duplicate("Mix".to_string())))
+        Err(StoreError::Name(NameError::Reserved("Mix".to_string())))
     );
     assert!(app.playlists.store.playlists().is_empty());
 
@@ -459,5 +459,275 @@ fn test_tab_5_label_is_highlighted_at_80_columns_after_pressing_5() {
         );
     }
 
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+/// Render at `width` x 30 and check `label` sits whole on the tab bar, highlighted as the
+/// active tab. Returns the tab bar row.
+fn assert_active_tab_label(app: &mut AppUI, width: u16, label: &str) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+    terminal.draw(|f| app.render(f)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let cells: Vec<String> = (0..width).map(|x| buffer[(x, 0)].symbol().to_string()).collect();
+    let row: String = cells.concat();
+    let len = label.chars().count();
+    let start = (0..cells.len().saturating_sub(len - 1))
+        .find(|&x| cells[x..x + len].concat() == label)
+        .unwrap_or_else(|| panic!("{label:?} not on the {width}-column tab bar: {row:?}"));
+    for x in start..start + len {
+        let cell = &buffer[(x as u16, 0)];
+        assert_eq!(
+            cell.fg,
+            ratatui::style::Color::Cyan,
+            "column {x} of {label:?} is not highlighted at {width} columns: {row:?}"
+        );
+        assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
+    }
+    row
+}
+
+#[test]
+fn test_active_tab_label_stays_visible_below_79_columns() {
+    common::isolate();
+    // Issue #59: below 79 columns the full labels don't fit and `[5] Playlists` was clipped, so
+    // tab 5 had no visible active tab.
+    let temp_dir = fresh_dirs("tabbar_narrow");
+    let mut app = new_app(&temp_dir);
+    press(&mut app, KeyCode::Char('5'));
+    assert_eq!(app.active_tab, 4);
+
+    // 79 columns still fits every full label.
+    let row = assert_active_tab_label(&mut app, 79, "[5] Playlists");
+    assert!(row.contains("[2] Queue & Library"), "{row:?}");
+
+    // Narrower, the labels shorten but every tab is still named.
+    for width in [78, 60] {
+        let row = assert_active_tab_label(&mut app, width, "[5] Playlists");
+        for label in ["[1] Now", "[2] Library", "[3] Devices", "[4] Settings"] {
+            assert!(row.contains(label), "missing {label:?} at {width} columns: {row:?}");
+        }
+    }
+
+    // Narrower still, the other tabs show only their numbers.
+    let row = assert_active_tab_label(&mut app, 40, "[5] Playlists");
+    for label in ["[1]", "[2]", "[3]", "[4]"] {
+        assert!(row.contains(label), "missing {label:?} at 40 columns: {row:?}");
+    }
+
+    // Any tab can be the active one.
+    app.active_tab = 1;
+    assert_active_tab_label(&mut app, 60, "[2] Library");
+    assert_active_tab_label(&mut app, 40, "[2] Library");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+/// Column (in characters) where `text` starts on the first row of `view` containing it.
+fn text_column(view: &str, text: &str) -> usize {
+    let line = view
+        .lines()
+        .find(|l| l.contains(text))
+        .unwrap_or_else(|| panic!("{text:?} not rendered:\n{view}"));
+    line[..line.find(text).unwrap()].chars().count()
+}
+
+#[test]
+fn test_help_modal_descriptions_line_up() {
+    common::isolate();
+    // Issue #59: `c / R / D` and `Enter/a` overflowed the key field, pushing their descriptions
+    // out of line with the rest of the column.
+    let temp_dir = fresh_dirs("help_align");
+    let mut app = new_app(&temp_dir);
+    press(&mut app, KeyCode::Char('?'));
+    assert!(app.show_help_modal);
+
+    for (width, height) in [(80, 24), (120, 40)] {
+        let view = render(&mut app, width, height);
+        let left = [
+            "Play / Pause",
+            "Previous / Next track",
+            "Tab: Now/Queue/Dev/Set/PL",
+            "New / Rename / Delete",
+            "Open/Play / Queue playlist",
+        ];
+        let right = [
+            "Open / Queue / Play",
+            "Autopilot (adds if playing)",
+            "Add to playlist",
+            "Set folder as startup home",
+            "Full library fuzzy search",
+        ];
+        for column in [&left, &right] {
+            let expected = text_column(&view, column[0]);
+            for desc in column.iter() {
+                assert_eq!(
+                    text_column(&view, desc),
+                    expected,
+                    "{desc:?} is out of line at {width}x{height}:\n{view}"
+                );
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_mix_picker_first_option_row_is_not_overdrawn() {
+    common::isolate();
+    // Issue #59: a leftover footer drew "Press [?], [Esc], or [q] to close" over the `[1]` row.
+    let temp_dir = fresh_dirs("mix_picker");
+    let mut app = new_app(&temp_dir);
+    app.handle_input_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(app.show_mix_picker_modal);
+
+    for (width, height) in [(80, 24), (120, 40)] {
+        let view = render(&mut app, width, height);
+        assert!(!view.contains("to close"), "{view}");
+        // Skip the tab bar, whose first label also starts with `[1]`.
+        let row = view
+            .lines()
+            .skip(1)
+            .find(|l| l.contains("[1]"))
+            .unwrap_or_else(|| panic!("no [1] row at {width}x{height}:\n{view}"));
+        assert!(
+            row.contains("[1] Diverse Artists Shuffle") && row.contains("— Fair random sampling"),
+            "[1] row overdrawn at {width}x{height}: {row:?}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+fn press_with(app: &mut AppUI, code: KeyCode, modifiers: KeyModifiers) {
+    app.handle_input_key(KeyEvent::new(code, modifiers)).unwrap();
+}
+
+#[test]
+fn test_playlists_tab_g_shift_g_and_page_keys_in_both_panes() {
+    common::isolate();
+    // Issue #52: g / G jump to the first / last row and PageUp / PageDown move a page, clamped
+    // at the ends (no wraparound), in both panes.
+    let temp_dir = fresh_dirs("jump_page");
+    for i in 0..12 {
+        write_playlist(&format!("List {:02}", i), Vec::new());
+    }
+    let tracks: Vec<PlaylistEntry> = (0..12)
+        .map(|i| {
+            entry(
+                &temp_dir,
+                &format!("t{:02}.flac", i),
+                "A",
+                &format!("Track {:02}", i),
+                60,
+            )
+        })
+        .collect();
+    write_playlist("List 00", tracks);
+    let mut app = new_app(&temp_dir);
+    wait_loaded(&mut app);
+    press(&mut app, KeyCode::Char('5'));
+    app.playlists.list_page_height = 5;
+    app.playlists.tracks_page_height = 4;
+
+    // Left pane.
+    press(&mut app, KeyCode::PageDown);
+    assert_eq!(app.playlists.list_cursor, 5);
+    press(&mut app, KeyCode::PageDown);
+    assert_eq!(app.playlists.list_cursor, 10);
+    press(&mut app, KeyCode::PageDown);
+    assert_eq!(app.playlists.list_cursor, 11, "PageDown stops at the last row");
+    press(&mut app, KeyCode::PageDown);
+    assert_eq!(app.playlists.list_cursor, 11, "PageDown does not wrap");
+    press(&mut app, KeyCode::PageUp);
+    assert_eq!(app.playlists.list_cursor, 6);
+    press(&mut app, KeyCode::PageUp);
+    press(&mut app, KeyCode::PageUp);
+    assert_eq!(app.playlists.list_cursor, 0, "PageUp stops at the first row");
+    press(&mut app, KeyCode::PageUp);
+    assert_eq!(app.playlists.list_cursor, 0, "PageUp does not wrap");
+    press_with(&mut app, KeyCode::Char('G'), KeyModifiers::SHIFT);
+    assert_eq!(app.playlists.list_cursor, 11);
+    press(&mut app, KeyCode::Char('g'));
+    assert_eq!(app.playlists.list_cursor, 0);
+    assert!(!app.playlists.tracks_focus);
+
+    // Tracks pane: the playlist selection stays put.
+    press(&mut app, KeyCode::Char('l'));
+    assert!(app.playlists.tracks_focus);
+    press_with(&mut app, KeyCode::Char('G'), KeyModifiers::SHIFT);
+    assert_eq!(app.playlists.track_cursor, 11);
+    press(&mut app, KeyCode::PageDown);
+    assert_eq!(app.playlists.track_cursor, 11, "PageDown does not wrap");
+    press(&mut app, KeyCode::PageUp);
+    assert_eq!(app.playlists.track_cursor, 7);
+    press(&mut app, KeyCode::Char('g'));
+    assert_eq!(app.playlists.track_cursor, 0);
+    press(&mut app, KeyCode::PageDown);
+    assert_eq!(app.playlists.track_cursor, 4);
+    assert_eq!(app.playlists.list_cursor, 0);
+
+    // Home / End match g / G, as on tab 2.
+    press(&mut app, KeyCode::End);
+    assert_eq!(app.playlists.track_cursor, 11);
+    press(&mut app, KeyCode::Home);
+    assert_eq!(app.playlists.track_cursor, 0);
+
+    // Moving to another playlist from the left pane starts its tracks at the top.
+    press(&mut app, KeyCode::PageDown);
+    press(&mut app, KeyCode::Char('h'));
+    press_with(&mut app, KeyCode::Char('G'), KeyModifiers::SHIFT);
+    assert_eq!(app.playlists.list_cursor, 11);
+    assert_eq!(app.playlists.track_cursor, 0);
+
+    // None of these keys changed tab, playback or the queue.
+    assert_eq!(app.active_tab, 4);
+    assert!(app.queue.is_empty());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_playlists_tab_page_size_follows_the_rendered_list_height() {
+    common::isolate();
+    let temp_dir = fresh_dirs("page_height");
+    write_playlist("Alpha", vec![entry(&temp_dir, "a1.flac", "A", "One", 60)]);
+    let mut app = new_app(&temp_dir);
+    wait_loaded(&mut app);
+    press(&mut app, KeyCode::Char('5'));
+
+    render(&mut app, 120, 30);
+    let (list_30, tracks_30) = (app.playlists.list_page_height, app.playlists.tracks_page_height);
+    render(&mut app, 120, 40);
+    let (list_40, tracks_40) = (app.playlists.list_page_height, app.playlists.tracks_page_height);
+    assert!(list_30 > 1 && tracks_30 > 1, "{list_30} {tracks_30}");
+    assert_eq!(list_40 - list_30, 10, "a page is the number of visible rows");
+    assert_eq!(tracks_40 - tracks_30, 10, "a page is the number of visible rows");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_help_modal_lists_page_keys() {
+    common::isolate();
+    let temp_dir = fresh_dirs("help_page");
+    let mut app = new_app(&temp_dir);
+    press(&mut app, KeyCode::Char('?'));
+    for (width, height) in [(80, 24), (120, 40)] {
+        let view = render(&mut app, width, height);
+        for text in [
+            "PgUp/PgDn",
+            "Page Up / Down (tabs 2 & 5)",
+            "Jump to Start / End",
+            "~",
+            "Jump to startup home dir",
+        ] {
+            assert!(
+                view.contains(text),
+                "{width}x{height} help should show {text:?}:\n{view}"
+            );
+        }
+    }
     let _ = fs::remove_dir_all(&temp_dir);
 }

@@ -12,9 +12,11 @@ use ratatui::widgets::*;
 
 pub mod playlists;
 pub mod search;
+pub mod tag_reads;
 pub mod workers;
 
 use self::search::SearchModalState;
+use self::tag_reads::{SharedTagReads, TagRead};
 use self::workers::WorkerRegistry;
 use crate::discovery::DeviceManager;
 use crate::metadata::is_supported_audio_file;
@@ -64,19 +66,20 @@ fn spawn_local_player(backend: &str, initial_volume: u8) -> Box<dyn AudioPlayer>
     ))
 }
 
-/// Start 4 threads that read tags for paths sent to the returned inbox and report results on
-/// `metadata_tx`. The threads exit once the inbox sender is dropped or `stop` is set (paths still
-/// queued in the inbox are then skipped).
+/// Start 4 threads that read tags for paths sent to the returned inbox through `tag_reads`, which
+/// reports results on `metadata_tx`. A path another worker is reading right now is skipped: that
+/// read reports it. The threads exit once the inbox sender is dropped or `stop` is set (paths
+/// still queued in the inbox are then skipped).
 fn spawn_queue_metadata_workers(
     workers: &mut WorkerRegistry,
-    metadata_tx: std::sync::mpsc::Sender<crate::metadata::AudioMetadata>,
+    tag_reads: SharedTagReads,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::sync::mpsc::Sender<PathBuf> {
     let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
     let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
     for _ in 0..4 {
         let rx = rx.clone();
-        let metadata_tx = metadata_tx.clone();
+        let tag_reads = tag_reads.clone();
         let stop = stop.clone();
         workers.spawn("queue-metadata", move || loop {
             let path = match rx.lock() {
@@ -89,12 +92,7 @@ fn spawn_queue_metadata_workers(
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
-            if let Ok(meta) = crate::metadata::extract_metadata(&path) {
-                crate::library::LibraryManager::append_to_cache(&meta);
-                if metadata_tx.send(meta).is_err() {
-                    break;
-                }
-            }
+            tag_reads.read_unless_busy(&path);
         });
     }
     tx
@@ -234,6 +232,9 @@ pub struct AppUI {
     pub queue_metadata_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Paths already sent to the queue metadata workers this session.
     pub queue_metadata_attempted: std::collections::HashSet<PathBuf>,
+    /// Tag reads shared by the browser, queue and folder-add workers, so no two of them read
+    /// the same file at once (issue #52).
+    tag_reads: SharedTagReads,
     /// Handles of background worker threads, joined (with a bounded wait) on shutdown.
     pub workers: WorkerRegistry,
     pub browser_state: ListState,
@@ -336,6 +337,7 @@ impl AppUI {
         let (metadata_tx, metadata_rx) = std::sync::mpsc::channel();
         let (queue_add_tx, queue_add_rx) = std::sync::mpsc::channel();
         let metadata_cache = crate::library::MetadataCache::from(crate::library::LibraryManager::load_cache_map());
+        let tag_reads = SharedTagReads::new(metadata_cache.clone(), metadata_tx.clone());
         let (dir_scan_tx, dir_scan_rx) = std::sync::mpsc::channel();
         let analysis_db = crate::analysis::AnalysisDatabase::open_default()
             .unwrap_or_else(|_| crate::analysis::AnalysisDatabase::open_in_memory().unwrap());
@@ -376,6 +378,7 @@ impl AppUI {
             queue_metadata_tx: None,
             queue_metadata_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             queue_metadata_attempted: std::collections::HashSet::new(),
+            tag_reads,
             workers: WorkerRegistry::new(),
             browser_state: ListState::default(),
             queue_state: ListState::default(),
@@ -960,7 +963,7 @@ impl AppUI {
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.metadata_worker_stop = Some(stop.clone());
-        let tx = self.metadata_tx.clone();
+        let tag_reads = self.tag_reads.clone();
 
         self.workers.spawn("browser-metadata", move || {
             let fetch_start = std::time::Instant::now();
@@ -969,12 +972,10 @@ impl AppUI {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                if let Ok(meta) = crate::metadata::extract_metadata(&path) {
-                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
-                    }
-                    crate::library::LibraryManager::append_to_cache(&meta);
-                    let _ = tx.send(meta);
+                // A file another worker is reading is skipped; that read refreshes its label.
+                // A finished read is always published, even if the stop flag was set meanwhile:
+                // a worker that skipped the file, or is waiting for it, relies on these tags.
+                if tag_reads.read_unless_busy(&path) == TagRead::Read {
                     extracted += 1;
                 }
             }
@@ -1014,11 +1015,11 @@ impl AppUI {
             return;
         }
 
-        let metadata_tx = self.metadata_tx.clone();
+        let tag_reads = self.tag_reads.clone();
         let (workers, stop) = (&mut self.workers, self.queue_metadata_stop.clone());
         let tx = self
             .queue_metadata_tx
-            .get_or_insert_with(|| spawn_queue_metadata_workers(workers, metadata_tx, stop));
+            .get_or_insert_with(|| spawn_queue_metadata_workers(workers, tag_reads, stop));
         for path in new_paths {
             let _ = tx.send(path);
         }
@@ -1054,6 +1055,24 @@ impl AppUI {
             self.start_queue_metadata_fetch();
         }
         added
+    }
+
+    /// Insert tracks before queue position `index`, keeping the current track and the cursor on
+    /// the rows they were on, and resolve missing tags on background workers.
+    fn insert_queue_tracks(&mut self, index: usize, tracks: Vec<crate::metadata::AudioMetadata>) {
+        let count = tracks.len();
+        if count == 0 {
+            return;
+        }
+        let index = index.min(self.queue.len());
+        for meta in &tracks {
+            self.register_stream_file(&meta.filepath);
+        }
+        if !self.queue.is_empty() && index <= self.queue_cursor {
+            self.queue_cursor += count;
+        }
+        self.queue.insert_tracks(index, tracks);
+        self.start_queue_metadata_fetch();
     }
 
     /// Keep the queue cursor on a real row after the queue shrinks.
@@ -1204,11 +1223,7 @@ impl AppUI {
             let gapless = self.settings_mgr.settings.gapless_autopilot;
 
             if is_dlna && gapless {
-                if let Some(ref ws) = self.web_server {
-                    ws.close_active_streams();
-                    *ws.stream_state().continuous.current_track_index.lock().unwrap() = 0;
-                    *ws.stream_state().continuous.current_position.lock().unwrap() = 0.0;
-                }
+                self.end_continuous_stream();
                 if let Ok(mut s) = self.web_state.write() {
                     s.is_autopilot = true;
                     s.autopilot_dir = self.autopilot_dir.as_ref().map(|d| d.to_string_lossy().to_string());
@@ -1492,6 +1507,19 @@ impl AppUI {
         self.workers.spawn("retire-player", move || drop(player));
     }
 
+    /// Replace the tag reader used by workers started from now on (tests use a counting or
+    /// blocking stand-in for the share). Public only because integration tests in `tests/`
+    /// drive `AppUI` directly.
+    #[doc(hidden)]
+    pub fn set_tag_reader(&mut self, reader: tag_reads::TagReader) {
+        self.tag_reads.set_reader(reader);
+    }
+
+    /// Number of files a background worker is reading tags from right now.
+    pub fn tag_reads_in_flight(&self) -> usize {
+        self.tag_reads.in_flight()
+    }
+
     /// Number of background worker threads still running.
     pub fn live_worker_count(&mut self) -> usize {
         self.workers.live_count()
@@ -1574,7 +1602,7 @@ impl AppUI {
             // Check if active track finished and auto-advance queue
             if self.player.is_track_finished() {
                 self.player.reset_finished();
-                self.play_next_track();
+                self.handle_track_finished();
             }
 
             // Synchronize continuous gapless stream track index
@@ -1850,6 +1878,9 @@ impl AppUI {
         if self.queue.is_empty() {
             return;
         }
+        if self.hold_skip_for_playlist_fill(playlists::PlaylistSkip::Next) {
+            return;
+        }
 
         let raw_mode = self.settings_mgr.settings.queue_mode.clone();
         let mode = if raw_mode == "repeat_one" { "loop" } else { &raw_mode };
@@ -1872,6 +1903,9 @@ impl AppUI {
 
     pub fn skip_prev_track_debounced(&mut self) {
         if self.queue.is_empty() {
+            return;
+        }
+        if self.hold_skip_for_playlist_fill(playlists::PlaylistSkip::Previous) {
             return;
         }
 
@@ -2749,6 +2783,18 @@ impl AppUI {
         playback_error
     }
 
+    /// The player reported that the current track ended: go on to the next one.
+    pub fn handle_track_finished(&mut self) {
+        // While tab 5's Enter is still checking the rest of a playlist, the next track may not
+        // be queued yet: wait for it rather than stop or replay (repeat-one replays anyway).
+        if self.settings_mgr.settings.queue_mode != "repeat_one"
+            && self.hold_skip_for_playlist_fill(playlists::PlaylistSkip::Ended)
+        {
+            return;
+        }
+        self.play_next_track();
+    }
+
     pub fn play_next_track(&mut self) {
         self.pending_track_skip = false;
         self.last_track_skip_time = None;
@@ -2858,12 +2904,46 @@ impl AppUI {
         self.start_autopilot_with_mode(dir, mode);
     }
 
-    pub fn start_autopilot_with_mode(&mut self, dir: PathBuf, mode: AutopilotRunMode) {
-        self.supersede_playlist_queue();
-        // 1. Cancel any active autopilot scanner
+    /// Stop any autopilot scan: signal its worker and drop its channel.
+    fn stop_autopilot_scan(&mut self) {
         if let Some(stop) = self.autopilot_scan_stop.take() {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        self.autopilot_rx = None;
+        self.is_autopilot_scanning = false;
+    }
+
+    /// End any continuous DLNA stream and rewind its track index and position, so the next
+    /// continuous session starts from the top of the queue.
+    fn end_continuous_stream(&self) {
+        if let Some(ref ws) = self.web_server {
+            ws.close_active_streams();
+            *ws.stream_state().continuous.current_track_index.lock().unwrap() = 0;
+            *ws.stream_state().continuous.current_position.lock().unwrap() = 0.0;
+        }
+    }
+
+    /// Stop playback and empty the queue.
+    fn stop_and_clear_queue(&mut self) {
+        let _ = self.player.stop();
+        self.queue.clear();
+        self.queue_cursor = 0;
+    }
+
+    /// End the whole playback session before something else replaces the queue: stop any
+    /// autopilot scan, end any continuous DLNA stream, stop playback and empty the queue.
+    pub fn reset_playback_session(&mut self) {
+        self.stop_autopilot_scan();
+        // The queue is no longer an autopilot mix (web dashboard badge).
+        self.autopilot_dir = None;
+        self.end_continuous_stream();
+        self.stop_and_clear_queue();
+    }
+
+    pub fn start_autopilot_with_mode(&mut self, dir: PathBuf, mode: AutopilotRunMode) {
+        self.supersede_playlist_queue();
+        // 1. Cancel any active autopilot scanner (its channel is replaced below)
+        self.stop_autopilot_scan();
         let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.autopilot_scan_stop = Some(stop_flag.clone());
 
@@ -2877,11 +2957,8 @@ impl AppUI {
         match mode {
             AutopilotRunMode::Fresh => {
                 // Clear current queue and stop previous playback
-                self.queue.clear();
-                self.queue.current_index = 0;
-                self.queue_cursor = 0;
+                self.stop_and_clear_queue();
                 self.status_message = format!("⚡ Autopilot: Discovering tracks from '{}'...", dir_display);
-                let _ = self.player.stop();
             }
             AutopilotRunMode::Append => {
                 // Keep current queue and playback uninterrupted
@@ -3361,6 +3438,22 @@ impl AppUI {
                         path.display()
                     );
                 }
+                crate::web::WebCommand::QueuePlaylist {
+                    name,
+                    entries,
+                    play_from,
+                    reply,
+                } => {
+                    let result = self.queue_web_playlist(name, entries, play_from);
+                    reply.send(result);
+                }
+                crate::web::WebCommand::CheckPlaylists => self.check_playlists_for_web(),
+                crate::web::WebCommand::EditPlaylist(edit, reply) => {
+                    let result = self.apply_web_playlist_edit(edit);
+                    // Publish first, so the dashboard's reload after the answer sees the edit.
+                    self.update_web_state();
+                    reply.send(result);
+                }
             }
         }
     }
@@ -3518,6 +3611,7 @@ impl AppUI {
                 state.next_track_title = None;
             }
         }
+        self.publish_web_playlists();
     }
 
     pub fn render(&mut self, f: &mut Frame) {
@@ -3555,13 +3649,7 @@ impl AppUI {
     }
 
     fn render_tabs(&self, f: &mut Frame, area: Rect) {
-        let titles = vec![
-            " [1] Now Playing",
-            " [2] Queue & Library",
-            " [3] Devices",
-            " [4] Settings",
-            " [5] Playlists",
-        ];
+        let titles = tab_titles(area.width, self.active_tab);
         // Zero padding keeps all five labels inside a standard 80-column terminal.
         let tabs = Tabs::new(titles)
             .padding("", "")
@@ -4593,31 +4681,29 @@ impl AppUI {
             ));
         }
 
-        // Output Device (without "Out:" prefix)
+        // Output device (without "Out:" prefix), volume and web server badge, each after a
+        // separator. Kept apart so a long status can take their room (see below).
+        let separator = || Span::styled("  │  ", Style::default().fg(Color::DarkGray));
         let active_dev_name = self
             .device_manager
             .get_active_device()
             .map(|d| d.friendly_name)
             .unwrap_or_else(|| "Local Audio".to_string());
-        row2_spans.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
-        row2_spans.push(Span::styled(active_dev_name, Style::default().fg(Color::White)));
-
-        // Volume
+        let device = vec![
+            separator(),
+            Span::styled(active_dev_name, Style::default().fg(Color::White)),
+        ];
         let vol = self.player.volume();
-        row2_spans.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
-        row2_spans.push(Span::styled(
-            format!("Vol: {}%", vol),
-            Style::default().fg(Color::White),
-        ));
-
-        // Web server badge
-        if let Some(ref s) = self.web_server {
-            row2_spans.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
-            row2_spans.push(Span::styled(
-                format!("🌐 :{}", s.port),
-                Style::default().fg(Color::Cyan),
-            ));
-        }
+        let volume = vec![
+            separator(),
+            Span::styled(format!("Vol: {}%", vol), Style::default().fg(Color::White)),
+        ];
+        let web = self.web_server.as_ref().map(|s| {
+            vec![
+                separator(),
+                Span::styled(format!("🌐 :{}", s.port), Style::default().fg(Color::Cyan)),
+            ]
+        });
 
         // Transient non-redundant notices
         let is_redundant = self.status_message.is_empty()
@@ -4627,16 +4713,34 @@ impl AppUI {
             || self.status_message == "Stopped"
             || self.status_message.starts_with("Welcome to Quickstream");
 
-        if !is_redundant {
-            row2_spans.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
+        let status = (!is_redundant).then(|| {
             let msg_lower = self.status_message.to_lowercase();
             let msg_style = if msg_lower.contains("error") || msg_lower.contains("failed") {
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Magenta)
             };
-            row2_spans.push(Span::styled(&self.status_message, msg_style));
+            vec![separator(), Span::styled(self.status_message.as_str(), msg_style)]
+        });
+
+        // A status that would be cut off at the right edge (an error naming two playlists, say)
+        // takes the room of the device name, then the web badge, then the volume: the status
+        // is the one part that changes, and the rest come back with the next shorter status.
+        let width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
+        let available = inner[1].width as usize;
+        let mut info = [Some(device), web, Some(volume)];
+        if let Some(status) = &status {
+            let needed = width(&row2_spans) + width(status);
+            for slot in 0..info.len() {
+                let shown: usize = info.iter().flatten().map(|spans| width(spans)).sum();
+                if needed + shown <= available {
+                    break;
+                }
+                info[slot] = None;
+            }
         }
+        let [device, web, volume] = info;
+        row2_spans.extend(device.into_iter().chain(volume).chain(web).chain(status).flatten());
 
         f.render_widget(Paragraph::new(Line::from(row2_spans)), inner[1]);
 
@@ -4707,7 +4811,8 @@ impl AppUI {
         }
 
         // Left Column: Playback & Navigation. Both columns must fit the 19 rows an 80x24
-        // terminal leaves for the key list, and each description fits in 29 columns there.
+        // terminal leaves for the key list, and each description fits in 27 columns there
+        // (38 per column, less the key field).
         let left_lines = vec![
             Self::help_section_header("PLAYBACK & AUDIO"),
             Self::help_key_line("Space", "Play / Pause"),
@@ -4723,19 +4828,19 @@ impl AppUI {
             Self::help_key_line("j / k", "Move Up / Down (wraps)"),
             Self::help_key_line("J / K", "Page (2) / Move track (5)"),
             Self::help_key_line("g / G", "Jump to Start / End"),
+            Self::help_key_line("PgUp/PgDn", "Page Up / Down (tabs 2 & 5)"),
             Self::help_key_line("Bksp", "Go up to parent dir"),
-            Self::help_key_line("~", "Jump to startup home dir"),
             Self::help_section_header("PLAYLISTS (TAB 5)"),
             Self::help_key_line("c / R / D", "New / Rename / Delete"),
             Self::help_key_line("Enter/a", "Open/Play / Queue playlist"),
         ];
         f.render_widget(Paragraph::new(left_lines), cols[0]);
 
-        // Right Column: Library & Search (concise to guarantee <= 34 chars)
+        // Right Column: Library & Search (descriptions <= 27 chars, as on the left)
         let right_lines = vec![
             Self::help_section_header("LIBRARY & QUEUE"),
             Self::help_key_line("Enter", "Open / Queue / Play"),
-            Self::help_key_line("p", "Autopilot (append if playing)"),
+            Self::help_key_line("p", "Autopilot (adds if playing)"),
             Self::help_key_line("P", "Autopilot Reshuffle (next+)"),
             Self::help_key_line("M", "Mix Picker modal (vibe/BPM)"),
             Self::help_key_line("r", "Seed Radio / Rescan dev"),
@@ -4746,6 +4851,7 @@ impl AppUI {
             Self::help_key_line("c", "Clear queue (queue pane)"),
             Self::help_key_line("b", "Bookmark folder in Homes"),
             Self::help_key_line("H", "Set folder as startup home"),
+            Self::help_key_line("~", "Jump to startup home dir"),
             Self::help_key_line("v", "Toggle tags vs filenames"),
             Line::from(""),
             Self::help_section_header("SEARCH & DISCOVERY"),
@@ -4874,20 +4980,6 @@ impl AppUI {
             Span::styled("Close", Style::default().fg(Color::White)),
         ]);
         f.render_widget(Paragraph::new(footer_line).alignment(Alignment::Center), inner[2]);
-
-        // Footer: dismiss instruction (if vertical room allows)
-        if inner.len() >= 2 {
-            let footer_line = Line::from(vec![
-                Span::styled("Press ", Style::default().fg(Color::DarkGray)),
-                Span::styled("[?]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(", ", Style::default().fg(Color::DarkGray)),
-                Span::styled("[Esc]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(", or ", Style::default().fg(Color::DarkGray)),
-                Span::styled("[q]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(" to close", Style::default().fg(Color::DarkGray)),
-            ]);
-            f.render_widget(Paragraph::new(footer_line).alignment(Alignment::Center), inner[1]);
-        }
     }
 
     fn help_section_header(title: &str) -> Line<'static> {
@@ -4900,7 +4992,7 @@ impl AppUI {
     fn help_key_line(key: &str, desc: &str) -> Line<'static> {
         Line::from(vec![
             Span::styled(
-                format!(" {:<7} ", key),
+                format!(" {:<width$} ", key, width = HELP_KEY_WIDTH),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
             Span::styled(desc.to_string(), Style::default().fg(Color::White)),
@@ -4931,6 +5023,49 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 fn help_modal_rect(r: Rect) -> Rect {
     modal_rect_with_height(r, 20)
 }
+
+/// Full tab labels: 79 columns with the dividers.
+const TAB_TITLES: [&str; 5] = [
+    " [1] Now Playing",
+    " [2] Queue & Library",
+    " [3] Devices",
+    " [4] Settings",
+    " [5] Playlists",
+];
+
+/// Short tab labels for terminals narrower than the full ones: 58 columns with the dividers.
+const SHORT_TAB_TITLES: [&str; 5] = ["[1] Now", "[2] Library", "[3] Devices", "[4] Settings", "[5] Playlists"];
+
+/// Tab bar labels that fit `width` columns, so the active tab stays visible: the full labels,
+/// else the short ones, else only the numbers with the active tab's short label.
+fn tab_titles(width: u16, active: usize) -> Vec<String> {
+    // Tabs draws a one-column divider between labels.
+    let fits = |titles: &[&str]| {
+        let text: usize = titles.iter().map(|t| t.chars().count()).sum();
+        text + titles.len() - 1 <= width as usize
+    };
+    if fits(&TAB_TITLES) {
+        return TAB_TITLES.iter().map(|t| t.to_string()).collect();
+    }
+    if fits(&SHORT_TAB_TITLES) {
+        return SHORT_TAB_TITLES.iter().map(|t| t.to_string()).collect();
+    }
+    SHORT_TAB_TITLES
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            if i == active {
+                t.to_string()
+            } else {
+                format!("[{}]", i + 1)
+            }
+        })
+        .collect()
+}
+
+/// Width of the help modal's key field: the longest key, `c / R / D`. A longer key would push
+/// its description out of line with the rest of the column.
+const HELP_KEY_WIDTH: usize = 9;
 
 /// Rows of the help modal: the key list, its footer and the border must fit.
 const HELP_MODAL_HEIGHT: u16 = 30;

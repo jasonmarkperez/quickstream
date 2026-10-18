@@ -95,11 +95,44 @@ fn render(app: &mut AppUI, width: u16, height: u16) -> String {
 fn test_mount_hint_is_the_first_two_folders() {
     common::isolate();
     assert_eq!(
-        mount_hint(Path::new("/Volumes/Share/Radiohead/OK Computer/01 Airbag.flac")),
-        "/Volumes/Share"
+        mount_hint(Path::new("/Volumes/Share/Radiohead/OK Computer/01 Airbag.flac")).as_deref(),
+        Some("/Volumes/Share")
     );
-    assert_eq!(mount_hint(Path::new("/Volumes/Share")), "/Volumes/Share");
-    assert_eq!(mount_hint(Path::new("/song.flac")), "/song.flac");
+    assert_eq!(
+        mount_hint(Path::new("/Volumes/Music/a/b.mp3")).as_deref(),
+        Some("/Volumes/Music")
+    );
+    assert_eq!(
+        mount_hint(Path::new("/Volumes/Share/song.flac")).as_deref(),
+        Some("/Volumes/Share")
+    );
+}
+
+#[test]
+fn test_mount_hint_never_names_a_file_or_a_top_level_folder() {
+    common::isolate();
+    // Issue #59: the hint comes from the folder holding the file, never the file itself. A file
+    // at `/` or directly in a top-level folder (`/Volumes`, `/mnt`) has no share to name:
+    // "Is /Volumes mounted?" reads wrong, so the hint is left out.
+    assert_eq!(mount_hint(Path::new("/ghost.mp3")), None);
+    assert_eq!(mount_hint(Path::new("/Volumes/ghost.mp3")), None);
+    assert_eq!(mount_hint(Path::new("/Volumes/Share")), None);
+}
+
+#[test]
+fn test_all_missing_without_a_mount_hint_leaves_out_the_question() {
+    common::isolate();
+    let dir = temp_dir("all_missing_root");
+    write_playlist(vec![entry(Path::new("/nonexistent-qs-ghost.mp3"), "A", "One")]);
+    let mut app = app_with_playlist(&dir);
+    install_recording_player(&mut app);
+    app.active_tab = 4;
+    app.playlists.tracks_focus = true;
+    app.playlists.track_cursor = 0;
+    press(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(poll_until(&mut app, |app| app.status_message.starts_with("None of")));
+    assert_eq!(app.status_message, "None of Road Trip's 1 track found.");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -625,7 +658,7 @@ fn test_second_queue_request_while_one_is_checking_starts_nothing() {
 
     // The active tab stays off tab 5, so no row existence checks call the checker.
     app.queue_selected_playlist(None);
-    assert_eq!(app.status_message, "Checking 1 tracks in Road Trip…");
+    assert_eq!(app.status_message, "Checking 1 track in Road Trip…");
     assert!(app.playlists.queue_check_pending());
     app.queue_selected_playlist(None);
     assert_eq!(app.status_message, "Still checking Road Trip…");
@@ -647,7 +680,7 @@ fn test_second_queue_request_while_one_is_checking_starts_nothing() {
 
     // Once the result is in, a new request starts.
     app.queue_selected_playlist(None);
-    assert_eq!(app.status_message, "Checking 1 tracks in Road Trip…");
+    assert_eq!(app.status_message, "Checking 1 track in Road Trip…");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -741,5 +774,526 @@ fn test_symlinked_entry_is_queued_by_its_checked_target() {
     app.persistence.flush();
     assert_eq!(std::fs::read(&file).unwrap(), before);
     assert_eq!(app.playlists.store.get(PLAYLIST).unwrap().entries[0].path, link);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A checker that answers `instant` paths at once (present when `true`) and blocks on every
+/// other path, like a stat on a hung share, until the returned sender is dropped; then it
+/// reports them present. It records the order of the paths it was asked about.
+fn checker_answering_first(
+    instant: Vec<(PathBuf, bool)>,
+) -> (ExistsChecker, std::sync::mpsc::Sender<()>, Arc<Mutex<Vec<PathBuf>>>) {
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+    let gate_rx = Arc::new(Mutex::new(gate_rx));
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let log = asked.clone();
+    let checker: ExistsChecker = Arc::new(move |path: &Path| {
+        log.lock().unwrap().push(path.to_path_buf());
+        if let Some((_, present)) = instant.iter().find(|(p, _)| p == path) {
+            return present.then(|| path.to_path_buf());
+        }
+        let _ = gate_rx.lock().unwrap().recv();
+        Some(path.to_path_buf())
+    });
+    (checker, gate_tx, asked)
+}
+
+fn play_calls(calls: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.starts_with("play "))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn test_enter_plays_the_selected_track_before_the_rest_are_checked() {
+    common::isolate();
+    // Issue #52: Enter waited for every entry to be checked before playing anything. The
+    // selected entry is checked first and plays at once; the rest of the queue fills in when
+    // their checks finish.
+    let dir = temp_dir("play_first");
+    let paths: Vec<PathBuf> = ["a.mp3", "b.mp3", "c.mp3", "d.mp3"]
+        .iter()
+        .map(|name| dir.join(name))
+        .collect();
+    for path in &paths {
+        touch(path);
+    }
+    write_playlist(vec![
+        entry(&paths[0], "Alpha", "One"),
+        entry(&paths[1], "Beta", "Two"),
+        entry(&paths[2], "Gamma", "Three"),
+        entry(&paths[3], "Delta", "Four"),
+    ]);
+    let mut app = app_with_playlist(&dir);
+    let calls = install_recording_player(&mut app);
+    let (checker, gate_tx, asked) = checker_answering_first(vec![(paths[1].clone(), true)]);
+    app.playlists.set_exists_checker(checker);
+    app.queue.add_track(old_track(&dir));
+
+    // The active tab stays off tab 5, so only the play request calls the checker.
+    app.queue_selected_playlist(Some(1));
+    assert!(
+        poll_until(&mut app, |_| !play_calls(&calls).is_empty()),
+        "the selected track did not start while the others were still being checked; status: {}",
+        app.status_message
+    );
+    assert_eq!(
+        asked.lock().unwrap()[0],
+        paths[1],
+        "the selected entry is checked first"
+    );
+    assert_eq!(play_calls(&calls), vec![format!("play {}", paths[1].display())]);
+    assert_eq!(queue_paths(&app), vec![paths[1].clone()], "the old queue was replaced");
+    assert_eq!(app.queue.current_index, 0);
+    assert!(app.playlists.queue_check_pending(), "the rest are still being checked");
+    assert_eq!(app.status_message, "Playing from Road Trip; checking the rest…");
+
+    drop(gate_tx);
+    assert!(
+        poll_until(&mut app, |app| app.status_message.starts_with("Queued")),
+        "status: {}",
+        app.status_message
+    );
+    assert_eq!(app.status_message, "Queued 4 tracks from Road Trip");
+    assert_eq!(queue_paths(&app), paths);
+    assert_eq!(app.queue.current_index, 1, "the playing track keeps its place");
+    assert_eq!(app.queue_cursor, 1);
+    assert_eq!(
+        play_calls(&calls).len(),
+        1,
+        "filling the queue must not restart playback"
+    );
+    assert!(!app.playlists.queue_check_pending());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_enter_on_a_missing_track_starts_the_next_existing_one_first() {
+    common::isolate();
+    let dir = temp_dir("play_first_missing");
+    let first = dir.join("a.mp3");
+    let ghost = dir.join("ghost.mp3");
+    let third = dir.join("c.mp3");
+    let fourth = dir.join("d.mp3");
+    for path in [&first, &third, &fourth] {
+        touch(path);
+    }
+    write_playlist(vec![
+        entry(&first, "Alpha", "One"),
+        entry(&ghost, "Ghost", "Gone"),
+        entry(&third, "Gamma", "Three"),
+        entry(&fourth, "Delta", "Four"),
+    ]);
+    let mut app = app_with_playlist(&dir);
+    let calls = install_recording_player(&mut app);
+    let (checker, gate_tx, asked) = checker_answering_first(vec![(ghost.clone(), false), (third.clone(), true)]);
+    app.playlists.set_exists_checker(checker);
+
+    app.queue_selected_playlist(Some(1));
+    assert!(
+        poll_until(&mut app, |_| !play_calls(&calls).is_empty()),
+        "status: {}",
+        app.status_message
+    );
+    assert_eq!(asked.lock().unwrap()[..2], [ghost.clone(), third.clone()]);
+    assert_eq!(play_calls(&calls), vec![format!("play {}", third.display())]);
+    assert_eq!(queue_paths(&app), vec![third.clone()]);
+
+    drop(gate_tx);
+    assert!(poll_until(&mut app, |app| app.status_message.starts_with("Queued")));
+    assert_eq!(app.status_message, "Queued 3 tracks from Road Trip, 1 missing");
+    assert_eq!(queue_paths(&app), vec![first.clone(), third.clone(), fourth.clone()]);
+    assert_eq!(app.queue.current_index, 1);
+    assert_eq!(play_calls(&calls).len(), 1);
+    assert!(app.playlists.is_missing(&ghost));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_enter_after_the_last_existing_track_wraps_to_the_first() {
+    common::isolate();
+    // Nothing exists at or after the selected entry: playback starts at the first existing
+    // entry, so the checks go on from the top of the playlist.
+    let dir = temp_dir("play_first_wrap");
+    let first = dir.join("a.mp3");
+    let second = dir.join("b.mp3");
+    let ghost = dir.join("ghost.mp3");
+    touch(&first);
+    touch(&second);
+    write_playlist(vec![
+        entry(&first, "Alpha", "One"),
+        entry(&second, "Beta", "Two"),
+        entry(&ghost, "Ghost", "Gone"),
+    ]);
+    let mut app = app_with_playlist(&dir);
+    let calls = install_recording_player(&mut app);
+    let (checker, gate_tx, asked) = checker_answering_first(vec![(ghost.clone(), false), (first.clone(), true)]);
+    app.playlists.set_exists_checker(checker);
+
+    app.queue_selected_playlist(Some(2));
+    assert!(poll_until(&mut app, |_| !play_calls(&calls).is_empty()));
+    assert_eq!(asked.lock().unwrap()[..2], [ghost.clone(), first.clone()]);
+    assert_eq!(play_calls(&calls), vec![format!("play {}", first.display())]);
+
+    drop(gate_tx);
+    assert!(poll_until(&mut app, |app| app.status_message.starts_with("Queued")));
+    assert_eq!(queue_paths(&app), vec![first.clone(), second.clone()]);
+    assert_eq!(app.queue.current_index, 0);
+    assert_eq!(play_calls(&calls).len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_tracks_queued_while_the_rest_are_checked_stay_after_the_playlist() {
+    common::isolate();
+    let dir = temp_dir("play_first_append");
+    let first = dir.join("a.mp3");
+    let second = dir.join("b.mp3");
+    let third = dir.join("c.mp3");
+    for path in [&first, &second, &third] {
+        touch(path);
+    }
+    write_playlist(vec![
+        entry(&first, "Alpha", "One"),
+        entry(&second, "Beta", "Two"),
+        entry(&third, "Gamma", "Three"),
+    ]);
+    let mut app = app_with_playlist(&dir);
+    let calls = install_recording_player(&mut app);
+    let (checker, gate_tx, _) = checker_answering_first(vec![(second.clone(), true)]);
+    app.playlists.set_exists_checker(checker);
+
+    app.queue_selected_playlist(Some(1));
+    assert!(poll_until(&mut app, |_| !play_calls(&calls).is_empty()));
+    // Something else is queued (tab 2 `a`, the web dashboard) before the checks finish.
+    app.queue.add_track(old_track(&dir));
+    app.queue_cursor = 1;
+
+    drop(gate_tx);
+    assert!(poll_until(&mut app, |app| app.status_message.starts_with("Queued")));
+    assert_eq!(
+        queue_paths(&app),
+        vec![first.clone(), second.clone(), third.clone(), dir.join("old.mp3")]
+    );
+    assert_eq!(app.queue.current_index, 1);
+    assert_eq!(app.queue_cursor, 3, "the cursor stays on the row it was on");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_rest_of_the_playlist_is_dropped_when_the_queue_is_cleared_meanwhile() {
+    common::isolate();
+    let dir = temp_dir("play_first_cleared");
+    let first = dir.join("a.mp3");
+    let second = dir.join("b.mp3");
+    touch(&first);
+    touch(&second);
+    write_playlist(vec![entry(&first, "Alpha", "One"), entry(&second, "Beta", "Two")]);
+    let mut app = app_with_playlist(&dir);
+    let calls = install_recording_player(&mut app);
+    let (checker, gate_tx, _) = checker_answering_first(vec![(first.clone(), true)]);
+    app.playlists.set_exists_checker(checker);
+
+    app.queue_selected_playlist(Some(0));
+    assert!(poll_until(&mut app, |_| !play_calls(&calls).is_empty()));
+    app.active_tab = 1;
+    app.queue_focus = true;
+    press(&mut app, crossterm::event::KeyCode::Char('c'));
+    assert!(app.queue.is_empty());
+
+    drop(gate_tx);
+    assert!(poll_until(&mut app, |app| !app.playlists.queue_check_pending()));
+    poll_for(&mut app, Duration::from_millis(100));
+    assert!(app.queue.is_empty(), "queue: {:?}", queue_paths(&app));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_enter_on_a_link_to_an_audio_file_starts_on_its_target() {
+    common::isolate();
+    // A hand-edited playlist may list a path without an audio extension that links to an
+    // audio file. The queue holds the checked target, so playback starts on it, and the rest of
+    // the playlist goes around it rather than duplicating it.
+    let dir = temp_dir("play_first_link");
+    let first = dir.join("a.mp3");
+    let target = dir.join("b.mp3");
+    let link = dir.join("note.txt");
+    let third = dir.join("c.mp3");
+    for path in [&first, &target, &third] {
+        touch(path);
+    }
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    write_playlist(vec![
+        entry(&first, "Alpha", "One"),
+        entry(&link, "Beta", "Two"),
+        entry(&third, "Gamma", "Three"),
+    ]);
+    let mut app = app_with_playlist(&dir);
+    let calls = install_recording_player(&mut app);
+
+    app.queue_selected_playlist(Some(1));
+    assert!(poll_until(&mut app, |app| app.status_message.starts_with("Queued")));
+    assert_eq!(queue_paths(&app), vec![first.clone(), target.clone(), third.clone()]);
+    assert_eq!(app.queue.current_index, 1);
+    assert_eq!(play_calls(&calls), vec![format!("play {}", target.display())]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Enter on a slow share: the started track ends, or Next / Previous is pressed, before the rest
+// of the playlist is checked (PR #65 review)
+// ---------------------------------------------------------------------------------------------
+
+/// An app set up by [`slow_share_app`].
+struct SlowShare {
+    app: AppUI,
+    dir: PathBuf,
+    paths: Vec<PathBuf>,
+    calls: Arc<Mutex<Vec<String>>>,
+    gate_tx: std::sync::mpsc::Sender<()>,
+}
+
+/// Three tracks, `Road Trip` selected; the checker answers entry `instant` at once and blocks on
+/// the others until `gate_tx` is dropped.
+fn slow_share_app(name: &str, instant: usize) -> SlowShare {
+    let dir = temp_dir(name);
+    let paths: Vec<PathBuf> = ["a.mp3", "b.mp3", "c.mp3"].iter().map(|n| dir.join(n)).collect();
+    for path in &paths {
+        touch(path);
+    }
+    write_playlist(vec![
+        entry(&paths[0], "Alpha", "One"),
+        entry(&paths[1], "Beta", "Two"),
+        entry(&paths[2], "Gamma", "Three"),
+    ]);
+    let mut app = app_with_playlist(&dir);
+    let calls = install_recording_player(&mut app);
+    let (checker, gate_tx, _) = checker_answering_first(vec![(paths[instant].clone(), true)]);
+    app.playlists.set_exists_checker(checker);
+    SlowShare {
+        app,
+        dir,
+        paths,
+        calls,
+        gate_tx,
+    }
+}
+
+#[test]
+fn test_started_track_ending_before_the_rest_is_checked_goes_on_to_the_next_track() {
+    common::isolate();
+    for mode in ["loop", "stop"] {
+        let SlowShare {
+            mut app,
+            dir,
+            paths,
+            calls,
+            gate_tx,
+        } = slow_share_app(&format!("ended_early_{}", mode), 0);
+        app.settings_mgr.settings.queue_mode = mode.to_string();
+        app.queue_selected_playlist(Some(0));
+        assert!(poll_until(&mut app, |_| !play_calls(&calls).is_empty()));
+        assert_eq!(queue_paths(&app), vec![paths[0].clone()]);
+
+        // The started track ends while the share is still being checked. It must not be
+        // played again (loop) and playback must not just stop (stop): the next track isn't
+        // known yet, so it plays once it is.
+        app.handle_track_finished();
+        assert_eq!(
+            play_calls(&calls),
+            vec![format!("play {}", paths[0].display())],
+            "{}: the started track was played again",
+            mode
+        );
+        assert_eq!(app.status_message, "Waiting for the rest of Road Trip…", "{}", mode);
+
+        drop(gate_tx);
+        assert!(
+            poll_until(&mut app, |app| !app.playlists.queue_check_pending()),
+            "{}",
+            mode
+        );
+        assert_eq!(queue_paths(&app), paths, "{}", mode);
+        assert_eq!(
+            app.queue.current_index, 1,
+            "{}: playback went on to the next track",
+            mode
+        );
+        assert_eq!(
+            play_calls(&calls),
+            vec![
+                format!("play {}", paths[0].display()),
+                format!("play {}", paths[1].display())
+            ],
+            "{}",
+            mode
+        );
+        assert_eq!(app.status_message, "Queued 3 tracks from Road Trip", "{}", mode);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn test_next_while_the_rest_is_checked_plays_the_next_track_once_known() {
+    common::isolate();
+    let SlowShare {
+        mut app,
+        dir,
+        paths,
+        calls,
+        gate_tx,
+    } = slow_share_app("next_early", 0);
+    app.queue_selected_playlist(Some(0));
+    assert!(poll_until(&mut app, |_| !play_calls(&calls).is_empty()));
+
+    // Right (Next) has nothing to go to yet; it says so and keeps the track playing.
+    press(&mut app, crossterm::event::KeyCode::Right);
+    assert_eq!(app.status_message, "Next track plays once Road Trip is checked…");
+    assert!(app.player.is_playing(), "the started track keeps playing");
+    assert_eq!(app.queue.current_index, 0);
+
+    drop(gate_tx);
+    assert!(poll_until(&mut app, |app| !app.playlists.queue_check_pending()));
+    assert_eq!(queue_paths(&app), paths);
+    assert_eq!(app.queue.current_index, 1);
+    assert_eq!(play_calls(&calls).last(), Some(&format!("play {}", paths[1].display())));
+    assert_eq!(play_calls(&calls).len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_previous_while_the_rest_is_checked_plays_the_previous_track_once_known() {
+    common::isolate();
+    let SlowShare {
+        mut app,
+        dir,
+        paths,
+        calls,
+        gate_tx,
+    } = slow_share_app("prev_early", 1);
+    app.queue_selected_playlist(Some(1));
+    assert!(poll_until(&mut app, |_| !play_calls(&calls).is_empty()));
+
+    press(&mut app, crossterm::event::KeyCode::Left);
+    assert_eq!(app.status_message, "Previous track plays once Road Trip is checked…");
+    assert_eq!(
+        play_calls(&calls),
+        vec![format!("play {}", paths[1].display())],
+        "the started track was not restarted"
+    );
+
+    drop(gate_tx);
+    assert!(poll_until(&mut app, |app| !app.playlists.queue_check_pending()));
+    assert_eq!(queue_paths(&app), paths);
+    assert_eq!(app.queue.current_index, 0);
+    assert_eq!(play_calls(&calls).last(), Some(&format!("play {}", paths[0].display())));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_track_ending_after_the_playlist_was_replaced_advances_as_usual() {
+    common::isolate();
+    // Once something else replaced the queue, the playlist's check no longer holds anything up.
+    let SlowShare {
+        mut app,
+        dir,
+        paths,
+        calls,
+        gate_tx,
+    } = slow_share_app("ended_superseded", 0);
+    app.queue_selected_playlist(Some(0));
+    assert!(poll_until(&mut app, |_| !play_calls(&calls).is_empty()));
+    app.supersede_playlist_queue();
+    app.handle_track_finished();
+    // Loop mode with one track: the track plays again, as for any one-track queue.
+    assert_eq!(play_calls(&calls).len(), 2);
+    drop(gate_tx);
+    assert!(poll_until(&mut app, |app| !app.playlists.queue_check_pending()));
+    assert_eq!(queue_paths(&app), vec![paths[0].clone()]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The same file listed twice (PR #65 review)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_enter_on_the_second_copy_of_a_file_queues_every_entry_once() {
+    common::isolate();
+    let dir = temp_dir("dup_second");
+    let x = dir.join("x.mp3");
+    let y = dir.join("y.mp3");
+    let z = dir.join("z.mp3");
+    for path in [&x, &y, &z] {
+        touch(path);
+    }
+    write_playlist(vec![
+        entry(&x, "X", "Ex"),
+        entry(&y, "Y", "Why"),
+        entry(&x, "X", "Ex"),
+        entry(&z, "Z", "Zed"),
+    ]);
+    let mut app = app_with_playlist(&dir);
+    let calls = install_recording_player(&mut app);
+    let (checker, gate_tx, _) = checker_answering_first(vec![(x.clone(), true)]);
+    app.playlists.set_exists_checker(checker);
+
+    app.queue_selected_playlist(Some(2));
+    assert!(poll_until(&mut app, |_| !play_calls(&calls).is_empty()));
+    assert_eq!(queue_paths(&app), vec![x.clone()]);
+
+    drop(gate_tx);
+    assert!(poll_until(&mut app, |app| app.status_message.starts_with("Queued")));
+    assert_eq!(app.status_message, "Queued 4 tracks from Road Trip");
+    assert_eq!(queue_paths(&app), vec![x.clone(), y.clone(), x.clone(), z.clone()]);
+    assert_eq!(app.queue.current_index, 2, "the second copy is the one playing");
+    assert_eq!(play_calls(&calls).len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_rest_goes_around_the_playing_copy_when_another_copy_is_queued_ahead_of_it() {
+    common::isolate();
+    // The started track is found by what is playing, not by its path: another copy of the same
+    // file moved ahead of it in the queue must not pull the rest of the playlist away from it.
+    let dir = temp_dir("dup_ahead");
+    let x = dir.join("x.mp3");
+    let y = dir.join("y.mp3");
+    let z = dir.join("z.mp3");
+    for path in [&x, &y, &z] {
+        touch(path);
+    }
+    write_playlist(vec![
+        entry(&x, "X", "Ex"),
+        entry(&y, "Y", "Why"),
+        entry(&x, "X", "Ex"),
+        entry(&z, "Z", "Zed"),
+    ]);
+    let mut app = app_with_playlist(&dir);
+    let calls = install_recording_player(&mut app);
+    let (checker, gate_tx, _) = checker_answering_first(vec![(x.clone(), true)]);
+    app.playlists.set_exists_checker(checker);
+
+    app.queue_selected_playlist(Some(2));
+    assert!(poll_until(&mut app, |_| !play_calls(&calls).is_empty()));
+    // Tab 2: the same file is queued again and moved to the top.
+    app.queue.add_track(AudioMetadata {
+        filepath: x.clone(),
+        title: "Ex again".to_string(),
+        ..Default::default()
+    });
+    assert!(app.queue.reorder_track(1, 0));
+    assert_eq!(app.queue.current_index, 1);
+
+    drop(gate_tx);
+    assert!(poll_until(&mut app, |app| app.status_message.starts_with("Queued")));
+    let titles: Vec<String> = app.queue.tracks.iter().map(|t| t.title.clone()).collect();
+    assert_eq!(titles, vec!["Ex", "Why", "Ex again", "Ex", "Zed"]);
+    assert_eq!(app.queue.current_index, 3);
+    assert_eq!(app.queue.tracks[4].filepath, z);
     let _ = std::fs::remove_dir_all(&dir);
 }

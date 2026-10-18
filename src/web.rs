@@ -55,6 +55,75 @@ pub struct WebBrowserResponse {
     pub terminal_dir: Option<String>,
 }
 
+/// One track of a playlist in the `GET /api/playlists` snapshot (issue #50).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WebPlaylistEntry {
+    pub index: usize,
+    pub title: String,
+    pub artist: String,
+    /// Whole seconds, or -1 when unknown.
+    pub duration_seconds: i64,
+    /// The entry's path. Responses clear it (and set `outside`) when it lies outside the allowed
+    /// folders, as `/api/status` does for queue entries.
+    pub path: String,
+    /// Set in responses for an entry whose path lies outside the allowed folders: the dashboard
+    /// can't play a playlist holding one.
+    #[serde(default)]
+    pub outside: bool,
+    /// What this session's existence check found: `Some(true)` missing, `Some(false)` found,
+    /// `None` not checked yet. Checks run on workers.
+    #[serde(default)]
+    pub missing: Option<bool>,
+}
+
+/// One playlist in the `GET /api/playlists` snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WebPlaylist {
+    pub name: String,
+    pub track_count: usize,
+    /// Sum of the known durations, in seconds.
+    pub total_duration_seconds: i64,
+    pub entries: Vec<WebPlaylistEntry>,
+}
+
+/// Whether the playlists can be used yet (the store is read by a worker at startup).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WebPlaylistsState {
+    #[default]
+    Loading,
+    /// The playlists folder couldn't be listed; edits stay refused for the session.
+    Failed,
+    Ready,
+}
+
+/// The playlists as the UI thread last published them; `GET /api/playlists` serves this, never
+/// the playlists folder.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WebPlaylists {
+    pub state: WebPlaylistsState,
+    /// Why playlists can't be used yet (the TUI's message), `None` when ready.
+    pub message: Option<String>,
+    /// `PlaylistStore::revision` of this snapshot. Requests that name a track by index send it
+    /// back, so an index into a list that changed meanwhile is refused.
+    pub revision: u64,
+    /// The playlist last added to, which the add picker highlights.
+    pub last_playlist: Option<String>,
+    pub playlists: Vec<WebPlaylist>,
+}
+
+impl Default for WebPlaylists {
+    fn default() -> Self {
+        Self {
+            state: WebPlaylistsState::Loading,
+            message: Some(crate::playlist_store::StoreError::NotLoaded.to_string()),
+            revision: 0,
+            last_playlist: None,
+            playlists: Vec::new(),
+        }
+    }
+}
+
 /// Live playback state shared between Quickstream and the web server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NowPlayingState {
@@ -103,6 +172,13 @@ pub struct NowPlayingState {
     /// Never sent to clients.
     #[serde(skip)]
     pub allowed_roots: Vec<PathBuf>,
+    /// The playlists snapshot the UI thread publishes for `GET /api/playlists` (issue #50). Not
+    /// part of `/api/status`, which is polled several times a second.
+    #[serde(skip)]
+    pub playlists: Arc<WebPlaylists>,
+    /// Changes whenever `playlists` is republished, so the dashboard knows when to fetch it.
+    #[serde(default)]
+    pub playlists_version: u64,
 }
 
 impl Default for NowPlayingState {
@@ -139,6 +215,8 @@ impl Default for NowPlayingState {
             bpm: None,
             key: None,
             allowed_roots: Vec::new(),
+            playlists: Arc::new(WebPlaylists::default()),
+            playlists_version: 0,
         }
     }
 }
@@ -170,7 +248,105 @@ pub enum WebCommand {
     SeedRadio(PathBuf),
     /// A web request named a path outside the allowed folders; it was ignored.
     PathRejected(PathBuf),
+    /// Queue a playlist (issue #50): replace the queue and play from entry `play_from`, or
+    /// append when `None`. `entries` are the snapshot's entries, every path already checked
+    /// against the allowed folders by the web thread; the UI queues these, not the store's
+    /// current list, so it never queues an entry the web thread did not check. The UI answers
+    /// on `reply` whether it started checking them or refused (`Still checking …`), and the web
+    /// request returns that answer.
+    QueuePlaylist {
+        name: String,
+        entries: Vec<crate::playlist::PlaylistEntry>,
+        play_from: Option<usize>,
+        reply: WebReply,
+    },
+    /// The dashboard fetched the playlists: check their files on workers so missing ones are
+    /// marked in the snapshot.
+    CheckPlaylists,
+    /// Change a playlist (issue #50). The UI applies it through `PlaylistStore` and answers on
+    /// the reply channel; the web request returns that answer.
+    EditPlaylist(PlaylistEdit, WebReply),
 }
+
+/// A playlist edit from the web dashboard. Names are matched ignoring case, like the TUI's.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlaylistEdit {
+    Create {
+        name: String,
+    },
+    Rename {
+        name: String,
+        new_name: String,
+    },
+    Delete {
+        name: String,
+    },
+    /// Add an audio file. `path` is the file as the request named it (absolute, normalized
+    /// with [`crate::playlist::normalize_path`]), the form a terminal add stores, so the same file
+    /// added from either side is a duplicate and its tags are found; when that form resolves to a
+    /// different file than the one checked, `path` is `canonical` instead. `canonical` is the same file
+    /// with symlinks resolved, which the web thread checked lies inside the allowed folders; a
+    /// playlist already holding it counts as already holding the file.
+    Add {
+        name: String,
+        path: PathBuf,
+        canonical: PathBuf,
+    },
+    /// Remove track `index`. `revision` is the snapshot revision the index came from; the edit
+    /// is refused when the playlists changed since. Requests without one are refused.
+    Remove {
+        name: String,
+        index: usize,
+        revision: u64,
+    },
+    /// Move track `index` one row (no wraparound). `revision` as for `Remove`.
+    Move {
+        name: String,
+        index: usize,
+        dir: crate::playlist_store::MoveDir,
+        revision: u64,
+    },
+}
+
+/// What the UI answers to a [`PlaylistEdit`]: the status message, or why it was refused.
+pub type PlaylistReply = Result<String, String>;
+
+/// Where the UI thread sends its answer to a web request that waits for one.
+#[derive(Clone, Default)]
+pub struct WebReply(Option<mpsc::Sender<PlaylistReply>>);
+
+impl WebReply {
+    /// A reply slot and the receiver its answer arrives on.
+    pub fn channel() -> (Self, mpsc::Receiver<PlaylistReply>) {
+        let (tx, rx) = mpsc::channel();
+        (Self(Some(tx)), rx)
+    }
+
+    /// Answer the request; a no-op when nobody waits any more.
+    pub fn send(&self, reply: PlaylistReply) {
+        if let Some(tx) = &self.0 {
+            let _ = tx.send(reply);
+        }
+    }
+}
+
+impl std::fmt::Debug for WebReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WebReply")
+    }
+}
+
+/// The reply channel is not part of what a command asks for: commands that differ only in it
+/// are equal.
+impl PartialEq for WebReply {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+/// How long a web request waits for the UI thread's answer to a playlist edit or play. The UI handles
+/// web commands every tick, so this only runs out when it is stuck.
+const EDIT_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 struct ActionPayload {
@@ -185,6 +361,258 @@ struct ActionPayload {
     path: Option<String>,
     #[serde(default)]
     mode: Option<String>,
+    /// Playlist name (playlist actions).
+    #[serde(default)]
+    name: Option<String>,
+    /// [`WebPlaylists::revision`] the request was made against (playlist actions with an index).
+    #[serde(default)]
+    revision: Option<u64>,
+    /// New name (`playlist_rename`).
+    #[serde(default)]
+    new_name: Option<String>,
+    /// `up` or `down` (`playlist_move`).
+    #[serde(default)]
+    direction: Option<String>,
+}
+
+/// A JSON response for `/api/action`: status line and body.
+struct ActionResponse {
+    status: &'static str,
+    body: serde_json::Value,
+}
+
+impl ActionResponse {
+    fn ok() -> Self {
+        Self {
+            status: "200 OK",
+            body: serde_json::json!({ "ok": true }),
+        }
+    }
+
+    fn done(message: String) -> Self {
+        Self {
+            status: "200 OK",
+            body: serde_json::json!({ "ok": true, "message": message }),
+        }
+    }
+
+    fn refused(status: &'static str, error: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: serde_json::json!({ "ok": false, "error": error.into() }),
+        }
+    }
+}
+
+/// `playlist_create` / `_rename` / `_delete` / `_add` / `_remove` / `_move`: build the edit,
+/// hand it to the UI thread and return its answer. A file to add is checked like `add_file`
+/// (`allow` records a path outside the allowed folders and the request is refused with 403).
+/// Name rules, duplicates and the loaded check are the store's, applied on the UI thread.
+fn edit_playlist_action(
+    payload: &ActionPayload,
+    cmd_tx: &mpsc::Sender<WebCommand>,
+    allow: &mut dyn FnMut(String) -> Option<PathBuf>,
+) -> ActionResponse {
+    let bad = |error: &str| ActionResponse::refused("400 Bad Request", error);
+    let Some(name) = payload.name.clone() else {
+        return bad(MISSING_NAME);
+    };
+    let index = || payload.index.ok_or_else(|| bad("Missing track index"));
+    // An index names a track only in the list it was read from (PR #65 review).
+    let revision = || payload.revision.ok_or_else(|| bad(MISSING_REVISION));
+    let edit = match payload.action.as_str() {
+        "playlist_create" => PlaylistEdit::Create { name },
+        "playlist_rename" => match payload.new_name.clone() {
+            Some(new_name) => PlaylistEdit::Rename { name, new_name },
+            None => return bad("Missing new name"),
+        },
+        "playlist_delete" => PlaylistEdit::Delete { name },
+        "playlist_add" => {
+            let Some(requested) = payload.path.clone() else {
+                return bad("Missing path");
+            };
+            let Some(canonical) = allow(requested.clone()) else {
+                // Refused with 403 by the caller.
+                return ActionResponse::ok();
+            };
+            if !canonical.is_file() || !crate::metadata::is_supported_audio_file(&canonical) {
+                return bad("Not an audio file");
+            }
+            // `allow` only accepts absolute paths. Store the form a terminal add would, but only
+            // when it is the file that was checked: after a symlinked folder, text-only `..`
+            // removal can name a different file, possibly outside the allowed folders.
+            let normalized = crate::playlist::normalize_path(Path::new(&requested));
+            let path = match std::fs::canonicalize(&normalized) {
+                Ok(resolved) if resolved == canonical => normalized,
+                _ => canonical.clone(),
+            };
+            PlaylistEdit::Add { name, path, canonical }
+        }
+        "playlist_remove" => match index().and_then(|index| Ok((index, revision()?))) {
+            Ok((index, revision)) => PlaylistEdit::Remove { name, index, revision },
+            Err(response) => return response,
+        },
+        "playlist_move" => {
+            let (index, revision) = match index().and_then(|index| Ok((index, revision()?))) {
+                Ok(found) => found,
+                Err(response) => return response,
+            };
+            let dir = match payload.direction.as_deref() {
+                Some("up") => crate::playlist_store::MoveDir::Up,
+                Some("down") => crate::playlist_store::MoveDir::Down,
+                _ => return bad("Direction must be up or down"),
+            };
+            PlaylistEdit::Move {
+                name,
+                index,
+                dir,
+                revision,
+            }
+        }
+        _ => return bad("Unknown playlist action"),
+    };
+    let (reply, answer) = WebReply::channel();
+    if cmd_tx.send(WebCommand::EditPlaylist(edit, reply)).is_err() {
+        return ActionResponse::refused("503 Service Unavailable", NO_ANSWER);
+    }
+    ui_answer(&answer)
+}
+
+/// The UI thread's answer to a playlist request: 200 with its message, 409 with its refusal, or
+/// 503 when it didn't answer in time.
+fn ui_answer(answer: &mpsc::Receiver<PlaylistReply>) -> ActionResponse {
+    match answer.recv_timeout(EDIT_REPLY_TIMEOUT) {
+        Ok(Ok(message)) => ActionResponse::done(message),
+        Ok(Err(error)) => ActionResponse::refused("409 Conflict", error),
+        Err(_) => ActionResponse::refused("503 Service Unavailable", NO_ANSWER),
+    }
+}
+
+/// Error when the UI thread did not answer an edit in time (or has gone away).
+const NO_ANSWER: &str = "Quickstream didn't answer; try again";
+
+/// Status for a playlist request whose index refers to a list that changed meanwhile.
+pub const PLAYLISTS_CHANGED: &str = "Playlists changed; try again";
+
+/// Error for a playlist request that names a track by index without the snapshot revision the
+/// index came from.
+pub const MISSING_REVISION: &str = "Missing revision: reload the playlists and try again";
+
+/// Error for a playlist action that names no playlist.
+const MISSING_NAME: &str = "Missing playlist name";
+
+/// Whether a playlist entry may be queued from the web: its file resolves inside the allowed
+/// folders, or it doesn't exist (nothing to follow) and its path lies inside them; the queue
+/// skips missing files. Anything else, including a symlink leading out, is outside. Touches the
+/// disk: web thread only.
+fn playlist_entry_allowed(
+    path: &Path,
+    allowed: &crate::web_access::AllowedRoots,
+    visible: &crate::web_access::VisibleRoots,
+) -> bool {
+    if allowed.resolve(path).is_some() {
+        return true;
+    }
+    std::fs::symlink_metadata(path).is_err() && visible.contains(path)
+}
+
+/// `playlist_play` / `playlist_append`: check the snapshot's playlist and every entry's path on
+/// this (web) thread, then hand the entries to the UI as [`WebCommand::QueuePlaylist`]. An entry
+/// outside the allowed folders refuses the whole request, like `add_file`.
+fn queue_playlist_action(
+    payload: &ActionPayload,
+    play: bool,
+    state: &Arc<RwLock<NowPlayingState>>,
+    cmd_tx: &mpsc::Sender<WebCommand>,
+    rejected: &mut Option<PathBuf>,
+) -> ActionResponse {
+    let (snapshot, roots) = {
+        let s = state.read().unwrap();
+        (s.playlists.clone(), s.allowed_roots.clone())
+    };
+    if snapshot.state != WebPlaylistsState::Ready {
+        let message = snapshot.message.clone().unwrap_or_default();
+        return ActionResponse::refused("409 Conflict", message);
+    }
+    let Some(name) = payload.name.as_deref() else {
+        return ActionResponse::refused("400 Bad Request", MISSING_NAME);
+    };
+    let Some(playlist) = snapshot
+        .playlists
+        .iter()
+        .find(|p| crate::playlist::names_equal(&p.name, name))
+    else {
+        let missing = crate::playlist_store::StoreError::NotFound(name.to_string());
+        return ActionResponse::refused("404 Not Found", missing.to_string());
+    };
+    // Playing from an index needs the revision it came from (PR #65 review).
+    if payload.index.is_some() && payload.revision.is_none() {
+        return ActionResponse::refused("400 Bad Request", MISSING_REVISION);
+    }
+    if payload.revision.is_some_and(|r| r != snapshot.revision) {
+        return ActionResponse::refused("409 Conflict", PLAYLISTS_CHANGED);
+    }
+    if playlist.entries.is_empty() {
+        return ActionResponse::refused("409 Conflict", format!("{} is empty", playlist.name));
+    }
+    let play_from = play.then(|| payload.index.unwrap_or(0));
+    if play_from.is_some_and(|i| i >= playlist.entries.len()) {
+        let error = crate::playlist_store::StoreError::IndexOutOfRange;
+        return ActionResponse::refused("400 Bad Request", error.to_string());
+    }
+    // The roots are canonicalized once for the whole playlist, not once per entry.
+    let allowed = crate::web_access::AllowedRoots::new(&roots);
+    let visible = crate::web_access::VisibleRoots::new(&roots);
+    if let Some(outside) = playlist
+        .entries
+        .iter()
+        .map(|e| PathBuf::from(&e.path))
+        .find(|p| !playlist_entry_allowed(p, &allowed, &visible))
+    {
+        *rejected = Some(outside);
+        return ActionResponse::ok();
+    }
+    let entries = playlist
+        .entries
+        .iter()
+        .map(|e| crate::playlist::PlaylistEntry {
+            path: PathBuf::from(&e.path),
+            duration_secs: e.duration_seconds,
+            artist: e.artist.clone(),
+            title: e.title.clone(),
+        })
+        .collect();
+    // Wait for the UI's answer: it may refuse (`Still checking …`), and the dashboard must not
+    // report a play that never started.
+    let (reply, answer) = WebReply::channel();
+    let command = WebCommand::QueuePlaylist {
+        name: playlist.name.clone(),
+        entries,
+        play_from,
+        reply,
+    };
+    if cmd_tx.send(command).is_err() {
+        return ActionResponse::refused("503 Service Unavailable", NO_ANSWER);
+    }
+    ui_answer(&answer)
+}
+
+/// `GET /api/playlists`: the published snapshot, with paths outside the allowed folders
+/// cleared as `/api/status` does.
+fn playlists_response(state: &Arc<RwLock<NowPlayingState>>) -> String {
+    let (snapshot, roots) = {
+        let s = state.read().unwrap();
+        (s.playlists.clone(), s.allowed_roots.clone())
+    };
+    let visible = crate::web_access::VisibleRoots::new(&roots);
+    let mut out = (*snapshot).clone();
+    for entry in out.playlists.iter_mut().flat_map(|p| p.entries.iter_mut()) {
+        if !visible.contains(Path::new(&entry.path)) {
+            entry.path.clear();
+            entry.outside = true;
+        }
+    }
+    serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// An armed continuous stream: the renderer must request `/stream/continuous-<nonce>.wav`.
@@ -1031,6 +1459,21 @@ fn handle_client(
                 stream.write_all(body)?;
             }
             stream.flush()?;
+        } else if route == "/api/playlists" {
+            // The snapshot the UI thread published; the playlists folder is never read here.
+            let json = playlists_response(state);
+            let body = json.as_bytes();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes())?;
+            if !is_head {
+                stream.write_all(body)?;
+            }
+            stream.flush()?;
+            // Someone is looking at the playlists: have their files checked on workers.
+            let _ = cmd_tx.send(WebCommand::CheckPlaylists);
         } else if path.starts_with("/api/cover") {
             // Serve cover art (JPEG/PNG/WebP/GIF) or SVG placeholder. `extract_cover_art` only
             // returns allowlisted MIME types; re-check here so a tag string never reaches the
@@ -1226,13 +1669,18 @@ fn handle_client(
         // Paths must resolve inside the allowed folders; commands carry the resolved path.
         let roots = state.read().unwrap().allowed_roots.clone();
         let mut rejected: Option<PathBuf> = None;
+        // Canonicalized on first use, at most once per request.
+        let mut allowed: Option<crate::web_access::AllowedRoots> = None;
         let mut allow = |p: String| -> Option<PathBuf> {
-            let resolved = crate::web_access::resolve_allowed_path(Path::new(&p), &roots);
+            let resolved = allowed
+                .get_or_insert_with(|| crate::web_access::AllowedRoots::new(&roots))
+                .resolve(Path::new(&p));
             if resolved.is_none() {
                 rejected = Some(PathBuf::from(p));
             }
             resolved
         };
+        let mut response = ActionResponse::ok();
         if let Ok(payload) = serde_json::from_slice::<ActionPayload>(&body_bytes) {
             match payload.action.as_str() {
                 "toggle_pause" => {
@@ -1344,6 +1792,14 @@ fn handle_client(
                         let _ = cmd_tx.send(WebCommand::SeedRadio(p));
                     }
                 }
+                "playlist_play" | "playlist_append" => {
+                    let play = payload.action == "playlist_play";
+                    response = queue_playlist_action(&payload, play, state, cmd_tx, &mut rejected);
+                }
+                "playlist_create" | "playlist_rename" | "playlist_delete" | "playlist_add" | "playlist_remove"
+                | "playlist_move" => {
+                    response = edit_playlist_action(&payload, cmd_tx, &mut allow);
+                }
                 _ => {}
             }
         }
@@ -1354,8 +1810,14 @@ fn handle_client(
             return Ok(());
         }
 
-        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}";
-        stream.write_all(resp)?;
+        let body = response.body.to_string();
+        let header = format!(
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response.status,
+            body.len()
+        );
+        stream.write_all(header.as_bytes())?;
+        stream.write_all(body.as_bytes())?;
         stream.flush()?;
     } else {
         let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
@@ -3052,6 +3514,148 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       padding: 1px 5px;
     }
 
+    /* Playlists */
+    .playlist-card {
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .playlist-card.open {
+      border-color: rgba(0, 210, 255, 0.3);
+    }
+    .playlist-head {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.5rem 0.6rem 0.5rem 0.75rem;
+    }
+    .playlist-head-main {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      flex: 1;
+      min-width: 0;
+      cursor: pointer;
+    }
+    .playlist-chevron {
+      color: var(--text-dim);
+      font-size: 1rem;
+      width: 0.8rem;
+      transition: transform 0.15s ease;
+    }
+    .playlist-card.open .playlist-chevron {
+      transform: rotate(90deg);
+    }
+    .playlist-name {
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .playlist-meta {
+      font-size: 0.72rem;
+      color: var(--text-dim);
+    }
+    .playlist-tracks {
+      display: flex;
+      flex-direction: column;
+      gap: 0.2rem;
+      padding: 0 0.4rem 0.5rem;
+    }
+    .playlist-track {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.3rem 0.35rem 0.3rem 0.5rem;
+      border-radius: 8px;
+    }
+    .playlist-track:hover {
+      background: rgba(255, 255, 255, 0.06);
+    }
+    .playlist-track .queue-item-main {
+      cursor: pointer;
+    }
+    .playlist-track.missing .queue-item-title,
+    .playlist-track.outside .queue-item-title {
+      color: var(--text-dim);
+    }
+    .playlist-track.missing .queue-item-title {
+      color: var(--danger);
+    }
+    .playlists-note {
+      text-align: center;
+      padding: 2rem 0;
+    }
+    .picker-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 90;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+      background: rgba(0, 0, 0, 0.55);
+    }
+    .picker-backdrop.show {
+      display: flex;
+    }
+    .picker {
+      width: 340px;
+      max-width: 100%;
+      max-height: 70vh;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      padding: 1rem;
+      border-radius: 18px;
+      background: rgba(15, 20, 28, 0.97);
+      border: 1px solid var(--card-border);
+      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
+    }
+    .picker-title {
+      font-weight: 700;
+      color: var(--text);
+    }
+    .picker-label {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .picker-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+      min-height: 0;
+      overflow-y: auto;
+    }
+    .picker-row {
+      text-align: left;
+      padding: 0.5rem 0.7rem;
+      border-radius: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--text);
+      font-size: 0.85rem;
+      cursor: pointer;
+    }
+    .picker-row:hover {
+      background: rgba(255, 255, 255, 0.08);
+    }
+    .picker-row.last {
+      border-color: rgba(0, 210, 255, 0.4);
+      background: rgba(0, 210, 255, 0.08);
+    }
+    .picker-row.new {
+      color: #00e676;
+    }
+
     /* Empty States */
     .empty-state {
       display: flex;
@@ -3178,6 +3782,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       <button class="tab-btn" data-tab="tab-queue" id="tabBtnQueue">Queue <span id="queueBadgeTab" class="tab-badge">0</span></button>
       <button class="tab-btn" data-tab="tab-browser" id="tabBtnBrowser">Library</button>
       <button class="tab-btn" data-tab="tab-devices" id="tabBtnDevices">Devices</button>
+      <button class="tab-btn" data-tab="tab-playlists" id="tabBtnPlaylists">Playlists</button>
     </div>
 
     <!-- TAB 1: Now Playing -->
@@ -3381,15 +3986,48 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
 
       <div class="devices-list" id="devicesList"></div>
     </div>
+
+    <!-- TAB 5: Playlists (issue #50) -->
+    <div class="tab-panel" id="tab-playlists">
+      <div class="panel-header">
+        <div>
+          <span class="panel-title">Playlists</span>
+          <span class="panel-subtitle" id="playlistsSummaryText"></span>
+        </div>
+        <div style="display:flex;gap:0.5rem;align-items:center;">
+          <button class="btn-sm" id="btnPlaylistAddCurrent" title="Add the now-playing track to a playlist">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle></svg>
+            Add Playing
+          </button>
+          <button class="btn-sm accent" id="btnPlaylistCreate" title="Create a playlist">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+            New
+          </button>
+        </div>
+      </div>
+
+      <div class="queue-list" id="playlistsList"></div>
+    </div>
   </div>
 
   <div class="toast" id="toast"></div>
+
+  <!-- Add-to-playlist picker (issue #50) -->
+  <div class="picker-backdrop" id="playlistPicker">
+    <div class="picker" role="dialog" aria-label="Add to playlist">
+      <div class="picker-title">Add to playlist</div>
+      <div class="picker-label" id="playlistPickerLabel"></div>
+      <div class="picker-list" id="playlistPickerList"></div>
+      <button class="btn-text" id="btnPlaylistPickerCancel">Cancel</button>
+    </div>
+  </div>
 
   <script>
     let localPosition = 0;
     let localDuration = 0;
     let isPlaying = false;
     let lastPollTime = Date.now();
+    let lastStatus = null;
     let currentTrackPath = "";
     let isScrubbing = false;
     let scrubPosition = 0;
@@ -3414,6 +4052,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     const ICON_SEED_RADIO = '<span style="font-size:12px;">📻</span>';
     const ICON_REMOVE = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>';
     const ICON_ADD = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>';
+    const ICON_PLAYLIST_ADD = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="3" y1="6" x2="15" y2="6"></line><line x1="3" y1="12" x2="15" y2="12"></line><line x1="3" y1="18" x2="11" y2="18"></line><line x1="18" y1="13" x2="18" y2="21"></line><line x1="14" y1="17" x2="22" y2="17"></line></svg>';
 
     function el(tag, className, text) {
       const node = document.createElement(tag);
@@ -3492,6 +4131,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     }
 
     function renderStatus(data) {
+      lastStatus = data;
       // 1. Now Playing interpolation
       if (!isScrubbing) {
         isPlaying = data.is_playing && !data.is_paused;
@@ -3608,6 +4248,14 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       if (data.current_browser_dir) {
         latestTerminalDir = data.current_browser_dir;
       }
+
+      // 4. Playlists: fetch again when the app published a new snapshot.
+      if (data.playlists_version !== playlistsVersion) {
+        playlistsVersion = data.playlists_version;
+        if (document.getElementById('tab-playlists').classList.contains('active')) {
+          loadPlaylists();
+        }
+      }
     }
 
     function updateProgressUI() {
@@ -3714,6 +4362,9 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
 
         if (targetId === 'tab-browser' && !currentBrowserData) {
           loadBrowser();
+        }
+        if (targetId === 'tab-playlists') {
+          loadPlaylists();
         }
       });
     });
@@ -3912,6 +4563,10 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
           const seedBtn = iconButton('btn-icon-sm', 'Seed Radio station from this track', 'seed', ICON_SEED_RADIO);
           seedBtn.dataset.path = path;
           actions.appendChild(seedBtn);
+          const playlistBtn = iconButton('btn-icon-sm', 'Add to playlist', 'to-playlist', ICON_PLAYLIST_ADD);
+          playlistBtn.dataset.path = path;
+          playlistBtn.dataset.name = item.name || '';
+          actions.appendChild(playlistBtn);
           const addBtn = iconButton('btn-icon-sm add-btn', 'Add to queue', 'add', ICON_ADD);
           addBtn.dataset.path = path;
           actions.appendChild(addBtn);
@@ -3925,6 +4580,7 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
       browse: (d) => browseTo(d.path),
       add: (d) => addFile(d.path),
       seed: (d) => seedRadio(d.path),
+      'to-playlist': (d) => openPlaylistPicker(d.name, d.path),
     };
     delegateClicks('browserList', browserClickHandlers);
     delegateClicks('bookmarksRow', browserClickHandlers);
@@ -4065,6 +4721,307 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     document.getElementById('btnRescanDevices').addEventListener('click', () => {
       sendAction('rescan_devices');
       showToast('Scanning network for DLNA renderers...');
+    });
+
+    // --- PLAYLISTS TAB (issue #50) ---
+    // The snapshot comes from GET /api/playlists. Actions that name a track by index send the
+    // snapshot's revision, so Quickstream refuses them if the playlists changed meanwhile.
+    let playlistsData = null;
+    let playlistsVersion = null;
+    const openPlaylists = new Set();
+    const ICON_PLAY = '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 4 20 12 6 20 6 4"></polygon></svg>';
+    const ICON_RENAME = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 20h9"></path><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"></path></svg>';
+    const ICON_UP = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 15 12 9 6 15"></polyline></svg>';
+    const ICON_DOWN = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"></polyline></svg>';
+
+    // m:ss, or h:mm:ss from one hour; -:-- when unknown (as in the terminal).
+    function playlistDuration(seconds) {
+      if (seconds === null || seconds === undefined || seconds < 0) return '-:--';
+      const total = Math.floor(seconds);
+      const hours = Math.floor(total / 3600);
+      const mins = Math.floor((total % 3600) / 60);
+      const secs = String(total % 60).padStart(2, '0');
+      return hours > 0 ? `${hours}:${String(mins).padStart(2, '0')}:${secs}` : `${mins}:${secs}`;
+    }
+
+    function trackCountLabel(count) {
+      return count === 1 ? '1 track' : `${count} tracks`;
+    }
+
+    function playlistEntryLabel(entry) {
+      return entry.artist ? `${entry.artist} - ${entry.title}` : (entry.title || '');
+    }
+
+    async function loadPlaylists() {
+      try {
+        const res = await fetch('/api/playlists?t=' + Date.now());
+        if (!res.ok) throw new Error("Failed to load playlists");
+        renderPlaylists(await res.json());
+      } catch (e) {
+        console.error("Playlists error:", e);
+      }
+    }
+
+    function renderPlaylists(data) {
+      playlistsData = data;
+      if (pickerOpen()) renderPlaylistPicker(data);
+      const list = document.getElementById('playlistsList');
+      const summary = document.getElementById('playlistsSummaryText');
+      clearChildren(list);
+      if (!data || data.state !== 'ready') {
+        summary.textContent = '';
+        list.appendChild(el('div', 'empty-sub playlists-note', (data && data.message) || 'Loading playlists…'));
+        return;
+      }
+      const playlists = data.playlists || [];
+      summary.textContent = playlists.length === 1 ? '1 playlist' : `${playlists.length} playlists`;
+      if (playlists.length === 0) {
+        list.appendChild(el('div', 'empty-sub playlists-note', 'No playlists yet.'));
+        return;
+      }
+      for (const playlist of playlists) {
+        const name = playlist.name || '';
+        const open = openPlaylists.has(name);
+        const card = el('div', open ? 'playlist-card open' : 'playlist-card');
+
+        const head = el('div', 'playlist-head');
+        const main = el('div', 'playlist-head-main');
+        main.dataset.action = 'toggle';
+        main.dataset.name = name;
+        main.appendChild(el('span', 'playlist-chevron', '›'));
+        const meta = el('div', 'queue-item-meta');
+        meta.appendChild(el('div', 'playlist-name', name));
+        meta.appendChild(el('div', 'playlist-meta',
+          `${trackCountLabel(playlist.track_count)} · ${playlistDuration(playlist.total_duration_seconds)}`));
+        main.appendChild(meta);
+        head.appendChild(main);
+        const playBtn = iconButton('btn-icon-sm', 'Play playlist (replaces the queue)', 'play', ICON_PLAY);
+        playBtn.dataset.name = name;
+        head.appendChild(playBtn);
+        const appendBtn = iconButton('btn-icon-sm', 'Append playlist to the queue', 'append', ICON_ADD);
+        appendBtn.dataset.name = name;
+        head.appendChild(appendBtn);
+        const renameBtn = iconButton('btn-icon-sm', 'Rename playlist', 'rename', ICON_RENAME);
+        renameBtn.dataset.name = name;
+        head.appendChild(renameBtn);
+        const deleteBtn = iconButton('btn-icon-sm danger-hover', 'Delete playlist', 'delete', ICON_REMOVE);
+        deleteBtn.dataset.name = name;
+        deleteBtn.dataset.count = String(playlist.track_count);
+        head.appendChild(deleteBtn);
+        card.appendChild(head);
+
+        if (open) {
+          card.appendChild(renderPlaylistTracks(playlist));
+        }
+        list.appendChild(card);
+      }
+    }
+
+    function renderPlaylistTracks(playlist) {
+      const tracks = el('div', 'playlist-tracks');
+      const entries = playlist.entries || [];
+      if (entries.length === 0) {
+        tracks.appendChild(el('div', 'empty-sub', 'Empty. Add tracks from the Library.'));
+        return tracks;
+      }
+      for (const entry of entries) {
+        const missing = entry.missing === true;
+        let className = 'playlist-track';
+        if (missing) className += ' missing';
+        if (entry.outside) className += ' outside';
+        const row = el('div', className);
+
+        const main = el('div', 'queue-item-main');
+        main.dataset.action = 'play-from';
+        main.dataset.name = playlist.name || '';
+        main.dataset.index = String(entry.index);
+        main.appendChild(el('span', 'queue-num', (entry.index + 1) + '.'));
+        const meta = el('div', 'queue-item-meta');
+        const label = playlistEntryLabel(entry);
+        meta.appendChild(el('div', 'queue-item-title', missing ? '✗ missing: ' + label : label));
+        if (entry.outside) {
+          meta.appendChild(el('div', 'queue-item-artist', 'Outside your home, bookmarks and launch folder'));
+        }
+        main.appendChild(meta);
+        row.appendChild(main);
+        row.appendChild(el('span', 'queue-item-dur', missing ? '----' : playlistDuration(entry.duration_seconds)));
+        for (const [title, action, icon] of [
+          ['Move up', 'move-up', ICON_UP],
+          ['Move down', 'move-down', ICON_DOWN],
+          ['Remove from playlist', 'remove', ICON_REMOVE],
+        ]) {
+          const btn = iconButton(action === 'remove' ? 'btn-icon-sm danger-hover' : 'btn-icon-sm', title, action, icon);
+          btn.dataset.name = playlist.name || '';
+          btn.dataset.index = String(entry.index);
+          row.appendChild(btn);
+        }
+        tracks.appendChild(row);
+      }
+      return tracks;
+    }
+
+    // Send a playlist action and report Quickstream's answer.
+    async function playlistAction(action, extra, doneMessage) {
+      try {
+        const res = await fetch('/api/action', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(Object.assign({ action, value: null }, extra))
+        });
+        let data = {};
+        try {
+          data = await res.json();
+        } catch (e) {
+          data = {};
+        }
+        if (!res.ok || data.ok === false) {
+          showToast(data.error || 'Request failed');
+          loadPlaylists();
+          return false;
+        }
+        showToast(data.message || doneMessage || 'Done');
+        loadPlaylists();
+        setTimeout(pollStatus, 80);
+        return true;
+      } catch (e) {
+        console.error("Playlist action error:", e);
+        return false;
+      }
+    }
+
+    function playlistRevision() {
+      return playlistsData ? playlistsData.revision : null;
+    }
+
+    function togglePlaylist(name) {
+      if (openPlaylists.has(name)) {
+        openPlaylists.delete(name);
+      } else {
+        openPlaylists.add(name);
+      }
+      if (playlistsData) renderPlaylists(playlistsData);
+    }
+
+    function playPlaylist(name, index) {
+      playlistAction('playlist_play', { name, index, revision: playlistRevision() }, `Playing ${name}`);
+    }
+
+    function appendPlaylist(name) {
+      playlistAction('playlist_append', { name }, `Appending ${name}`);
+    }
+
+    function renamePlaylist(name) {
+      const newName = prompt(`Rename "${name}" to:`, name);
+      if (newName === null) return;
+      playlistAction('playlist_rename', { name, new_name: newName });
+    }
+
+    function deletePlaylist(name, count) {
+      if (!confirm(`Delete "${name}" (${trackCountLabel(count)})?`)) return;
+      playlistAction('playlist_delete', { name });
+    }
+
+    function moveTrack(name, index, direction) {
+      playlistAction('playlist_move', { name, index, direction, revision: playlistRevision() });
+    }
+
+    function removeTrack(name, index) {
+      playlistAction('playlist_remove', { name, index, revision: playlistRevision() });
+    }
+
+    delegateClicks('playlistsList', {
+      toggle: (d) => togglePlaylist(d.name),
+      play: (d) => playPlaylist(d.name, 0),
+      'play-from': (d) => playPlaylist(d.name, Number(d.index)),
+      append: (d) => appendPlaylist(d.name),
+      rename: (d) => renamePlaylist(d.name),
+      delete: (d) => deletePlaylist(d.name, Number(d.count)),
+      'move-up': (d) => moveTrack(d.name, Number(d.index), 'up'),
+      'move-down': (d) => moveTrack(d.name, Number(d.index), 'down'),
+      remove: (d) => removeTrack(d.name, Number(d.index)),
+    });
+
+    document.getElementById('btnPlaylistCreate').addEventListener('click', () => {
+      const name = prompt('New playlist name:');
+      if (name === null) return;
+      playlistAction('playlist_create', { name });
+    });
+
+    // The track the terminal plays, if any. Quickstream refuses a path outside the allowed
+    // folders (the status then holds only its file name).
+    document.getElementById('btnPlaylistAddCurrent').addEventListener('click', () => {
+      const playing = lastStatus && (lastStatus.is_playing || lastStatus.is_paused) && lastStatus.filepath;
+      if (!playing) {
+        showToast('Nothing is playing');
+        return;
+      }
+      openPlaylistPicker(lastStatus.title || lastStatus.filepath, lastStatus.filepath);
+    });
+
+    // --- ADD-TO-PLAYLIST PICKER ---
+    // Lists the playlists with the last one added to highlighted, then "+ New playlist…".
+    let pickerPath = null;
+
+    function pickerOpen() {
+      return document.getElementById('playlistPicker').classList.contains('show');
+    }
+
+    function openPlaylistPicker(label, path) {
+      if (!path) return;
+      pickerPath = path;
+      document.getElementById('playlistPickerLabel').textContent = label || path;
+      document.getElementById('playlistPicker').classList.add('show');
+      renderPlaylistPicker(playlistsData);
+      loadPlaylists();
+    }
+
+    function closePlaylistPicker() {
+      document.getElementById('playlistPicker').classList.remove('show');
+    }
+
+    function renderPlaylistPicker(data) {
+      const list = document.getElementById('playlistPickerList');
+      clearChildren(list);
+      if (!data || data.state !== 'ready') {
+        list.appendChild(el('div', 'empty-sub', (data && data.message) || 'Loading playlists…'));
+        return;
+      }
+      for (const playlist of data.playlists || []) {
+        const row = el('button', playlist.name === data.last_playlist ? 'picker-row last' : 'picker-row',
+          `${playlist.name} (${trackCountLabel(playlist.track_count)})`);
+        row.dataset.action = 'pick';
+        row.dataset.name = playlist.name || '';
+        list.appendChild(row);
+      }
+      const newRow = el('button', 'picker-row new', '+ New playlist…');
+      newRow.dataset.action = 'new';
+      list.appendChild(newRow);
+    }
+
+    function addToPlaylist(name) {
+      const path = pickerPath;
+      closePlaylistPicker();
+      playlistAction('playlist_add', { name, path });
+    }
+
+    async function newPlaylistAndAdd() {
+      const path = pickerPath;
+      closePlaylistPicker();
+      const input = prompt('New playlist name:');
+      if (input === null) return;
+      const name = input.trim();
+      if (await playlistAction('playlist_create', { name })) {
+        playlistAction('playlist_add', { name, path });
+      }
+    }
+
+    delegateClicks('playlistPickerList', {
+      pick: (d) => addToPlaylist(d.name),
+      new: () => newPlaylistAndAdd(),
+    });
+    document.getElementById('btnPlaylistPickerCancel').addEventListener('click', closePlaylistPicker);
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && pickerOpen()) closePlaylistPicker();
     });
 
     // Keyboard shortcuts

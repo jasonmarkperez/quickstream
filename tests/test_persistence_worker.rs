@@ -453,3 +453,365 @@ fn test_save_after_a_rename_of_a_missing_file_still_writes() {
     assert_eq!(names_in(&dir), vec!["New.m3u8".to_string()]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// PR #65 review: a failed rename leaves the writer noting that the target name stands for the
+/// old file. A later rename onto that name whose source is gone moves nothing, so the note is
+/// stale: saves to the name must write it, and a delete of it must never follow the note to the
+/// other playlist's file.
+#[test]
+fn test_rename_of_a_missing_file_clears_an_earlier_failure_on_the_target() {
+    common::isolate();
+    let dir = scratch("stale_stranded");
+    let a = dir.join("A.m3u8");
+    let b = dir.join("B.m3u8");
+    let c = dir.join("C.m3u8");
+    std::fs::write(&a, b"#EXTM3U\n#PLAYLIST:A\n").unwrap();
+    std::fs::write(&b, b"foreign").unwrap();
+    let worker = PersistenceWorker::spawn();
+
+    // A -> B fails: B.m3u8 is someone else's file.
+    worker.rename(a.clone(), b.clone());
+    assert!(worker.flush());
+    assert_eq!(std::fs::read(&b).unwrap(), b"foreign");
+    // Outside the app the foreign file goes away, and C.m3u8 was never there.
+    std::fs::remove_file(&b).unwrap();
+    worker.rename(c.clone(), b.clone());
+    worker.save(b.clone(), b"#EXTM3U\n#PLAYLIST:B\n".to_vec());
+    assert!(worker.flush());
+    assert_eq!(std::fs::read(&b).unwrap(), b"#EXTM3U\n#PLAYLIST:B\n");
+
+    worker.delete(b.clone());
+    assert!(worker.flush());
+    assert_eq!(
+        names_in(&dir),
+        vec!["A.m3u8".to_string()],
+        "the delete removed the wrong file"
+    );
+    assert_eq!(std::fs::read(&a).unwrap(), b"#EXTM3U\n#PLAYLIST:A\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------- creates that never replace, and failures reported back (issues #62, #52) ----------
+
+use quickstream::persist::{PersistFailure, PersistReport, Reporter};
+use std::sync::mpsc;
+
+/// Failures reported on `rx` so far (the acknowledgements of operations that worked are dropped).
+fn reported(rx: &mpsc::Receiver<PersistReport>) -> Vec<PersistFailure> {
+    rx.try_iter()
+        .filter_map(|report| match report {
+            PersistReport::Failed(failure) => Some(failure),
+            PersistReport::Done { .. } => None,
+        })
+        .collect()
+}
+
+/// PR #65 review: every create and rename queued with a reporter answers exactly once, so the
+/// store knows which names the writer is still working on. One that worked, a rename of a file
+/// that is already gone and a rename from a path whose own rename failed each say `Done`.
+#[test]
+fn test_every_reported_create_and_rename_answers_once() {
+    common::isolate();
+    let dir = scratch("acks");
+    let (tx, rx) = mpsc::channel();
+    let worker = PersistenceWorker::spawn();
+    let handle = worker.handle();
+    let path = |name: &str| dir.join(format!("{}.m3u8", name));
+    std::fs::write(path("Theirs"), b"theirs").unwrap();
+
+    handle.create(path("A"), b"a".to_vec(), Reporter::new(1, tx.clone()));
+    handle.rename_reporting(path("A"), path("B"), Reporter::new(2, tx.clone()));
+    handle.rename_reporting(path("Gone"), path("C"), Reporter::new(3, tx.clone()));
+    handle.rename_reporting(path("B"), path("Theirs"), Reporter::new(4, tx.clone()));
+    handle.rename_reporting(path("Theirs"), path("D"), Reporter::new(5, tx.clone()));
+    handle.create(path("Theirs"), b"x".to_vec(), Reporter::new(6, tx));
+    assert!(worker.flush());
+
+    let reports: Vec<PersistReport> = rx.try_iter().collect();
+    let tags: Vec<u64> = reports.iter().map(PersistReport::tag).collect();
+    assert_eq!(tags, vec![1, 2, 3, 4, 5, 6], "{:?}", reports);
+    let failed: Vec<u64> = reports
+        .iter()
+        .filter(|r| matches!(r, PersistReport::Failed(_)))
+        .map(PersistReport::tag)
+        .collect();
+    assert_eq!(failed, vec![4, 6]);
+    assert_eq!(std::fs::read(path("Theirs")).unwrap(), b"theirs");
+    assert_eq!(std::fs::read(path("B")).unwrap(), b"a");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_create_writes_a_new_file_and_reports_nothing() {
+    common::isolate();
+    let dir = scratch("create_new");
+    let path = dir.join("sub").join("Mix.m3u8");
+    let (tx, rx) = mpsc::channel();
+    let worker = PersistenceWorker::spawn();
+
+    worker
+        .handle()
+        .create(path.clone(), b"#EXTM3U\n".to_vec(), Reporter::new(1, tx));
+    assert!(worker.flush());
+    assert_eq!(std::fs::read(&path).unwrap(), b"#EXTM3U\n");
+    assert_eq!(
+        names_in(&dir.join("sub")),
+        vec!["Mix.m3u8".to_string()],
+        "no temp file left"
+    );
+    assert!(reported(&rx).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #62: the store's name check can't model every file system's name rules, so a create
+/// can land on a file the store never saw. The writer must leave that file alone and say so.
+#[test]
+fn test_create_never_replaces_an_existing_file_and_reports_it() {
+    common::isolate();
+    let dir = scratch("create_exists");
+    let path = dir.join("Mix.m3u8");
+    std::fs::write(&path, b"#EXTM3U\n/user/own.flac\n").unwrap();
+    let (tx, rx) = mpsc::channel();
+    let worker = PersistenceWorker::spawn();
+
+    worker
+        .handle()
+        .create(path.clone(), b"#EXTM3U\n#PLAYLIST:Mix\n".to_vec(), Reporter::new(7, tx));
+    assert!(worker.flush());
+    assert_eq!(std::fs::read(&path).unwrap(), b"#EXTM3U\n/user/own.flac\n");
+    assert_eq!(names_in(&dir), vec!["Mix.m3u8".to_string()], "no temp file left");
+    match reported(&rx).as_slice() {
+        [PersistFailure::Create {
+            tag: 7, path: p, kind, ..
+        }] => {
+            assert_eq!(p, &path);
+            assert_eq!(*kind, std::io::ErrorKind::AlreadyExists);
+        }
+        other => panic!("expected one create failure, got {:?}", other),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// After a create collided, the playlist's later saves (queued before the store heard about it)
+/// and its delete must not touch the file that was already there, in this batch or a later one.
+#[test]
+fn test_saves_and_deletes_after_a_failed_create_leave_the_file_alone() {
+    common::isolate();
+    let dir = scratch("create_exists_later");
+    let path = dir.join("Mix.m3u8");
+    std::fs::write(&path, b"theirs").unwrap();
+    let (tx, _rx) = mpsc::channel();
+    let worker = PersistenceWorker::spawn();
+    let handle = worker.handle();
+
+    handle.create(path.clone(), b"ours v1".to_vec(), Reporter::new(1, tx));
+    handle.save(path.clone(), b"ours v2".to_vec());
+    assert!(worker.flush());
+    handle.save(path.clone(), b"ours v3".to_vec());
+    handle.delete(path.clone());
+    assert!(worker.flush());
+    assert_eq!(std::fs::read(&path).unwrap(), b"theirs");
+
+    // Renaming the playlist moves nothing either: the file at its old name is not its own.
+    let moved = dir.join("Mix 2.m3u8");
+    handle.rename(path.clone(), moved.clone());
+    handle.save(moved.clone(), b"ours v4".to_vec());
+    assert!(worker.flush());
+    assert_eq!(std::fs::read(&path).unwrap(), b"theirs");
+    assert!(!moved.exists(), "a save after the refused rename created a file");
+
+    // The worker is gone: saves run on the calling thread and still refuse the path.
+    drop(worker);
+    handle.save(path.clone(), b"ours v5".to_vec());
+    handle.save(moved.clone(), b"ours v5".to_vec());
+    assert_eq!(std::fs::read(&path).unwrap(), b"theirs");
+    assert!(!moved.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_create_after_shutdown_still_refuses_and_reports() {
+    common::isolate();
+    let dir = scratch("create_late");
+    let taken = dir.join("Mix.m3u8");
+    let free = dir.join("Road Trip.m3u8");
+    std::fs::write(&taken, b"theirs").unwrap();
+    let (tx, rx) = mpsc::channel();
+    let worker = PersistenceWorker::spawn();
+    let handle = worker.handle();
+    drop(worker);
+
+    handle.create(taken.clone(), b"ours".to_vec(), Reporter::new(3, tx.clone()));
+    handle.create(free.clone(), b"ours".to_vec(), Reporter::new(4, tx));
+    assert_eq!(std::fs::read(&taken).unwrap(), b"theirs");
+    assert_eq!(std::fs::read(&free).unwrap(), b"ours");
+    let tags: Vec<u64> = reported(&rx)
+        .iter()
+        .map(|f| match f {
+            PersistFailure::Create { tag, .. } | PersistFailure::Rename { tag, .. } => *tag,
+        })
+        .collect();
+    assert_eq!(tags, vec![3]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A save queued after a create is not merged ahead of it: the create would then find the
+/// playlist's own file and fail.
+#[test]
+fn test_create_then_saves_end_with_the_last_bytes() {
+    common::isolate();
+    let dir = scratch("create_save");
+    let path = dir.join("Mix.m3u8");
+    let (tx, rx) = mpsc::channel();
+    let worker = PersistenceWorker::spawn();
+
+    worker
+        .handle()
+        .create(path.clone(), b"v0".to_vec(), Reporter::new(1, tx));
+    worker.save(path.clone(), b"v1".to_vec());
+    worker.save(path.clone(), b"v2".to_vec());
+    assert!(worker.flush());
+    assert_eq!(std::fs::read(&path).unwrap(), b"v2");
+    assert!(reported(&rx).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #52: a rename that fails is reported, and saves to the new name sent in later batches
+/// (before the store heard about the failure) never create the new file next to the old one.
+#[test]
+fn test_failed_rename_is_reported_and_later_batches_do_not_create_the_target() {
+    common::isolate();
+    let dir = scratch("failed_rename_report");
+    let locked = dir.join("locked");
+    let open = dir.join("open");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::create_dir_all(&open).unwrap();
+    let old = locked.join("Old.m3u8");
+    let new = open.join("New.m3u8");
+    std::fs::write(&old, b"#EXTM3U\n#PLAYLIST:Old\n").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(locked.join("probe"), b"").is_ok() {
+        // Running as root: permissions don't apply, nothing to test.
+        let _ = std::fs::remove_file(locked.join("probe"));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let (tx, rx) = mpsc::channel();
+    let worker = PersistenceWorker::spawn();
+
+    worker
+        .handle()
+        .rename_reporting(old.clone(), new.clone(), Reporter::new(9, tx));
+    worker.save(new.clone(), b"#EXTM3U\n#PLAYLIST:New\n".to_vec());
+    assert!(worker.flush());
+    worker.save(new.clone(), b"#EXTM3U\n#PLAYLIST:New\n/a.flac\n".to_vec());
+    assert!(worker.flush());
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!new.exists(), "a later save created a second playlist");
+    assert_eq!(std::fs::read(&old).unwrap(), b"#EXTM3U\n#PLAYLIST:Old\n");
+    match reported(&rx).as_slice() {
+        [PersistFailure::Rename {
+            tag: 9, from, to, kind, ..
+        }] => {
+            assert_eq!((from, to), (&old, &new));
+            assert_eq!(*kind, std::io::ErrorKind::PermissionDenied);
+        }
+        other => panic!("expected one rename failure, got {:?}", other),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A rename never replaces another file: the target is left as it was, the failure is
+/// reported, and a delete of the new name removes the playlist's real file (the old name).
+#[test]
+fn test_rename_never_replaces_another_file() {
+    common::isolate();
+    let dir = scratch("rename_onto_file");
+    let old = dir.join("Old.m3u8");
+    let new = dir.join("New.m3u8");
+    std::fs::write(&old, b"ours").unwrap();
+    std::fs::write(&new, b"theirs").unwrap();
+    let (tx, rx) = mpsc::channel();
+    let worker = PersistenceWorker::spawn();
+
+    worker
+        .handle()
+        .rename_reporting(old.clone(), new.clone(), Reporter::new(2, tx));
+    worker.save(new.clone(), b"ours, renamed".to_vec());
+    assert!(worker.flush());
+    assert_eq!(std::fs::read(&old).unwrap(), b"ours");
+    assert_eq!(std::fs::read(&new).unwrap(), b"theirs");
+    match reported(&rx).as_slice() {
+        [PersistFailure::Rename { tag: 2, kind, .. }] => assert_eq!(*kind, std::io::ErrorKind::AlreadyExists),
+        other => panic!("expected one rename failure, got {:?}", other),
+    }
+
+    worker.delete(new.clone());
+    assert!(worker.flush());
+    assert!(!old.exists(), "deleting the playlist removes its real file");
+    assert_eq!(std::fs::read(&new).unwrap(), b"theirs");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PR #65 review (CC2): after a rename A -> B failed, renaming B back to A lands on the file that
+/// really is A, so A is ours again: later saves of A write it instead of being dropped.
+#[test]
+fn test_renaming_back_onto_the_real_file_after_a_failed_rename_keeps_saving() {
+    common::isolate();
+    let dir = scratch("rename_back");
+    let a = dir.join("A.m3u8");
+    let b = dir.join("B.m3u8");
+    std::fs::write(&a, b"ours").unwrap();
+    std::fs::write(&b, b"theirs").unwrap();
+    let (tx, rx) = mpsc::channel();
+    let worker = PersistenceWorker::spawn();
+
+    worker
+        .handle()
+        .rename_reporting(a.clone(), b.clone(), Reporter::new(1, tx));
+    worker.rename(b.clone(), a.clone());
+    worker.save(a.clone(), b"ours v2".to_vec());
+    assert!(worker.flush());
+    worker.save(a.clone(), b"ours v3".to_vec());
+    assert!(worker.flush());
+
+    assert_eq!(std::fs::read(&a).unwrap(), b"ours v3");
+    assert_eq!(std::fs::read(&b).unwrap(), b"theirs");
+    assert!(matches!(
+        reported(&rx).as_slice(),
+        [PersistFailure::Rename { tag: 1, .. }]
+    ));
+
+    // And deleting A removes A, not the file that was in the way.
+    worker.delete(a.clone());
+    assert!(worker.flush());
+    assert!(!a.exists());
+    assert_eq!(std::fs::read(&b).unwrap(), b"theirs");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_failed_rename_after_shutdown_is_reported() {
+    common::isolate();
+    let dir = scratch("rename_late_report");
+    let old = dir.join("Old.m3u8");
+    let new = dir.join("New.m3u8");
+    std::fs::write(&old, b"ours").unwrap();
+    std::fs::write(&new, b"theirs").unwrap();
+    let (tx, rx) = mpsc::channel();
+    let worker = PersistenceWorker::spawn();
+    let handle = worker.handle();
+    drop(worker);
+
+    handle.rename_reporting(old.clone(), new.clone(), Reporter::new(5, tx));
+    handle.save(new.clone(), b"ours, renamed".to_vec());
+    assert_eq!(std::fs::read(&old).unwrap(), b"ours");
+    assert_eq!(std::fs::read(&new).unwrap(), b"theirs");
+    assert!(matches!(
+        reported(&rx).as_slice(),
+        [PersistFailure::Rename { tag: 5, .. }]
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -1,7 +1,7 @@
 //! Playlists (issue #37): the extended M3U8 file format, playlist names, and turning a playlist
 //! into queue tracks. Pure: nothing here reads or writes the disk, so it is safe on the UI thread.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::metadata::AudioMetadata;
 
@@ -16,7 +16,7 @@ pub const MAX_NAME_CHARS: usize = 100;
 pub const MAX_NAME_BYTES: usize = 200;
 
 /// One track of a playlist. The path is the source of truth for the file; artist, title and
-/// duration are only what the `#EXTINF` line shows.
+/// duration are only what the `#EXTINF` and `#EXTART` lines show.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlaylistEntry {
     pub path: PathBuf,
@@ -78,14 +78,29 @@ impl Playlist {
         }
     }
 
-    /// Extended M3U8 text: UTF-8, LF line endings, no BOM, an `#EXTINF` line before each path.
+    /// Extended M3U8 text: UTF-8, LF line endings, no BOM. Each path follows an `#EXTINF` line
+    /// (`Artist - Title`, as other players show it) and an `#EXTART` line holding the artist,
+    /// empty when there is none, so [`parse_m3u8`] can tell where the artist ends even when the
+    /// artist or title contains ` - ` (issue #52). Artist and title are written trimmed, since
+    /// the parser trims tag text.
     pub fn to_m3u8(&self) -> String {
         let mut out = String::from("#EXTM3U\n");
         out.push_str(&format!("#PLAYLIST:{}\n", single_line(&self.name)));
         for entry in &self.entries {
             let secs = entry.duration_secs.max(-1);
-            out.push_str(&format!("#EXTINF:{},{}\n", secs, single_line(&entry.display_label())));
-            // M3U8 is UTF-8 text, so a path that is not valid UTF-8 is written lossily.
+            let artist = single_line(&entry.artist);
+            let artist = artist.trim();
+            let title = single_line(&entry.title);
+            let title = title.trim();
+            let label = if artist.is_empty() {
+                title.to_string()
+            } else {
+                format!("{} - {}", artist, title)
+            };
+            out.push_str(&format!("#EXTINF:{},{}\n", secs, label));
+            out.push_str(&format!("#EXTART:{}\n", artist));
+            // M3U8 is UTF-8 text, so a path that is not valid UTF-8 is written lossily. The path is
+            // written as is, spaces included.
             out.push_str(&entry.path.to_string_lossy());
             out.push('\n');
         }
@@ -108,29 +123,45 @@ impl Playlist {
 /// Parse extended M3U / M3U8 text, including files edited by hand or copied in from other
 /// players: a leading BOM, CRLF line endings, blank lines and unknown `#` lines are accepted.
 /// `name` (the file stem) is the playlist's name; a `#PLAYLIST` line is ignored. Relative paths
-/// are resolved against `base_dir`, the folder holding the playlist file. Any other line is kept
-/// as a path entry as written (a Windows path or a `file://` URL simply shows up as missing).
+/// are resolved against `base_dir`, the folder holding the playlist file, and every path is
+/// normalized with [`normalize_path`] so a `..` is never written back. Any other line is kept
+/// as a path entry (a Windows path or a `file://` URL simply shows up as missing). A path line
+/// always loses its line ending and leading whitespace. Its trailing whitespace is kept only when
+/// the entry has an `#EXTART` line, which Quickstream writes for every entry: a file name may end
+/// in spaces (issue #52). Files from other players or edited by hand have no `#EXTART` lines, and
+/// a stray trailing space or tab there is trimmed, so the entry isn't shown as missing.
+/// Artist and title come from the entry's `#EXTINF` and `#EXTART` lines, as `entry_label` describes.
 pub fn parse_m3u8(name: &str, text: &str, base_dir: &Path) -> Playlist {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut playlist = Playlist::new(name);
-    // The `#EXTINF` duration and text waiting for the path line they describe.
+    // The `#EXTINF` duration and text, and the `#EXTART` artist, waiting for the path line they
+    // describe.
     let mut pending: Option<(i64, String)> = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+    let mut pending_artist: Option<String> = None;
+    for raw in text.lines() {
+        // `lines` drops `\n` and `\r\n`; a stray `\r` left before them is a line ending too.
+        let line = raw.trim_end_matches('\r').trim_start();
+        let tag = line.trim_end();
+        if tag.is_empty() {
             continue;
         }
-        if let Some(info) = strip_extinf(line) {
+        if let Some(info) = strip_tag(tag, "#EXTINF:") {
             pending = Some(parse_extinf(info));
             continue;
         }
-        if line.starts_with('#') {
+        if let Some(artist) = strip_tag(tag, "#EXTART:") {
+            pending_artist = Some(artist.trim().to_string());
             continue;
         }
+        if tag.starts_with('#') {
+            continue;
+        }
+        // Only an entry Quickstream wrote (it has an `#EXTART` line) keeps trailing whitespace.
+        let written = if pending_artist.is_some() { line } else { tag };
         // `join` keeps an absolute path unchanged and resolves a relative one against the folder.
-        let path = base_dir.join(line);
+        let path = normalize_path(&base_dir.join(written));
         let (duration_secs, label) = pending.take().unwrap_or((-1, String::new()));
-        let (artist, title) = split_label(&label);
+        let (artist, title) = entry_label(&label, pending_artist.take().as_deref());
         let title = if title.is_empty() { file_stem(&path) } else { title };
         playlist.entries.push(PlaylistEntry {
             path,
@@ -142,11 +173,44 @@ pub fn parse_m3u8(name: &str, text: &str, base_dir: &Path) -> Playlist {
     playlist
 }
 
-/// The text after `#EXTINF:` (tag matched case-insensitively), or `None` for any other line.
-fn strip_extinf(line: &str) -> Option<&str> {
-    const TAG: &str = "#EXTINF:";
-    match line.get(..TAG.len()) {
-        Some(prefix) if prefix.eq_ignore_ascii_case(TAG) => Some(&line[TAG.len()..]),
+/// `path` with `.` components dropped and each `..` cancelling the component before it, worked
+/// out from the text alone (issue #58): the disk is never read and symlinks are not followed, so
+/// `link/..` becomes the folder holding `link` even when `link` points elsewhere. A `..` right
+/// after the root is dropped, as the OS does; on a relative path a leading `..` with nothing to
+/// cancel is kept. A relative path that cancels out entirely becomes `.`.
+pub fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    // Normal components in `out` that a later `..` may cancel.
+    let mut depth = 0usize;
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => out.push(component),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if depth > 0 {
+                    out.pop();
+                    depth -= 1;
+                } else if !out.has_root() {
+                    out.push(component);
+                }
+            }
+            Component::Normal(name) => {
+                out.push(name);
+                depth += 1;
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push(Component::CurDir);
+    }
+    out
+}
+
+/// The text after `tag` (such as `#EXTINF:`, matched case-insensitively), or `None` for any
+/// other line.
+fn strip_tag<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
+    match line.get(..tag.len()) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(tag) => Some(&line[tag.len()..]),
         _ => None,
     }
 }
@@ -161,6 +225,28 @@ fn parse_extinf(info: &str) -> (i64, String) {
         .map(whole_seconds)
         .unwrap_or(-1);
     (secs, text.trim().to_string())
+}
+
+/// (artist, title) of an entry from its `#EXTINF` text and `#EXTART` artist (issue #52). Our own
+/// files always have both: an empty `#EXTART` means no artist and the whole text is the title;
+/// otherwise the title is the text after `<artist> - `. Other players use `#EXTART` for the
+/// album artist, so when the text does not start with `<artist> -` the `#EXTART` line is
+/// ignored, and without one the text is split by [`split_label`] as it always was.
+fn entry_label(label: &str, extart: Option<&str>) -> (String, String) {
+    match extart {
+        Some("") => (String::new(), label.to_string()),
+        Some(artist) => {
+            // The text is trimmed, so `<artist> - ` with an empty title reads `<artist> -`.
+            let rest = label.strip_prefix(artist).and_then(|r| r.strip_prefix(" -"));
+            match rest {
+                Some(title) if title.is_empty() || title.starts_with(' ') => {
+                    (artist.to_string(), title.trim().to_string())
+                }
+                _ => split_label(label),
+            }
+        }
+        None => split_label(label),
+    }
 }
 
 /// `<artist> - <title>` split at the first ` - `; text without one is the title alone.
@@ -206,6 +292,11 @@ pub enum NameError {
     /// Another playlist already has this name, ignoring case. Raised by the store, which knows
     /// the other names; [`validate_name`] never returns it.
     Duplicate(String),
+    /// A file in the playlists folder already has this name, ignoring case, but the store
+    /// skipped it: it couldn't be read or parsed, it lost to a name differing only in case or
+    /// normalization, or it appeared after the load. Raised by the store; carries the file's
+    /// own stem. [`validate_name`] never returns it.
+    Reserved(String),
 }
 
 impl std::fmt::Display for NameError {
@@ -219,6 +310,9 @@ impl std::fmt::Display for NameError {
             NameError::ControlChar => write!(f, "Name can't contain control characters"),
             NameError::LeadingDot => write!(f, "Name can't start with ."),
             NameError::Duplicate(name) => write!(f, "\"{}\" already exists", name),
+            NameError::Reserved(name) => {
+                write!(f, "A playlist file named \"{}\" exists but couldn't be loaded", name)
+            }
         }
     }
 }
@@ -307,6 +401,9 @@ pub fn placeholder_metadata(entry: &PlaylistEntry) -> AudioMetadata {
 pub struct QueuePlan {
     /// The entries whose file exists, in playlist order.
     pub tracks: Vec<AudioMetadata>,
+    /// For each of `tracks`, the index in the playlist of the entry it came from: the exact
+    /// identity of a track even when the playlist lists the same file twice.
+    pub entry_indices: Vec<usize>,
     /// Position in `tracks` to start playing from; `None` when no track was selected or no file
     /// exists.
     pub start_index: Option<usize>,
@@ -325,6 +422,7 @@ pub fn plan_queue(
     cached: &dyn Fn(&Path) -> Option<AudioMetadata>,
 ) -> QueuePlan {
     let mut tracks = Vec::new();
+    let mut entry_indices = Vec::new();
     // Existing entries before the selected one: the queue position of the selected entry if it
     // exists, otherwise of the next existing entry after it.
     let mut kept_before_selected = 0;
@@ -338,6 +436,7 @@ pub fn plan_queue(
             kept_before_selected += 1;
         }
         tracks.push(cached(&entry.path).unwrap_or_else(|| placeholder_metadata(entry)));
+        entry_indices.push(i);
     }
     let start_index = match selected {
         Some(_) if kept_before_selected < tracks.len() => Some(kept_before_selected),
@@ -347,6 +446,7 @@ pub fn plan_queue(
     let missing = entries.len() - tracks.len();
     QueuePlan {
         tracks,
+        entry_indices,
         start_index,
         missing,
     }

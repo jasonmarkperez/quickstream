@@ -41,6 +41,18 @@ impl PlaybackQueue {
         self.tracks.extend(tracks);
     }
 
+    /// Insert `tracks` before position `index` (clamped to the end). `current_index` keeps naming
+    /// the same track, so tracks inserted at or before it shift it along.
+    pub fn insert_tracks(&mut self, index: usize, tracks: Vec<AudioMetadata>) {
+        let index = index.min(self.tracks.len());
+        let count = tracks.len();
+        let had_tracks = !self.tracks.is_empty();
+        self.tracks.splice(index..index, tracks);
+        if had_tracks && index <= self.current_index {
+            self.current_index += count;
+        }
+    }
+
     /// Remove the track at `index`, keeping `current_index` on the same track. See [`Self::remove`].
     pub fn remove_track(&mut self, index: usize) -> Option<AudioMetadata> {
         self.remove(index).map(|r| r.track)
