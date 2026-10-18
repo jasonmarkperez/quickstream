@@ -87,12 +87,16 @@ impl PlaylistChecks {
     }
 }
 
-/// The first two folders of `path` (`/Volumes/Music/...` -> `/Volumes/Music`): the share a
-/// playlist whose files are all missing most likely lives on. Pure: no file system access.
-pub fn mount_hint(path: &std::path::Path) -> String {
+/// The first two folders above the file at `path` (`/Volumes/Music/...` -> `/Volumes/Music`):
+/// the share a playlist whose files are all missing most likely lives on. `None` when the file
+/// sits fewer than two folders deep (`/ghost.mp3`, `/Volumes/ghost.mp3`): a top-level folder
+/// such as `/Volumes` or `/mnt` holds mounts but is not one, so there is no share to name.
+/// Pure: no file system access.
+pub fn mount_hint(path: &std::path::Path) -> Option<String> {
+    let parent = path.parent()?;
     let mut hint = std::path::PathBuf::new();
     let mut folders = 0;
-    for component in path.components() {
+    for component in parent.components() {
         if matches!(component, std::path::Component::Normal(_)) {
             if folders == 2 {
                 break;
@@ -101,7 +105,7 @@ pub fn mount_hint(path: &std::path::Path) -> String {
         }
         hint.push(component);
     }
-    hint.display().to_string()
+    (folders == 2).then(|| hint.display().to_string())
 }
 
 /// Row text for a playlist entry whose file was not found: `<n>. ✗ missing: <label>  ----`.
@@ -660,7 +664,7 @@ impl AppUI {
             }
             NamePurpose::CreateAndAdd(pending) => {
                 self.playlists.track_cursor = 0;
-                self.apply_pending_add(&name, pending);
+                self.apply_pending_add(&name, pending, true);
             }
         }
     }
@@ -820,6 +824,15 @@ pub fn list_folder_audio_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// `text` with its first character uppercased, to start a status line.
+fn capitalize_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 /// Status for `L` on a browser row that is neither a track nor a folder (`★ Music Homes`, `..`).
 const SELECT_TRACK_OR_FOLDER: &str = "Select a track or folder";
 
@@ -827,6 +840,8 @@ const SELECT_TRACK_OR_FOLDER: &str = "Select a track or folder";
 #[derive(Debug)]
 struct FolderListing {
     playlist: String,
+    /// The playlist was created for this add ("+ New playlist…").
+    created: bool,
     dir: PathBuf,
     result: std::io::Result<Vec<PathBuf>>,
 }
@@ -990,7 +1005,7 @@ impl super::AppUI {
             }
         };
         match self.playlists.store.playlists().get(cursor).map(|p| p.name.clone()) {
-            Some(name) => self.apply_pending_add(&name, pending),
+            Some(name) => self.apply_pending_add(&name, pending, false),
             None => {
                 self.playlists.modal = Some(PlaylistModal::NamePrompt {
                     purpose: NamePurpose::CreateAndAdd(pending),
@@ -1001,10 +1016,12 @@ impl super::AppUI {
         }
     }
 
-    fn apply_pending_add(&mut self, playlist: &str, pending: PendingAdd) {
+    /// Add `pending` to `playlist`. `created` is true when the name prompt just created the
+    /// playlist for this add, so a folder that adds nothing still reports the new playlist.
+    fn apply_pending_add(&mut self, playlist: &str, pending: PendingAdd, created: bool) {
         match pending {
             PendingAdd::Entries { entries, .. } => self.add_entries_to_playlist(playlist, entries),
-            PendingAdd::Folder { dir, .. } => self.start_folder_add(playlist, dir),
+            PendingAdd::Folder { dir, .. } => self.start_folder_add(playlist, dir, created),
         }
     }
 
@@ -1036,7 +1053,7 @@ impl super::AppUI {
     /// queue rows refresh. They are also put in the cache directly, so
     /// `poll_playlist_folder_adds` builds the entries from them when the listing arrives. The
     /// worker stops, adding nothing, once shutdown is signalled.
-    fn start_folder_add(&mut self, playlist: &str, dir: PathBuf) {
+    fn start_folder_add(&mut self, playlist: &str, dir: PathBuf, created: bool) {
         self.status_message = format!("Reading {}…", folder_display_name(&dir));
         let tx = self.playlists.folder_tx.clone();
         let metadata_tx = self.metadata_tx.clone();
@@ -1066,7 +1083,12 @@ impl super::AppUI {
                 }
             }
             if !stopped() {
-                let _ = tx.send(FolderUpdate::Listing(FolderListing { playlist, dir, result }));
+                let _ = tx.send(FolderUpdate::Listing(FolderListing {
+                    playlist,
+                    created,
+                    dir,
+                    result,
+                }));
             }
         });
     }
@@ -1082,19 +1104,26 @@ impl super::AppUI {
                 FolderUpdate::Listing(listing) => listing,
             };
             let folder = folder_display_name(&listing.dir);
-            match listing.result {
-                Ok(files) if files.is_empty() => {
-                    self.status_message = format!("No audio files in {}", folder);
-                }
+            let problem = match listing.result {
+                Ok(files) if files.is_empty() => format!("no audio files in {}", folder),
                 Ok(files) => {
                     let entries = files.iter().map(|path| self.playlist_entry_for_path(path)).collect();
                     self.add_entries_to_playlist(&listing.playlist, entries);
+                    continue;
                 }
                 Err(e) => {
                     crate::log_warn!("playlists", "Couldn't read {}: {}", listing.dir.display(), e);
-                    self.status_message = format!("Couldn't read {}", folder);
+                    format!("couldn't read {}", folder)
                 }
-            }
+            };
+            // "+ New playlist…" creates the playlist before the folder is listed, so the name
+            // prompt can still show a name error. When the folder then adds nothing, the status
+            // says the playlist was created anyway.
+            self.status_message = if listing.created {
+                format!("Created \"{}\"; {}", listing.playlist, problem)
+            } else {
+                capitalize_first(&problem)
+            };
         }
     }
 
@@ -1336,13 +1365,15 @@ impl AppUI {
             missing,
         } = crate::playlist::plan_queue(&checked, &exists, result.play_from, &cached);
         if tracks.is_empty() {
-            let hint = result.entries.first().map(|e| mount_hint(&e.path)).unwrap_or_default();
-            self.status_message = format!(
-                "None of {}'s {} found. Is {} mounted?",
+            let mut status = format!(
+                "None of {}'s {} found.",
                 result.name,
-                track_count_label(result.entries.len()),
-                hint
+                track_count_label(result.entries.len())
             );
+            if let Some(hint) = result.entries.first().and_then(|e| mount_hint(&e.path)) {
+                status.push_str(&format!(" Is {} mounted?", hint));
+            }
+            self.status_message = status;
             return;
         }
         let queued = tracks.len();

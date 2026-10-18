@@ -95,11 +95,44 @@ fn render(app: &mut AppUI, width: u16, height: u16) -> String {
 fn test_mount_hint_is_the_first_two_folders() {
     common::isolate();
     assert_eq!(
-        mount_hint(Path::new("/Volumes/Share/Radiohead/OK Computer/01 Airbag.flac")),
-        "/Volumes/Share"
+        mount_hint(Path::new("/Volumes/Share/Radiohead/OK Computer/01 Airbag.flac")).as_deref(),
+        Some("/Volumes/Share")
     );
-    assert_eq!(mount_hint(Path::new("/Volumes/Share")), "/Volumes/Share");
-    assert_eq!(mount_hint(Path::new("/song.flac")), "/song.flac");
+    assert_eq!(
+        mount_hint(Path::new("/Volumes/Music/a/b.mp3")).as_deref(),
+        Some("/Volumes/Music")
+    );
+    assert_eq!(
+        mount_hint(Path::new("/Volumes/Share/song.flac")).as_deref(),
+        Some("/Volumes/Share")
+    );
+}
+
+#[test]
+fn test_mount_hint_never_names_a_file_or_a_top_level_folder() {
+    common::isolate();
+    // Issue #59: the hint comes from the folder holding the file, never the file itself. A file
+    // at `/` or directly in a top-level folder (`/Volumes`, `/mnt`) has no share to name:
+    // "Is /Volumes mounted?" reads wrong, so the hint is left out.
+    assert_eq!(mount_hint(Path::new("/ghost.mp3")), None);
+    assert_eq!(mount_hint(Path::new("/Volumes/ghost.mp3")), None);
+    assert_eq!(mount_hint(Path::new("/Volumes/Share")), None);
+}
+
+#[test]
+fn test_all_missing_without_a_mount_hint_leaves_out_the_question() {
+    common::isolate();
+    let dir = temp_dir("all_missing_root");
+    write_playlist(vec![entry(Path::new("/nonexistent-qs-ghost.mp3"), "A", "One")]);
+    let mut app = app_with_playlist(&dir);
+    install_recording_player(&mut app);
+    app.active_tab = 4;
+    app.playlists.tracks_focus = true;
+    app.playlists.track_cursor = 0;
+    press(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(poll_until(&mut app, |app| app.status_message.starts_with("None of")));
+    assert_eq!(app.status_message, "None of Road Trip's 1 track found.");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -287,6 +287,11 @@ pub enum NameError {
     /// Another playlist already has this name, ignoring case. Raised by the store, which knows
     /// the other names; [`validate_name`] never returns it.
     Duplicate(String),
+    /// A file in the playlists folder already has this name, ignoring case, but the store
+    /// skipped it: it couldn't be read or parsed, it lost to a name differing only in case or
+    /// normalization, or it appeared after the load. Raised by the store; carries the file's
+    /// own stem. [`validate_name`] never returns it.
+    Reserved(String),
 }
 
 impl std::fmt::Display for NameError {
@@ -300,6 +305,9 @@ impl std::fmt::Display for NameError {
             NameError::ControlChar => write!(f, "Name can't contain control characters"),
             NameError::LeadingDot => write!(f, "Name can't start with ."),
             NameError::Duplicate(name) => write!(f, "\"{}\" already exists", name),
+            NameError::Reserved(name) => {
+                write!(f, "A playlist file named \"{}\" exists but couldn't be loaded", name)
+            }
         }
     }
 }

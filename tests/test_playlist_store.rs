@@ -254,15 +254,15 @@ fn test_create_refuses_the_name_of_a_skipped_file() {
     assert!(store.playlists().is_empty());
     assert_eq!(
         store.create("latin"),
-        Err(StoreError::Name(NameError::Duplicate("Latin".to_string())))
+        Err(StoreError::Name(NameError::Reserved("Latin".to_string())))
     );
     assert_eq!(
         store.create(" LATIN ").unwrap_err().to_string(),
-        "\"Latin\" already exists"
+        "A playlist file named \"Latin\" exists but couldn't be loaded"
     );
     assert_eq!(
         store.create("mix"),
-        Err(StoreError::Name(NameError::Duplicate("Mix".to_string())))
+        Err(StoreError::Name(NameError::Reserved("Mix".to_string())))
     );
     assert!(store.playlists().is_empty());
     // Other names are still fine.
@@ -589,11 +589,11 @@ fn test_rename_refuses_the_name_of_a_skipped_file() {
     store.add("Other", vec![entry("a")]).unwrap();
     assert_eq!(
         store.rename("Other", "LATIN"),
-        Err(StoreError::Name(NameError::Duplicate("Latin".to_string())))
+        Err(StoreError::Name(NameError::Reserved("Latin".to_string())))
     );
     assert_eq!(
         store.rename("other", "mix"),
-        Err(StoreError::Name(NameError::Duplicate("Mix".to_string())))
+        Err(StoreError::Name(NameError::Reserved("Mix".to_string())))
     );
     assert_eq!(names(&store), vec!["Other"]);
 
@@ -618,14 +618,14 @@ fn test_a_case_duplicate_dropped_at_load_is_never_written_over() {
 
     assert_eq!(
         store.rename("Mix", "mix"),
-        Err(StoreError::Name(NameError::Duplicate("mix".to_string())))
+        Err(StoreError::Name(NameError::Reserved("mix".to_string())))
     );
     assert_eq!(names(&store), vec!["Mix"]);
 
     store.delete("Mix").unwrap();
     assert_eq!(
         store.create("mix"),
-        Err(StoreError::Name(NameError::Duplicate("mix".to_string())))
+        Err(StoreError::Name(NameError::Reserved("mix".to_string())))
     );
     assert!(store.playlists().is_empty());
 
@@ -759,7 +759,7 @@ fn test_unreadable_file_is_skipped_and_never_rewritten() {
     assert!(store.playlists().is_empty());
     assert_eq!(
         store.create("locked"),
-        Err(StoreError::Name(NameError::Duplicate("Locked".to_string())))
+        Err(StoreError::Name(NameError::Reserved("Locked".to_string())))
     );
     store.create("Fresh").unwrap();
     assert!(worker.flush());
@@ -861,7 +861,7 @@ fn test_skipped_file_reserves_its_name_in_either_normalization() {
     store.reserve_names(vec![ZOE_NFC.to_string()]);
     assert!(matches!(
         store.create(ZOE_NFD),
-        Err(StoreError::Name(NameError::Duplicate(_)))
+        Err(StoreError::Name(NameError::Reserved(_)))
     ));
 }
 
@@ -896,7 +896,7 @@ fn test_rename_refuses_a_reserved_name_differing_only_in_normalization() {
     assert_eq!(names(&store), vec![ZOE_NFC]);
     assert!(matches!(
         store.rename(ZOE_NFC, "zo\u{eb}"),
-        Err(StoreError::Name(NameError::Duplicate(_)))
+        Err(StoreError::Name(NameError::Reserved(_)))
     ));
 }
 
@@ -957,7 +957,7 @@ fn test_create_onto_an_unseen_file_is_undone_and_the_file_kept() {
     // The name is now known to be taken.
     assert_eq!(
         store.create("Mix"),
-        Err(StoreError::Name(NameError::Duplicate("Mix".to_string())))
+        Err(StoreError::Name(NameError::Reserved("Mix".to_string())))
     );
     assert!(worker.flush());
     assert_eq!(fs::read_to_string(&path).unwrap(), theirs);

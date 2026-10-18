@@ -87,7 +87,7 @@ pub struct Playlist {
 ### `PlaylistStore` (new, held by `AppUI`)
 
 - Holds `Vec<Playlist>`, sorted by name (case-insensitive).
-- At startup a worker (`self.workers.spawn`) reads every `*.m3u8` in the playlists folder and sends the parsed playlists to the UI over an mpsc channel. Until the result arrives the tab shows `Loading playlists…`. A file that cannot be read or is not valid UTF-8 is logged and skipped. It is never rewritten or renamed. If the folder exists but cannot be listed (permissions, an entry that cannot be read, or a symlink whose target is missing), the load fails: the store stays not loaded, the tab shows `Couldn't load playlists`, and every edit is refused for the session, so no create can overwrite a file the store never read (issue #56).
+- At startup a worker (`self.workers.spawn`) reads every `*.m3u8` in the playlists folder and sends the parsed playlists to the UI over an mpsc channel. Until the result arrives the tab shows `Loading playlists…`. A file that cannot be read or is not valid UTF-8 is logged and skipped. It is never rewritten or renamed, and its name is reserved: creating or renaming a playlist onto it is refused with `A playlist file named "Latin" exists but couldn't be loaded` (`NameError::Reserved`, issue #59), since no playlist of that name is listed. If the folder exists but cannot be listed (permissions, an entry that cannot be read, or a symlink whose target is missing), the load fails: the store stays not loaded, the tab shows `Couldn't load playlists`, and every edit is refused for the session, so no create can overwrite a file the store never read (issue #56).
 - Operations, each changing the in-memory copy first and then handing the full file contents to the background writer (`PersistHandle::save`, atomic temp-file-then-rename):
   - `create(name)` – fails on an invalid name or a case-insensitive duplicate. The file is written with `PersistHandle::create` (`create_new_file`: temp file, fsync, then a hard link to the final name, which fails instead of replacing; a disk without hard links falls back to `OpenOptions::create_new`). The name checks can't model every file system (HFS+, SMB or exFAT name matching, another running instance), so a file the store never saw may already be there: the writer leaves it untouched and reports the collision, and the store removes the playlist, reserves the name and the status reads `Couldn't create "Mix": a file with that name already exists` (issue #62);
   - `add(name, entries) -> AddResult { added, skipped_duplicates }` – a duplicate is an entry whose path is already in the playlist. Each path is first made absolute (`std::path::absolute`) and normalized with `normalize_path`, so the same file reached through `..` (`quickstream ./music/../music`) is a duplicate and no `..` is stored (issue #58);
@@ -127,13 +127,13 @@ pub struct Playlist {
   - browser, `★ Music Homes` or `..` row: status `Select a track or folder`;
   - queue pane: the selected queue track.
 - On every other tab it adds the now-playing track. With nothing playing: status `Nothing is playing`.
-- It opens the **add picker** modal: header shows what is being added (track title, or `<folder> (folder)`); rows are the playlists, the `last_playlist` highlighted, then `+ New playlist…`. `j`/`k`/arrows move with wraparound, `Enter` adds, `Esc`/`q` cancels. `+ New playlist…` opens the name prompt; on confirm it creates the playlist and adds.
+- It opens the **add picker** modal: header shows what is being added (track title, or `<folder> (folder)`); rows are the playlists, the `last_playlist` highlighted, then `+ New playlist…`. `j`/`k`/arrows move with wraparound, `Enter` adds, `Esc`/`q` cancels. `+ New playlist…` opens the name prompt; on confirm it creates the playlist and adds. A folder is listed after the playlist is created (so a name error still shows in the open prompt); if it then adds nothing the status says so and names the new playlist: `Created "Road Trip"; no audio files in <folder>` or `Created "Road Trip"; couldn't read <folder>` (issue #59).
 - Result messages: `Added "Kerala" to Road Trip (25 tracks)`, `Already in Road Trip`, `Added 9 to Road Trip, skipped 3 already in it`.
 
 ### Name prompt modal
 
 - Same pattern as `editing_home_dir`: captured before the global hotkeys, every `Char` is text (including `q` and digits), `Backspace` deletes, `Enter` confirms, `Esc` cancels.
-- On an invalid or duplicate name the prompt stays open and shows the error, for example `Name can't contain /` or `"Road Trip" already exists`.
+- On an invalid or duplicate name the prompt stays open and shows the error, for example `Name can't contain /` or `"Road Trip" already exists`. A name reserved by a file the store skipped shows `A playlist file named "Latin" exists but couldn't be loaded`.
 
 ### Docs
 
@@ -145,7 +145,7 @@ pub struct Playlist {
 ### Adding
 
 - A track's entry is built from metadata the app already holds, in this order: the queue row or now-playing `AudioMetadata`, then `MetadataCache`. On a miss the title is the file stem, artist empty, duration `-1`. Nothing reads the share on the UI thread.
-- A folder add runs on a worker: read the folder listing, keep files where `is_supported_audio_file` is true, sort by name, send the paths back over a channel. The UI then builds entries as above and calls `PlaylistStore::add`. If the folder can't be read: status `Couldn't read <folder>`.
+- A folder add runs on a worker: read the folder listing, keep files where `is_supported_audio_file` is true, sort by name, send the paths back over a channel. The UI then builds entries as above and calls `PlaylistStore::add`. If the folder can't be read: status `Couldn't read <folder>`. If it holds no audio files: `No audio files in <folder>`.
 
 ### Missing-file check
 
@@ -159,7 +159,7 @@ pub struct Playlist {
 2. The worker checks which files exist and builds placeholder `AudioMetadata` from the entry data plus a `MetadataCache` hit, without the `stat` that `fallback_metadata` does. It sends the result to the UI over the existing `queue_add_tx` channel with a source tag.
 3. `poll_pending_queue_adds` calls `enqueue_tracks`, which registers each file for DLNA streaming (`register_stream_file`) and starts the background tag fetch. Its status message uses the source tag (`Queued 22 tracks from Road Trip, 2 missing`) instead of the hard-coded `(web)`.
 4. **Replace** (`Enter`) runs before step 3 adds anything: stop any autopilot scan (`autopilot_scan_stop`, `autopilot_rx = None`, `is_autopilot_scanning = false`), close any continuous DLNA stream, stop playback, clear the queue. After adding, set `current_index` and `queue_cursor` to the selected track's position among the tracks that exist, then call `play_current_track`. If the selected track itself is missing, play the next existing track after it, or the first existing track if none follows.
-5. If every entry is missing: nothing is queued, the queue is left as it was, and the status is `None of Road Trip's 24 tracks found. Is /Volumes/Music mounted?` (the folder shown is the first entry's top two path components).
+5. If every entry is missing: nothing is queued, the queue is left as it was, and the status is `None of Road Trip's 24 tracks found. Is /Volumes/Music mounted?` (the folder shown is the top two folders above the first entry's file). When that file is fewer than two folders deep (`/ghost.mp3`, `/Volumes/ghost.mp3`) there is no share to name and the question is left out: `None of Road Trip's 1 track found.` (issue #59).
 
 ### Other cases
 

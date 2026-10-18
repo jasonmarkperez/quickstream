@@ -647,6 +647,64 @@ fn test_folder_that_cannot_be_read_reports_it() {
 }
 
 #[test]
+fn test_new_playlist_from_a_folder_without_audio_says_it_was_created() {
+    common::isolate();
+    // Issue #59: "+ New playlist…" creates the playlist before the worker lists the folder, so
+    // the status must not hide that a playlist now exists.
+    let dir = scratch_dir("create_empty_folder");
+    let empty = dir.join("Artwork");
+    fs::create_dir_all(&empty).unwrap();
+    fs::write(empty.join("cover.jpg"), b"").unwrap();
+    let mut app = new_app(&dir);
+    wait_loaded(&mut app);
+    select_browser_row(&mut app, &empty);
+
+    press(&mut app, KeyCode::Char('L'));
+    press(&mut app, KeyCode::Enter); // the only row: "+ New playlist…"
+    type_text(&mut app, "Road Trip");
+    press(&mut app, KeyCode::Enter);
+    wait_for(&mut app, "empty folder listing", |a| {
+        !a.status_message.starts_with("Reading")
+    });
+    assert_eq!(app.status_message, "Created \"Road Trip\"; no audio files in Artwork");
+    assert!(app.playlists.store.get("Road Trip").unwrap().entries.is_empty());
+
+    // Adding the same folder to the existing playlist creates nothing, so says only that.
+    press(&mut app, KeyCode::Char('L'));
+    press(&mut app, KeyCode::Enter); // Road Trip
+    wait_for(&mut app, "second empty folder listing", |a| {
+        !a.status_message.starts_with("Reading")
+    });
+    assert_eq!(app.status_message, "No audio files in Artwork");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_new_playlist_from_an_unreadable_folder_says_it_was_created() {
+    common::isolate();
+    let dir = scratch_dir("create_unreadable");
+    let mut app = new_app(&dir);
+    wait_loaded(&mut app);
+
+    app.playlists.modal = Some(PlaylistModal::AddPicker {
+        pending: PendingAdd::Folder {
+            label: "Unplugged (folder)".to_string(),
+            dir: dir.join("Unplugged"),
+        },
+        cursor: 0,
+    });
+    press(&mut app, KeyCode::Enter); // "+ New playlist…"
+    type_text(&mut app, "Road Trip");
+    press(&mut app, KeyCode::Enter);
+    wait_for(&mut app, "folder read error", |a| {
+        !a.status_message.starts_with("Reading")
+    });
+    assert_eq!(app.status_message, "Created \"Road Trip\"; couldn't read Unplugged");
+    assert!(app.playlists.store.get("Road Trip").is_some());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_add_key_uses_queue_row_and_now_playing_track() {
     common::isolate();
     let dir = scratch_dir("queue_now_playing");

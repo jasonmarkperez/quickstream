@@ -580,6 +580,10 @@ fn test_name_error_messages() {
         NameError::Duplicate("Road Trip".to_string()).to_string(),
         "\"Road Trip\" already exists"
     );
+    assert_eq!(
+        NameError::Reserved("UPPER".to_string()).to_string(),
+        "A playlist file named \"UPPER\" exists but couldn't be loaded"
+    );
 }
 
 #[test]

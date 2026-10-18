@@ -3555,13 +3555,7 @@ impl AppUI {
     }
 
     fn render_tabs(&self, f: &mut Frame, area: Rect) {
-        let titles = vec![
-            " [1] Now Playing",
-            " [2] Queue & Library",
-            " [3] Devices",
-            " [4] Settings",
-            " [5] Playlists",
-        ];
+        let titles = tab_titles(area.width, self.active_tab);
         // Zero padding keeps all five labels inside a standard 80-column terminal.
         let tabs = Tabs::new(titles)
             .padding("", "")
@@ -4707,7 +4701,8 @@ impl AppUI {
         }
 
         // Left Column: Playback & Navigation. Both columns must fit the 19 rows an 80x24
-        // terminal leaves for the key list, and each description fits in 29 columns there.
+        // terminal leaves for the key list, and each description fits in 27 columns there
+        // (38 per column, less the key field).
         let left_lines = vec![
             Self::help_section_header("PLAYBACK & AUDIO"),
             Self::help_key_line("Space", "Play / Pause"),
@@ -4731,11 +4726,11 @@ impl AppUI {
         ];
         f.render_widget(Paragraph::new(left_lines), cols[0]);
 
-        // Right Column: Library & Search (concise to guarantee <= 34 chars)
+        // Right Column: Library & Search (descriptions <= 27 chars, as on the left)
         let right_lines = vec![
             Self::help_section_header("LIBRARY & QUEUE"),
             Self::help_key_line("Enter", "Open / Queue / Play"),
-            Self::help_key_line("p", "Autopilot (append if playing)"),
+            Self::help_key_line("p", "Autopilot (adds if playing)"),
             Self::help_key_line("P", "Autopilot Reshuffle (next+)"),
             Self::help_key_line("M", "Mix Picker modal (vibe/BPM)"),
             Self::help_key_line("r", "Seed Radio / Rescan dev"),
@@ -4874,20 +4869,6 @@ impl AppUI {
             Span::styled("Close", Style::default().fg(Color::White)),
         ]);
         f.render_widget(Paragraph::new(footer_line).alignment(Alignment::Center), inner[2]);
-
-        // Footer: dismiss instruction (if vertical room allows)
-        if inner.len() >= 2 {
-            let footer_line = Line::from(vec![
-                Span::styled("Press ", Style::default().fg(Color::DarkGray)),
-                Span::styled("[?]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(", ", Style::default().fg(Color::DarkGray)),
-                Span::styled("[Esc]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(", or ", Style::default().fg(Color::DarkGray)),
-                Span::styled("[q]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(" to close", Style::default().fg(Color::DarkGray)),
-            ]);
-            f.render_widget(Paragraph::new(footer_line).alignment(Alignment::Center), inner[1]);
-        }
     }
 
     fn help_section_header(title: &str) -> Line<'static> {
@@ -4900,7 +4881,7 @@ impl AppUI {
     fn help_key_line(key: &str, desc: &str) -> Line<'static> {
         Line::from(vec![
             Span::styled(
-                format!(" {:<7} ", key),
+                format!(" {:<width$} ", key, width = HELP_KEY_WIDTH),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
             Span::styled(desc.to_string(), Style::default().fg(Color::White)),
@@ -4931,6 +4912,49 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 fn help_modal_rect(r: Rect) -> Rect {
     modal_rect_with_height(r, 20)
 }
+
+/// Full tab labels: 79 columns with the dividers.
+const TAB_TITLES: [&str; 5] = [
+    " [1] Now Playing",
+    " [2] Queue & Library",
+    " [3] Devices",
+    " [4] Settings",
+    " [5] Playlists",
+];
+
+/// Short tab labels for terminals narrower than the full ones: 58 columns with the dividers.
+const SHORT_TAB_TITLES: [&str; 5] = ["[1] Now", "[2] Library", "[3] Devices", "[4] Settings", "[5] Playlists"];
+
+/// Tab bar labels that fit `width` columns, so the active tab stays visible: the full labels,
+/// else the short ones, else only the numbers with the active tab's short label.
+fn tab_titles(width: u16, active: usize) -> Vec<String> {
+    // Tabs draws a one-column divider between labels.
+    let fits = |titles: &[&str]| {
+        let text: usize = titles.iter().map(|t| t.chars().count()).sum();
+        text + titles.len() - 1 <= width as usize
+    };
+    if fits(&TAB_TITLES) {
+        return TAB_TITLES.iter().map(|t| t.to_string()).collect();
+    }
+    if fits(&SHORT_TAB_TITLES) {
+        return SHORT_TAB_TITLES.iter().map(|t| t.to_string()).collect();
+    }
+    SHORT_TAB_TITLES
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            if i == active {
+                t.to_string()
+            } else {
+                format!("[{}]", i + 1)
+            }
+        })
+        .collect()
+}
+
+/// Width of the help modal's key field: the longest key, `c / R / D`. A longer key would push
+/// its description out of line with the rest of the column.
+const HELP_KEY_WIDTH: usize = 9;
 
 /// Rows of the help modal: the key list, its footer and the border must fit.
 const HELP_MODAL_HEIGHT: u16 = 30;

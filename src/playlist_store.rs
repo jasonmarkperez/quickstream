@@ -377,7 +377,7 @@ impl PlaylistStore {
         // to the kept `Mix.m3u8`: renaming `Mix` to exactly `mix` would replace that file.
         // Case-sensitive APFS still ignores normalization, so compare canonical forms.
         if let Some(r) = self.reserved.iter().find(|r| same_canonical(r, &new_name)) {
-            return Err(StoreError::Name(NameError::Duplicate(r.clone())));
+            return Err(StoreError::Name(NameError::Reserved(r.clone())));
         }
         let new_path = self.file_for(&new_name)?;
         let old_name = std::mem::replace(&mut self.playlists[slot].name, new_name.clone());
@@ -410,8 +410,8 @@ impl PlaylistStore {
     ///
     /// - A failed create removes the playlist (whatever it is called now). When a file was in
     ///   the way, its name is reserved like a file skipped at load, so a second create is refused
-    ///   with `"Mix" already exists` instead of failing the same way. A report for a playlist
-    ///   already deleted changes nothing.
+    ///   with `A playlist file named "Mix" exists but couldn't be loaded` instead of failing the
+    ///   same way. A report for a playlist already deleted changes nothing.
     /// - A failed rename gives the playlist back the name its file still has and saves it there,
     ///   so edits made in the meantime (which the writer dropped) reach the real file.
     pub fn poll_write_failures(&mut self) -> Vec<WriteFailure> {
@@ -524,10 +524,12 @@ impl PlaylistStore {
     }
 
     /// Refuse `name` when it is the name of a file skipped at load, ignoring case. The error
-    /// carries the file's own stem, so the message reads `"Latin" already exists`.
+    /// carries the file's own stem, so the message reads
+    /// `A playlist file named "Latin" exists but couldn't be loaded`: no such playlist is listed,
+    /// so `"Latin" already exists` would not make sense.
     fn ensure_not_reserved(&self, name: &str) -> Result<(), StoreError> {
         match self.reserved.iter().find(|r| names_equal(r, name)) {
-            Some(reserved) => Err(StoreError::Name(NameError::Duplicate(reserved.clone()))),
+            Some(reserved) => Err(StoreError::Name(NameError::Reserved(reserved.clone()))),
             None => Ok(()),
         }
     }

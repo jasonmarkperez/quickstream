@@ -678,7 +678,7 @@ fn test_create_onto_an_unseen_file_shows_an_error_and_removes_the_playlist() {
     type_text(&mut app, "Mix");
     press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
     assert!(
-        matches!(&app.playlists.modal, Some(PlaylistModal::NamePrompt { error: Some(e), .. }) if e == "\"Mix\" already exists"),
+        matches!(&app.playlists.modal, Some(PlaylistModal::NamePrompt { error: Some(e), .. }) if e == "A playlist file named \"Mix\" exists but couldn't be loaded"),
         "{:?}",
         app.playlists.modal
     );
