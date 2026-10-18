@@ -1142,3 +1142,63 @@ fn test_id_follows_a_rename_the_writer_undid() {
     assert_eq!(store.poll_write_failures().len(), 1);
     assert_eq!(store.name_of(id), Some("Old"));
 }
+
+/// Issue #50: the web dashboard's snapshot is rebuilt when the revision changes, and edits from
+/// the dashboard carry the revision they were made against. Every change to the playlists bumps
+/// it; anything that changes nothing leaves it alone.
+#[test]
+fn test_revision_changes_with_every_edit_and_only_then() {
+    common::isolate();
+    let dir = scratch("revision");
+    let worker = PersistenceWorker::spawn();
+    let mut store = PlaylistStore::new(dir.clone(), worker.handle());
+    let unloaded = store.revision();
+    store.set_loaded(Vec::new());
+    let mut last = store.revision();
+    assert_ne!(last, unloaded, "loading changes what the store holds");
+
+    let mut changed = |store: &PlaylistStore, what: &str| {
+        let now = store.revision();
+        assert_ne!(now, last, "{} did not bump the revision", what);
+        last = now;
+    };
+    store.create("Road Trip").unwrap();
+    changed(&store, "create");
+    store.add("Road Trip", vec![entry("a"), entry("b")]).unwrap();
+    changed(&store, "add");
+    store.move_entry("Road Trip", 0, MoveDir::Down).unwrap();
+    changed(&store, "move");
+    store.remove("Road Trip", 0).unwrap();
+    changed(&store, "remove");
+    store.rename("Road Trip", "Summer").unwrap();
+    changed(&store, "rename");
+    store.delete("Summer").unwrap();
+    changed(&store, "delete");
+
+    // No-ops and refusals leave it alone.
+    store.create("Mix").unwrap();
+    store.add("Mix", vec![entry("a")]).unwrap();
+    let before = store.revision();
+    store.add("Mix", vec![entry("a")]).unwrap();
+    store.move_entry("Mix", 0, MoveDir::Up).unwrap();
+    store.rename("Mix", "Mix").unwrap();
+    let _ = store.create("mix");
+    let _ = store.remove("Mix", 5);
+    let _ = store.delete("Nope");
+    assert_eq!(store.revision(), before);
+    assert!(worker.flush());
+}
+
+/// Undoing a create or rename the writer couldn't do changes the playlists too.
+#[test]
+fn test_revision_changes_when_a_failed_write_is_undone() {
+    common::isolate();
+    let dir = scratch("revision_undo");
+    let (worker, mut store) = open_store(&dir);
+    foreign_file(&dir, "Mix.m3u8", "theirs");
+    store.create("Mix").unwrap();
+    assert!(worker.flush());
+    let before = store.revision();
+    assert_eq!(store.poll_write_failures().len(), 1);
+    assert_ne!(store.revision(), before);
+}

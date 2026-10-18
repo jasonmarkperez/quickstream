@@ -225,7 +225,8 @@ function assertNoMarkupFromData() {
   for (const el of walk(document.getElementById('queueList'))
     .concat(walk(document.getElementById('browserList')))
     .concat(walk(document.getElementById('bookmarksRow')))
-    .concat(walk(document.getElementById('devicesList')))) {
+    .concat(walk(document.getElementById('devicesList')))
+    .concat(walk(document.getElementById('playlistsList')))) {
     for (const name of Object.keys(el.attributes)) {
       assert.ok(!name.startsWith('on'), `element has inline handler attribute ${name}`);
     }
@@ -392,6 +393,70 @@ for (let i = 0; i < chips.length; i++) {
 // Filtering still works and only shows matching entries.
 sandbox.renderBrowser(browserData, 'd' + H.img.toLowerCase());
 assert.strictEqual(byClass(browserList, 'browser-item').length, 1);
+assertNoMarkupFromData();
+
+// ---------------------------------------------------------------------------
+// 3. Playlists via renderPlaylists (issue #50)
+// ---------------------------------------------------------------------------
+const playlistsList = document.getElementById('playlistsList');
+const playlistsSnapshot = {
+  state: 'ready',
+  message: null,
+  revision: 9,
+  last_playlist: H.img,
+  playlists: all.map(v => ({
+    name: v,
+    track_count: 2,
+    total_duration_seconds: 65,
+    entries: [
+      { index: 0, title: v, artist: v, duration_seconds: 65, path: '/music/' + v, outside: false, missing: false },
+      { index: 1, title: v, artist: '', duration_seconds: -1, path: '', outside: true, missing: true },
+    ],
+  })),
+};
+sandbox.renderPlaylists(playlistsSnapshot);
+assertNoMarkupFromData();
+assert.deepStrictEqual(byClass(playlistsList, 'playlist-name').map(n => n.textContent), all,
+  'playlist names not rendered verbatim as text');
+assert.strictEqual(byClass(playlistsList, 'playlist-meta')[0].textContent, '2 tracks · 1:05');
+assert.strictEqual(byClass(playlistsList, 'playlist-track').length, 0, 'playlists start closed');
+
+for (let i = 0; i < all.length; i++) {
+  const card = () => byClass(playlistsList, 'playlist-card')[i];
+  const buttons = walk(card()).filter(n => n.tagName === 'BUTTON');
+  const play = buttons.find(b => b.title === 'Play playlist (replaces the queue)');
+  const append = buttons.find(b => b.title === 'Append playlist to the queue');
+  assert.ok(play && append, 'playlist buttons missing');
+  click(playlistsList, play);
+  assert.deepStrictEqual(lastAction(), { action: 'playlist_play', value: null, name: all[i], index: 0, revision: 9 });
+  click(playlistsList, append);
+  assert.deepStrictEqual(lastAction(), { action: 'playlist_append', value: null, name: all[i] });
+
+  // Open it: its tracks show, the missing one marked, the outside one labelled.
+  const before = fetchCalls.length;
+  click(playlistsList, byClass(card(), 'playlist-name')[0]);
+  assert.strictEqual(fetchCalls.length, before, 'opening a playlist sends nothing');
+  assert.ok(card().classList.contains('open'));
+  const rows = byClass(card(), 'playlist-track');
+  assert.strictEqual(rows.length, 2);
+  assert.strictEqual(byClass(rows[0], 'queue-item-title')[0].textContent, all[i] + ' - ' + all[i]);
+  assert.strictEqual(byClass(rows[0], 'queue-item-dur')[0].textContent, '1:05');
+  assert.strictEqual(byClass(rows[1], 'queue-item-title')[0].textContent, '✗ missing: ' + all[i]);
+  assert.strictEqual(byClass(rows[1], 'queue-item-dur')[0].textContent, '----');
+  assert.ok(rows[1].classList.contains('missing') && rows[1].classList.contains('outside'));
+  assertNoMarkupFromData();
+
+  click(playlistsList, byClass(rows[1], 'queue-item-title')[0]);
+  assert.deepStrictEqual(lastAction(), { action: 'playlist_play', value: null, name: all[i], index: 1, revision: 9 });
+
+  // Close it again.
+  click(playlistsList, byClass(card(), 'playlist-name')[0]);
+  assert.strictEqual(byClass(card(), 'playlist-track').length, 0);
+}
+
+// Not loaded: the app's message is shown as text.
+sandbox.renderPlaylists({ state: 'failed', message: H.scriptTag, revision: 0, last_playlist: null, playlists: [] });
+assert.strictEqual(playlistsList.textContent, H.scriptTag);
 assertNoMarkupFromData();
 
 console.log('dashboard DOM harness: all checks passed');

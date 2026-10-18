@@ -61,7 +61,13 @@ fn test_remote_dashboard_without_token_is_unauthorized() {
 fn test_remote_api_without_token_is_unauthorized() {
     common::isolate();
     let h = headers(&[&lan_host()]);
-    for path in ["/api/status", "/api/browser?path=/", "/api/cover", "/favicon.ico"] {
+    for path in [
+        "/api/status",
+        "/api/browser?path=/",
+        "/api/cover",
+        "/api/playlists",
+        "/favicon.ico",
+    ] {
         assert_eq!(
             authorize(lan_peer(), PORT, "GET", path, &h, TOKEN),
             AuthDecision::Unauthorized,
@@ -596,6 +602,35 @@ fn test_loopback_server_rejects_cross_site_style_posts() {
     let (status, _, _) = post_with(port, &origin, r#"{"action":"next"}"#);
     assert_eq!(status, 200);
     assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), WebCommand::Next);
+    handle.stop();
+}
+
+/// Issue #50: the playlist actions share `/api/action`, so they get the same Content-Type and
+/// Origin checks as every other action.
+#[test]
+fn test_loopback_server_rejects_cross_site_style_playlist_posts() {
+    common::isolate();
+    let (handle, rx) = start(Arc::new(RwLock::new(NowPlayingState::default())));
+    let port = handle.port;
+    for body in [
+        r#"{"action":"playlist_play","name":"Road Trip"}"#,
+        r#"{"action":"playlist_append","name":"Road Trip"}"#,
+        r#"{"action":"playlist_create","name":"Road Trip"}"#,
+        r#"{"action":"playlist_delete","name":"Road Trip"}"#,
+    ] {
+        for headers in [
+            "Content-Type: text/plain\r\n",
+            "",
+            "Content-Type: application/json\r\nOrigin: http://evil.example\r\n",
+        ] {
+            let (status, _, _) = post_with(port, headers, body);
+            assert_eq!(status, 403, "{} with {:?}", body, headers);
+        }
+    }
+    assert!(
+        rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "rejected requests must not dispatch commands"
+    );
     handle.stop();
 }
 

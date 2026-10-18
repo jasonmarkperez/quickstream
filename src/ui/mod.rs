@@ -3420,6 +3420,12 @@ impl AppUI {
                         path.display()
                     );
                 }
+                crate::web::WebCommand::QueuePlaylist {
+                    name,
+                    entries,
+                    play_from,
+                } => self.queue_web_playlist(name, entries, play_from),
+                crate::web::WebCommand::CheckPlaylists => self.check_playlists_for_web(),
             }
         }
     }
@@ -3577,6 +3583,7 @@ impl AppUI {
                 state.next_track_title = None;
             }
         }
+        self.publish_web_playlists();
     }
 
     pub fn render(&mut self, f: &mut Frame) {

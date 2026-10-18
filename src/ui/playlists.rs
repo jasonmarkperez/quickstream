@@ -47,6 +47,8 @@ struct QueueCheckResult {
     play_from: Option<usize>,
     /// [`PlaylistChecks::queue_generation`] when the request was made.
     generation: u64,
+    /// `resolved` says which files exist (tab 5), rather than which the web may queue.
+    records_exists: bool,
 }
 
 /// `Enter`: the entry to start playing passed its check before the rest of the playlist was
@@ -180,6 +182,10 @@ pub struct PlaylistsUi {
     pub modal: Option<PlaylistModal>,
     /// `Path::exists()` results for playlist entries, cached for the session.
     pub exists: HashMap<PathBuf, bool>,
+    /// Bumped when a check changes `exists`, so the web snapshot shows the new marks.
+    exists_version: u64,
+    /// What the last web snapshot was built from; `None` before the first.
+    web_published: Option<WebSnapshotKey>,
     checks: PlaylistChecks,
     /// Folder listings for folder adds (`L` on a folder), sent by `playlist-folder` workers.
     folder_tx: mpsc::Sender<FolderUpdate>,
@@ -206,6 +212,8 @@ impl PlaylistsUi {
             tracks_focus: false,
             modal: None,
             exists: HashMap::new(),
+            exists_version: 0,
+            web_published: None,
             checks: PlaylistChecks::new(),
             folder_tx,
             folder_rx,
@@ -1321,6 +1329,13 @@ impl PlaylistsUi {
         self.exists.get(path) == Some(&false)
     }
 
+    /// Cache a check's result for the session.
+    fn record_exists(&mut self, path: PathBuf, exists: bool) {
+        if self.exists.insert(path, exists) != Some(exists) {
+            self.exists_version = self.exists_version.wrapping_add(1);
+        }
+    }
+
     /// Number of paths whose existence check is still running.
     pub fn checks_in_flight(&self) -> usize {
         self.checks.in_flight.len()
@@ -1355,12 +1370,19 @@ impl AppUI {
         if self.active_tab != 4 {
             return;
         }
+        let cursor = self.playlists.list_cursor;
+        self.check_playlist_entries(cursor..cursor + 1);
+    }
+
+    /// Start existence checks, on one worker, for the entries of the playlists at `range` (store
+    /// positions) that were not checked this session and are not being checked now.
+    fn check_playlist_entries(&mut self, range: std::ops::Range<usize>) {
         let ui = &mut self.playlists;
-        let Some(playlist) = ui.store.playlists().get(ui.list_cursor) else {
+        let Some(playlists) = ui.store.playlists().get(range) else {
             return;
         };
         let mut paths = Vec::new();
-        for entry in &playlist.entries {
+        for entry in playlists.iter().flat_map(|p| &p.entries) {
             // Called every tick: look up before cloning, so a fully checked playlist allocates
             // nothing.
             if ui.exists.contains_key(&entry.path) || ui.checks.in_flight.contains(&entry.path) {
@@ -1393,7 +1415,7 @@ impl AppUI {
     fn poll_playlist_checks(&mut self) {
         while let Ok((path, exists)) = self.playlists.checks.exists_rx.try_recv() {
             self.playlists.checks.in_flight.remove(&path);
-            self.playlists.exists.insert(path, exists);
+            self.playlists.record_exists(path, exists);
         }
         while let Ok(update) = self.playlists.checks.queue_rx.try_recv() {
             match update {
@@ -1420,8 +1442,25 @@ impl AppUI {
             self.status_message = "No playlist selected".to_string();
             return;
         };
-        if playlist.entries.is_empty() {
-            self.status_message = format!("{} is empty", playlist.name);
+        let name = playlist.name.clone();
+        let entries = playlist.entries.clone();
+        self.queue_playlist_entries(name, entries, play_from, None);
+    }
+
+    /// Check `entries` (playlist `name`) on a worker, then replace the queue and play from
+    /// `play_from`, or append when `None`: tab 5's `Enter` / `a` and the web dashboard's Play /
+    /// Append. With `allowed_roots` (web requests), an entry is only queued when its checked file
+    /// lies inside those folders, so a symlink changed after the web thread's check can't reach
+    /// anything else.
+    fn queue_playlist_entries(
+        &mut self,
+        name: String,
+        entries: Vec<PlaylistEntry>,
+        play_from: Option<usize>,
+        allowed_roots: Option<Vec<PathBuf>>,
+    ) {
+        if entries.is_empty() {
+            self.status_message = format!("{} is empty", name);
             return;
         }
         // One request at a time: a hung share would otherwise pile up workers, and each result
@@ -1430,12 +1469,22 @@ impl AppUI {
             self.status_message = format!("Still checking {}…", pending);
             return;
         }
-        let name = playlist.name.clone();
-        let entries = playlist.entries.clone();
         self.status_message = format!("Checking {} tracks in {}…", entries.len(), name);
         self.playlists.checks.queue_pending = Some(name.clone());
         let generation = self.playlists.checks.queue_generation;
-        let checker = self.playlists.checks.checker.clone();
+        // A restricted check also refuses files that exist, so its results don't go in the
+        // session's missing-file cache.
+        let records_exists = allowed_roots.is_none();
+        let checker = match allowed_roots {
+            None => self.playlists.checks.checker.clone(),
+            Some(roots) => {
+                let check = self.playlists.checks.checker.clone();
+                let restricted: ExistsChecker = std::sync::Arc::new(move |path: &Path| {
+                    check(path).filter(|resolved| crate::web_access::resolve_allowed_path(resolved, &roots).is_some())
+                });
+                restricted
+            }
+        };
         let tx = self.playlists.checks.queue_tx.clone();
         let stop = self.playlists.checks.stop.clone();
         self.workers.spawn("playlist-queue", move || {
@@ -1479,6 +1528,7 @@ impl AppUI {
                 resolved,
                 play_from,
                 generation,
+                records_exists,
             }));
         });
     }
@@ -1524,7 +1574,7 @@ impl AppUI {
             // The queue was replaced or playback started while this check ran.
             return;
         }
-        self.playlists.exists.insert(start.entry.path.clone(), true);
+        self.playlists.record_exists(start.entry.path.clone(), true);
         let plan = self.plan_checked_queue(
             std::slice::from_ref(&start.entry),
             &[Some(start.resolved.clone())],
@@ -1581,8 +1631,10 @@ impl AppUI {
         self.playlists.checks.queue_pending = None;
         let started = self.playlists.checks.started.take();
         // Fresh results update the session cache; they never change the playlist or its file.
-        for (entry, resolved) in result.entries.iter().zip(&result.resolved) {
-            self.playlists.exists.insert(entry.path.clone(), resolved.is_some());
+        if result.records_exists {
+            for (entry, resolved) in result.entries.iter().zip(&result.resolved) {
+                self.playlists.record_exists(entry.path.clone(), resolved.is_some());
+            }
         }
         if result.generation != self.playlists.checks.queue_generation {
             // The queue was replaced or playback started while this check ran.
@@ -1650,5 +1702,102 @@ impl AppUI {
     /// action that replaces the queue or starts playback.
     pub fn supersede_playlist_queue(&mut self) {
         self.playlists.checks.queue_generation = self.playlists.checks.queue_generation.wrapping_add(1);
+    }
+}
+
+/// What a web snapshot was built from; while none of it changes the snapshot is current.
+#[derive(Debug, Clone, PartialEq)]
+struct WebSnapshotKey {
+    revision: u64,
+    exists_version: u64,
+    loaded: bool,
+    load_failed: bool,
+    last_playlist: Option<String>,
+}
+
+// Web dashboard (issue #50): the snapshot behind `GET /api/playlists`, and the web's Play and
+// Append, which go through the same checks and queue code as tab 5.
+impl AppUI {
+    /// Publish the playlists to the web state when anything they show changed since the last
+    /// snapshot. Called with the rest of the web state on every tick; cheap when nothing changed.
+    pub(super) fn publish_web_playlists(&mut self) {
+        let key = WebSnapshotKey {
+            revision: self.playlists.store.revision(),
+            exists_version: self.playlists.exists_version,
+            loaded: self.playlists.store.is_loaded(),
+            load_failed: self.playlists.load_failed,
+            last_playlist: self.settings_mgr.settings.last_playlist.clone(),
+        };
+        if self.playlists.web_published.as_ref() == Some(&key) {
+            return;
+        }
+        let snapshot = std::sync::Arc::new(self.web_playlists_snapshot());
+        if let Ok(mut state) = self.web_state.write() {
+            state.playlists = snapshot;
+            state.playlists_version = state.playlists_version.wrapping_add(1);
+        }
+        self.playlists.web_published = Some(key);
+    }
+
+    fn web_playlists_snapshot(&self) -> crate::web::WebPlaylists {
+        use crate::web::{WebPlaylist, WebPlaylistEntry, WebPlaylists, WebPlaylistsState};
+        let ui = &self.playlists;
+        let state = if ui.load_failed {
+            WebPlaylistsState::Failed
+        } else if !ui.store.is_loaded() {
+            WebPlaylistsState::Loading
+        } else {
+            WebPlaylistsState::Ready
+        };
+        let playlists = ui
+            .store
+            .playlists()
+            .iter()
+            .map(|playlist| WebPlaylist {
+                name: playlist.name.clone(),
+                track_count: playlist.entries.len(),
+                total_duration_seconds: playlist.total_duration_secs(),
+                entries: playlist
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| WebPlaylistEntry {
+                        index,
+                        title: entry.title.clone(),
+                        artist: entry.artist.clone(),
+                        duration_seconds: entry.duration_secs,
+                        path: entry.path.to_string_lossy().into_owned(),
+                        outside: false,
+                        missing: ui.exists.get(&entry.path).map(|exists| !exists),
+                    })
+                    .collect(),
+            })
+            .collect();
+        WebPlaylists {
+            state,
+            message: (state != WebPlaylistsState::Ready).then(|| ui.not_loaded_message()),
+            revision: ui.store.revision(),
+            last_playlist: self.settings_mgr.settings.last_playlist.clone(),
+            playlists,
+        }
+    }
+
+    /// The dashboard fetched the playlists: check every playlist's files that this session has
+    /// not checked, on a worker, so the snapshot can mark the missing ones.
+    pub(super) fn check_playlists_for_web(&mut self) {
+        let count = self.playlists.store.playlists().len();
+        self.check_playlist_entries(0..count);
+    }
+
+    /// The dashboard's Play (`play_from` set) or Append, with entries the web thread checked
+    /// against the allowed folders. Same checks, queueing and status messages as tab 5; the
+    /// status names the playlist rather than saying `(web)`.
+    pub(super) fn queue_web_playlist(&mut self, name: String, entries: Vec<PlaylistEntry>, play_from: Option<usize>) {
+        if !self.playlists.store.is_loaded() {
+            self.status_message = self.playlists.not_loaded_message();
+            return;
+        }
+        let roots = self.web_allowed_roots();
+        self.queue_playlist_entries(name, entries, play_from, Some(roots));
     }
 }

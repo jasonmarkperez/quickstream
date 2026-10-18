@@ -112,6 +112,8 @@ pub struct PlaylistStore {
     /// Reports taken off `failures_rx` by [`has_write_failures`](Self::has_write_failures) and
     /// not yet applied.
     unapplied: Vec<PersistFailure>,
+    /// Bumped by every change to the playlists; see [`revision`](Self::revision).
+    revision: u64,
 }
 
 impl PlaylistStore {
@@ -129,6 +131,7 @@ impl PlaylistStore {
             failures_tx,
             failures_rx,
             unapplied: Vec::new(),
+            revision: 0,
         }
     }
 
@@ -225,6 +228,7 @@ impl PlaylistStore {
             self.playlists.push(playlist);
         }
         self.loaded = true;
+        self.changed();
     }
 
     /// Treat `names` (the stems [`load_dir_reserving`](Self::load_dir_reserving) skipped) as
@@ -238,6 +242,14 @@ impl PlaylistStore {
 
     pub fn is_loaded(&self) -> bool {
         self.loaded
+    }
+
+    /// A number that changes whenever the playlists change (load, create, add, remove, move,
+    /// rename, delete, or an undone write) and only then. The web dashboard rebuilds its
+    /// snapshot when it changes, and its edits name the revision they were made against so an
+    /// edit of a list that changed meanwhile is refused (issue #50).
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn dir(&self) -> &Path {
@@ -290,6 +302,7 @@ impl PlaylistStore {
         sort_by_name(&mut self.playlists);
         let reporter = self.reporter_for(&name);
         self.persist.create(path, bytes, reporter);
+        self.changed();
         Ok(name)
     }
 
@@ -326,6 +339,7 @@ impl PlaylistStore {
         let total = playlist.entries.len();
         if added > 0 {
             self.write_through(slot, path);
+            self.changed();
         }
         Ok(AddResult { added, skipped, total })
     }
@@ -339,6 +353,7 @@ impl PlaylistStore {
         }
         let removed = entries.remove(index);
         self.write_through(slot, path);
+        self.changed();
         Ok(removed)
     }
 
@@ -357,6 +372,7 @@ impl PlaylistStore {
         };
         entries.swap(index, target);
         self.write_through(slot, path);
+        self.changed();
         Ok(target)
     }
 
@@ -408,6 +424,7 @@ impl PlaylistStore {
         self.persist.rename_reporting(old_path, new_path.clone(), reporter);
         // Save again so the `#PLAYLIST` line carries the new name.
         self.persist.save(new_path, bytes);
+        self.changed();
         Ok(new_name)
     }
 
@@ -417,6 +434,7 @@ impl PlaylistStore {
         let removed = self.playlists.remove(slot);
         self.ids.remove(&removed.name);
         self.persist.delete(path);
+        self.changed();
         Ok(())
     }
 
@@ -432,7 +450,11 @@ impl PlaylistStore {
     pub fn poll_write_failures(&mut self) -> Vec<WriteFailure> {
         self.has_write_failures();
         let reports = std::mem::take(&mut self.unapplied);
-        reports.into_iter().filter_map(|report| self.undo(report)).collect()
+        let undone: Vec<WriteFailure> = reports.into_iter().filter_map(|report| self.undo(report)).collect();
+        if !undone.is_empty() {
+            self.changed();
+        }
+        undone
     }
 
     /// Whether the writer has reported failures that [`poll_write_failures`](Self::poll_write_failures)
@@ -533,6 +555,11 @@ impl PlaylistStore {
     /// Current name of the playlist with id `id`.
     fn name_with_id(&self, id: u64) -> Option<String> {
         self.name_of(id).map(str::to_string)
+    }
+
+    /// Record a change to the playlists for [`revision`](Self::revision).
+    fn changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
     }
 
     fn ensure_loaded(&self) -> Result<(), StoreError> {
