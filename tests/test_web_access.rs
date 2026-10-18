@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use quickstream::web::{NowPlayingState, WebBrowserResponse, WebCommand, WebServer};
 use quickstream::web_access::{
-    authorize, is_acceptable_root, load_or_create_token, resolve_allowed_path, AuthDecision, AuthHeaders,
+    authorize, is_acceptable_root, load_or_create_token, resolve_allowed_path, AllowedRoots, AuthDecision, AuthHeaders,
 };
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
@@ -485,6 +485,75 @@ fn test_resolve_allowed_path_accepts_only_paths_inside_roots() {
             None
         );
     }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_allowed_roots_resolved_once_give_the_same_answers_as_resolve_allowed_path() {
+    common::isolate();
+    // PR #65 review: checking a playlist's entries canonicalized every root again for every
+    // entry. `AllowedRoots` canonicalizes them once; every answer must stay the same, including
+    // for roots and paths reached through symlinks.
+    let dir = temp_dir("roots_once");
+    let real = dir.join("Real");
+    let private = dir.join("Private");
+    fs::create_dir_all(real.join("Album")).unwrap();
+    fs::create_dir_all(&private).unwrap();
+    fs::write(real.join("Album").join("a.mp3"), b"x").unwrap();
+    fs::write(private.join("secret.mp3"), b"x").unwrap();
+    // A root that is itself a symlink to the real music folder.
+    let linked_root = dir.join("Music");
+    std::os::unix::fs::symlink(&real, &linked_root).unwrap();
+    // Inside the real folder: a link to a folder in it, and a link leading out.
+    std::os::unix::fs::symlink(real.join("Album"), real.join("Shortcut")).unwrap();
+    std::os::unix::fs::symlink(&private, real.join("escape")).unwrap();
+    // A root that points at / and one that doesn't exist grant nothing.
+    let everything = dir.join("everything");
+    std::os::unix::fs::symlink("/", &everything).unwrap();
+
+    let root_sets = [
+        vec![linked_root.clone()],
+        vec![real.clone()],
+        vec![everything.clone(), linked_root.clone()],
+        vec![dir.join("ghost"), real.join("Album")],
+        vec![],
+    ];
+    let paths = [
+        linked_root.clone(),
+        linked_root.join("Album").join("a.mp3"),
+        real.join("Album").join("a.mp3"),
+        real.join("Shortcut").join("a.mp3"),
+        linked_root.join("Shortcut").join("a.mp3"),
+        real.join("escape").join("secret.mp3"),
+        linked_root.join("escape"),
+        private.join("secret.mp3"),
+        linked_root.join("..").join("Private").join("secret.mp3"),
+        linked_root.join("Album").join("ghost.mp3"),
+        PathBuf::from("/etc"),
+        PathBuf::from("Music"),
+    ];
+    for roots in &root_sets {
+        let allowed = AllowedRoots::new(roots);
+        for path in &paths {
+            assert_eq!(
+                allowed.resolve(path),
+                resolve_allowed_path(path, roots),
+                "roots {:?}, path {}",
+                roots,
+                path.display()
+            );
+        }
+    }
+    // Spot checks, so the comparison above can't pass with both sides wrong.
+    let allowed = AllowedRoots::new(std::slice::from_ref(&linked_root));
+    let canonical_real = fs::canonicalize(&real).unwrap();
+    assert_eq!(
+        allowed.resolve(&linked_root.join("Shortcut").join("a.mp3")),
+        Some(canonical_real.join("Album").join("a.mp3"))
+    );
+    assert_eq!(allowed.resolve(&real.join("escape").join("secret.mp3")), None);
+    assert_eq!(AllowedRoots::new(&[everything]).resolve(Path::new("/etc")), None);
     let _ = fs::remove_dir_all(&dir);
 }
 

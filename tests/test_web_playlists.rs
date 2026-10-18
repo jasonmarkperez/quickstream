@@ -514,6 +514,7 @@ fn test_play_and_append_send_the_checked_entries_to_the_ui() {
     ];
     let state = state_with(&music, 3, vec![web_playlist(PLAYLIST, entries)]);
     let (handle, rx) = start_server(state);
+    let rx = answer_edits(rx, Ok("Checking 3 tracks in Road Trip…".to_string()));
     let expected: Vec<PlaylistEntry> = [(&a, "A"), (&ghost, "Ghost"), (&b, "B")]
         .iter()
         .map(|(p, t)| entry(p, "Artist", t, 100))
@@ -526,12 +527,15 @@ fn test_play_and_append_send_the_checked_entries_to_the_ui() {
     );
     assert_eq!(status, 200, "{}", json);
     assert_eq!(json["ok"], true);
+    // The answer is the UI's: what it started.
+    assert_eq!(json["message"], "Checking 3 tracks in Road Trip…");
     assert_eq!(
         drain(&rx),
         vec![WebCommand::QueuePlaylist {
             name: PLAYLIST.to_string(),
             entries: expected.clone(),
             play_from: Some(2),
+            reply: WebReply::default(),
         }]
     );
 
@@ -552,11 +556,13 @@ fn test_play_and_append_send_the_checked_entries_to_the_ui() {
                 name: PLAYLIST.to_string(),
                 entries: expected.clone(),
                 play_from: Some(0),
+                reply: WebReply::default(),
             },
             WebCommand::QueuePlaylist {
                 name: PLAYLIST.to_string(),
                 entries: expected,
                 play_from: None,
+                reply: WebReply::default(),
             },
         ]
     );
@@ -638,9 +644,15 @@ fn test_play_refusals_name_the_reason() {
             "Empty is empty",
         ),
         (
-            serde_json::json!({"action": "playlist_play", "name": PLAYLIST, "index": 1}),
+            serde_json::json!({"action": "playlist_play", "name": PLAYLIST, "index": 1, "revision": 4}),
             400,
             "No such track",
+        ),
+        // PR #65 review: an index names a track only together with the revision it came from.
+        (
+            serde_json::json!({"action": "playlist_play", "name": PLAYLIST, "index": 0}),
+            400,
+            "Missing revision",
         ),
         (
             serde_json::json!({"action": "playlist_play", "name": PLAYLIST, "revision": 3}),
@@ -729,6 +741,7 @@ fn test_web_play_replaces_the_queue_and_plays_from_the_track() {
             name: PLAYLIST.to_string(),
             entries,
             play_from: Some(1),
+            reply: WebReply::default(),
         },
     );
     assert!(
@@ -767,6 +780,7 @@ fn test_web_append_keeps_the_queue() {
             name: PLAYLIST.to_string(),
             entries,
             play_from: None,
+            reply: WebReply::default(),
         },
     );
     assert!(poll_until(&mut app, |app| app.status_message.starts_with("Queued")));
@@ -801,6 +815,7 @@ fn test_web_play_never_queues_a_file_that_resolves_outside_the_allowed_folders()
             name: PLAYLIST.to_string(),
             entries,
             play_from: None,
+            reply: WebReply::default(),
         },
     );
     assert!(poll_until(&mut app, |app| app.status_message.starts_with("Queued")));
@@ -827,12 +842,24 @@ fn test_web_play_is_refused_until_the_playlists_load() {
             name: PLAYLIST.to_string(),
             entries: vec![entry(&a, "A", "One", 100)],
             play_from: Some(0),
+            reply: WebReply::default(),
         },
     );
     assert_eq!(app.status_message, "Playlists are still loading");
     assert!(!app.playlists.queue_check_pending());
     assert!(app.queue.is_empty());
     let _ = fs::remove_dir_all(&music);
+}
+
+/// Send `body` to the app's own server from another thread while the UI handles web commands,
+/// as the event loop does, and return the response.
+fn request_while_ticking(app: &mut AppUI, port: u16, body: serde_json::Value) -> (u16, serde_json::Value) {
+    let worker = std::thread::spawn(move || post(port, &body));
+    while !worker.is_finished() {
+        app.handle_web_commands();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    worker.join().unwrap()
 }
 
 /// End to end: the dashboard's request reaches the app's own server, and the next UI ticks
@@ -852,11 +879,14 @@ fn test_dashboard_play_request_plays_the_playlist() {
     let port = app.web_server.as_ref().unwrap().port;
     let revision = snapshot(&app).revision;
 
-    let (status, json) = post(
+    // The request waits for the UI's answer, so the UI must keep ticking meanwhile.
+    let (status, json) = request_while_ticking(
+        &mut app,
         port,
-        &serde_json::json!({"action": "playlist_play", "name": PLAYLIST, "index": 1, "revision": revision}),
+        serde_json::json!({"action": "playlist_play", "name": PLAYLIST, "index": 1, "revision": revision}),
     );
     assert_eq!(status, 200, "{}", json);
+    assert_eq!(json["message"], "Checking 2 tracks in Road Trip…");
     assert!(poll_until(&mut app, |app| app.status_message.starts_with("Queued")));
     assert_eq!(queue_paths(&app), vec![a, b]);
     assert_eq!(app.queue.current_index, 1);
@@ -1091,6 +1121,7 @@ fn test_web_add_remove_and_move_tracks() {
     let add = PlaylistEdit::Add {
         name: PLAYLIST.to_string(),
         path: c.clone(),
+        canonical: c.clone(),
     };
     assert_eq!(
         edit(&mut app, add.clone()),
@@ -1109,7 +1140,7 @@ fn test_web_add_remove_and_move_tracks() {
                 name: PLAYLIST.to_string(),
                 index: 2,
                 dir: MoveDir::Up,
-                revision: Some(revision),
+                revision,
             }
         ),
         Ok("Moved \"C - Three\" to 2".to_string())
@@ -1123,7 +1154,7 @@ fn test_web_add_remove_and_move_tracks() {
             PlaylistEdit::Remove {
                 name: PLAYLIST.to_string(),
                 index: 2,
-                revision: Some(revision),
+                revision,
             }
         ),
         Err("Playlists changed; try again".to_string())
@@ -1137,7 +1168,7 @@ fn test_web_add_remove_and_move_tracks() {
             PlaylistEdit::Remove {
                 name: PLAYLIST.to_string(),
                 index: 0,
-                revision: Some(revision),
+                revision,
             }
         ),
         Ok("Removed \"A - One\" from Road Trip".to_string())
@@ -1150,7 +1181,7 @@ fn test_web_add_remove_and_move_tracks() {
             PlaylistEdit::Remove {
                 name: PLAYLIST.to_string(),
                 index: 5,
-                revision: Some(revision),
+                revision,
             }
         ),
         Err("No such track".to_string())
@@ -1187,6 +1218,7 @@ fn test_web_edits_are_refused_until_the_playlists_load() {
         PlaylistEdit::Add {
             name: PLAYLIST.to_string(),
             path: music.join("a.mp3"),
+            canonical: music.join("a.mp3"),
         },
     ] {
         assert_eq!(edit(&mut app, request), Err("Playlists are still loading".to_string()));
@@ -1272,14 +1304,17 @@ fn test_web_edits_keep_the_terminal_on_its_playlist() {
 // Edits over HTTP: the web thread waits for the UI's answer
 // ---------------------------------------------------------------------------------------------
 
-/// Answer every edit the server sends with `answer`, and hand the edits back on the returned
-/// channel. Other commands are passed on too.
+/// Answer every edit and every play / append the server sends with `answer`, and hand the
+/// commands back on the returned channel. Other commands are passed on too.
 fn answer_edits(rx: mpsc::Receiver<WebCommand>, answer: Result<String, String>) -> mpsc::Receiver<WebCommand> {
     let (out_tx, out_rx) = mpsc::channel();
     std::thread::spawn(move || {
         for cmd in rx {
-            if let WebCommand::EditPlaylist(_, ref reply) = cmd {
-                reply.send(answer.clone());
+            match cmd {
+                WebCommand::EditPlaylist(_, ref reply) | WebCommand::QueuePlaylist { ref reply, .. } => {
+                    reply.send(answer.clone())
+                }
+                _ => {}
             }
             if out_tx.send(cmd).is_err() {
                 break;
@@ -1331,7 +1366,7 @@ fn test_edit_requests_reach_the_ui_and_return_its_answer() {
             PlaylistEdit::Remove {
                 name: PLAYLIST.to_string(),
                 index: 3,
-                revision: Some(5),
+                revision: 5,
             },
         ),
         (
@@ -1340,16 +1375,7 @@ fn test_edit_requests_reach_the_ui_and_return_its_answer() {
                 name: PLAYLIST.to_string(),
                 index: 1,
                 dir: MoveDir::Down,
-                revision: Some(5),
-            },
-        ),
-        (
-            serde_json::json!({"action": "playlist_move", "name": PLAYLIST, "index": 1, "direction": "up"}),
-            PlaylistEdit::Move {
-                name: PLAYLIST.to_string(),
-                index: 1,
-                dir: MoveDir::Up,
-                revision: None,
+                revision: 5,
             },
         ),
     ];
@@ -1389,7 +1415,10 @@ fn test_malformed_edit_requests_are_refused_before_the_ui() {
         serde_json::json!({"action": "playlist_add", "name": PLAYLIST}),
         serde_json::json!({"action": "playlist_remove", "name": PLAYLIST}),
         serde_json::json!({"action": "playlist_move", "name": PLAYLIST, "index": 0}),
-        serde_json::json!({"action": "playlist_move", "name": PLAYLIST, "index": 0, "direction": "sideways"}),
+        serde_json::json!({"action": "playlist_move", "name": PLAYLIST, "index": 0, "direction": "sideways", "revision": 5}),
+        // PR #65 review: index-based edits need the revision their index came from.
+        serde_json::json!({"action": "playlist_remove", "name": PLAYLIST, "index": 0}),
+        serde_json::json!({"action": "playlist_move", "name": PLAYLIST, "index": 0, "direction": "up"}),
     ] {
         let (status, json) = post(handle.port, &body);
         assert_eq!(status, 400, "{}: {}", body, json);
@@ -1442,7 +1471,8 @@ fn test_adding_a_file_checks_its_path_like_add_file() {
     assert_eq!(json["error"], "Not an audio file");
     assert!(drain(&rx).is_empty());
 
-    // Inside: the UI gets the resolved path.
+    // Inside: the UI gets the path as the request named it, normalized as a terminal add
+    // would store it, and the checked (canonical) path.
     fs::create_dir_all(music.join("sub")).unwrap();
     let spelled = music.join("sub/../in.mp3");
     let (status, json) = post(
@@ -1455,6 +1485,26 @@ fn test_adding_a_file_checks_its_path_like_add_file() {
         vec![PlaylistEdit::Add {
             name: PLAYLIST.to_string(),
             path: inside.clone(),
+            canonical: inside.clone(),
+        }]
+    );
+    // PR #65 review: through a symlinked folder the stored path keeps the folder the request
+    // named, like a terminal add; the canonical path is only for the check.
+    let real = music.join("Real");
+    touch(&real.join("song.mp3"));
+    std::os::unix::fs::symlink(&real, music.join("Linked")).unwrap();
+    let linked = music.join("Linked").join("song.mp3");
+    let (status, json) = post(
+        handle.port,
+        &serde_json::json!({"action": "playlist_add", "name": PLAYLIST, "path": linked}),
+    );
+    assert_eq!(status, 200, "{}", json);
+    assert_eq!(
+        edits(&rx),
+        vec![PlaylistEdit::Add {
+            name: PLAYLIST.to_string(),
+            path: linked.clone(),
+            canonical: real.join("song.mp3"),
         }]
     );
     handle.stop();
@@ -1519,5 +1569,202 @@ fn test_dashboard_edit_requests_change_the_store() {
     assert_eq!(app.playlists.store.get("Mix").unwrap().entries[0].path, a);
     assert!(app.persistence.flush());
     assert!(playlist_file("Mix").is_file());
+    let _ = fs::remove_dir_all(&music);
+}
+
+// ---------------------------------------------------------------------------------------------
+// PR #65 review
+// ---------------------------------------------------------------------------------------------
+
+/// SP Minor 6: a file reached through a symlinked folder is stored as the request named it, as
+/// a terminal add stores it, so adding it from both sides is a duplicate and its tags are found.
+#[test]
+fn test_web_add_through_a_symlinked_folder_matches_the_terminal_add() {
+    common::isolate();
+    let music = temp_dir("add_symlinked");
+    let real = music.join("Real");
+    let song = real.join("song.mp3");
+    touch(&song);
+    let linked_dir = music.join("Linked");
+    std::os::unix::fs::symlink(&real, &linked_dir).unwrap();
+    let linked = linked_dir.join("song.mp3");
+    write_playlists(&[(PLAYLIST, vec![]), ("Old", vec![entry(&song, "", "song", -1)])]);
+    let mut app = web_app(&music);
+    // The browser read the tags through the symlinked folder.
+    app.metadata_cache.insert(quickstream::metadata::AudioMetadata {
+        filepath: linked.clone(),
+        title: "Song".to_string(),
+        artist: "Band".to_string(),
+        duration_seconds: 90.0,
+        ..Default::default()
+    });
+    let add = |name: &str| PlaylistEdit::Add {
+        name: name.to_string(),
+        path: linked.clone(),
+        canonical: song.clone(),
+    };
+
+    assert_eq!(
+        edit(&mut app, add(PLAYLIST)),
+        Ok("Added \"Song\" to Road Trip (1 track)".to_string())
+    );
+    let stored = &app.playlists.store.get(PLAYLIST).unwrap().entries[0];
+    assert_eq!(stored.path, linked, "stored as a terminal add would store it");
+    assert_eq!((stored.artist.as_str(), stored.duration_secs), ("Band", 90));
+    // The terminal adding the same file finds it already there.
+    let result = app
+        .playlists
+        .store
+        .add(PLAYLIST, vec![PlaylistEntry::from_path(&linked)])
+        .unwrap();
+    assert_eq!((result.added, result.skipped), (0, 1));
+    // A playlist that already holds the file by its canonical path (an older web add) gets no
+    // second copy either.
+    assert_eq!(edit(&mut app, add("Old")), Ok("Already in Old".to_string()));
+    assert_eq!(app.playlists.store.get("Old").unwrap().entries.len(), 1);
+    let _ = fs::remove_dir_all(&music);
+}
+
+/// SP Minor 5: a play the UI refuses (another playlist is still being checked) is reported as
+/// refused, not as started.
+#[test]
+fn test_web_play_refused_by_the_ui_is_not_reported_as_started() {
+    common::isolate();
+    let music = temp_dir("play_refused_by_ui");
+    let a = music.join("a.mp3");
+    touch(&a);
+    write_playlists(&[
+        (PLAYLIST, vec![entry(&a, "A", "One", 100)]),
+        ("Mix", vec![entry(&a, "A", "One", 100)]),
+    ]);
+    let mut app = web_app(&music);
+    app.player = Box::new(SilentPlayer { playing: false });
+    // A check that never finishes during the test, like a hung share.
+    let (gate_tx, gate_rx) = mpsc::channel::<()>();
+    let gate_rx = std::sync::Mutex::new(gate_rx);
+    let checker: quickstream::ui::playlists::ExistsChecker = Arc::new(move |path: &Path| {
+        let _ = gate_rx.lock().unwrap().recv();
+        Some(path.to_path_buf())
+    });
+    app.playlists.set_exists_checker(checker);
+
+    app.update_web_state();
+    let port = app.web_server.as_ref().unwrap().port;
+    let (status, json) = request_while_ticking(
+        &mut app,
+        port,
+        serde_json::json!({"action": "playlist_play", "name": "Mix"}),
+    );
+    assert_eq!(status, 200, "{}", json);
+    assert_eq!(
+        json,
+        serde_json::json!({"ok": true, "message": "Checking 1 track in Mix…"})
+    );
+
+    // Mix is still being checked: the UI refuses, and the request says so with a 409, so the
+    // dashboard shows the refusal instead of "Playing Road Trip".
+    for action in ["playlist_play", "playlist_append"] {
+        let (status, json) =
+            request_while_ticking(&mut app, port, serde_json::json!({"action": action, "name": PLAYLIST}));
+        assert_eq!(status, 409, "{}: {}", action, json);
+        assert_eq!(json, serde_json::json!({"ok": false, "error": "Still checking Mix…"}));
+    }
+    drop(gate_tx);
+    let _ = fs::remove_dir_all(&music);
+}
+
+/// CC7: while existence checks stream in, the snapshot is rebuilt (and `playlists_version`
+/// bumped, which makes the dashboard fetch again) at most every 500 ms. Edits still publish at
+/// once.
+#[test]
+fn test_snapshot_rebuilds_for_existence_checks_are_throttled() {
+    common::isolate();
+    let music = temp_dir("throttle");
+    let here = music.join("here.mp3");
+    let ghost = music.join("ghost.mp3");
+    touch(&here);
+    write_playlists(&[(
+        PLAYLIST,
+        vec![entry(&here, "A", "Here", 100), entry(&ghost, "A", "Ghost", 100)],
+    )]);
+    let mut app = web_app(&music);
+    app.update_web_state();
+    let version = |app: &AppUI| app.web_state.read().unwrap().playlists_version;
+    // Let any earlier republish age past the interval, then publish an edit: edits are never
+    // held back, and it starts a new interval.
+    std::thread::sleep(Duration::from_millis(600));
+    app.playlists.store.create("Mix").unwrap();
+    let before = version(&app);
+    app.update_web_state();
+    assert_eq!(version(&app), before + 1, "an edit publishes at once");
+    let published = version(&app);
+
+    send(&mut app, WebCommand::CheckPlaylists);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while app.playlists.checks_in_flight() > 0 && Instant::now() < deadline {
+        app.poll_playlists();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(app.playlists.checks_in_flight(), 0, "checks did not finish");
+    for _ in 0..5 {
+        app.update_web_state();
+    }
+    assert_eq!(
+        version(&app),
+        published,
+        "existence results within 500 ms are held back"
+    );
+    assert_eq!(snapshot(&app).playlists[1].entries[1].missing, None);
+
+    std::thread::sleep(Duration::from_millis(550));
+    app.update_web_state();
+    assert_eq!(version(&app), published + 1, "the held-back results are published");
+    assert_eq!(snapshot(&app).playlists[1].entries[1].missing, Some(true));
+    app.update_web_state();
+    assert_eq!(version(&app), published + 1, "nothing changed since");
+    let _ = fs::remove_dir_all(&music);
+}
+
+/// CC7: the dashboard sends CheckPlaylists on every fetch; paths already checked (or being
+/// checked) start no new check, so fetching again can't loop.
+#[test]
+fn test_repeated_check_playlists_does_not_check_paths_again() {
+    common::isolate();
+    let music = temp_dir("recheck");
+    let here = music.join("here.mp3");
+    touch(&here);
+    write_playlists(&[(
+        PLAYLIST,
+        vec![
+            entry(&here, "A", "Here", 100),
+            entry(&music.join("ghost.mp3"), "A", "Ghost", 100),
+        ],
+    )]);
+    let mut app = web_app(&music);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+    let checker: quickstream::ui::playlists::ExistsChecker = Arc::new(move |path: &Path| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        quickstream::ui::playlists::playable_audio_file(path)
+    });
+    app.playlists.set_exists_checker(checker);
+
+    send(&mut app, WebCommand::CheckPlaylists);
+    // Sent again while the first checks may still run: nothing is checked twice.
+    send(&mut app, WebCommand::CheckPlaylists);
+    assert!(poll_until(&mut app, |app| app.playlists.checks_in_flight() == 0));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    for _ in 0..3 {
+        send(&mut app, WebCommand::CheckPlaylists);
+        app.poll_playlists();
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    app.poll_playlists();
+    assert_eq!(app.playlists.checks_in_flight(), 0);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "already-checked paths were checked again"
+    );
     let _ = fs::remove_dir_all(&music);
 }

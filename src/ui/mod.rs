@@ -1602,7 +1602,7 @@ impl AppUI {
             // Check if active track finished and auto-advance queue
             if self.player.is_track_finished() {
                 self.player.reset_finished();
-                self.play_next_track();
+                self.handle_track_finished();
             }
 
             // Synchronize continuous gapless stream track index
@@ -1878,6 +1878,9 @@ impl AppUI {
         if self.queue.is_empty() {
             return;
         }
+        if self.hold_skip_for_playlist_fill(playlists::PlaylistSkip::Next) {
+            return;
+        }
 
         let raw_mode = self.settings_mgr.settings.queue_mode.clone();
         let mode = if raw_mode == "repeat_one" { "loop" } else { &raw_mode };
@@ -1900,6 +1903,9 @@ impl AppUI {
 
     pub fn skip_prev_track_debounced(&mut self) {
         if self.queue.is_empty() {
+            return;
+        }
+        if self.hold_skip_for_playlist_fill(playlists::PlaylistSkip::Previous) {
             return;
         }
 
@@ -2777,6 +2783,18 @@ impl AppUI {
         playback_error
     }
 
+    /// The player reported that the current track ended: go on to the next one.
+    pub fn handle_track_finished(&mut self) {
+        // While tab 5's Enter is still checking the rest of a playlist, the next track may not
+        // be queued yet: wait for it rather than stop or replay (repeat-one replays anyway).
+        if self.settings_mgr.settings.queue_mode != "repeat_one"
+            && self.hold_skip_for_playlist_fill(playlists::PlaylistSkip::Ended)
+        {
+            return;
+        }
+        self.play_next_track();
+    }
+
     pub fn play_next_track(&mut self) {
         self.pending_track_skip = false;
         self.last_track_skip_time = None;
@@ -3424,7 +3442,11 @@ impl AppUI {
                     name,
                     entries,
                     play_from,
-                } => self.queue_web_playlist(name, entries, play_from),
+                    reply,
+                } => {
+                    let result = self.queue_web_playlist(name, entries, play_from);
+                    reply.send(result);
+                }
                 crate::web::WebCommand::CheckPlaylists => self.check_playlists_for_web(),
                 crate::web::WebCommand::EditPlaylist(edit, reply) => {
                     let result = self.apply_web_playlist_edit(edit);

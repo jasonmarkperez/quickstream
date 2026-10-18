@@ -431,13 +431,18 @@ fn test_path_with_surrounding_spaces_round_trips() {
 }
 
 #[test]
-fn test_parse_path_lines_keep_trailing_spaces_and_drop_leading_ones() {
+fn test_parse_path_lines_without_extart_lose_surrounding_whitespace() {
     common::isolate();
+    // PR #65 review: a file from another player, or edited by hand, has no `#EXTART` lines. A
+    // stray trailing space or tab on its path lines is trimmed as it always was, so the entry
+    // isn't shown as missing.
     let text = "#EXTM3U
-  	/m/indented.flac
-/m/trailing.flac  
+  \t/m/indented.flac
+/m/trailing.flac  \t
    
-	
+\t
+#EXTINF:12,Artist - Title
+/m/labelled.flac \t
 /m/last.flac";
     let parsed = parse_m3u8("p", text, Path::new("/pl"));
     let paths: Vec<PathBuf> = parsed.entries.iter().map(|e| e.path.clone()).collect();
@@ -445,8 +450,35 @@ fn test_parse_path_lines_keep_trailing_spaces_and_drop_leading_ones() {
         paths,
         vec![
             PathBuf::from("/m/indented.flac"),
-            PathBuf::from("/m/trailing.flac  "),
+            PathBuf::from("/m/trailing.flac"),
+            PathBuf::from("/m/labelled.flac"),
             PathBuf::from("/m/last.flac"),
+        ]
+    );
+}
+
+#[test]
+fn test_parse_path_lines_after_extart_keep_trailing_spaces() {
+    common::isolate();
+    // Quickstream writes an `#EXTART` line for every entry, so a path line that follows one is
+    // kept exactly: the file name may end in spaces (issue #52). Only the entry with the
+    // `#EXTART` line keeps them; the next one is trimmed again.
+    let text = "#EXTM3U
+#EXTINF:10,A - Intro
+#EXTART:A
+/m/Album /01 Intro.flac \t
+#EXTINF:11,Plain
+#EXTART:
+/m/track  
+/m/other.flac  ";
+    let parsed = parse_m3u8("p", text, Path::new("/pl"));
+    let paths: Vec<PathBuf> = parsed.entries.iter().map(|e| e.path.clone()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            PathBuf::from("/m/Album /01 Intro.flac \t"),
+            PathBuf::from("/m/track  "),
+            PathBuf::from("/m/other.flac"),
         ]
     );
 }
@@ -459,14 +491,17 @@ fn test_parse_crlf_file_with_extart_and_trailing_space() {
         entries: vec![
             entry("/m/Album /01 - Intro .flac", 61, "", "01 - Intro"),
             entry("/m/b.flac", 200, "Artist", "Title - Remix"),
+            entry("/m/c.flac ", 10, "C", "Spaced"),
         ],
     };
     // The same file saved by an editor that writes CRLF line endings.
     let crlf = original.to_m3u8().replace('\n', "\r\n");
     assert_eq!(parse_m3u8("p", &crlf, Path::new("/unused")), original);
     // A stray CR before the CRLF is a line ending too, not part of the path.
-    let parsed = parse_m3u8("p", "/m/a.flac \r\r\n", Path::new("/pl"));
+    let parsed = parse_m3u8("p", "#EXTART:\n/m/a.flac \r\r\n", Path::new("/pl"));
     assert_eq!(parsed.entries[0].path, PathBuf::from("/m/a.flac "));
+    let parsed = parse_m3u8("p", "/m/a.flac \r\r\n", Path::new("/pl"));
+    assert_eq!(parsed.entries[0].path, PathBuf::from("/m/a.flac"));
 }
 
 #[test]

@@ -126,7 +126,10 @@ impl Playlist {
 /// are resolved against `base_dir`, the folder holding the playlist file, and every path is
 /// normalized with [`normalize_path`] so a `..` is never written back. Any other line is kept
 /// as a path entry (a Windows path or a `file://` URL simply shows up as missing). A path line
-/// loses its line ending and leading whitespace only: a file name may end in spaces (issue #52).
+/// always loses its line ending and leading whitespace. Its trailing whitespace is kept only when
+/// the entry has an `#EXTART` line, which Quickstream writes for every entry: a file name may end
+/// in spaces (issue #52). Files from other players or edited by hand have no `#EXTART` lines, and
+/// a stray trailing space or tab there is trimmed, so the entry isn't shown as missing.
 /// Artist and title come from the entry's `#EXTINF` and `#EXTART` lines, as `entry_label` describes.
 pub fn parse_m3u8(name: &str, text: &str, base_dir: &Path) -> Playlist {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
@@ -153,8 +156,10 @@ pub fn parse_m3u8(name: &str, text: &str, base_dir: &Path) -> Playlist {
         if tag.starts_with('#') {
             continue;
         }
+        // Only an entry Quickstream wrote (it has an `#EXTART` line) keeps trailing whitespace.
+        let written = if pending_artist.is_some() { line } else { tag };
         // `join` keeps an absolute path unchanged and resolves a relative one against the folder.
-        let path = normalize_path(&base_dir.join(line));
+        let path = normalize_path(&base_dir.join(written));
         let (duration_secs, label) = pending.take().unwrap_or((-1, String::new()));
         let (artist, title) = entry_label(&label, pending_artist.take().as_deref());
         let title = if title.is_empty() { file_stem(&path) } else { title };
@@ -396,6 +401,9 @@ pub fn placeholder_metadata(entry: &PlaylistEntry) -> AudioMetadata {
 pub struct QueuePlan {
     /// The entries whose file exists, in playlist order.
     pub tracks: Vec<AudioMetadata>,
+    /// For each of `tracks`, the index in the playlist of the entry it came from: the exact
+    /// identity of a track even when the playlist lists the same file twice.
+    pub entry_indices: Vec<usize>,
     /// Position in `tracks` to start playing from; `None` when no track was selected or no file
     /// exists.
     pub start_index: Option<usize>,
@@ -414,6 +422,7 @@ pub fn plan_queue(
     cached: &dyn Fn(&Path) -> Option<AudioMetadata>,
 ) -> QueuePlan {
     let mut tracks = Vec::new();
+    let mut entry_indices = Vec::new();
     // Existing entries before the selected one: the queue position of the selected entry if it
     // exists, otherwise of the next existing entry after it.
     let mut kept_before_selected = 0;
@@ -427,6 +436,7 @@ pub fn plan_queue(
             kept_before_selected += 1;
         }
         tracks.push(cached(&entry.path).unwrap_or_else(|| placeholder_metadata(entry)));
+        entry_indices.push(i);
     }
     let start_index = match selected {
         Some(_) if kept_before_selected < tracks.len() => Some(kept_before_selected),
@@ -436,6 +446,7 @@ pub fn plan_queue(
     let missing = entries.len() - tracks.len();
     QueuePlan {
         tracks,
+        entry_indices,
         start_index,
         missing,
     }

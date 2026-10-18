@@ -251,11 +251,14 @@ pub enum WebCommand {
     /// Queue a playlist (issue #50): replace the queue and play from entry `play_from`, or
     /// append when `None`. `entries` are the snapshot's entries, every path already checked
     /// against the allowed folders by the web thread; the UI queues these, not the store's
-    /// current list, so it never queues an entry the web thread did not check.
+    /// current list, so it never queues an entry the web thread did not check. The UI answers
+    /// on `reply` whether it started checking them or refused (`Still checking …`), and the web
+    /// request returns that answer.
     QueuePlaylist {
         name: String,
         entries: Vec<crate::playlist::PlaylistEntry>,
         play_from: Option<usize>,
+        reply: WebReply,
     },
     /// The dashboard fetched the playlists: check their files on workers so missing ones are
     /// marked in the snapshot.
@@ -278,24 +281,29 @@ pub enum PlaylistEdit {
     Delete {
         name: String,
     },
-    /// Add the audio file at `path`, already resolved inside the allowed folders.
+    /// Add an audio file. `path` is the file as the request named it (absolute, normalized
+    /// with [`crate::playlist::normalize_path`]), the form a terminal add stores, so the same file
+    /// added from either side is a duplicate and its tags are found. `canonical` is the same file
+    /// with symlinks resolved, which the web thread checked lies inside the allowed folders; a
+    /// playlist already holding it counts as already holding the file.
     Add {
         name: String,
         path: PathBuf,
+        canonical: PathBuf,
     },
     /// Remove track `index`. `revision` is the snapshot revision the index came from; the edit
-    /// is refused when the playlists changed since.
+    /// is refused when the playlists changed since. Requests without one are refused.
     Remove {
         name: String,
         index: usize,
-        revision: Option<u64>,
+        revision: u64,
     },
     /// Move track `index` one row (no wraparound). `revision` as for `Remove`.
     Move {
         name: String,
         index: usize,
         dir: crate::playlist_store::MoveDir,
-        revision: Option<u64>,
+        revision: u64,
     },
 }
 
@@ -335,7 +343,7 @@ impl PartialEq for WebReply {
     }
 }
 
-/// How long a web request waits for the UI thread's answer to a playlist edit. The UI handles
+/// How long a web request waits for the UI thread's answer to a playlist edit or play. The UI handles
 /// web commands every tick, so this only runs out when it is stuck.
 const EDIT_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -409,6 +417,8 @@ fn edit_playlist_action(
         return bad(MISSING_NAME);
     };
     let index = || payload.index.ok_or_else(|| bad("Missing track index"));
+    // An index names a track only in the list it was read from (PR #65 review).
+    let revision = || payload.revision.ok_or_else(|| bad(MISSING_REVISION));
     let edit = match payload.action.as_str() {
         "playlist_create" => PlaylistEdit::Create { name },
         "playlist_rename" => match payload.new_name.clone() {
@@ -420,26 +430,24 @@ fn edit_playlist_action(
             let Some(requested) = payload.path.clone() else {
                 return bad("Missing path");
             };
-            let Some(path) = allow(requested) else {
+            let Some(canonical) = allow(requested.clone()) else {
                 // Refused with 403 by the caller.
                 return ActionResponse::ok();
             };
-            if !path.is_file() || !crate::metadata::is_supported_audio_file(&path) {
+            if !canonical.is_file() || !crate::metadata::is_supported_audio_file(&canonical) {
                 return bad("Not an audio file");
             }
-            PlaylistEdit::Add { name, path }
+            // `allow` only accepts absolute paths. Store the form a terminal add would.
+            let path = crate::playlist::normalize_path(Path::new(&requested));
+            PlaylistEdit::Add { name, path, canonical }
         }
-        "playlist_remove" => match index() {
-            Ok(index) => PlaylistEdit::Remove {
-                name,
-                index,
-                revision: payload.revision,
-            },
+        "playlist_remove" => match index().and_then(|index| Ok((index, revision()?))) {
+            Ok((index, revision)) => PlaylistEdit::Remove { name, index, revision },
             Err(response) => return response,
         },
         "playlist_move" => {
-            let index = match index() {
-                Ok(index) => index,
+            let (index, revision) = match index().and_then(|index| Ok((index, revision()?))) {
+                Ok(found) => found,
                 Err(response) => return response,
             };
             let dir = match payload.direction.as_deref() {
@@ -451,7 +459,7 @@ fn edit_playlist_action(
                 name,
                 index,
                 dir,
-                revision: payload.revision,
+                revision,
             }
         }
         _ => return bad("Unknown playlist action"),
@@ -460,6 +468,12 @@ fn edit_playlist_action(
     if cmd_tx.send(WebCommand::EditPlaylist(edit, reply)).is_err() {
         return ActionResponse::refused("503 Service Unavailable", NO_ANSWER);
     }
+    ui_answer(&answer)
+}
+
+/// The UI thread's answer to a playlist request: 200 with its message, 409 with its refusal, or
+/// 503 when it didn't answer in time.
+fn ui_answer(answer: &mpsc::Receiver<PlaylistReply>) -> ActionResponse {
     match answer.recv_timeout(EDIT_REPLY_TIMEOUT) {
         Ok(Ok(message)) => ActionResponse::done(message),
         Ok(Err(error)) => ActionResponse::refused("409 Conflict", error),
@@ -473,6 +487,10 @@ const NO_ANSWER: &str = "Quickstream didn't answer; try again";
 /// Status for a playlist request whose index refers to a list that changed meanwhile.
 pub const PLAYLISTS_CHANGED: &str = "Playlists changed; try again";
 
+/// Error for a playlist request that names a track by index without the snapshot revision the
+/// index came from.
+pub const MISSING_REVISION: &str = "Missing revision: reload the playlists and try again";
+
 /// Error for a playlist action that names no playlist.
 const MISSING_NAME: &str = "Missing playlist name";
 
@@ -480,8 +498,12 @@ const MISSING_NAME: &str = "Missing playlist name";
 /// folders, or it doesn't exist (nothing to follow) and its path lies inside them; the queue
 /// skips missing files. Anything else, including a symlink leading out, is outside. Touches the
 /// disk: web thread only.
-fn playlist_entry_allowed(path: &Path, roots: &[PathBuf], visible: &crate::web_access::VisibleRoots) -> bool {
-    if crate::web_access::resolve_allowed_path(path, roots).is_some() {
+fn playlist_entry_allowed(
+    path: &Path,
+    allowed: &crate::web_access::AllowedRoots,
+    visible: &crate::web_access::VisibleRoots,
+) -> bool {
+    if allowed.resolve(path).is_some() {
         return true;
     }
     std::fs::symlink_metadata(path).is_err() && visible.contains(path)
@@ -516,6 +538,10 @@ fn queue_playlist_action(
         let missing = crate::playlist_store::StoreError::NotFound(name.to_string());
         return ActionResponse::refused("404 Not Found", missing.to_string());
     };
+    // Playing from an index needs the revision it came from (PR #65 review).
+    if payload.index.is_some() && payload.revision.is_none() {
+        return ActionResponse::refused("400 Bad Request", MISSING_REVISION);
+    }
     if payload.revision.is_some_and(|r| r != snapshot.revision) {
         return ActionResponse::refused("409 Conflict", PLAYLISTS_CHANGED);
     }
@@ -527,12 +553,14 @@ fn queue_playlist_action(
         let error = crate::playlist_store::StoreError::IndexOutOfRange;
         return ActionResponse::refused("400 Bad Request", error.to_string());
     }
+    // The roots are canonicalized once for the whole playlist, not once per entry.
+    let allowed = crate::web_access::AllowedRoots::new(&roots);
     let visible = crate::web_access::VisibleRoots::new(&roots);
     if let Some(outside) = playlist
         .entries
         .iter()
         .map(|e| PathBuf::from(&e.path))
-        .find(|p| !playlist_entry_allowed(p, &roots, &visible))
+        .find(|p| !playlist_entry_allowed(p, &allowed, &visible))
     {
         *rejected = Some(outside);
         return ActionResponse::ok();
@@ -547,12 +575,19 @@ fn queue_playlist_action(
             title: e.title.clone(),
         })
         .collect();
-    let _ = cmd_tx.send(WebCommand::QueuePlaylist {
+    // Wait for the UI's answer: it may refuse (`Still checking …`), and the dashboard must not
+    // report a play that never started.
+    let (reply, answer) = WebReply::channel();
+    let command = WebCommand::QueuePlaylist {
         name: playlist.name.clone(),
         entries,
         play_from,
-    });
-    ActionResponse::ok()
+        reply,
+    };
+    if cmd_tx.send(command).is_err() {
+        return ActionResponse::refused("503 Service Unavailable", NO_ANSWER);
+    }
+    ui_answer(&answer)
 }
 
 /// `GET /api/playlists`: the published snapshot, with paths outside the allowed folders
@@ -1627,8 +1662,12 @@ fn handle_client(
         // Paths must resolve inside the allowed folders; commands carry the resolved path.
         let roots = state.read().unwrap().allowed_roots.clone();
         let mut rejected: Option<PathBuf> = None;
+        // Canonicalized on first use, at most once per request.
+        let mut allowed: Option<crate::web_access::AllowedRoots> = None;
         let mut allow = |p: String| -> Option<PathBuf> {
-            let resolved = crate::web_access::resolve_allowed_path(Path::new(&p), &roots);
+            let resolved = allowed
+                .get_or_insert_with(|| crate::web_access::AllowedRoots::new(&roots))
+                .resolve(Path::new(&p));
             if resolved.is_none() {
                 rejected = Some(PathBuf::from(p));
             }

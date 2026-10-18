@@ -704,6 +704,53 @@ fn test_folder_add_to_a_playlist_deleted_meanwhile_adds_nothing() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// PR #65 review: "+ New playlist…" on a folder, and the create fails because a file the store
+/// never read has that name. The folder add then finds no playlist; its status must keep saying
+/// the playlist couldn't be created, not that someone deleted it.
+#[test]
+fn test_folder_add_to_a_new_playlist_whose_create_failed_says_so() {
+    common::isolate();
+    let dir = scratch_dir("folder_add_create_failed");
+    let album = dir.join("Album");
+    fs::create_dir_all(&album).unwrap();
+    for name in ["01 Intro.flac", "02 Outro.flac"] {
+        fs::write(album.join(name), b"").unwrap();
+    }
+    let mut app = new_app(&dir);
+    wait_loaded(&mut app);
+    // Appears after the load, so the store can't see it.
+    let playlists = quickstream::paths::get_playlists_dir();
+    fs::create_dir_all(&playlists).unwrap();
+    let theirs = "#EXTM3U\n/user/own.flac\n";
+    fs::write(playlists.join("Mix.m3u8"), theirs).unwrap();
+    let (reader, started, release) = held_tag_reader();
+    app.set_tag_reader(reader);
+    select_browser_row(&mut app, &album);
+
+    press(&mut app, KeyCode::Char('L'));
+    press(&mut app, KeyCode::Enter); // the only row: "+ New playlist…"
+    type_text(&mut app, "Mix");
+    press(&mut app, KeyCode::Enter);
+    started
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the folder add started reading tags");
+    // The writer reports the failed create while the tags are read.
+    assert!(app.persistence.flush());
+    app.poll_playlists();
+    assert_eq!(
+        app.status_message,
+        "Couldn't create \"Mix\": a file with that name already exists"
+    );
+    assert!(app.playlists.store.get("Mix").is_none());
+
+    drop(release);
+    wait_for(&mut app, "folder add", |a| a.status_message.ends_with("nothing added"));
+    assert_eq!(app.status_message, "Mix couldn't be created; nothing added");
+    assert!(app.playlists.store.get("Mix").is_none());
+    assert_eq!(fs::read_to_string(playlists.join("Mix.m3u8")).unwrap(), theirs);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_folder_that_cannot_be_read_reports_it() {
     common::isolate();

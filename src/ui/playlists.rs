@@ -55,6 +55,8 @@ struct QueueCheckResult {
 /// checked, so playback can start now and the rest of the queue fill in later.
 struct QueueStart {
     name: String,
+    /// Index of the entry in the playlist: which copy started when a file is listed twice.
+    index: usize,
     entry: crate::playlist::PlaylistEntry,
     /// The checked (canonical) path to queue.
     resolved: std::path::PathBuf,
@@ -70,10 +72,30 @@ enum QueueCheckUpdate {
 
 /// The track an `Enter` started before the rest of its playlist was checked.
 struct StartedPlay {
-    /// Its queued (checked) path, to find it in the queue when the rest arrives.
+    /// Its queued (checked) path: the started track is the current track while the current
+    /// track has this path.
     path: std::path::PathBuf,
+    /// Index of its entry in the playlist, so the rest is put around exactly this entry even
+    /// when the playlist lists the same file twice.
+    entry_index: usize,
+    /// [`PlaylistChecks::queue_generation`] when it started.
+    generation: u64,
     /// `play_current_track`'s error, kept for the final status.
     playback_error: Option<String>,
+    /// The track ended, or Next / Previous was pressed, before the rest was checked: done once
+    /// the rest is in the queue.
+    pending_skip: Option<PlaylistSkip>,
+}
+
+/// What to do once the rest of the playlist `Enter` started is in the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaylistSkip {
+    /// The started track ended: play the next track.
+    Ended,
+    /// Next was pressed.
+    Next,
+    /// Previous was pressed.
+    Previous,
 }
 
 /// Background existence checks for tab 5. Files are only checked on workers: a `stat` on an
@@ -186,6 +208,8 @@ pub struct PlaylistsUi {
     exists_version: u64,
     /// What the last web snapshot was built from; `None` before the first.
     web_published: Option<WebSnapshotKey>,
+    /// When the last web snapshot was published.
+    web_published_at: Option<std::time::Instant>,
     checks: PlaylistChecks,
     /// Folder listings for folder adds (`L` on a folder), sent by `playlist-folder` workers.
     folder_tx: mpsc::Sender<FolderUpdate>,
@@ -204,6 +228,10 @@ pub struct PlaylistsUi {
     /// writer then reports the create failed, the cursor goes back there instead of staying on
     /// the row the new playlist had sorted into.
     created_from: Option<(String, Option<String>)>,
+    /// Folder adds whose playlist "+ New playlist…" created for them, by target id, and whether
+    /// the writer then reported that create failed: the add's result says so instead of
+    /// reporting the playlist as deleted.
+    folder_add_creates: HashMap<u64, bool>,
 }
 
 impl PlaylistsUi {
@@ -218,6 +246,7 @@ impl PlaylistsUi {
             exists: HashMap::new(),
             exists_version: 0,
             web_published: None,
+            web_published_at: None,
             checks: PlaylistChecks::new(),
             folder_tx,
             folder_rx,
@@ -228,6 +257,7 @@ impl PlaylistsUi {
             list_page_height: 10,
             tracks_page_height: 10,
             created_from: None,
+            folder_add_creates: HashMap::new(),
         }
     }
 
@@ -431,10 +461,20 @@ impl AppUI {
         }
         // Before the store re-sorts: afterwards the cursor's row may hold another playlist.
         let mut selected = self.playlists.selected_name();
+        // Names of the playlists created for a folder add still running, before any is removed.
+        let folder_add_targets: Vec<(u64, String)> = self
+            .playlists
+            .folder_add_creates
+            .keys()
+            .filter_map(|&id| self.playlists.store.name_of(id).map(|name| (id, name.to_string())))
+            .collect();
         let failures = self.playlists.store.poll_write_failures();
         for failure in failures {
             match &failure {
                 WriteFailure::CreateUndone { name, .. } => {
+                    for (id, _) in folder_add_targets.iter().filter(|(_, target)| target == name) {
+                        self.playlists.folder_add_creates.insert(*id, true);
+                    }
                     self.follow_last_playlist(name, None);
                     let created_from = self.playlists.created_from.take_if(|(created, _)| created == name);
                     if let Some((_, before)) = created_from {
@@ -1034,7 +1074,13 @@ struct FolderListing {
 /// What a `playlist-folder` worker sends: tag-reading progress, then the listing.
 #[derive(Debug)]
 enum FolderUpdate {
-    Progress { dir: PathBuf, done: usize, total: usize },
+    Progress {
+        /// Id of the target playlist, as in [`FolderListing::target`].
+        target: u64,
+        dir: PathBuf,
+        done: usize,
+        total: usize,
+    },
     Listing(FolderListing),
 }
 
@@ -1253,6 +1299,9 @@ impl super::AppUI {
             self.status_message = crate::playlist_store::StoreError::NotFound(playlist.to_string()).to_string();
             return;
         };
+        if created {
+            self.playlists.folder_add_creates.insert(target, false);
+        }
         self.status_message = format!("Reading {}…", folder_display_name(&dir));
         let tx = self.playlists.folder_tx.clone();
         let tag_reads = self.tag_reads.clone();
@@ -1270,6 +1319,7 @@ impl super::AppUI {
                         return;
                     }
                     let _ = tx.send(FolderUpdate::Progress {
+                        target,
                         dir: dir.clone(),
                         done,
                         total,
@@ -1296,14 +1346,29 @@ impl super::AppUI {
     fn poll_playlist_folder_adds(&mut self) {
         while let Ok(update) = self.playlists.folder_rx.try_recv() {
             let listing = match update {
-                FolderUpdate::Progress { dir, done, total } => {
-                    self.status_message = format!("Reading tags in {}… {}/{}", folder_display_name(&dir), done, total);
+                FolderUpdate::Progress {
+                    target,
+                    dir,
+                    done,
+                    total,
+                } => {
+                    // Once the target is gone (deleted, or its create failed) the status keeps
+                    // saying so; progress towards adding nothing would only hide it.
+                    if self.playlists.store.name_of(target).is_some() {
+                        self.status_message =
+                            format!("Reading tags in {}… {}/{}", folder_display_name(&dir), done, total);
+                    }
                     continue;
                 }
                 FolderUpdate::Listing(listing) => listing,
             };
+            let create_failed = self.playlists.folder_add_creates.remove(&listing.target) == Some(true);
             let Some(playlist) = self.playlists.store.name_of(listing.target).map(str::to_string) else {
-                self.status_message = format!("{} was deleted; nothing added", listing.playlist);
+                self.status_message = if listing.created && create_failed {
+                    format!("{} couldn't be created; nothing added", listing.playlist)
+                } else {
+                    format!("{} was deleted; nothing added", listing.playlist)
+                };
                 continue;
             };
             let folder = folder_display_name(&listing.dir);
@@ -1521,25 +1586,26 @@ impl AppUI {
     /// `play_from`, or append when `None`: tab 5's `Enter` / `a` and the web dashboard's Play /
     /// Append. With `allowed_roots` (web requests), an entry is only queued when its checked file
     /// lies inside those folders, so a symlink changed after the web thread's check can't reach
-    /// anything else.
+    /// anything else. Returns whether the check started; either way the status says what
+    /// happened.
     fn queue_playlist_entries(
         &mut self,
         name: String,
         entries: Vec<PlaylistEntry>,
         play_from: Option<usize>,
         allowed_roots: Option<Vec<PathBuf>>,
-    ) {
+    ) -> bool {
         if entries.is_empty() {
             self.status_message = format!("{} is empty", name);
-            return;
+            return false;
         }
         // One request at a time: a hung share would otherwise pile up workers, and each result
         // would replace the queue again whenever it arrived.
         if let Some(pending) = &self.playlists.checks.queue_pending {
             self.status_message = format!("Still checking {}…", pending);
-            return;
+            return false;
         }
-        self.status_message = format!("Checking {} tracks in {}…", entries.len(), name);
+        self.status_message = format!("Checking {} in {}…", track_count_label(entries.len()), name);
         self.playlists.checks.queue_pending = Some(name.clone());
         let generation = self.playlists.checks.queue_generation;
         // A restricted check also refuses files that exist, so its results don't go in the
@@ -1549,8 +1615,11 @@ impl AppUI {
             None => self.playlists.checks.checker.clone(),
             Some(roots) => {
                 let check = self.playlists.checks.checker.clone();
+                // Canonicalized on the worker, once for the whole playlist (never on the UI thread).
+                let allowed = std::sync::OnceLock::new();
                 let restricted: ExistsChecker = std::sync::Arc::new(move |path: &Path| {
-                    check(path).filter(|resolved| crate::web_access::resolve_allowed_path(resolved, &roots).is_some())
+                    let allowed = allowed.get_or_init(|| crate::web_access::AllowedRoots::new(&roots));
+                    check(path).filter(|resolved| allowed.resolve(resolved).is_some())
                 });
                 restricted
             }
@@ -1586,6 +1655,7 @@ impl AppUI {
                     start_sent = true;
                     let _ = tx.send(QueueCheckUpdate::Start(QueueStart {
                         name: name.clone(),
+                        index,
                         entry: entry.clone(),
                         resolved: path.clone(),
                         generation,
@@ -1601,6 +1671,7 @@ impl AppUI {
                 records_exists,
             }));
         });
+        true
     }
 
     /// The queue plan for checked entries: `resolved[i]` is entry `i`'s checked path, or `None`
@@ -1665,31 +1736,85 @@ impl AppUI {
         };
         self.playlists.checks.started = Some(StartedPlay {
             path: start.resolved,
+            entry_index: start.index,
+            generation: start.generation,
             playback_error,
+            pending_skip: None,
         });
         self.update_web_state();
     }
 
+    /// Queue position of the track `Enter` started: the current track while it has the started
+    /// track's path (it is playing, and a copy of the same file queued elsewhere is not it), else
+    /// the first queued track with that path, or `None` once it has left the queue.
+    fn started_queue_position(&self, started: &StartedPlay) -> Option<usize> {
+        if self.queue.current_track().is_some_and(|t| t.filepath == started.path) {
+            return Some(self.queue.current_index);
+        }
+        self.queue.tracks.iter().position(|t| t.filepath == started.path)
+    }
+
+    /// Whether the track `Enter` started is the current track and the rest of its playlist is
+    /// still being checked, so the tracks around it are not in the queue yet.
+    fn started_track_is_current(&self) -> bool {
+        self.playlists.checks.started.as_ref().is_some_and(|started| {
+            started.generation == self.playlists.checks.queue_generation
+                && self.queue.current_track().is_some_and(|t| t.filepath == started.path)
+        })
+    }
+
+    /// The started track ended, or Next / Previous was pressed, while the rest of its playlist is
+    /// still being checked (a slow share). The track to go to isn't queued yet, so remember the
+    /// skip and do it once the rest arrives (`apply_playlist_queue`), instead of stopping at the
+    /// end of a one-track queue or playing the started track again. Returns true when held.
+    pub(super) fn hold_skip_for_playlist_fill(&mut self, skip: PlaylistSkip) -> bool {
+        if !self.started_track_is_current() {
+            return false;
+        }
+        let name = self.playlists.checks.queue_pending.clone().unwrap_or_default();
+        if let Some(started) = self.playlists.checks.started.as_mut() {
+            started.pending_skip = Some(skip);
+        }
+        self.status_message = match skip {
+            PlaylistSkip::Ended => format!("Waiting for the rest of {}…", name),
+            PlaylistSkip::Next => format!("Next track plays once {} is checked…", name),
+            PlaylistSkip::Previous => format!("Previous track plays once {} is checked…", name),
+        };
+        self.update_web_state();
+        true
+    }
+
     /// Put the rest of a playlist around the track `Enter` already started: the tracks before
     /// it at the top of the queue, the tracks after it right behind it, so anything queued
-    /// meanwhile follows the playlist. If the started track has left the queue, the rest is
+    /// meanwhile follows the playlist. The started track is matched by its entry's index, not
+    /// its path, so a file listed twice is queued once per entry. If no planned track is the
+    /// started entry (which the worker's start rule rules out), nothing is left out: every
+    /// planned track goes around it. If the started track has left the queue, the rest is
     /// appended in playlist order.
-    fn fill_playlist_around(&mut self, started: &Path, mut tracks: Vec<crate::metadata::AudioMetadata>, start: usize) {
-        // The worker picks the start by `plan_queue`'s rule, so `tracks[start]` is the started
-        // track itself.
-        debug_assert_eq!(tracks.get(start).map(|t| t.filepath.as_path()), Some(started));
-        let after = tracks.split_off(start + 1);
-        tracks.truncate(start);
-        let before = tracks;
-        match self.queue.tracks.iter().position(|t| t.filepath == started) {
+    fn fill_playlist_around(
+        &mut self,
+        started: &StartedPlay,
+        tracks: Vec<crate::metadata::AudioMetadata>,
+        entry_indices: &[usize],
+    ) {
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for (track, &index) in tracks.into_iter().zip(entry_indices) {
+            if index < started.entry_index {
+                before.push(track);
+            } else if index > started.entry_index {
+                after.push(track);
+            }
+            // `index == started.entry_index`: the started track itself, already queued.
+        }
+        match self.started_queue_position(started) {
             Some(position) => {
                 self.insert_queue_tracks(position + 1, after);
                 self.insert_queue_tracks(0, before);
             }
             None => {
-                let mut rest = before;
-                rest.extend(after);
-                self.enqueue_tracks(rest);
+                before.extend(after);
+                self.enqueue_tracks(before);
             }
         }
     }
@@ -1712,6 +1837,7 @@ impl AppUI {
         }
         let crate::playlist::QueuePlan {
             tracks,
+            entry_indices,
             start_index,
             missing,
         } = self.plan_checked_queue(&result.entries, &result.resolved, result.play_from);
@@ -1732,9 +1858,15 @@ impl AppUI {
         // play_current_track returns its "Playback error: ..." when the player fails to start.
         // The status keeps that error and puts the queue summary after it, so a failed start is
         // never reported as plain success.
+        let mut skip = None;
         let playback_error = match (result.play_from, start_index, started) {
-            (Some(_), Some(start), Some(started)) => {
-                self.fill_playlist_around(&started.path, tracks, start);
+            (Some(_), Some(_), Some(started)) => {
+                self.fill_playlist_around(&started, tracks, &entry_indices);
+                // Only while the started track is still the current one: the user may have
+                // played something else meanwhile.
+                if self.queue.current_track().is_some_and(|t| t.filepath == started.path) {
+                    skip = started.pending_skip;
+                }
                 started.playback_error
             }
             // Not reached in practice: the worker sends the start before any track that
@@ -1761,6 +1893,21 @@ impl AppUI {
                 missing
             )
         };
+        // The started track ended, or Next / Previous was pressed, while the rest was checked:
+        // the track to go to is queued now. A playback error from that start replaces the one
+        // from the started track.
+        let playback_error = match skip {
+            Some(skip) => {
+                self.status_message.clear();
+                match skip {
+                    PlaylistSkip::Ended | PlaylistSkip::Next => self.play_next_track(),
+                    PlaylistSkip::Previous => self.play_prev_track(),
+                }
+                self.queue_cursor = self.queue.current_index;
+                (!self.status_message.is_empty()).then(|| self.status_message.clone())
+            }
+            None => playback_error,
+        };
         self.status_message = match playback_error {
             Some(err) => format!("{}. {}", err, summary),
             None => summary,
@@ -1774,6 +1921,11 @@ impl AppUI {
         self.playlists.checks.queue_generation = self.playlists.checks.queue_generation.wrapping_add(1);
     }
 }
+
+/// Shortest time between two web snapshots that differ only in existence-check results. A large
+/// check sends a result almost every tick, and each new snapshot makes the dashboard fetch the
+/// playlists again (PR #65 review).
+pub const WEB_EXISTS_REPUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// What a web snapshot was built from; while none of it changes the snapshot is current.
 #[derive(Debug, Clone, PartialEq)]
@@ -1790,6 +1942,8 @@ struct WebSnapshotKey {
 impl AppUI {
     /// Publish the playlists to the web state when anything they show changed since the last
     /// snapshot. Called with the rest of the web state on every tick; cheap when nothing changed.
+    /// A change in existence-check results alone waits until [`WEB_EXISTS_REPUBLISH_INTERVAL`]
+    /// has passed since the last snapshot; edits and the load publish at once.
     pub(super) fn publish_web_playlists(&mut self) {
         let key = WebSnapshotKey {
             revision: self.playlists.store.revision(),
@@ -1798,8 +1952,21 @@ impl AppUI {
             load_failed: self.playlists.load_failed,
             last_playlist: self.settings_mgr.settings.last_playlist.clone(),
         };
-        if self.playlists.web_published.as_ref() == Some(&key) {
-            return;
+        if let Some(published) = &self.playlists.web_published {
+            if *published == key {
+                return;
+            }
+            let exists_only = WebSnapshotKey {
+                exists_version: key.exists_version,
+                ..published.clone()
+            } == key;
+            let recent = self
+                .playlists
+                .web_published_at
+                .is_some_and(|at| at.elapsed() < WEB_EXISTS_REPUBLISH_INTERVAL);
+            if exists_only && recent {
+                return;
+            }
         }
         let snapshot = std::sync::Arc::new(self.web_playlists_snapshot());
         if let Ok(mut state) = self.web_state.write() {
@@ -1807,6 +1974,7 @@ impl AppUI {
             state.playlists_version = state.playlists_version.wrapping_add(1);
         }
         self.playlists.web_published = Some(key);
+        self.playlists.web_published_at = Some(std::time::Instant::now());
     }
 
     fn web_playlists_snapshot(&self) -> crate::web::WebPlaylists {
@@ -1861,14 +2029,25 @@ impl AppUI {
 
     /// The dashboard's Play (`play_from` set) or Append, with entries the web thread checked
     /// against the allowed folders. Same checks, queueing and status messages as tab 5; the
-    /// status names the playlist rather than saying `(web)`.
-    pub(super) fn queue_web_playlist(&mut self, name: String, entries: Vec<PlaylistEntry>, play_from: Option<usize>) {
+    /// status names the playlist rather than saying `(web)`. Returns the status: `Ok` when the
+    /// check started, `Err` when it was refused (not loaded, empty, another still checking), so
+    /// the dashboard never reports a play that didn't start.
+    pub(super) fn queue_web_playlist(
+        &mut self,
+        name: String,
+        entries: Vec<PlaylistEntry>,
+        play_from: Option<usize>,
+    ) -> Result<String, String> {
         if !self.playlists.store.is_loaded() {
             self.status_message = self.playlists.not_loaded_message();
-            return;
+            return Err(self.status_message.clone());
         }
         let roots = self.web_allowed_roots();
-        self.queue_playlist_entries(name, entries, play_from, Some(roots));
+        if self.queue_playlist_entries(name, entries, play_from, Some(roots)) {
+            Ok(self.status_message.clone())
+        } else {
+            Err(self.status_message.clone())
+        }
     }
 
     /// Apply a playlist edit from the dashboard with the same store calls, rules and messages
@@ -1888,7 +2067,16 @@ impl AppUI {
                     .map_err(|e| e.to_string()),
                 PlaylistEdit::Rename { name, new_name } => self.web_rename(&name, &new_name, &mut selected),
                 PlaylistEdit::Delete { name } => self.delete_playlist_named(&name).map_err(|e| e.to_string()),
-                PlaylistEdit::Add { name, path } => {
+                PlaylistEdit::Add { name, path, canonical } => {
+                    // Stored as the request named it, like a terminal add. A playlist that
+                    // already holds the canonical path (added that way before) holds the file:
+                    // adding that path reports it as already there.
+                    let has_canonical = self
+                        .playlists
+                        .store
+                        .get(&name)
+                        .is_some_and(|playlist| playlist.contains_path(&canonical));
+                    let path = if has_canonical { canonical } else { path };
                     let entry = self.playlist_entry_for_web_add(&path);
                     self.add_entries_to_playlist(&name, vec![entry])
                 }
@@ -1919,10 +2107,11 @@ impl AppUI {
     }
 
     /// Refuse an index-based edit made against a list that has changed since.
-    fn check_web_revision(&self, revision: Option<u64>) -> Result<(), String> {
-        match revision {
-            Some(r) if r != self.playlists.store.revision() => Err(crate::web::PLAYLISTS_CHANGED.to_string()),
-            _ => Ok(()),
+    fn check_web_revision(&self, revision: u64) -> Result<(), String> {
+        if revision == self.playlists.store.revision() {
+            Ok(())
+        } else {
+            Err(crate::web::PLAYLISTS_CHANGED.to_string())
         }
     }
 
