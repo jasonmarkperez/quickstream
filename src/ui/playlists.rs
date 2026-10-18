@@ -962,14 +962,23 @@ impl super::AppUI {
         }
     }
 
-    /// List `dir` on a worker (it may be on a slow or unmounted share);
-    /// `poll_playlist_folder_adds` adds the files when the listing arrives.
+    /// List `dir` and read the tags of files not yet in the metadata cache, on a worker (it may
+    /// be on a slow or unmounted share); `poll_playlist_folder_adds` adds the files when the
+    /// listing arrives and builds their entries from the filled cache.
     fn start_folder_add(&mut self, playlist: &str, dir: PathBuf) {
         self.status_message = format!("Reading {}…", folder_display_name(&dir));
         let tx = self.playlists.folder_tx.clone();
+        let cache = self.metadata_cache.clone();
         let playlist = playlist.to_string();
         self.workers.spawn("playlist-folder", move || {
             let result = list_folder_audio_files(&dir);
+            if let Ok(files) = &result {
+                for path in files.iter().filter(|path| cache.get(path).is_none()) {
+                    if let Ok(meta) = crate::metadata::extract_metadata(path) {
+                        cache.insert(meta);
+                    }
+                }
+            }
             let _ = tx.send(FolderListing { playlist, dir, result });
         });
     }
@@ -1259,10 +1268,11 @@ impl AppUI {
                 None
             }
         };
+        let noun = if queued == 1 { "track" } else { "tracks" };
         let summary = if missing == 0 {
-            format!("Queued {} tracks from {}", queued, result.name)
+            format!("Queued {} {} from {}", queued, noun, result.name)
         } else {
-            format!("Queued {} tracks from {}, {} missing", queued, result.name, missing)
+            format!("Queued {} {} from {}, {} missing", queued, noun, result.name, missing)
         };
         self.status_message = match playback_error {
             Some(err) => format!("{}. {}", err, summary),

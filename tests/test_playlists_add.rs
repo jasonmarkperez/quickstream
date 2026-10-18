@@ -464,6 +464,59 @@ fn test_add_key_on_folder_adds_its_audio_files_in_name_order() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A 2-second silent PCM WAV, enough for the tag reader to report a duration.
+fn write_two_second_wav(path: &Path) {
+    let sample_rate: u32 = 44100;
+    let channels: u16 = 2;
+    let bits: u16 = 16;
+    let block_align = channels * (bits / 8);
+    let data_size = sample_rate * 2 * block_align as u32;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + data_size).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&channels.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&(sample_rate * block_align as u32).to_le_bytes());
+    bytes.extend_from_slice(&block_align.to_le_bytes());
+    bytes.extend_from_slice(&bits.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_size.to_le_bytes());
+    bytes.resize(bytes.len() + data_size as usize, 0);
+    fs::write(path, bytes).unwrap();
+}
+
+/// Files in a folder that was never shown in the browser have no cached tags. The folder add
+/// worker reads them, so the playlist stores real durations and the cache is filled.
+#[test]
+fn test_folder_add_reads_tags_for_files_not_in_the_cache() {
+    common::isolate();
+    let dir = scratch_dir("folder_tags");
+    let album = dir.join("Album");
+    fs::create_dir_all(&album).unwrap();
+    let track = album.join("01 Intro.wav");
+    write_two_second_wav(&track);
+    let mut app = new_app(&dir);
+    wait_loaded(&mut app);
+    app.playlists.store.create("Road Trip").unwrap();
+    select_browser_row(&mut app, &album);
+    assert!(app.metadata_cache.get(&track).is_none());
+
+    press(&mut app, KeyCode::Char('L'));
+    press(&mut app, KeyCode::Enter);
+    wait_for(&mut app, "folder add", |a| {
+        a.playlists.store.get("Road Trip").is_some_and(|p| p.entries.len() == 1)
+    });
+
+    let entry = app.playlists.store.get("Road Trip").unwrap().entries[0].clone();
+    assert_eq!(entry.path, track);
+    assert_eq!(entry.duration_secs, 2);
+    assert!(app.metadata_cache.get(&track).is_some());
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_folder_that_cannot_be_read_reports_it() {
     common::isolate();

@@ -556,7 +556,7 @@ fn test_symlink_to_a_non_audio_file_is_not_queued() {
         app.status_message
     );
     assert_eq!(queue_paths(&app), vec![good.clone()]);
-    assert_eq!(app.status_message, "Queued 1 tracks from Road Trip, 1 missing");
+    assert_eq!(app.status_message, "Queued 1 track from Road Trip, 1 missing");
     assert!(app.playlists.is_missing(&link));
     let _ = std::fs::remove_dir_all(&dir);
 }
