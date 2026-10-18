@@ -1507,6 +1507,28 @@ fn test_adding_a_file_checks_its_path_like_add_file() {
             canonical: real.join("song.mp3"),
         }]
     );
+    // `..` after a symlinked folder: the OS resolves it from the link's target, text-only
+    // normalization from the link's parent. Here the text form names Private/secret.mp3
+    // (outside), the checked file is Music/Private/secret.mp3 (inside). The stored path must
+    // be the file that was checked, never the text form.
+    fs::create_dir_all(music.join("a/b")).unwrap();
+    std::os::unix::fs::symlink(music.join("a/b"), music.join("Deep")).unwrap();
+    let checked = music.join("Private").join("secret.mp3");
+    touch(&checked);
+    let tricky = music.join("Deep/../../Private/secret.mp3");
+    let (status, json) = post(
+        handle.port,
+        &serde_json::json!({"action": "playlist_add", "name": PLAYLIST, "path": tricky}),
+    );
+    assert_eq!(status, 200, "{}", json);
+    assert_eq!(
+        edits(&rx),
+        vec![PlaylistEdit::Add {
+            name: PLAYLIST.to_string(),
+            path: checked.clone(),
+            canonical: checked.clone(),
+        }]
+    );
     handle.stop();
     let _ = fs::remove_dir_all(&dir);
 }

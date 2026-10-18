@@ -283,7 +283,8 @@ pub enum PlaylistEdit {
     },
     /// Add an audio file. `path` is the file as the request named it (absolute, normalized
     /// with [`crate::playlist::normalize_path`]), the form a terminal add stores, so the same file
-    /// added from either side is a duplicate and its tags are found. `canonical` is the same file
+    /// added from either side is a duplicate and its tags are found; when that form resolves to a
+    /// different file than the one checked, `path` is `canonical` instead. `canonical` is the same file
     /// with symlinks resolved, which the web thread checked lies inside the allowed folders; a
     /// playlist already holding it counts as already holding the file.
     Add {
@@ -437,8 +438,14 @@ fn edit_playlist_action(
             if !canonical.is_file() || !crate::metadata::is_supported_audio_file(&canonical) {
                 return bad("Not an audio file");
             }
-            // `allow` only accepts absolute paths. Store the form a terminal add would.
-            let path = crate::playlist::normalize_path(Path::new(&requested));
+            // `allow` only accepts absolute paths. Store the form a terminal add would, but only
+            // when it is the file that was checked: after a symlinked folder, text-only `..`
+            // removal can name a different file, possibly outside the allowed folders.
+            let normalized = crate::playlist::normalize_path(Path::new(&requested));
+            let path = match std::fs::canonicalize(&normalized) {
+                Ok(resolved) if resolved == canonical => normalized,
+                _ => canonical.clone(),
+            };
             PlaylistEdit::Add { name, path, canonical }
         }
         "playlist_remove" => match index().and_then(|index| Ok((index, revision()?))) {
