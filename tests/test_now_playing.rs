@@ -36,8 +36,8 @@ fn test_now_playing_tab_key_navigation() {
     let _ = app.handle_input_key(crossterm::event::KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
     assert_eq!(app.active_tab, 0);
 
-    // Press 'Esc': return to Queue & Library (tab 1)
-    app.handle_tab_key(KeyCode::Esc);
+    // Press 'n': back to Queue & Library (tab 1)
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
     assert_eq!(app.active_tab, 1);
 
     // Numeric keys 2, 3, 4
@@ -75,6 +75,12 @@ fn test_render_now_playing_tab_empty_and_populated() {
 
     let view = terminal.backend().to_string();
     assert!(view.contains("NOW PLAYING"), "Should render NOW PLAYING title in view");
+    // Esc is the global quit key, so the footer must not offer it for switching tabs (#57).
+    assert!(
+        view.contains("[n] Queue & Library"),
+        "Footer should name n for Queue & Library"
+    );
+    assert!(!view.contains("Esc"), "Footer should not mention Esc");
     assert!(
         view.contains("No Track Loaded"),
         "Should render No Track Loaded when queue is empty"

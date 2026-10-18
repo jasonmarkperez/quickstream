@@ -2325,20 +2325,12 @@ impl AppUI {
 
     pub fn handle_tab_key_with_modifiers(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         match self.active_tab {
-            0 => {
-                // Now Playing Tab
-                match (code, modifiers) {
-                    (KeyCode::Esc, _) | (KeyCode::Char('q'), KeyModifiers::NONE) => {
-                        self.active_tab = 1;
-                    }
-                    (KeyCode::Char('r'), KeyModifiers::NONE) => {
-                        if let Some(current) = self.queue.current_track() {
-                            self.start_seed_radio(current.filepath.clone());
-                        } else {
-                            self.status_message = "No track playing to start Seed Radio".to_string();
-                        }
-                    }
-                    _ => {}
+            // Now Playing Tab: `r` is its only tab key
+            0 if (code, modifiers) == (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                if let Some(current) = self.queue.current_track() {
+                    self.start_seed_radio(current.filepath.clone());
+                } else {
+                    self.status_message = "No track playing to start Seed Radio".to_string();
                 }
             }
             1 => {
@@ -3593,7 +3585,7 @@ impl AppUI {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ))
             .title_bottom(Span::styled(
-                " [Space] Play/Pause   [←/→] Prev/Next Track   [[/]] Seek 10s   [+/-] Vol   [n / Esc] Queue & Library ",
+                " [Space] Play/Pause   [←/→] Prev/Next Track   [[/]] Seek 10s   [+/-] Vol   [n] Queue & Library ",
                 Style::default().fg(Color::DarkGray),
             ));
 
