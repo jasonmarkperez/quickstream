@@ -454,6 +454,43 @@ fn test_save_after_a_rename_of_a_missing_file_still_writes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// PR #65 review: a failed rename leaves the writer noting that the target name stands for the
+/// old file. A later rename onto that name whose source is gone moves nothing, so the note is
+/// stale: saves to the name must write it, and a delete of it must never follow the note to the
+/// other playlist's file.
+#[test]
+fn test_rename_of_a_missing_file_clears_an_earlier_failure_on_the_target() {
+    common::isolate();
+    let dir = scratch("stale_stranded");
+    let a = dir.join("A.m3u8");
+    let b = dir.join("B.m3u8");
+    let c = dir.join("C.m3u8");
+    std::fs::write(&a, b"#EXTM3U\n#PLAYLIST:A\n").unwrap();
+    std::fs::write(&b, b"foreign").unwrap();
+    let worker = PersistenceWorker::spawn();
+
+    // A -> B fails: B.m3u8 is someone else's file.
+    worker.rename(a.clone(), b.clone());
+    assert!(worker.flush());
+    assert_eq!(std::fs::read(&b).unwrap(), b"foreign");
+    // Outside the app the foreign file goes away, and C.m3u8 was never there.
+    std::fs::remove_file(&b).unwrap();
+    worker.rename(c.clone(), b.clone());
+    worker.save(b.clone(), b"#EXTM3U\n#PLAYLIST:B\n".to_vec());
+    assert!(worker.flush());
+    assert_eq!(std::fs::read(&b).unwrap(), b"#EXTM3U\n#PLAYLIST:B\n");
+
+    worker.delete(b.clone());
+    assert!(worker.flush());
+    assert_eq!(
+        names_in(&dir),
+        vec!["A.m3u8".to_string()],
+        "the delete removed the wrong file"
+    );
+    assert_eq!(std::fs::read(&a).unwrap(), b"#EXTM3U\n#PLAYLIST:A\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------- creates that never replace, and failures reported back (issues #62, #52) ----------
 
 use quickstream::persist::{PersistFailure, PersistReport, Reporter};

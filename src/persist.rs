@@ -588,8 +588,11 @@ fn apply_op(op: &Op, writer: &Writer, stranded: &mut HashMap<PathBuf, Option<Pat
                         e
                     ));
                     // With `from` gone nothing moved and nothing is in the way: a save to `to`
-                    // just writes the file fresh.
+                    // just writes the file fresh. An earlier failure noted on `to` is stale now
+                    // that the caller owns the name, and following it would reach another
+                    // playlist's file (PR #65 review).
                     if e.kind() == io::ErrorKind::NotFound {
+                        stranded.remove(to);
                         done();
                         return;
                     }
