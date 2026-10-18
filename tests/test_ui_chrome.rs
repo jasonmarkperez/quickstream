@@ -970,10 +970,16 @@ fn spotlight_hint_is_cleared_when_spotlight_closes() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The active tab chip on the tab row (row 3 from 24 rows): its text and first column.
-fn active_chip(buffer: &ratatui::buffer::Buffer) -> (String, u16) {
+/// The tab row: the first row from the top that holds `label` (the active tab's label, which the
+/// header above it never holds).
+fn tab_row_index(buffer: &ratatui::buffer::Buffer, label: &str) -> u16 {
+    tui::find_row(buffer, label)
+        .unwrap_or_else(|| panic!("no tab row with {label:?}:\n{}", tui::rows(buffer).join("\n")))
+}
+
+/// The active tab chip on tab row `y`: its text and first column.
+fn active_chip(buffer: &ratatui::buffer::Buffer, y: u16) -> (String, u16) {
     let ink = theme::palette().ink;
-    let y = 3;
     let xs: Vec<u16> = (0..buffer.area.width).filter(|&x| buffer[(x, y)].bg == ink).collect();
     assert!(
         !xs.is_empty(),
@@ -996,8 +1002,9 @@ fn tab_row_keeps_the_active_chip_whole_down_to_20_columns() {
         for (tab, label) in labels.iter().enumerate() {
             app.active_tab = tab;
             let buffer = tui::render(&mut app, width, 24);
-            let row = tui::row(&buffer, 3);
-            let (chip, _) = active_chip(&buffer);
+            let y = tab_row_index(&buffer, label);
+            let row = tui::row(&buffer, y);
+            let (chip, _) = active_chip(&buffer, y);
             assert_eq!(chip, format!(" {label} "), "tab {tab} at {width}: {row:?}");
             assert!(row.ends_with("  "), "right gutter kept at {width}: {row:?}");
             // The numbers that remain are the ones nearest the active tab, in order.
@@ -1024,8 +1031,9 @@ fn tab_row_cuts_the_active_chip_with_an_ellipsis_when_it_alone_does_not_fit() {
     let (mut app, dir) = chrome_app("tabs_tiny");
     app.active_tab = 4;
     let buffer = tui::render(&mut app, 14, 24);
-    let (chip, x) = active_chip(&buffer);
-    assert_eq!(chip, " 5 PLAYL… ", "{:?}", tui::row(&buffer, 3));
+    let y = tab_row_index(&buffer, "5 PLAYL…");
+    let (chip, x) = active_chip(&buffer, y);
+    assert_eq!(chip, " 5 PLAYL… ", "{:?}", tui::row(&buffer, y));
     assert_eq!(x, 2, "after the left gutter");
     let _ = fs::remove_dir_all(&dir);
 }
@@ -1147,6 +1155,8 @@ fn key_row_shows_the_open_modals_keys_instead_of_the_tabs() {
     app.status_message.clear();
     app.active_tab = 1;
     app.queue_focus = false;
+    // Where the tab's own key row sits with no modal open.
+    let tab_key_row = key_row_index(&tui::render(&mut app, 120, 40));
     for modal in MODALS {
         open_modal(&mut app, modal);
         app.status_message.clear();
@@ -1156,7 +1166,7 @@ fn key_row_shows_the_open_modals_keys_instead_of_the_tabs() {
             .rev()
             .find(|&y| tui::row(&buffer, y).contains(keys[0]))
             .unwrap_or_else(|| panic!("{modal:?}: no key row\n{}", tui::rows(&buffer).join("\n")));
-        assert_eq!(y, 38, "{modal:?}: the key row stays in place");
+        assert_eq!(y, tab_key_row, "{modal:?}: the key row stays in place");
         let row = tui::row(&buffer, y);
         for key in keys {
             assert!(row.contains(key), "{modal:?}: {key:?} missing: {row:?}");
