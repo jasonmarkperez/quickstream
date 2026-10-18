@@ -3782,7 +3782,10 @@ impl AppUI {
             // Row 4: Format Quality Badges
             let mut badge_spans = Vec::new();
             if self.autopilot_dir.is_some() {
-                badge_spans.push(Span::styled("[⚡ AUTOPILOT]", theme::cursor()));
+                badge_spans.push(Span::styled(
+                    format!("[⚡ AUTOPILOT · {}]", kit::upper(self.active_mix_profile.short_name())),
+                    theme::cursor(),
+                ));
                 badge_spans.push(Span::raw(" "));
             }
             if !track.format_name.is_empty() {

@@ -330,6 +330,23 @@ impl AppUI {
             right.clear();
         }
 
+        // The autopilot's mix profile has the lowest priority: it shows only when the title (and
+        // artist) still fit whole beside it and everything else.
+        if self.autopilot_dir.is_some() && !right.is_empty() {
+            let profile = format!("⚡ {}", kit::upper(self.active_mix_profile.short_name()));
+            let mut left_width = 2 + text_width(&title);
+            if screen.tier >= WidthTier::Medium && !track.artist.is_empty() {
+                left_width += 3 + text_width(&kit::upper(&track.artist));
+            }
+            let profile_width = text_width(&profile) + PART_GAP;
+            if left_width + PART_GAP + profile_width + spans_width(&right) <= width {
+                right.insert(
+                    0,
+                    Span::styled(format!("{profile}{}", " ".repeat(PART_GAP)), theme::mid()),
+                );
+            }
+        }
+
         let room = width.saturating_sub(spans_width(&right) + if right.is_empty() { 0 } else { PART_GAP });
         let title = kit::clip(&title, room.saturating_sub(2));
         let mut left = vec![Span::styled(

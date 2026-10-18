@@ -1177,3 +1177,45 @@ fn key_row_shows_the_open_modals_keys_instead_of_the_tabs() {
     assert!(row.contains(" /  SPOTLIGHT"), "{row:?}");
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn strip_names_the_mix_profile_while_autopilot_runs_when_there_is_room() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("strip_profile");
+    app.queue.add_track(track(&dir, "Halcyon Drift", "Mira Lenz"));
+    app.active_mix_profile = quickstream::analysis::MixProfile::BpmFlow {
+        target_bpm: 120.0,
+        tolerance: 0.15,
+    };
+    app.active_tab = 1;
+    let strip = |app: &mut AppUI, width: u16| {
+        let buffer = tui::render(app, width, 30);
+        let y = tui::find_row(&buffer, "HALCYON").unwrap_or_else(|| panic!("no strip at {width}"));
+        tui::row(&buffer, y)
+    };
+
+    // Autopilot off: no profile.
+    assert!(!strip(&mut app, 120).contains("BPM FLOW"));
+
+    app.autopilot_dir = Some(dir.clone());
+    for tab in 1..5 {
+        app.active_tab = tab;
+        let row = strip(&mut app, 120);
+        assert!(row.contains("BPM FLOW"), "tab {tab}: {row:?}");
+        let styles = tui::text_styles(&tui::render(&mut app, 120, 30), "BPM FLOW").unwrap();
+        assert!(styles.iter().all(|s| s.fg == Some(theme::palette().mid)), "in MID");
+        // Everything else is still whole.
+        for part in ["HALCYON DRIFT", "MIRA LENZ", "00:00 ▕", "▏ 05:52", "VOL "] {
+            assert!(row.contains(part), "tab {tab}: {part:?} missing: {row:?}");
+        }
+    }
+
+    // Lowest priority: dropped first when the strip is short of room.
+    app.active_tab = 1;
+    let row = strip(&mut app, 85);
+    assert!(!row.contains("BPM FLOW"), "{row:?}");
+    assert!(row.contains("HALCYON DRIFT"), "title kept whole: {row:?}");
+    let row = strip(&mut app, 60);
+    assert!(!row.contains("BPM FLOW"), "{row:?}");
+    let _ = fs::remove_dir_all(&dir);
+}

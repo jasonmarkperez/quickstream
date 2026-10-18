@@ -6,6 +6,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
+use quickstream::analysis::{MixProfile, MoodType};
 use quickstream::metadata::AudioMetadata;
 use quickstream::settings::SettingsManager;
 use quickstream::ui::AppUI;
@@ -257,5 +258,34 @@ fn test_now_playing_shows_a_pending_skip_as_queued_from_its_start() {
         "Two from 00:00 of 05:52: {timeline:?}"
     );
     assert!(!screen.contains("02:05"), "One's position is gone: {screen}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_now_playing_autopilot_badge_names_the_mix_profile() {
+    common::isolate();
+    let (mut app, dir) = hero_app("profile", &["One", "Two"]);
+    let screen = common::tui::render_text(&mut app, 120, 40);
+    assert!(!screen.contains("AUTOPILOT"), "no badge without autopilot: {screen}");
+
+    app.autopilot_dir = Some(dir.clone());
+    for (profile, name) in [
+        (MixProfile::DiverseShuffle, "AUTOPILOT · DIVERSE SHUFFLE"),
+        (
+            MixProfile::BpmFlow {
+                target_bpm: 120.0,
+                tolerance: 0.15,
+            },
+            "AUTOPILOT · BPM FLOW",
+        ),
+        (MixProfile::MoodVibe(MoodType::Chill), "AUTOPILOT · CHILL & AMBIENT"),
+        (MixProfile::MoodVibe(MoodType::Workout), "AUTOPILOT · WORKOUT"),
+        (MixProfile::MoodVibe(MoodType::Groove), "AUTOPILOT · LATE NIGHT GROOVE"),
+        (MixProfile::SeedRadio(dir.join("One.flac")), "AUTOPILOT · SEED RADIO"),
+    ] {
+        app.active_mix_profile = profile;
+        let screen = common::tui::render_text(&mut app, 120, 40);
+        assert!(screen.contains(name), "{name:?} missing:\n{screen}");
+    }
     let _ = fs::remove_dir_all(&dir);
 }
