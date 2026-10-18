@@ -49,6 +49,31 @@ struct QueueCheckResult {
     generation: u64,
 }
 
+/// `Enter`: the entry to start playing passed its check before the rest of the playlist was
+/// checked, so playback can start now and the rest of the queue fill in later.
+struct QueueStart {
+    name: String,
+    entry: crate::playlist::PlaylistEntry,
+    /// The checked (canonical) path to queue.
+    resolved: std::path::PathBuf,
+    generation: u64,
+}
+
+/// What a `playlist-queue` worker sends: for `Enter`, the track to start on as soon as it is
+/// found, then (for `Enter` and `a`) every entry's check.
+enum QueueCheckUpdate {
+    Start(QueueStart),
+    Done(QueueCheckResult),
+}
+
+/// The track an `Enter` started before the rest of its playlist was checked.
+struct StartedPlay {
+    /// Its queued (checked) path, to find it in the queue when the rest arrives.
+    path: std::path::PathBuf,
+    /// `play_current_track`'s error, kept for the final status.
+    playback_error: Option<String>,
+}
+
 /// Background existence checks for tab 5. Files are only checked on workers: a `stat` on an
 /// unmounted share can hang, and the UI must keep drawing.
 struct PlaylistChecks {
@@ -57,10 +82,12 @@ struct PlaylistChecks {
     in_flight: std::collections::HashSet<std::path::PathBuf>,
     exists_tx: std::sync::mpsc::Sender<(std::path::PathBuf, bool)>,
     exists_rx: std::sync::mpsc::Receiver<(std::path::PathBuf, bool)>,
-    queue_tx: std::sync::mpsc::Sender<QueueCheckResult>,
-    queue_rx: std::sync::mpsc::Receiver<QueueCheckResult>,
+    queue_tx: std::sync::mpsc::Sender<QueueCheckUpdate>,
+    queue_rx: std::sync::mpsc::Receiver<QueueCheckUpdate>,
     /// Name of the playlist whose queue check is running; at most one runs at a time.
     queue_pending: Option<String>,
+    /// Set while the track an `Enter` started plays and the rest of its playlist is checked.
+    started: Option<StartedPlay>,
     /// Bumped by anything else that replaces the queue or starts playback, so a check that
     /// finishes afterwards is dropped instead of undoing it.
     queue_generation: u64,
@@ -81,6 +108,7 @@ impl PlaylistChecks {
             queue_tx,
             queue_rx,
             queue_pending: None,
+            started: None,
             queue_generation: 0,
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -163,6 +191,9 @@ pub struct PlaylistsUi {
     load_failed: bool,
     list_state: ListState,
     tracks_state: ListState,
+    /// Rows each pane showed at the last render: how far PageUp / PageDown move.
+    pub list_page_height: usize,
+    pub tracks_page_height: usize,
 }
 
 impl PlaylistsUi {
@@ -182,6 +213,8 @@ impl PlaylistsUi {
             load_failed: false,
             list_state: ListState::default(),
             tracks_state: ListState::default(),
+            list_page_height: 10,
+            tracks_page_height: 10,
         }
     }
 
@@ -236,6 +269,45 @@ impl PlaylistsUi {
                 self.track_cursor = 0;
             }
         }
+    }
+
+    /// Put the focused pane's cursor on `row(len)`, clamped to the list (`g`/`G`, PageUp/PageDown:
+    /// no wraparound).
+    fn set_focused_cursor(&mut self, row: impl Fn(usize, usize) -> usize) {
+        if self.tracks_focus {
+            let tracks = self.selected_playlist().map_or(0, |p| p.entries.len());
+            self.track_cursor = row(self.track_cursor, tracks).min(tracks.saturating_sub(1));
+        } else {
+            let playlists = self.store.playlists().len();
+            let before = self.list_cursor;
+            self.list_cursor = row(self.list_cursor, playlists).min(playlists.saturating_sub(1));
+            if self.list_cursor != before {
+                self.track_cursor = 0;
+            }
+        }
+    }
+
+    /// `g` / `G` (and Home / End): first or last row of the focused pane.
+    fn jump_cursor(&mut self, to_end: bool) {
+        self.set_focused_cursor(|_, len| if to_end { len.saturating_sub(1) } else { 0 });
+    }
+
+    /// PageUp / PageDown: move the focused pane's cursor by the rows it showed at the last
+    /// render, stopping at the first or last row.
+    fn page_cursor(&mut self, down: bool) {
+        let page = if self.tracks_focus {
+            self.tracks_page_height
+        } else {
+            self.list_page_height
+        }
+        .max(1);
+        self.set_focused_cursor(|cursor, _| {
+            if down {
+                cursor.saturating_add(page)
+            } else {
+                cursor.saturating_sub(page)
+            }
+        });
     }
 }
 
@@ -442,6 +514,10 @@ impl AppUI {
             (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
                 self.playlists.move_cursor(true);
             }
+            (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => self.playlists.jump_cursor(false),
+            (KeyCode::End, _) | (KeyCode::Char('G'), _) => self.playlists.jump_cursor(true),
+            (KeyCode::PageUp, _) => self.playlists.page_cursor(false),
+            (KeyCode::PageDown, _) => self.playlists.page_cursor(true),
             _ => {}
         }
     }
@@ -465,6 +541,9 @@ impl AppUI {
             .border_style(unfocused);
 
         let ui = &mut self.playlists;
+        // Rows inside each pane's borders: one page for PageUp / PageDown.
+        ui.list_page_height = usize::from(split[0].height.saturating_sub(2)).max(1);
+        ui.tracks_page_height = usize::from(split[1].height.saturating_sub(2)).max(1);
         if !ui.store.is_loaded() {
             let text = if ui.load_failed {
                 "Couldn't load playlists. Restart Quickstream to try again."
@@ -766,15 +845,48 @@ fn render_name_prompt(f: &mut Frame, purpose: &NamePurpose, input: &str, error: 
             Style::default().fg(Color::DarkGray),
         )),
     };
+    // Scroll long names horizontally: the field shows the end of the name, where typing
+    // happens, and the cursor block (issue #52).
+    let label = "Name: ";
+    let field_width = (area.width as usize)
+        .saturating_sub(2) // borders
+        .saturating_sub(label.len())
+        .saturating_sub(1); // cursor
     let lines = vec![
         Line::from(vec![
-            Span::styled("Name: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("{}█", input), Style::default().fg(Color::White)),
+            Span::styled(label, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{}█", visible_tail(input, field_width)),
+                Style::default().fg(Color::White),
+            ),
         ]),
         Line::from(""),
         message,
     ];
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Columns `c` takes in the terminal (2 for wide characters such as CJK).
+fn char_width(c: char) -> usize {
+    let mut buf = [0u8; 4];
+    Span::raw(&*c.encode_utf8(&mut buf)).width()
+}
+
+/// `text` if it fits in `width` columns; otherwise `…` followed by as much of its end as fits.
+fn visible_tail(text: &str, width: usize) -> String {
+    if Span::raw(text).width() <= width {
+        return text.to_string();
+    }
+    let mut used = 1; // the `…`
+    let mut start = text.len();
+    for (index, c) in text.char_indices().rev() {
+        used += char_width(c);
+        if used > width {
+            break;
+        }
+        start = index;
+    }
+    format!("…{}", &text[start..])
 }
 
 fn render_confirm_delete(f: &mut Frame, name: &str, count: usize) {
@@ -1270,14 +1382,22 @@ impl AppUI {
             self.playlists.checks.in_flight.remove(&path);
             self.playlists.exists.insert(path, exists);
         }
-        while let Ok(result) = self.playlists.checks.queue_rx.try_recv() {
-            self.apply_playlist_queue(result);
+        while let Ok(update) = self.playlists.checks.queue_rx.try_recv() {
+            match update {
+                QueueCheckUpdate::Start(start) => self.start_playlist_play(start),
+                QueueCheckUpdate::Done(result) => self.apply_playlist_queue(result),
+            }
         }
         self.request_playlist_exists_checks();
     }
 
     /// `Enter` in the tracks pane (`play_from` = selected track) or `a` (`None`): check the
     /// selected playlist's files on a worker, then replace the queue and play, or append.
+    ///
+    /// For `Enter` the worker checks the selected entry first, then the ones after it, then the
+    /// ones before it. The first entry in that order that can be queued is the one playback
+    /// starts on (`plan_queue`'s rule), so it is sent as soon as it is found and plays while the
+    /// rest are checked (issue #52).
     pub fn queue_selected_playlist(&mut self, play_from: Option<usize>) {
         if !self.playlists.store.is_loaded() {
             self.status_message = self.playlists.not_loaded_message();
@@ -1306,41 +1426,63 @@ impl AppUI {
         let tx = self.playlists.checks.queue_tx.clone();
         let stop = self.playlists.checks.stop.clone();
         self.workers.spawn("playlist-queue", move || {
-            let mut resolved = Vec::with_capacity(entries.len());
-            for entry in &entries {
+            let len = entries.len();
+            let order: Vec<usize> = match play_from {
+                Some(selected) => {
+                    let selected = selected.min(len);
+                    (selected..len).chain(0..selected).collect()
+                }
+                None => (0..len).collect(),
+            };
+            let mut resolved = vec![None; len];
+            let mut start_sent = play_from.is_none();
+            for index in order {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
-                resolved.push(checker(entry.path.as_path()));
+                let entry = &entries[index];
+                resolved[index] = checker(entry.path.as_path());
+                if start_sent {
+                    continue;
+                }
+                // The test `plan_checked_queue` applies (an audio file at the checked path), so
+                // the start is the track `apply_playlist_queue` will find at its start index.
+                if let Some(path) = resolved[index]
+                    .as_ref()
+                    .filter(|path| crate::metadata::is_supported_audio_file(path))
+                {
+                    start_sent = true;
+                    let _ = tx.send(QueueCheckUpdate::Start(QueueStart {
+                        name: name.clone(),
+                        entry: entry.clone(),
+                        resolved: path.clone(),
+                        generation,
+                    }));
+                }
             }
-            let _ = tx.send(QueueCheckResult {
+            let _ = tx.send(QueueCheckUpdate::Done(QueueCheckResult {
                 name,
                 entries,
                 resolved,
                 play_from,
                 generation,
-            });
+            }));
         });
     }
 
-    /// Queue the files of a checked playlist that exist. Replace (`play_from` set) only clears
-    /// the queue once something can be queued, so an all-missing playlist leaves it as it was.
-    fn apply_playlist_queue(&mut self, result: QueueCheckResult) {
-        self.playlists.checks.queue_pending = None;
-        // Fresh results update the session cache; they never change the playlist or its file.
-        for (entry, resolved) in result.entries.iter().zip(&result.resolved) {
-            self.playlists.exists.insert(entry.path.clone(), resolved.is_some());
-        }
-        if result.generation != self.playlists.checks.queue_generation {
-            // The queue was replaced or playback started while this check ran.
-            return;
-        }
-        // Queue the checked paths only: the queue and the /stream registry never see an entry's
-        // own path, which may be a symlink swapped since the check.
+    /// The queue plan for checked entries: `resolved[i]` is entry `i`'s checked path, or `None`
+    /// when it can't be queued. Tracks carry the checked paths only: the queue and the /stream
+    /// registry never see an entry's own path, which may be a symlink swapped since the check.
+    fn plan_checked_queue(
+        &self,
+        entries: &[PlaylistEntry],
+        resolved: &[Option<PathBuf>],
+        play_from: Option<usize>,
+    ) -> crate::playlist::QueuePlan {
         let mut originals = HashMap::new();
-        let mut checked = Vec::with_capacity(result.entries.len());
-        let mut exists = Vec::with_capacity(result.entries.len());
-        for (entry, resolved) in result.entries.iter().zip(&result.resolved) {
+        let mut checked = Vec::with_capacity(entries.len());
+        let mut exists = Vec::with_capacity(entries.len());
+        for (entry, resolved) in entries.iter().zip(resolved) {
             let mut entry = entry.clone();
             if let Some(resolved) = resolved {
                 originals.insert(resolved.clone(), entry.path.clone());
@@ -1359,11 +1501,85 @@ impl AppUI {
                     meta
                 })
         };
+        crate::playlist::plan_queue(&checked, &exists, play_from, &cached)
+    }
+
+    /// `Enter`: the track to start on passed its check. Replace the queue with it and play it
+    /// now; `apply_playlist_queue` puts the rest of the playlist around it once checked.
+    fn start_playlist_play(&mut self, start: QueueStart) {
+        if start.generation != self.playlists.checks.queue_generation {
+            // The queue was replaced or playback started while this check ran.
+            return;
+        }
+        self.playlists.exists.insert(start.entry.path.clone(), true);
+        let plan = self.plan_checked_queue(
+            std::slice::from_ref(&start.entry),
+            &[Some(start.resolved.clone())],
+            Some(0),
+        );
+        if plan.tracks.is_empty() {
+            return;
+        }
+        // Stop any autopilot scan and continuous stream, then the queue is this one track.
+        self.reset_playback_session();
+        self.enqueue_tracks(plan.tracks);
+        self.queue.current_index = 0;
+        self.queue_cursor = 0;
+        let playback_error = self.play_current_track();
+        self.status_message = match &playback_error {
+            Some(err) => format!("{}. Checking the rest of {}…", err, start.name),
+            None => format!("Playing from {}; checking the rest…", start.name),
+        };
+        self.playlists.checks.started = Some(StartedPlay {
+            path: start.resolved,
+            playback_error,
+        });
+        self.update_web_state();
+    }
+
+    /// Put the rest of a playlist around the track `Enter` already started: the tracks before
+    /// it at the top of the queue, the tracks after it right behind it, so anything queued
+    /// meanwhile follows the playlist. If the started track has left the queue, the rest is
+    /// appended in playlist order.
+    fn fill_playlist_around(&mut self, started: &Path, mut tracks: Vec<crate::metadata::AudioMetadata>, start: usize) {
+        // The worker picks the start by `plan_queue`'s rule, so `tracks[start]` is the started
+        // track itself.
+        debug_assert_eq!(tracks.get(start).map(|t| t.filepath.as_path()), Some(started));
+        let after = tracks.split_off(start + 1);
+        tracks.truncate(start);
+        let before = tracks;
+        match self.queue.tracks.iter().position(|t| t.filepath == started) {
+            Some(position) => {
+                self.insert_queue_tracks(position + 1, after);
+                self.insert_queue_tracks(0, before);
+            }
+            None => {
+                let mut rest = before;
+                rest.extend(after);
+                self.enqueue_tracks(rest);
+            }
+        }
+    }
+
+    /// Queue the files of a checked playlist that exist. Replace (`play_from` set) only clears
+    /// the queue once something can be queued, so an all-missing playlist leaves it as it was.
+    /// When `start_playlist_play` already started the first track, the rest is put around it.
+    fn apply_playlist_queue(&mut self, result: QueueCheckResult) {
+        self.playlists.checks.queue_pending = None;
+        let started = self.playlists.checks.started.take();
+        // Fresh results update the session cache; they never change the playlist or its file.
+        for (entry, resolved) in result.entries.iter().zip(&result.resolved) {
+            self.playlists.exists.insert(entry.path.clone(), resolved.is_some());
+        }
+        if result.generation != self.playlists.checks.queue_generation {
+            // The queue was replaced or playback started while this check ran.
+            return;
+        }
         let crate::playlist::QueuePlan {
             tracks,
             start_index,
             missing,
-        } = crate::playlist::plan_queue(&checked, &exists, result.play_from, &cached);
+        } = self.plan_checked_queue(&result.entries, &result.resolved, result.play_from);
         if tracks.is_empty() {
             let mut status = format!(
                 "None of {}'s {} found.",
@@ -1381,9 +1597,15 @@ impl AppUI {
         // play_current_track returns its "Playback error: ..." when the player fails to start.
         // The status keeps that error and puts the queue summary after it, so a failed start is
         // never reported as plain success.
-        let playback_error = match (result.play_from, start_index) {
-            (Some(_), Some(start)) => {
-                self.clear_queue_for_playlist();
+        let playback_error = match (result.play_from, start_index, started) {
+            (Some(_), Some(start), Some(started)) => {
+                self.fill_playlist_around(&started.path, tracks, start);
+                started.playback_error
+            }
+            // Not reached in practice: the worker sends the start before any track that
+            // `plan_queue` keeps. Kept so a result without one still replaces and plays.
+            (Some(_), Some(start), None) => {
+                self.reset_playback_session();
                 self.enqueue_tracks(tracks);
                 self.queue.current_index = start;
                 self.queue_cursor = start;
@@ -1415,25 +1637,5 @@ impl AppUI {
     /// action that replaces the queue or starts playback.
     pub fn supersede_playlist_queue(&mut self) {
         self.playlists.checks.queue_generation = self.playlists.checks.queue_generation.wrapping_add(1);
-    }
-
-    /// Before a playlist replaces the queue: stop any autopilot scan, end any continuous DLNA
-    /// stream the way autopilot does before its own fresh start, stop playback, empty the queue.
-    fn clear_queue_for_playlist(&mut self) {
-        if let Some(stop) = self.autopilot_scan_stop.take() {
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.autopilot_rx = None;
-        self.is_autopilot_scanning = false;
-        // The queue is now the playlist, not an autopilot mix (web dashboard badge).
-        self.autopilot_dir = None;
-        if let Some(ref ws) = self.web_server {
-            ws.close_active_streams();
-            *ws.stream_state().continuous.current_track_index.lock().unwrap() = 0;
-            *ws.stream_state().continuous.current_position.lock().unwrap() = 0.0;
-        }
-        let _ = self.player.stop();
-        self.queue.clear();
-        self.queue_cursor = 0;
     }
 }

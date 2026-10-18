@@ -599,3 +599,135 @@ fn test_mix_picker_first_option_row_is_not_overdrawn() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+fn press_with(app: &mut AppUI, code: KeyCode, modifiers: KeyModifiers) {
+    app.handle_input_key(KeyEvent::new(code, modifiers)).unwrap();
+}
+
+#[test]
+fn test_playlists_tab_g_shift_g_and_page_keys_in_both_panes() {
+    common::isolate();
+    // Issue #52: g / G jump to the first / last row and PageUp / PageDown move a page, clamped
+    // at the ends (no wraparound), in both panes.
+    let temp_dir = fresh_dirs("jump_page");
+    for i in 0..12 {
+        write_playlist(&format!("List {:02}", i), Vec::new());
+    }
+    let tracks: Vec<PlaylistEntry> = (0..12)
+        .map(|i| {
+            entry(
+                &temp_dir,
+                &format!("t{:02}.flac", i),
+                "A",
+                &format!("Track {:02}", i),
+                60,
+            )
+        })
+        .collect();
+    write_playlist("List 00", tracks);
+    let mut app = new_app(&temp_dir);
+    wait_loaded(&mut app);
+    press(&mut app, KeyCode::Char('5'));
+    app.playlists.list_page_height = 5;
+    app.playlists.tracks_page_height = 4;
+
+    // Left pane.
+    press(&mut app, KeyCode::PageDown);
+    assert_eq!(app.playlists.list_cursor, 5);
+    press(&mut app, KeyCode::PageDown);
+    assert_eq!(app.playlists.list_cursor, 10);
+    press(&mut app, KeyCode::PageDown);
+    assert_eq!(app.playlists.list_cursor, 11, "PageDown stops at the last row");
+    press(&mut app, KeyCode::PageDown);
+    assert_eq!(app.playlists.list_cursor, 11, "PageDown does not wrap");
+    press(&mut app, KeyCode::PageUp);
+    assert_eq!(app.playlists.list_cursor, 6);
+    press(&mut app, KeyCode::PageUp);
+    press(&mut app, KeyCode::PageUp);
+    assert_eq!(app.playlists.list_cursor, 0, "PageUp stops at the first row");
+    press(&mut app, KeyCode::PageUp);
+    assert_eq!(app.playlists.list_cursor, 0, "PageUp does not wrap");
+    press_with(&mut app, KeyCode::Char('G'), KeyModifiers::SHIFT);
+    assert_eq!(app.playlists.list_cursor, 11);
+    press(&mut app, KeyCode::Char('g'));
+    assert_eq!(app.playlists.list_cursor, 0);
+    assert!(!app.playlists.tracks_focus);
+
+    // Tracks pane: the playlist selection stays put.
+    press(&mut app, KeyCode::Char('l'));
+    assert!(app.playlists.tracks_focus);
+    press_with(&mut app, KeyCode::Char('G'), KeyModifiers::SHIFT);
+    assert_eq!(app.playlists.track_cursor, 11);
+    press(&mut app, KeyCode::PageDown);
+    assert_eq!(app.playlists.track_cursor, 11, "PageDown does not wrap");
+    press(&mut app, KeyCode::PageUp);
+    assert_eq!(app.playlists.track_cursor, 7);
+    press(&mut app, KeyCode::Char('g'));
+    assert_eq!(app.playlists.track_cursor, 0);
+    press(&mut app, KeyCode::PageDown);
+    assert_eq!(app.playlists.track_cursor, 4);
+    assert_eq!(app.playlists.list_cursor, 0);
+
+    // Home / End match g / G, as on tab 2.
+    press(&mut app, KeyCode::End);
+    assert_eq!(app.playlists.track_cursor, 11);
+    press(&mut app, KeyCode::Home);
+    assert_eq!(app.playlists.track_cursor, 0);
+
+    // Moving to another playlist from the left pane starts its tracks at the top.
+    press(&mut app, KeyCode::PageDown);
+    press(&mut app, KeyCode::Char('h'));
+    press_with(&mut app, KeyCode::Char('G'), KeyModifiers::SHIFT);
+    assert_eq!(app.playlists.list_cursor, 11);
+    assert_eq!(app.playlists.track_cursor, 0);
+
+    // None of these keys changed tab, playback or the queue.
+    assert_eq!(app.active_tab, 4);
+    assert!(app.queue.is_empty());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_playlists_tab_page_size_follows_the_rendered_list_height() {
+    common::isolate();
+    let temp_dir = fresh_dirs("page_height");
+    write_playlist("Alpha", vec![entry(&temp_dir, "a1.flac", "A", "One", 60)]);
+    let mut app = new_app(&temp_dir);
+    wait_loaded(&mut app);
+    press(&mut app, KeyCode::Char('5'));
+
+    render(&mut app, 120, 30);
+    let (list_30, tracks_30) = (app.playlists.list_page_height, app.playlists.tracks_page_height);
+    render(&mut app, 120, 40);
+    let (list_40, tracks_40) = (app.playlists.list_page_height, app.playlists.tracks_page_height);
+    assert!(list_30 > 1 && tracks_30 > 1, "{list_30} {tracks_30}");
+    assert_eq!(list_40 - list_30, 10, "a page is the number of visible rows");
+    assert_eq!(tracks_40 - tracks_30, 10, "a page is the number of visible rows");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_help_modal_lists_page_keys() {
+    common::isolate();
+    let temp_dir = fresh_dirs("help_page");
+    let mut app = new_app(&temp_dir);
+    press(&mut app, KeyCode::Char('?'));
+    for (width, height) in [(80, 24), (120, 40)] {
+        let view = render(&mut app, width, height);
+        for text in [
+            "PgUp/PgDn",
+            "Page Up / Down (tabs 2 & 5)",
+            "Jump to Start / End",
+            "~",
+            "Jump to startup home dir",
+        ] {
+            assert!(
+                view.contains(text),
+                "{width}x{height} help should show {text:?}:\n{view}"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&temp_dir);
+}

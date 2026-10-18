@@ -1056,6 +1056,24 @@ impl AppUI {
         added
     }
 
+    /// Insert tracks before queue position `index`, keeping the current track and the cursor on
+    /// the rows they were on, and resolve missing tags on background workers.
+    fn insert_queue_tracks(&mut self, index: usize, tracks: Vec<crate::metadata::AudioMetadata>) {
+        let count = tracks.len();
+        if count == 0 {
+            return;
+        }
+        let index = index.min(self.queue.len());
+        for meta in &tracks {
+            self.register_stream_file(&meta.filepath);
+        }
+        if !self.queue.is_empty() && index <= self.queue_cursor {
+            self.queue_cursor += count;
+        }
+        self.queue.insert_tracks(index, tracks);
+        self.start_queue_metadata_fetch();
+    }
+
     /// Keep the queue cursor on a real row after the queue shrinks.
     pub fn clamp_queue_cursor(&mut self) {
         self.queue_cursor = self.queue_cursor.min(self.queue.len().saturating_sub(1));
@@ -1204,11 +1222,7 @@ impl AppUI {
             let gapless = self.settings_mgr.settings.gapless_autopilot;
 
             if is_dlna && gapless {
-                if let Some(ref ws) = self.web_server {
-                    ws.close_active_streams();
-                    *ws.stream_state().continuous.current_track_index.lock().unwrap() = 0;
-                    *ws.stream_state().continuous.current_position.lock().unwrap() = 0.0;
-                }
+                self.end_continuous_stream();
                 if let Ok(mut s) = self.web_state.write() {
                     s.is_autopilot = true;
                     s.autopilot_dir = self.autopilot_dir.as_ref().map(|d| d.to_string_lossy().to_string());
@@ -2858,12 +2872,46 @@ impl AppUI {
         self.start_autopilot_with_mode(dir, mode);
     }
 
-    pub fn start_autopilot_with_mode(&mut self, dir: PathBuf, mode: AutopilotRunMode) {
-        self.supersede_playlist_queue();
-        // 1. Cancel any active autopilot scanner
+    /// Stop any autopilot scan: signal its worker and drop its channel.
+    fn stop_autopilot_scan(&mut self) {
         if let Some(stop) = self.autopilot_scan_stop.take() {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        self.autopilot_rx = None;
+        self.is_autopilot_scanning = false;
+    }
+
+    /// End any continuous DLNA stream and rewind its track index and position, so the next
+    /// continuous session starts from the top of the queue.
+    fn end_continuous_stream(&self) {
+        if let Some(ref ws) = self.web_server {
+            ws.close_active_streams();
+            *ws.stream_state().continuous.current_track_index.lock().unwrap() = 0;
+            *ws.stream_state().continuous.current_position.lock().unwrap() = 0.0;
+        }
+    }
+
+    /// Stop playback and empty the queue.
+    fn stop_and_clear_queue(&mut self) {
+        let _ = self.player.stop();
+        self.queue.clear();
+        self.queue_cursor = 0;
+    }
+
+    /// End the whole playback session before something else replaces the queue: stop any
+    /// autopilot scan, end any continuous DLNA stream, stop playback and empty the queue.
+    pub fn reset_playback_session(&mut self) {
+        self.stop_autopilot_scan();
+        // The queue is no longer an autopilot mix (web dashboard badge).
+        self.autopilot_dir = None;
+        self.end_continuous_stream();
+        self.stop_and_clear_queue();
+    }
+
+    pub fn start_autopilot_with_mode(&mut self, dir: PathBuf, mode: AutopilotRunMode) {
+        self.supersede_playlist_queue();
+        // 1. Cancel any active autopilot scanner (its channel is replaced below)
+        self.stop_autopilot_scan();
         let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.autopilot_scan_stop = Some(stop_flag.clone());
 
@@ -2877,11 +2925,8 @@ impl AppUI {
         match mode {
             AutopilotRunMode::Fresh => {
                 // Clear current queue and stop previous playback
-                self.queue.clear();
-                self.queue.current_index = 0;
-                self.queue_cursor = 0;
+                self.stop_and_clear_queue();
                 self.status_message = format!("⚡ Autopilot: Discovering tracks from '{}'...", dir_display);
-                let _ = self.player.stop();
             }
             AutopilotRunMode::Append => {
                 // Keep current queue and playback uninterrupted
@@ -4718,8 +4763,8 @@ impl AppUI {
             Self::help_key_line("j / k", "Move Up / Down (wraps)"),
             Self::help_key_line("J / K", "Page (2) / Move track (5)"),
             Self::help_key_line("g / G", "Jump to Start / End"),
+            Self::help_key_line("PgUp/PgDn", "Page Up / Down (tabs 2 & 5)"),
             Self::help_key_line("Bksp", "Go up to parent dir"),
-            Self::help_key_line("~", "Jump to startup home dir"),
             Self::help_section_header("PLAYLISTS (TAB 5)"),
             Self::help_key_line("c / R / D", "New / Rename / Delete"),
             Self::help_key_line("Enter/a", "Open/Play / Queue playlist"),
@@ -4741,6 +4786,7 @@ impl AppUI {
             Self::help_key_line("c", "Clear queue (queue pane)"),
             Self::help_key_line("b", "Bookmark folder in Homes"),
             Self::help_key_line("H", "Set folder as startup home"),
+            Self::help_key_line("~", "Jump to startup home dir"),
             Self::help_key_line("v", "Toggle tags vs filenames"),
             Line::from(""),
             Self::help_section_header("SEARCH & DISCOVERY"),

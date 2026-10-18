@@ -104,6 +104,7 @@ pub struct Playlist {
 
 - Key `5` opens it. Tab/BackTab cycling changes from `% 4` to `% 5` (`src/ui/mod.rs` around line 2075) and the tab bar gets a fifth label.
 - Split pane like tab 2: playlists on the left, tracks of the selected playlist on the right. `h`/`l` switch focus. All lists wrap around (AGENTS.md section 3 invariant).
+- In either pane `g`/`G` (or `Home`/`End`) jump to the first/last row, and `PageUp`/`PageDown` move by the number of rows the pane showed at the last render, stopping at the first/last row without wrapping (issue #52). None of these keys is a global hotkey.
 - Left pane: each row shows the name and track count.
   - `c` create (opens the name prompt)
   - `R` rename (name prompt prefilled with the current name)
@@ -133,6 +134,7 @@ pub struct Playlist {
 ### Name prompt modal
 
 - Same pattern as `editing_home_dir`: captured before the global hotkeys, every `Char` is text (including `q` and digits), `Backspace` deletes, `Enter` confirms, `Esc` cancels.
+- A name wider than the field (about 55 columns in a full-width prompt) scrolls horizontally: the field shows `…` followed by as much of the end of the name as fits, measured in display columns, then the cursor (issue #52).
 - On an invalid or duplicate name the prompt stays open and shows the error, for example `Name can't contain /` or `"Road Trip" already exists`. A name reserved by a file the store skipped shows `A playlist file named "Latin" exists but couldn't be loaded`.
 
 ### Docs
@@ -158,7 +160,7 @@ pub struct Playlist {
 1. The UI sends the playlist's entries (and, for `Enter`, the selected index) to a worker.
 2. The worker checks which files exist and builds placeholder `AudioMetadata` from the entry data plus a `MetadataCache` hit, without the `stat` that `fallback_metadata` does. It sends the result to the UI over the existing `queue_add_tx` channel with a source tag.
 3. `poll_pending_queue_adds` calls `enqueue_tracks`, which registers each file for DLNA streaming (`register_stream_file`) and starts the background tag fetch. Its status message uses the source tag (`Queued 22 tracks from Road Trip, 2 missing`) instead of the hard-coded `(web)`.
-4. **Replace** (`Enter`) runs before step 3 adds anything: stop any autopilot scan (`autopilot_scan_stop`, `autopilot_rx = None`, `is_autopilot_scanning = false`), close any continuous DLNA stream, stop playback, clear the queue. After adding, set `current_index` and `queue_cursor` to the selected track's position among the tracks that exist, then call `play_current_track`. If the selected track itself is missing, play the next existing track after it, or the first existing track if none follows.
+4. **Replace** (`Enter`) does not wait for every check (issue #52). The worker checks the selected entry first, then the entries after it, then the ones before it. The first entry in that order that can be queued is the track playback starts on (the rule below), so the worker sends it as soon as it is found, and the UI resets the session as described here, queues that one track and plays it, with the status `Playing from Road Trip; checking the rest…`. When every check has finished, the tracks before it go to the top of the queue and the tracks after it right behind it, so anything queued meanwhile follows the playlist, and the status becomes the usual summary (keeping a playback error from the start). If the queue was replaced or cleared in between, the rest is dropped. The reset (`AppUI::reset_playback_session`, whose parts autopilot shares) stops any autopilot scan (`autopilot_scan_stop`, `autopilot_rx = None`, `is_autopilot_scanning = false`), closes any continuous DLNA stream, stops playback and clears the queue. Once the rest is in, `current_index` and `queue_cursor` stay on the started track, which is the selected track's position among the tracks that exist. If the selected track itself is missing, playback starts on the next existing track after it, or the first existing track if none follows.
 5. If every entry is missing: nothing is queued, the queue is left as it was, and the status is `None of Road Trip's 24 tracks found. Is /Volumes/Music mounted?` (the folder shown is the top two folders above the first entry's file). When that file is fewer than two folders deep (`/ghost.mp3`, `/Volumes/ghost.mp3`) there is no share to name and the question is left out: `None of Road Trip's 1 track found.` (issue #59).
 
 ### Other cases

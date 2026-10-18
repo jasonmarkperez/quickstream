@@ -737,3 +737,68 @@ fn test_failed_rename_shows_an_error_and_restores_the_name() {
     drop(app);
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+/// The text after `Name: ` on the prompt's row, up to the prompt's right border.
+fn prompt_name_field(view: &str) -> String {
+    let line = view
+        .lines()
+        .find(|l| l.contains("Name: "))
+        .unwrap_or_else(|| panic!("no name prompt row:\n{view}"));
+    let after = &line[line.find("Name: ").unwrap() + "Name: ".len()..];
+    after.split('│').next().unwrap_or("").trim_end().to_string()
+}
+
+#[test]
+fn test_name_prompt_scrolls_to_keep_the_end_of_a_long_name_visible() {
+    common::isolate();
+    // Issue #52: the prompt field holds about 55 characters; a longer name was cut off at the
+    // right, hiding what was being typed.
+    let (mut app, temp_dir) = app_on_playlists_tab("long_name");
+    press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+    let name: String = (0..7).map(|i| format!("chunk{}xyz", i)).collect::<String>() + "THE-END";
+    assert_eq!(name.chars().count(), 70);
+    type_text(&mut app, &name);
+
+    for (width, height) in [(120, 30), (80, 24), (40, 20)] {
+        let view = render_view(&mut app, width, height);
+        let field = prompt_name_field(&view);
+        assert!(
+            field.ends_with("THE-END█"),
+            "the end of the name and the cursor must stay visible at {width}x{height}: {field:?}\n{view}"
+        );
+        assert!(
+            field.starts_with('…'),
+            "a scrolled name starts with … at {width}x{height}: {field:?}"
+        );
+    }
+
+    // A name that fits is shown whole, from its first character.
+    for _ in 0..name.len() {
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+    }
+    type_text(&mut app, "Road Trip");
+    let field = prompt_name_field(&render_view(&mut app, 120, 30));
+    assert_eq!(field, "Road Trip█");
+
+    drop(app);
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_name_prompt_scrolls_by_display_width() {
+    common::isolate();
+    // Wide characters take two columns each: 40 of them (80 columns) still scroll so the last
+    // one and the cursor show.
+    let (mut app, temp_dir) = app_on_playlists_tab("wide_name");
+    press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+    let name: String = "旅".repeat(39) + "終";
+    type_text(&mut app, &name);
+
+    let view = render_view(&mut app, 120, 30);
+    let field = prompt_name_field(&view);
+    assert!(field.starts_with('…'), "{field:?}\n{view}");
+    assert!(field.ends_with("終█"), "{field:?}\n{view}");
+
+    drop(app);
+    let _ = fs::remove_dir_all(&temp_dir);
+}
