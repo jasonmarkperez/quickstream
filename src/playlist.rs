@@ -252,10 +252,20 @@ pub fn validate_name(name: &str) -> Result<String, NameError> {
     Ok(name.to_string())
 }
 
-/// Playlist names compare case-insensitively (Unicode lower case), because the default macOS
-/// file system does: `road trip.m3u8` and `Road Trip.m3u8` are the same file there.
+/// Playlist names compare case-insensitively (Unicode lower case) and ignoring Unicode
+/// normalization, because the default macOS file system does: `road trip.m3u8` and
+/// `Road Trip.m3u8` are the same file there, and so are `Zoë.m3u8` typed (NFC) and pasted from
+/// a Finder file name (NFD).
 pub fn names_equal(a: &str, b: &str) -> bool {
-    a.to_lowercase() == b.to_lowercase()
+    name_key(a) == name_key(b)
+}
+
+/// The form [`names_equal`] compares: NFC, lower case, NFC again (lower-casing can leave a
+/// composable sequence). Equal keys mean the same file on APFS.
+pub fn name_key(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let lower = name.nfc().collect::<String>().to_lowercase();
+    lower.nfc().collect()
 }
 
 /// `<dir>/<name>.m3u8`, or `None` when that file would not sit directly in `dir`. Every playlist

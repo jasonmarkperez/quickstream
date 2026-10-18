@@ -3,6 +3,7 @@
 mod common;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -576,6 +577,47 @@ fn test_rename_to_the_same_name_says_name_unchanged() {
     assert!(app.playlists.modal.is_none());
     assert_eq!(app.status_message, "Name unchanged");
     assert_eq!(playlist_names(&app), vec!["Alpha"]);
+
+    drop(app);
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_unlistable_playlists_folder_refuses_edits_and_keeps_files() {
+    common::isolate();
+    // Issue #56: a folder that exists but can't be listed must not load as empty, or creating
+    // a playlist with an existing file's name would overwrite that file.
+    let (mut app, temp_dir) = app_on_playlists_tab("unlistable");
+    let dir = paths::get_playlists_dir();
+    fs::create_dir_all(&dir).unwrap();
+    let original = "#EXTM3U\n#PLAYLIST:bom\n/music/a.flac\n";
+    fs::write(dir.join("bom.m3u8"), original).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+
+    app.playlists.store = PlaylistStore::new(dir.clone(), app.persistence.handle());
+    app.start_playlist_load();
+    for _ in 0..200 {
+        app.poll_playlists();
+        if app.playlists.load_failed || app.playlists.store.is_loaded() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let loaded = app.playlists.store.is_loaded();
+    let failed = app.playlists.load_failed;
+    press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+    let prompt_opened = app.playlists.modal.is_some();
+    let status = app.status_message.clone();
+    let view = render_view(&mut app, 100, 30);
+    assert!(app.persistence.flush());
+
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!loaded, "store must stay not loaded");
+    assert!(failed, "load must be marked failed");
+    assert!(!prompt_opened, "no create prompt after a failed load");
+    assert_eq!(status, "Couldn't load playlists");
+    assert!(view.contains("Couldn't load playlists"), "{}", view);
+    assert_eq!(fs::read_to_string(dir.join("bom.m3u8")).unwrap(), original);
 
     drop(app);
     let _ = fs::remove_dir_all(&temp_dir);

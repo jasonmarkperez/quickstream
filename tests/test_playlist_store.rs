@@ -27,7 +27,7 @@ fn scratch(name: &str) -> PathBuf {
 fn open_store(dir: &Path) -> (PersistenceWorker, PlaylistStore) {
     let worker = PersistenceWorker::spawn();
     let mut store = PlaylistStore::new(dir.to_path_buf(), worker.handle());
-    let (playlists, skipped) = PlaylistStore::load_dir_reserving(dir);
+    let (playlists, skipped) = PlaylistStore::load_dir_reserving(dir).unwrap();
     store.set_loaded(playlists);
     store.reserve_names(skipped);
     (worker, store)
@@ -93,7 +93,10 @@ fn test_load_dir_of_missing_folder_is_empty_and_creates_nothing() {
     common::isolate();
     let dir = scratch("missing");
     assert!(PlaylistStore::load_dir(&dir).is_empty());
-    assert_eq!(PlaylistStore::load_dir_reserving(&dir), (Vec::new(), Vec::new()));
+    assert_eq!(
+        PlaylistStore::load_dir_reserving(&dir).unwrap(),
+        (Vec::new(), Vec::new())
+    );
     assert!(!dir.exists());
 }
 
@@ -110,7 +113,7 @@ fn test_load_dir_reserving_returns_the_stems_it_skipped() {
     fs::write(dir.join("._Good.m3u8"), [0u8, 5, 22, 7]).unwrap();
     fs::write(dir.join("notes.txt"), "/music/not-a-playlist.flac\n").unwrap();
 
-    let (loaded, skipped) = PlaylistStore::load_dir_reserving(&dir);
+    let (loaded, skipped) = PlaylistStore::load_dir_reserving(&dir).unwrap();
     let loaded_names: Vec<&str> = loaded.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(loaded_names, vec!["Good"]);
     assert_eq!(skipped, vec!["Latin", "Mix", "folder"]);
@@ -684,4 +687,87 @@ fn test_rename_to_the_unchanged_name_is_ok_even_when_that_name_is_reserved() {
     assert_eq!(store.rename("Mix", "Mix"), Ok("Mix".to_string()));
     assert!(worker.flush());
     assert_eq!(file_names(&dir), vec!["Mix.m3u8"]);
+}
+
+/// NFC `Zoë` and the same name in NFD (e + combining diaeresis).
+const ZOE_NFC: &str = "Zo\u{eb}";
+const ZOE_NFD: &str = "Zoe\u{308}";
+
+#[test]
+fn test_create_refuses_a_name_differing_only_in_unicode_normalization() {
+    common::isolate();
+    // Issue #55: on APFS both names open the same file, so the create would overwrite it.
+    let dir = scratch("nfd_create");
+    let (worker, mut store) = open_store(&dir);
+    store.create(ZOE_NFC).unwrap();
+    store.add(ZOE_NFC, vec![entry("a")]).unwrap();
+
+    assert_eq!(
+        store.create(ZOE_NFD),
+        Err(StoreError::Name(NameError::Duplicate(ZOE_NFC.to_string())))
+    );
+    assert_eq!(store.get(ZOE_NFD).map(|p| p.name.as_str()), Some(ZOE_NFC));
+    assert!(worker.flush());
+    assert_eq!(paths(&on_disk(&dir, ZOE_NFC).entries), paths(&[entry("a")]));
+}
+
+#[test]
+fn test_rename_refuses_a_name_differing_only_in_unicode_normalization() {
+    common::isolate();
+    let dir = scratch("nfd_rename");
+    let (_worker, mut store) = open_store(&dir);
+    store.create(ZOE_NFC).unwrap();
+    store.create("Other").unwrap();
+    assert_eq!(
+        store.rename("Other", ZOE_NFD),
+        Err(StoreError::Name(NameError::Duplicate(ZOE_NFC.to_string())))
+    );
+}
+
+#[test]
+fn test_set_loaded_keeps_one_of_names_differing_only_in_unicode_normalization() {
+    common::isolate();
+    // Possible on a disk that keeps both forms (Linux): `Zoë.m3u8` twice, byte-different.
+    let dir = scratch("nfd_load");
+    let worker = PersistenceWorker::spawn();
+    let mut store = PlaylistStore::new(dir, worker.handle());
+    store.set_loaded(vec![
+        Playlist::new(ZOE_NFD),
+        Playlist::new("Zz"),
+        Playlist::new(ZOE_NFC),
+    ]);
+    assert_eq!(names(&store).len(), 2, "one Zoë is dropped: {:?}", names(&store));
+    // The dropped file is reserved, so creating either form is refused.
+    assert!(store.create(ZOE_NFC).is_err());
+    assert!(store.create(ZOE_NFD).is_err());
+}
+
+#[test]
+fn test_skipped_file_reserves_its_name_in_either_normalization() {
+    common::isolate();
+    let dir = scratch("nfd_reserved");
+    let (_worker, mut store) = open_store(&dir);
+    store.reserve_names(vec![ZOE_NFC.to_string()]);
+    assert!(matches!(
+        store.create(ZOE_NFD),
+        Err(StoreError::Name(NameError::Duplicate(_)))
+    ));
+}
+
+#[test]
+fn test_load_dir_reserving_fails_when_the_folder_cannot_be_listed() {
+    common::isolate();
+    // Issue #56: an unlistable folder must not look empty, or a create would overwrite its files.
+    let dir = scratch("unlistable");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("bom.m3u8"), "#EXTM3U\n/music/a.flac\n").unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+
+    // Root lists any folder, so the test proves nothing there.
+    let listable = fs::read_dir(&dir).is_ok();
+    let result = PlaylistStore::load_dir_reserving(&dir);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    if !listable {
+        assert!(result.is_err(), "expected an error, got {:?}", result);
+    }
 }

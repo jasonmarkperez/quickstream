@@ -358,6 +358,15 @@ fn test_names_equal_ignores_case() {
 }
 
 #[test]
+fn test_names_equal_ignores_unicode_normalization() {
+    common::isolate();
+    // Issue #55: APFS treats NFC `Zoë` and NFD `Zoë` (e + combining diaeresis) as one file name.
+    assert!(names_equal("Zo\u{eb}", "Zoe\u{308}"));
+    assert!(names_equal("ZO\u{cb}", "zoe\u{308}"));
+    assert!(!names_equal("Zo\u{eb}", "Zoe"));
+}
+
+#[test]
 fn test_playlist_file_path_stays_in_dir() {
     common::isolate();
     let dir = Path::new("/home/me/.config/quickstream/playlists");
