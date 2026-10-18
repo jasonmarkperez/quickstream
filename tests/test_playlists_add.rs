@@ -517,6 +517,109 @@ fn test_folder_add_reads_tags_for_files_not_in_the_cache() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Tags read by a folder add go through the shared metadata pipeline: they are saved to the
+/// on-disk index and refresh queue rows for the same files.
+#[test]
+fn test_folder_add_tags_reach_the_index_and_refresh_queue_rows() {
+    common::isolate();
+    let dir = scratch_dir("folder_tags_pipeline");
+    let album = dir.join("Album");
+    fs::create_dir_all(&album).unwrap();
+    let track = album.join("01 Intro.wav");
+    write_two_second_wav(&track);
+    let mut app = new_app(&dir);
+    wait_loaded(&mut app);
+    app.playlists.store.create("Road Trip").unwrap();
+    // The same file is already queued as a placeholder with no tags.
+    app.queue.add_track(AudioMetadata {
+        filepath: track.clone(),
+        filename: "01 Intro.wav".to_string(),
+        ..Default::default()
+    });
+    select_browser_row(&mut app, &album);
+
+    press(&mut app, KeyCode::Char('L'));
+    press(&mut app, KeyCode::Enter);
+    let mut refreshed = false;
+    for _ in 0..200 {
+        app.poll_playlists();
+        app.poll_background_metadata();
+        if app.queue.tracks[0].duration_seconds > 1.5
+            && app
+                .playlists
+                .store
+                .get("Road Trip")
+                .is_some_and(|p| p.entries.len() == 1)
+        {
+            refreshed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(refreshed, "queue row was not refreshed with the folder add's tags");
+    let index = fs::read_to_string(quickstream::paths::get_music_index_path()).unwrap_or_default();
+    assert!(
+        index.contains("01 Intro.wav"),
+        "tags read by the folder add were not saved to the on-disk index"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A cached entry with no duration is a placeholder, so the folder add reads the file again.
+#[test]
+fn test_folder_add_rereads_cached_placeholders() {
+    common::isolate();
+    let dir = scratch_dir("folder_tags_placeholder");
+    let album = dir.join("Album");
+    fs::create_dir_all(&album).unwrap();
+    let track = album.join("01 Intro.wav");
+    write_two_second_wav(&track);
+    let mut app = new_app(&dir);
+    wait_loaded(&mut app);
+    app.playlists.store.create("Road Trip").unwrap();
+    app.metadata_cache.insert(AudioMetadata {
+        filepath: track.clone(),
+        filename: "01 Intro.wav".to_string(),
+        ..Default::default()
+    });
+    select_browser_row(&mut app, &album);
+
+    press(&mut app, KeyCode::Char('L'));
+    press(&mut app, KeyCode::Enter);
+    wait_for(&mut app, "folder add", |a| {
+        a.playlists.store.get("Road Trip").is_some_and(|p| p.entries.len() == 1)
+    });
+    assert_eq!(
+        app.playlists.store.get("Road Trip").unwrap().entries[0].duration_secs,
+        2
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// After shutdown is signalled the folder add worker stops reading and adds nothing.
+#[test]
+fn test_folder_add_stops_after_shutdown_signal() {
+    common::isolate();
+    let dir = scratch_dir("folder_tags_stop");
+    let album = dir.join("Album");
+    fs::create_dir_all(&album).unwrap();
+    write_two_second_wav(&album.join("01 Intro.wav"));
+    let mut app = new_app(&dir);
+    wait_loaded(&mut app);
+    app.playlists.store.create("Road Trip").unwrap();
+    select_browser_row(&mut app, &album);
+    app.playlists.stop_checks();
+
+    press(&mut app, KeyCode::Char('L'));
+    press(&mut app, KeyCode::Enter);
+    for _ in 0..50 {
+        app.poll_playlists();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(app.playlists.store.get("Road Trip").unwrap().entries.is_empty());
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_folder_that_cannot_be_read_reports_it() {
     common::isolate();
