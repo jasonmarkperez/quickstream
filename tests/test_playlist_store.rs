@@ -1090,3 +1090,55 @@ fn test_rename_refused_by_permissions_is_reverted() {
     assert_eq!(names(&store), vec!["Old"]);
     assert_eq!(file_names(&dir), vec!["Old.m3u8".to_string()]);
 }
+
+// ---------- stable ids for work that outlives a rename (issue #52) ----------
+
+/// A folder add reads tags on a worker and adds when the listing arrives. It names its target
+/// by id, so a rename in the meantime moves the add with the playlist.
+#[test]
+fn test_id_follows_renames_and_ends_with_delete() {
+    common::isolate();
+    let dir = scratch("ids");
+    // A playlist loaded from disk has no id until asked for one.
+    foreign_file(&dir, "Loaded.m3u8", "#EXTM3U\n");
+    let (worker, mut store) = open_store(&dir);
+    store.create("Road Trip").unwrap();
+
+    let loaded = store.id_of("loaded").expect("loaded playlists get an id on demand");
+    let road_trip = store.id_of("Road Trip").expect("created playlists have an id");
+    assert_ne!(loaded, road_trip);
+    assert_eq!(store.id_of("loaded"), Some(loaded), "asking again gives the same id");
+    assert_eq!(store.id_of("Missing"), None);
+    assert_eq!(store.name_of(loaded), Some("Loaded"));
+
+    store.rename("Road Trip", "Summer").unwrap();
+    assert_eq!(store.name_of(road_trip), Some("Summer"));
+    store.rename("Loaded", "Kept").unwrap();
+    assert_eq!(store.name_of(loaded), Some("Kept"));
+
+    store.delete("Summer").unwrap();
+    assert_eq!(store.name_of(road_trip), None);
+    // A new playlist under the old name is a different playlist.
+    store.create("Summer").unwrap();
+    assert_eq!(store.name_of(road_trip), None);
+    assert_ne!(store.id_of("Summer"), Some(road_trip));
+    assert!(worker.flush());
+}
+
+/// A failed rename gives the playlist its old name back; its id goes with it.
+#[test]
+fn test_id_follows_a_rename_the_writer_undid() {
+    common::isolate();
+    let dir = scratch("ids_rename_failure");
+    let (worker, mut store) = open_store(&dir);
+    store.create("Old").unwrap();
+    assert!(worker.flush());
+    foreign_file(&dir, "New.m3u8", "theirs");
+    let id = store.id_of("Old").unwrap();
+
+    store.rename("Old", "New").unwrap();
+    assert_eq!(store.name_of(id), Some("New"));
+    assert!(worker.flush());
+    assert_eq!(store.poll_write_failures().len(), 1);
+    assert_eq!(store.name_of(id), Some("Old"));
+}

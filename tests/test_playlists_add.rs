@@ -620,6 +620,90 @@ fn test_folder_add_stops_after_shutdown_signal() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A tag reader that holds every read until the returned sender is dropped or sends, and
+/// reports each read it starts.
+fn held_tag_reader() -> (
+    quickstream::ui::tag_reads::TagReader,
+    std::sync::mpsc::Receiver<PathBuf>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<PathBuf>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let reader: quickstream::ui::tag_reads::TagReader = std::sync::Arc::new(move |path: &Path| {
+        let _ = started_tx.send(path.to_path_buf());
+        let _ = release_rx.lock().unwrap().recv();
+        Ok(AudioMetadata {
+            filepath: path.to_path_buf(),
+            title: path.file_stem().unwrap().to_string_lossy().into_owned(),
+            artist: "Band".to_string(),
+            duration_seconds: 2.0,
+            ..Default::default()
+        })
+    });
+    (reader, started_rx, release_tx)
+}
+
+/// Start adding `album` (two tracks) to "Road Trip" and return once its first tag read is held.
+fn start_held_folder_add(dir: &Path) -> (AppUI, std::sync::mpsc::Sender<()>) {
+    let album = dir.join("Album");
+    fs::create_dir_all(&album).unwrap();
+    for name in ["01 Intro.flac", "02 Outro.flac"] {
+        fs::write(album.join(name), b"").unwrap();
+    }
+    let mut app = new_app(dir);
+    wait_loaded(&mut app);
+    app.playlists.store.create("Road Trip").unwrap();
+    let (reader, started, release) = held_tag_reader();
+    app.set_tag_reader(reader);
+    select_browser_row(&mut app, &album);
+    press(&mut app, KeyCode::Char('L'));
+    press(&mut app, KeyCode::Enter);
+    started
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the folder add started reading tags");
+    (app, release)
+}
+
+/// Issue #52: renaming the target while the folder add reads tags moves the add with it.
+#[test]
+fn test_folder_add_follows_a_rename_made_while_it_reads_tags() {
+    common::isolate();
+    let dir = scratch_dir("folder_add_rename");
+    let (mut app, release) = start_held_folder_add(&dir);
+
+    assert_eq!(
+        app.playlists.store.rename("Road Trip", "Summer"),
+        Ok("Summer".to_string())
+    );
+    drop(release);
+    wait_for(&mut app, "folder add", |a| !a.status_message.starts_with("Reading"));
+
+    assert_eq!(app.status_message, "Added 2 to Summer (2 tracks)");
+    assert_eq!(app.playlists.store.get("Summer").unwrap().entries.len(), 2);
+    assert_eq!(app.settings_mgr.settings.last_playlist.as_deref(), Some("Summer"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Issue #52: deleting the target while the folder add reads tags adds nothing, says so, and
+/// never lands in a new playlist that took the old name.
+#[test]
+fn test_folder_add_to_a_playlist_deleted_meanwhile_adds_nothing() {
+    common::isolate();
+    let dir = scratch_dir("folder_add_delete");
+    let (mut app, release) = start_held_folder_add(&dir);
+
+    app.playlists.store.delete("Road Trip").unwrap();
+    app.playlists.store.create("Road Trip").unwrap();
+    drop(release);
+    wait_for(&mut app, "folder add", |a| !a.status_message.starts_with("Reading"));
+
+    assert_eq!(app.status_message, "Road Trip was deleted; nothing added");
+    assert!(app.playlists.store.get("Road Trip").unwrap().entries.is_empty());
+    assert_eq!(app.settings_mgr.settings.last_playlist, None);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_folder_that_cannot_be_read_reports_it() {
     common::isolate();

@@ -12,9 +12,11 @@ use ratatui::widgets::*;
 
 pub mod playlists;
 pub mod search;
+pub mod tag_reads;
 pub mod workers;
 
 use self::search::SearchModalState;
+use self::tag_reads::{SharedTagReads, TagRead};
 use self::workers::WorkerRegistry;
 use crate::discovery::DeviceManager;
 use crate::metadata::is_supported_audio_file;
@@ -64,19 +66,20 @@ fn spawn_local_player(backend: &str, initial_volume: u8) -> Box<dyn AudioPlayer>
     ))
 }
 
-/// Start 4 threads that read tags for paths sent to the returned inbox and report results on
-/// `metadata_tx`. The threads exit once the inbox sender is dropped or `stop` is set (paths still
-/// queued in the inbox are then skipped).
+/// Start 4 threads that read tags for paths sent to the returned inbox through `tag_reads`, which
+/// reports results on `metadata_tx`. A path another worker is reading right now is skipped: that
+/// read reports it. The threads exit once the inbox sender is dropped or `stop` is set (paths
+/// still queued in the inbox are then skipped).
 fn spawn_queue_metadata_workers(
     workers: &mut WorkerRegistry,
-    metadata_tx: std::sync::mpsc::Sender<crate::metadata::AudioMetadata>,
+    tag_reads: SharedTagReads,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::sync::mpsc::Sender<PathBuf> {
     let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
     let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
     for _ in 0..4 {
         let rx = rx.clone();
-        let metadata_tx = metadata_tx.clone();
+        let tag_reads = tag_reads.clone();
         let stop = stop.clone();
         workers.spawn("queue-metadata", move || loop {
             let path = match rx.lock() {
@@ -89,12 +92,7 @@ fn spawn_queue_metadata_workers(
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
-            if let Ok(meta) = crate::metadata::extract_metadata(&path) {
-                crate::library::LibraryManager::append_to_cache(&meta);
-                if metadata_tx.send(meta).is_err() {
-                    break;
-                }
-            }
+            tag_reads.read_unless_busy(&path);
         });
     }
     tx
@@ -234,6 +232,9 @@ pub struct AppUI {
     pub queue_metadata_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Paths already sent to the queue metadata workers this session.
     pub queue_metadata_attempted: std::collections::HashSet<PathBuf>,
+    /// Tag reads shared by the browser, queue and folder-add workers, so no two of them read
+    /// the same file at once (issue #52).
+    tag_reads: SharedTagReads,
     /// Handles of background worker threads, joined (with a bounded wait) on shutdown.
     pub workers: WorkerRegistry,
     pub browser_state: ListState,
@@ -336,6 +337,7 @@ impl AppUI {
         let (metadata_tx, metadata_rx) = std::sync::mpsc::channel();
         let (queue_add_tx, queue_add_rx) = std::sync::mpsc::channel();
         let metadata_cache = crate::library::MetadataCache::from(crate::library::LibraryManager::load_cache_map());
+        let tag_reads = SharedTagReads::new(metadata_cache.clone(), metadata_tx.clone());
         let (dir_scan_tx, dir_scan_rx) = std::sync::mpsc::channel();
         let analysis_db = crate::analysis::AnalysisDatabase::open_default()
             .unwrap_or_else(|_| crate::analysis::AnalysisDatabase::open_in_memory().unwrap());
@@ -376,6 +378,7 @@ impl AppUI {
             queue_metadata_tx: None,
             queue_metadata_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             queue_metadata_attempted: std::collections::HashSet::new(),
+            tag_reads,
             workers: WorkerRegistry::new(),
             browser_state: ListState::default(),
             queue_state: ListState::default(),
@@ -960,7 +963,7 @@ impl AppUI {
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.metadata_worker_stop = Some(stop.clone());
-        let tx = self.metadata_tx.clone();
+        let tag_reads = self.tag_reads.clone();
 
         self.workers.spawn("browser-metadata", move || {
             let fetch_start = std::time::Instant::now();
@@ -969,12 +972,10 @@ impl AppUI {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                if let Ok(meta) = crate::metadata::extract_metadata(&path) {
-                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
-                    }
-                    crate::library::LibraryManager::append_to_cache(&meta);
-                    let _ = tx.send(meta);
+                // A file another worker is reading is skipped; that read refreshes its label.
+                // A finished read is always published, even if the stop flag was set meanwhile:
+                // a worker that skipped the file, or is waiting for it, relies on these tags.
+                if tag_reads.read_unless_busy(&path) == TagRead::Read {
                     extracted += 1;
                 }
             }
@@ -1014,11 +1015,11 @@ impl AppUI {
             return;
         }
 
-        let metadata_tx = self.metadata_tx.clone();
+        let tag_reads = self.tag_reads.clone();
         let (workers, stop) = (&mut self.workers, self.queue_metadata_stop.clone());
         let tx = self
             .queue_metadata_tx
-            .get_or_insert_with(|| spawn_queue_metadata_workers(workers, metadata_tx, stop));
+            .get_or_insert_with(|| spawn_queue_metadata_workers(workers, tag_reads, stop));
         for path in new_paths {
             let _ = tx.send(path);
         }
@@ -1504,6 +1505,19 @@ impl AppUI {
     /// renderer) never blocks the UI. Shutdown waits for it, so mpv is gone before the process exits.
     fn retire_player(&mut self, player: Box<dyn AudioPlayer>) {
         self.workers.spawn("retire-player", move || drop(player));
+    }
+
+    /// Replace the tag reader used by workers started from now on (tests use a counting or
+    /// blocking stand-in for the share). Public only because integration tests in `tests/`
+    /// drive `AppUI` directly.
+    #[doc(hidden)]
+    pub fn set_tag_reader(&mut self, reader: tag_reads::TagReader) {
+        self.tag_reads.set_reader(reader);
+    }
+
+    /// Number of files a background worker is reading tags from right now.
+    pub fn tag_reads_in_flight(&self) -> usize {
+        self.tag_reads.in_flight()
     }
 
     /// Number of background worker threads still running.

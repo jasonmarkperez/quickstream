@@ -102,9 +102,9 @@ pub struct PlaylistStore {
     reserved: Vec<String>,
     loaded: bool,
     persist: PersistHandle,
-    /// Id of each playlist that has been created or renamed this session, by its current name.
-    /// The writer's failure reports carry the id, so a report finds its playlist even after
-    /// later renames.
+    /// Id of each playlist that has been created or renamed this session, or asked for with
+    /// [`id_of`](Self::id_of), by its current name. The writer's failure reports and pending
+    /// folder adds carry the id, so they find their playlist even after later renames.
     ids: HashMap<String, u64>,
     next_id: u64,
     failures_tx: mpsc::Sender<PersistFailure>,
@@ -256,6 +256,21 @@ impl PlaylistStore {
     /// Position of the playlist named `name` (ignoring case) in [`playlists`](Self::playlists).
     pub fn index_of(&self, name: &str) -> Option<usize> {
         self.playlists.iter().position(|p| names_equal(&p.name, name))
+    }
+
+    /// Stable id of the playlist named `name` (ignoring case), giving it one if it has none.
+    /// The id follows the playlist through renames, including a rename the writer undid, and
+    /// ends when it is deleted (or its create is undone); a new playlist under the same name
+    /// gets a new id. Work that outlives a UI tick, such as a folder add, names its target by
+    /// id (issue #52).
+    pub fn id_of(&mut self, name: &str) -> Option<u64> {
+        let name = self.get(name)?.name.clone();
+        Some(self.id_for(&name))
+    }
+
+    /// Current name of the playlist with id `id`, or `None` once it was deleted.
+    pub fn name_of(&self, id: u64) -> Option<&str> {
+        self.ids.iter().find(|(_, v)| **v == id).map(|(name, _)| name.as_str())
     }
 
     /// Create an empty playlist and write its file. Returns the stored (trimmed) name. The file
@@ -499,20 +514,25 @@ impl PlaylistStore {
     /// The reporter for writes of the playlist called exactly `name`, giving it an id first if
     /// it has none.
     fn reporter_for(&mut self, name: &str) -> Reporter {
-        let id = match self.ids.get(name) {
+        let id = self.id_for(name);
+        Reporter::new(id, self.failures_tx.clone())
+    }
+
+    /// Id of the playlist called exactly `name`, giving it one if it has none.
+    fn id_for(&mut self, name: &str) -> u64 {
+        match self.ids.get(name) {
             Some(id) => *id,
             None => {
                 self.next_id += 1;
                 self.ids.insert(name.to_string(), self.next_id);
                 self.next_id
             }
-        };
-        Reporter::new(id, self.failures_tx.clone())
+        }
     }
 
     /// Current name of the playlist with id `id`.
     fn name_with_id(&self, id: u64) -> Option<String> {
-        self.ids.iter().find(|(_, v)| **v == id).map(|(name, _)| name.clone())
+        self.name_of(id).map(str::to_string)
     }
 
     fn ensure_loaded(&self) -> Result<(), StoreError> {

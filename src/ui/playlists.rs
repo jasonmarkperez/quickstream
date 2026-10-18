@@ -951,6 +951,10 @@ const SELECT_TRACK_OR_FOLDER: &str = "Select a track or folder";
 /// A folder listing for a folder add, sent from the worker to the UI thread.
 #[derive(Debug)]
 struct FolderListing {
+    /// Id of the target playlist ([`crate::playlist_store::PlaylistStore::id_of`]), so the add
+    /// follows a rename made while the tags were read (issue #52).
+    target: u64,
+    /// The target's name when the add started, for the message if it was deleted meanwhile.
     playlist: String,
     /// The playlist was created for this add ("+ New playlist…").
     created: bool,
@@ -1160,15 +1164,20 @@ impl super::AppUI {
     }
 
     /// List `dir` and read the tags of files the metadata cache has no real entry for, on a
-    /// worker (it may be on a slow or unmounted share). Tags go through the shared metadata
-    /// pipeline: saved to the on-disk index and sent on `metadata_tx`, so browser labels and
-    /// queue rows refresh. They are also put in the cache directly, so
-    /// `poll_playlist_folder_adds` builds the entries from them when the listing arrives. The
+    /// worker (it may be on a slow or unmounted share). Tags go through the shared tag reads
+    /// (`super::tag_reads`): saved to the on-disk index, put in the cache and sent on
+    /// `metadata_tx`, so browser labels and queue rows refresh and `poll_playlist_folder_adds`
+    /// builds the entries from the cache when the listing arrives. A file another worker is
+    /// reading is not read again: the folder add waits for that read and uses its tags. The
     /// worker stops, adding nothing, once shutdown is signalled.
     fn start_folder_add(&mut self, playlist: &str, dir: PathBuf, created: bool) {
+        let Some(target) = self.playlists.store.id_of(playlist) else {
+            self.status_message = crate::playlist_store::StoreError::NotFound(playlist.to_string()).to_string();
+            return;
+        };
         self.status_message = format!("Reading {}…", folder_display_name(&dir));
         let tx = self.playlists.folder_tx.clone();
-        let metadata_tx = self.metadata_tx.clone();
+        let tag_reads = self.tag_reads.clone();
         let cache = self.metadata_cache.clone();
         let stop = self.playlists.checks.stop.clone();
         let playlist = playlist.to_string();
@@ -1187,15 +1196,14 @@ impl super::AppUI {
                         done,
                         total,
                     });
-                    if let Ok(meta) = crate::metadata::extract_metadata(path) {
-                        crate::library::LibraryManager::append_to_cache(&meta);
-                        cache.insert(meta.clone());
-                        let _ = metadata_tx.send(meta);
+                    if tag_reads.read_or_wait(path, &stop) == super::tag_reads::TagRead::Stopped {
+                        return;
                     }
                 }
             }
             if !stopped() {
                 let _ = tx.send(FolderUpdate::Listing(FolderListing {
+                    target,
                     playlist,
                     created,
                     dir,
@@ -1205,7 +1213,8 @@ impl super::AppUI {
         });
     }
 
-    /// Apply finished folder listings from `start_folder_add`.
+    /// Apply finished folder listings from `start_folder_add`, to the target playlist under
+    /// its current name. A target deleted while the tags were read gets nothing.
     fn poll_playlist_folder_adds(&mut self) {
         while let Ok(update) = self.playlists.folder_rx.try_recv() {
             let listing = match update {
@@ -1215,12 +1224,16 @@ impl super::AppUI {
                 }
                 FolderUpdate::Listing(listing) => listing,
             };
+            let Some(playlist) = self.playlists.store.name_of(listing.target).map(str::to_string) else {
+                self.status_message = format!("{} was deleted; nothing added", listing.playlist);
+                continue;
+            };
             let folder = folder_display_name(&listing.dir);
             let problem = match listing.result {
                 Ok(files) if files.is_empty() => format!("no audio files in {}", folder),
                 Ok(files) => {
                     let entries = files.iter().map(|path| self.playlist_entry_for_path(path)).collect();
-                    self.add_entries_to_playlist(&listing.playlist, entries);
+                    self.add_entries_to_playlist(&playlist, entries);
                     continue;
                 }
                 Err(e) => {
@@ -1232,7 +1245,7 @@ impl super::AppUI {
             // prompt can still show a name error. When the folder then adds nothing, the status
             // says the playlist was created anyway.
             self.status_message = if listing.created {
-                format!("Created \"{}\"; {}", listing.playlist, problem)
+                format!("Created \"{}\"; {}", playlist, problem)
             } else {
                 capitalize_first(&problem)
             };

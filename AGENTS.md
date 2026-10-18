@@ -29,6 +29,7 @@ This guide is intended for AI coding agents and automated development tools work
 4. **Non-Blocking UI Invariant**:
    - Disk I/O, network SSDP discovery, audio decoding/analysis, metadata extraction, and library scanning **MUST** run asynchronously on background worker threads, worker pools, or Tokio tasks.
    - Communication with the main UI loop is performed using `std::sync::mpsc` channels and lock-free/atomic states. The Ratatui UI event loop must never block or drop below 60 FPS.
+   - Tag reads from the browser metadata fetch, the queue metadata pool and playlist folder adds all go through `SharedTagReads` (`src/ui/tag_reads.rs`), which keeps one set of paths being read so no two workers read the same file at once. The browser and queue workers skip a path that is being read; a folder add waits for that read. Every read publishes its tags (on-disk index, `MetadataCache`, `metadata_tx`) before releasing its path, and a failed or panicking read still releases it. `AppUI::set_tag_reader` is the test seam.
 
 5. **Dual Playback Architecture**:
    - Quickstream abstracts playback through the unified `AudioPlayer` trait (`src/player/mod.rs`):
@@ -63,6 +64,7 @@ quickstream/
 │   ├── ui/               # Terminal User Interface (Ratatui + Crossterm)
 │   │   ├── mod.rs        # AppUI state machine, 60 FPS render passes, tab switching, hotkey router
 │   │   ├── playlists.rs  # Tab 5 Playlists: PlaylistsUi, name prompt / delete confirm / add picker, L key, play & queue
+│   │   ├── tag_reads.rs  # SharedTagReads: tag reads shared by browser/queue/folder-add workers, in-flight path set
 │   │   └── search.rs     # SearchModalState, streaming fuzzy search (fuzzy-matcher / SkimMatcherV2)
 │   │
 │   ├── player/           # Audio playback abstraction layer
@@ -105,6 +107,7 @@ quickstream/
     ├── test_playlists_add.rs  # L key, add picker, folder adds, last_playlist
     ├── test_playlists_play.rs # Missing-file checks, Enter replace+play, a append, all-missing
     ├── test_search.rs        # Multi-threaded fuzzy search, scoped scan, and modal navigation
+    ├── test_shared_tag_reads.rs # No concurrent duplicate tag reads; skipped/waiting requests still get tags
     ├── test_upnp.rs          # UPnP SOAP XML generation, AVTransport state machine, continuous stream
     └── test_web.rs           # Embedded web server, byte ranges, REST API, and command dispatch
 ```
@@ -135,7 +138,7 @@ The background writer's create, delete and rename tests (used by `PlaylistStore`
   - **Help Modal (`?`)**: Full keyboard shortcut cheat-sheet.
   - **Fuzzy Search Modal (`f`)**: Streaming fuzzy finder with real-time preview card.
   - **Mix Profile Modal (`M`)**: Interactive autopilot mix profile selector (`[1]` Diverse Shuffle, `[2]` BPM Flow, `[3]` Chill & Ambient, `[4]` Workout, `[5]` Late Night Groove).
-  - **Add-to-Playlist Picker (`L`)**: the header names what is being added (the track title, or `<folder> (folder)`). The rows list the playlists, with `last_playlist` highlighted (or the first row if it no longer exists), then `+ New playlist…`. `j`/`k`/arrows wrap, `Enter` adds, `Esc`/`q` cancel. Results: `Added "<title>" to <name> (<n> tracks)`, `Already in <name>`, `Added <k> to <name>, skipped <m> already in it`.
+  - **Add-to-Playlist Picker (`L`)**: the header names what is being added (the track title, or `<folder> (folder)`). The rows list the playlists, with `last_playlist` highlighted (or the first row if it no longer exists), then `+ New playlist…`. `j`/`k`/arrows wrap, `Enter` adds, `Esc`/`q` cancel. Results: `Added "<title>" to <name> (<n> tracks)`, `Already in <name>`, `Added <k> to <name>, skipped <m> already in it`. A folder add follows its playlist by id (`PlaylistStore::id_of`), so a rename made while its tags are read moves the add with it; if the playlist was deleted meanwhile it reports `<name> was deleted; nothing added`.
   - **Playlist Name Prompt** (`c`, `R`, `+ New playlist…`): every character is text, including `q` and digits. `Backspace` deletes, `Enter` confirms, `Esc` cancels. An invalid or duplicate name (ignoring case, with full Unicode case folding, and Unicode normalization, as APFS does) keeps the prompt open and shows the error, e.g. `Name can't contain /` or `"Road Trip" already exists`. A name wider than the field scrolls: the field shows `…` and the end of the name, so the cursor stays visible. A name taken by a file the store skipped at load (or found in the way of a create) shows `A playlist file named "Latin" exists but couldn't be loaded` (`NameError::Reserved`).
   - **Playlist Delete Confirmation (`D`)**: `y` deletes the file. Any other key cancels.
   - Modals intercept keyboard input when active, before the global hotkeys. Most are dismissed with `Esc` or `q`. The playlist name prompt and the Startup Home Directory editor treat `q` as text and close only with `Esc`/`Enter`. `Ctrl+C` quits from any modal.

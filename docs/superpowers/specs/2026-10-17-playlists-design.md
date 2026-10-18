@@ -148,6 +148,8 @@ pub struct Playlist {
 
 - A track's entry is built from metadata the app already holds, in this order: the queue row or now-playing `AudioMetadata`, then `MetadataCache`. On a miss the title is the file stem, artist empty, duration `-1`. Nothing reads the share on the UI thread.
 - A folder add runs on a worker: read the folder listing, keep files where `is_supported_audio_file` is true, sort by name, send the paths back over a channel. The UI then builds entries as above and calls `PlaylistStore::add`. If the folder can't be read: status `Couldn't read <folder>`. If it holds no audio files: `No audio files in <folder>`.
+- The folder add worker reads tags for files with no real cache entry through the shared tag reads (`src/ui/tag_reads.rs`): a file the browser or queue metadata workers are reading right now is not read again; the folder add waits for that read and uses its tags from the cache (issue #52).
+- The folder add names its target by the store's stable id (`PlaylistStore::id_of` / `name_of`), not by name. A rename while the tags are read (including a rename the writer undid) moves the add with the playlist. If the playlist was deleted meanwhile, nothing is added and the status reads `<name> was deleted; nothing added` (the name it had when the add started); a new playlist that took the old name gets nothing.
 
 ### Missing-file check
 
