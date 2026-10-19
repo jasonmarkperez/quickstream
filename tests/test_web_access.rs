@@ -18,6 +18,9 @@ use quickstream::web_access::{
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const PORT: u16 = 8080;
+/// The Web Remote Access setting (`web_server_lan`), passed to `authorize`.
+const REMOTE_ON: bool = true;
+const REMOTE_OFF: bool = false;
 
 fn lan_peer() -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))
@@ -48,11 +51,11 @@ fn test_remote_dashboard_without_token_is_unauthorized() {
     common::isolate();
     let h = headers(&[&lan_host()]);
     assert_eq!(
-        authorize(lan_peer(), PORT, "GET", "/", &h, TOKEN),
+        authorize(lan_peer(), PORT, "GET", "/", &h, TOKEN, REMOTE_ON),
         AuthDecision::Unauthorized
     );
     assert_eq!(
-        authorize(lan_peer(), PORT, "GET", "/index.html", &h, TOKEN),
+        authorize(lan_peer(), PORT, "GET", "/index.html", &h, TOKEN, REMOTE_ON),
         AuthDecision::Unauthorized
     );
 }
@@ -69,7 +72,7 @@ fn test_remote_api_without_token_is_unauthorized() {
         "/favicon.ico",
     ] {
         assert_eq!(
-            authorize(lan_peer(), PORT, "GET", path, &h, TOKEN),
+            authorize(lan_peer(), PORT, "GET", path, &h, TOKEN, REMOTE_ON),
             AuthDecision::Unauthorized,
             "{}",
             path
@@ -77,7 +80,7 @@ fn test_remote_api_without_token_is_unauthorized() {
     }
     let post = headers(&[&lan_host(), "Content-Type: application/json"]);
     assert_eq!(
-        authorize(lan_peer(), PORT, "POST", "/api/action", &post, TOKEN),
+        authorize(lan_peer(), PORT, "POST", "/api/action", &post, TOKEN, REMOTE_ON),
         AuthDecision::Unauthorized
     );
 }
@@ -87,7 +90,10 @@ fn test_remote_pairing_link_with_valid_token_pairs() {
     common::isolate();
     let h = headers(&[&lan_host()]);
     let path = format!("/?token={}", TOKEN);
-    assert_eq!(authorize(lan_peer(), PORT, "GET", &path, &h, TOKEN), AuthDecision::Pair);
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", &path, &h, TOKEN, REMOTE_ON),
+        AuthDecision::Pair
+    );
 }
 
 #[test]
@@ -96,17 +102,17 @@ fn test_remote_pairing_link_with_wrong_token_is_unauthorized() {
     let h = headers(&[&lan_host()]);
     let wrong = "/?token=ffffffffffffffffffffffffffffffff";
     assert_eq!(
-        authorize(lan_peer(), PORT, "GET", wrong, &h, TOKEN),
+        authorize(lan_peer(), PORT, "GET", wrong, &h, TOKEN, REMOTE_ON),
         AuthDecision::Unauthorized
     );
     assert_eq!(
-        authorize(lan_peer(), PORT, "GET", "/?token=", &h, TOKEN),
+        authorize(lan_peer(), PORT, "GET", "/?token=", &h, TOKEN, REMOTE_ON),
         AuthDecision::Unauthorized
     );
     // A prefix of the real token must not match.
     let prefix = format!("/?token={}", &TOKEN[..16]);
     assert_eq!(
-        authorize(lan_peer(), PORT, "GET", &prefix, &h, TOKEN),
+        authorize(lan_peer(), PORT, "GET", &prefix, &h, TOKEN, REMOTE_ON),
         AuthDecision::Unauthorized
     );
 }
@@ -118,7 +124,7 @@ fn test_remote_token_in_query_of_api_does_not_authorize() {
     let h = headers(&[&lan_host()]);
     let path = format!("/api/status?token={}", TOKEN);
     assert_eq!(
-        authorize(lan_peer(), PORT, "GET", &path, &h, TOKEN),
+        authorize(lan_peer(), PORT, "GET", &path, &h, TOKEN, REMOTE_ON),
         AuthDecision::Unauthorized
     );
 }
@@ -128,9 +134,12 @@ fn test_remote_cookie_token_is_accepted() {
     common::isolate();
     let cookie = format!("Cookie: theme=dark; qs_token_{}={}; other=1", PORT, TOKEN);
     let h = headers(&[&lan_host(), &cookie]);
-    assert_eq!(authorize(lan_peer(), PORT, "GET", "/", &h, TOKEN), AuthDecision::Allow);
     assert_eq!(
-        authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+        authorize(lan_peer(), PORT, "GET", "/", &h, TOKEN, REMOTE_ON),
+        AuthDecision::Allow
+    );
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN, REMOTE_ON),
         AuthDecision::Allow
     );
 }
@@ -144,7 +153,7 @@ fn test_session_cookie_is_scoped_to_the_server_port() {
     for cookie in [unscoped, other_port] {
         let h = headers(&[&lan_host(), &cookie]);
         assert_eq!(
-            authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+            authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN, REMOTE_ON),
             AuthDecision::Unauthorized,
             "{}",
             cookie
@@ -159,7 +168,7 @@ fn test_remote_bearer_token_is_accepted() {
     let auth = format!("Authorization: Bearer {}", TOKEN);
     let h = headers(&[&lan_host(), &auth]);
     assert_eq!(
-        authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+        authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN, REMOTE_ON),
         AuthDecision::Allow
     );
 }
@@ -172,18 +181,18 @@ fn test_remote_wrong_cookie_or_bearer_is_unauthorized() {
         &format!("Cookie: qs_token_{}=ffffffffffffffffffffffffffffffff", PORT),
     ]);
     assert_eq!(
-        authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+        authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN, REMOTE_ON),
         AuthDecision::Unauthorized
     );
     let h = headers(&[&lan_host(), "Authorization: Bearer nope"]);
     assert_eq!(
-        authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+        authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN, REMOTE_ON),
         AuthDecision::Unauthorized
     );
     // A cookie whose name merely ends in the session cookie name is not the session cookie.
     let h = headers(&[&lan_host(), &format!("Cookie: xqs_token_{}={}", PORT, TOKEN)]);
     assert_eq!(
-        authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+        authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN, REMOTE_ON),
         AuthDecision::Unauthorized
     );
 }
@@ -194,21 +203,162 @@ fn test_remote_stream_requests_need_no_token() {
     // DLNA renderers cannot authenticate; /stream only serves registered files.
     let h = headers(&[&lan_host()]);
     assert_eq!(
-        authorize(lan_peer(), PORT, "GET", "/stream/song.flac", &h, TOKEN),
+        authorize(lan_peer(), PORT, "GET", "/stream/song.flac", &h, TOKEN, REMOTE_ON),
         AuthDecision::Allow
     );
     assert_eq!(
-        authorize(lan_peer(), PORT, "HEAD", "/stream/song.flac", &h, TOKEN),
+        authorize(lan_peer(), PORT, "HEAD", "/stream/song.flac", &h, TOKEN, REMOTE_ON),
         AuthDecision::Allow
     );
     assert_eq!(
-        authorize(lan_peer(), PORT, "GET", "/stream/continuous.wav", &h, TOKEN),
+        authorize(lan_peer(), PORT, "GET", "/stream/continuous.wav", &h, TOKEN, REMOTE_ON),
         AuthDecision::Allow
     );
     // Only /stream/... paths are exempt.
     assert_eq!(
-        authorize(lan_peer(), PORT, "GET", "/streamx", &h, TOKEN),
+        authorize(lan_peer(), PORT, "GET", "/streamx", &h, TOKEN, REMOTE_ON),
         AuthDecision::Unauthorized
+    );
+}
+
+/// Requests a paired phone makes: the dashboard, its API, the pairing link and an action.
+fn paired_requests() -> Vec<(&'static str, String, AuthHeaders)> {
+    let cookie = format!("Cookie: qs_token_{}={}", PORT, TOKEN);
+    let bearer = format!("Authorization: Bearer {}", TOKEN);
+    let get = headers(&[&lan_host(), &cookie]);
+    let post = headers(&[&lan_host(), &cookie, "Content-Type: application/json"]);
+    vec![
+        ("GET", "/".to_string(), get.clone()),
+        ("GET", "/index.html".to_string(), get.clone()),
+        ("GET", "/api/status".to_string(), get.clone()),
+        ("GET", "/api/playlists".to_string(), get.clone()),
+        ("GET", "/api/cover".to_string(), get.clone()),
+        ("GET", "/favicon.ico".to_string(), get),
+        ("GET", "/api/status".to_string(), headers(&[&lan_host(), &bearer])),
+        ("GET", format!("/?token={}", TOKEN), headers(&[&lan_host()])),
+        ("POST", "/api/action".to_string(), post.clone()),
+        ("POST", "/stream/song.flac".to_string(), post),
+    ]
+}
+
+#[test]
+fn test_paired_remote_peer_is_refused_while_remote_access_is_off() {
+    common::isolate();
+    // A renderer can make the server listen on the LAN with remote access off (issue #49): a
+    // phone paired earlier keeps its token, but must not control Quickstream.
+    for (method, path, h) in paired_requests() {
+        assert_eq!(
+            authorize(lan_peer(), PORT, method, &path, &h, TOKEN, REMOTE_OFF),
+            AuthDecision::Forbidden("remote access is off"),
+            "{} {}",
+            method,
+            path
+        );
+    }
+    // Unpaired peers are refused the same way.
+    let h = headers(&[&lan_host()]);
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", "/api/status", &h, TOKEN, REMOTE_OFF),
+        AuthDecision::Forbidden("remote access is off")
+    );
+}
+
+#[test]
+fn test_paired_remote_peer_is_allowed_while_remote_access_is_on() {
+    common::isolate();
+    for (method, path, h) in paired_requests() {
+        let expected = if path.contains("?token=") {
+            AuthDecision::Pair
+        } else {
+            AuthDecision::Allow
+        };
+        assert_eq!(
+            authorize(lan_peer(), PORT, method, &path, &h, TOKEN, REMOTE_ON),
+            expected,
+            "{} {}",
+            method,
+            path
+        );
+    }
+}
+
+#[test]
+fn test_remote_stream_requests_are_served_while_remote_access_is_off() {
+    common::isolate();
+    // The active renderer still needs its tokenless, read-only stream.
+    let h = headers(&[&lan_host()]);
+    for (method, path) in [
+        ("GET", "/stream/song.flac"),
+        ("HEAD", "/stream/song.flac"),
+        ("GET", "/stream/continuous-0123.wav"),
+    ] {
+        assert_eq!(
+            authorize(lan_peer(), PORT, method, path, &h, TOKEN, REMOTE_OFF),
+            AuthDecision::Allow,
+            "{} {}",
+            method,
+            path
+        );
+    }
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", "/streamx", &h, TOKEN, REMOTE_OFF),
+        AuthDecision::Forbidden("remote access is off")
+    );
+}
+
+#[test]
+fn test_loopback_is_unaffected_by_remote_access() {
+    common::isolate();
+    let local = format!("Host: 127.0.0.1:{}", PORT);
+    let cases: Vec<(&str, String, AuthHeaders)> = vec![
+        ("GET", "/".to_string(), headers(&[&local])),
+        ("GET", "/api/status".to_string(), headers(&[&local])),
+        ("GET", "/stream/song.flac".to_string(), headers(&[&local])),
+        ("GET", format!("/?token={}", TOKEN), headers(&[&local])),
+        (
+            "POST",
+            "/api/action".to_string(),
+            headers(&[&local, "Content-Type: application/json"]),
+        ),
+        ("POST", "/api/action".to_string(), headers(&[&local])),
+        (
+            "GET",
+            "/api/status".to_string(),
+            headers(&["Host: rebind.evil.example"]),
+        ),
+    ];
+    for (method, path, h) in cases {
+        assert_eq!(
+            authorize(loopback_peer(), PORT, method, &path, &h, TOKEN, REMOTE_OFF),
+            authorize(loopback_peer(), PORT, method, &path, &h, TOKEN, REMOTE_ON),
+            "{} {}",
+            method,
+            path
+        );
+    }
+    assert_eq!(
+        authorize(
+            loopback_peer(),
+            PORT,
+            "GET",
+            "/api/status",
+            &headers(&[&local]),
+            TOKEN,
+            REMOTE_OFF
+        ),
+        AuthDecision::Allow
+    );
+    assert_eq!(
+        authorize(
+            loopback_peer(),
+            PORT,
+            "POST",
+            "/api/action",
+            &headers(&[&local, "Content-Type: application/json"]),
+            TOKEN,
+            REMOTE_OFF
+        ),
+        AuthDecision::Allow
     );
 }
 
@@ -218,17 +368,17 @@ fn test_remote_post_requires_json_content_type() {
     let cookie = format!("Cookie: qs_token_{}={}", PORT, TOKEN);
     let h = headers(&[&lan_host(), &cookie, "Content-Type: text/plain"]);
     assert!(matches!(
-        authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN, REMOTE_ON),
         AuthDecision::Forbidden(_)
     ));
     let h = headers(&[&lan_host(), &cookie]);
     assert!(matches!(
-        authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN, REMOTE_ON),
         AuthDecision::Forbidden(_)
     ));
     let h = headers(&[&lan_host(), &cookie, "Content-Type: application/json; charset=utf-8"]);
     assert_eq!(
-        authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN, REMOTE_ON),
         AuthDecision::Allow
     );
 }
@@ -244,18 +394,18 @@ fn test_remote_post_with_foreign_origin_is_forbidden() {
         "Origin: http://evil.example",
     ]);
     assert!(matches!(
-        authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN, REMOTE_ON),
         AuthDecision::Forbidden(_)
     ));
     let h = headers(&[&lan_host(), &cookie, "Content-Type: application/json", "Origin: null"]);
     assert!(matches!(
-        authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN, REMOTE_ON),
         AuthDecision::Forbidden(_)
     ));
     let origin = format!("Origin: http://192.168.1.10:{}", PORT);
     let h = headers(&[&lan_host(), &cookie, "Content-Type: application/json", &origin]);
     assert_eq!(
-        authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        authorize(lan_peer(), PORT, "POST", "/api/action", &h, TOKEN, REMOTE_ON),
         AuthDecision::Allow
     );
 }
@@ -266,7 +416,7 @@ fn test_loopback_needs_no_token_but_requires_loopback_host() {
     for host in ["127.0.0.1", "localhost", "LOCALHOST", "[::1]"] {
         let h = headers(&[&format!("Host: {}:{}", host, PORT)]);
         assert_eq!(
-            authorize(loopback_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+            authorize(loopback_peer(), PORT, "GET", "/api/status", &h, TOKEN, REMOTE_ON),
             AuthDecision::Allow,
             "{}",
             host
@@ -275,22 +425,22 @@ fn test_loopback_needs_no_token_but_requires_loopback_host() {
     // DNS rebinding: an attacker's name resolving to 127.0.0.1.
     let h = headers(&[&format!("Host: rebind.evil.example:{}", PORT)]);
     assert!(matches!(
-        authorize(loopback_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+        authorize(loopback_peer(), PORT, "GET", "/api/status", &h, TOKEN, REMOTE_ON),
         AuthDecision::Forbidden(_)
     ));
     assert!(matches!(
-        authorize(loopback_peer(), PORT, "GET", "/", &h, TOKEN),
+        authorize(loopback_peer(), PORT, "GET", "/", &h, TOKEN, REMOTE_ON),
         AuthDecision::Forbidden(_)
     ));
     // Wrong port and missing Host are rejected too.
     let h = headers(&["Host: 127.0.0.1:9999"]);
     assert!(matches!(
-        authorize(loopback_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+        authorize(loopback_peer(), PORT, "GET", "/api/status", &h, TOKEN, REMOTE_ON),
         AuthDecision::Forbidden(_)
     ));
     let h = headers(&[]);
     assert!(matches!(
-        authorize(loopback_peer(), PORT, "GET", "/api/status", &h, TOKEN),
+        authorize(loopback_peer(), PORT, "GET", "/api/status", &h, TOKEN, REMOTE_ON),
         AuthDecision::Forbidden(_)
     ));
 }
@@ -301,23 +451,23 @@ fn test_loopback_post_requires_json_and_same_origin() {
     let host = format!("Host: 127.0.0.1:{}", PORT);
     let h = headers(&[&host, "Content-Type: text/plain"]);
     assert!(matches!(
-        authorize(loopback_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        authorize(loopback_peer(), PORT, "POST", "/api/action", &h, TOKEN, REMOTE_ON),
         AuthDecision::Forbidden(_)
     ));
     let h = headers(&[&host, "Content-Type: application/json", "Origin: http://evil.example"]);
     assert!(matches!(
-        authorize(loopback_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        authorize(loopback_peer(), PORT, "POST", "/api/action", &h, TOKEN, REMOTE_ON),
         AuthDecision::Forbidden(_)
     ));
     let origin = format!("Origin: http://127.0.0.1:{}", PORT);
     let h = headers(&[&host, "Content-Type: application/json", &origin]);
     assert_eq!(
-        authorize(loopback_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        authorize(loopback_peer(), PORT, "POST", "/api/action", &h, TOKEN, REMOTE_ON),
         AuthDecision::Allow
     );
     let h = headers(&[&host, "Content-Type: application/json"]);
     assert_eq!(
-        authorize(loopback_peer(), PORT, "POST", "/api/action", &h, TOKEN),
+        authorize(loopback_peer(), PORT, "POST", "/api/action", &h, TOKEN, REMOTE_ON),
         AuthDecision::Allow
     );
 }
@@ -331,7 +481,7 @@ fn test_loopback_stream_requires_loopback_host() {
             let h = headers(&[&format!("Host: evil.example:{}", PORT)]);
             assert!(
                 matches!(
-                    authorize(loopback_peer(), PORT, method, path, &h, TOKEN),
+                    authorize(loopback_peer(), PORT, method, path, &h, TOKEN, REMOTE_ON),
                     AuthDecision::Forbidden(_)
                 ),
                 "{} {}",
@@ -340,7 +490,7 @@ fn test_loopback_stream_requires_loopback_host() {
             );
             let h = headers(&[]);
             assert!(matches!(
-                authorize(loopback_peer(), PORT, method, path, &h, TOKEN),
+                authorize(loopback_peer(), PORT, method, path, &h, TOKEN, REMOTE_ON),
                 AuthDecision::Forbidden(_)
             ));
         }
@@ -349,7 +499,7 @@ fn test_loopback_stream_requires_loopback_host() {
     for host in ["127.0.0.1", "localhost", "[::1]"] {
         let h = headers(&[&format!("Host: {}:{}", host, PORT)]);
         assert_eq!(
-            authorize(loopback_peer(), PORT, "GET", "/stream/a.mp3", &h, TOKEN),
+            authorize(loopback_peer(), PORT, "GET", "/stream/a.mp3", &h, TOKEN, REMOTE_ON),
             AuthDecision::Allow,
             "{}",
             host
@@ -388,7 +538,7 @@ fn test_ipv4_mapped_loopback_peer_counts_as_loopback() {
     let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
     let h = headers(&[&format!("Host: localhost:{}", PORT)]);
     assert_eq!(
-        authorize(mapped, PORT, "GET", "/api/status", &h, TOKEN),
+        authorize(mapped, PORT, "GET", "/api/status", &h, TOKEN, REMOTE_ON),
         AuthDecision::Allow
     );
 }
@@ -1039,6 +1189,25 @@ fn test_filesystem_root_and_home_are_never_allowed_roots() {
         );
         assert_eq!(resolve_allowed_path(&music, &[link]), None);
     }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_app_publishes_remote_access_setting_to_web_state() {
+    common::isolate();
+    let dir = temp_dir("remote_access_state");
+    fs::create_dir_all(&dir).unwrap();
+    let mut app = web_app(dir.clone(), None);
+    assert!(!app.web_state.read().unwrap().remote_access);
+
+    // Toggled while the server runs: the web thread's gate follows on the next publish.
+    app.settings_mgr.settings.web_server_lan = true;
+    app.update_web_state();
+    assert!(app.web_state.read().unwrap().remote_access);
+
+    app.settings_mgr.settings.web_server_lan = false;
+    app.update_web_state();
+    assert!(!app.web_state.read().unwrap().remote_access);
     let _ = fs::remove_dir_all(&dir);
 }
 

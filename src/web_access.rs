@@ -3,6 +3,9 @@
 //! - Network (non-loopback) peers need the session token, sent as the `qs_token_<port>` cookie (set by
 //!   opening the pairing link `/?token=<token>`) or an `Authorization: Bearer` header. `/stream/*`
 //!   is exempt: DLNA renderers cannot authenticate, and it only serves registered files.
+//! - While Web Remote Access (`web_server_lan`) is off, network peers get only `/stream/*`, even
+//!   with a valid token: a remote renderer makes the server listen on the LAN regardless of the
+//!   setting, and a phone paired earlier keeps its token.
 //! - Loopback peers need no token, but the `Host` header must name the loopback address on every
 //!   route (including `/stream/*`), which blocks DNS rebinding.
 //! - State-changing requests need `Content-Type: application/json` (a cross-site form or
@@ -133,7 +136,9 @@ fn is_loopback_host(host: &str, port: u16) -> bool {
         .any(|name| host == format!("{}:{}", name, port) || (port == 80 && host == *name))
 }
 
-/// Decide whether a request may proceed. `server_port` is the port the request arrived on.
+/// Decide whether a request may proceed. `server_port` is the port the request arrived on;
+/// `remote_access` is the Web Remote Access setting (`web_server_lan`), which network peers need
+/// for every route but `/stream/*`.
 pub fn authorize(
     peer: IpAddr,
     server_port: u16,
@@ -141,6 +146,7 @@ pub fn authorize(
     path: &str,
     headers: &AuthHeaders,
     token: &str,
+    remote_access: bool,
 ) -> AuthDecision {
     let route = path_only(path);
     let read_only = method == "GET" || method == "HEAD";
@@ -157,6 +163,9 @@ pub fn authorize(
     } else if read_only && route.starts_with("/stream/") {
         // DLNA renderers cannot authenticate.
         return AuthDecision::Allow;
+    } else if !remote_access {
+        // The server may listen on the LAN only for a renderer's streams.
+        return AuthDecision::Forbidden("remote access is off");
     } else {
         let is_dashboard = route == "/" || route == "/index.html";
         if read_only && is_dashboard {
@@ -277,13 +286,15 @@ pub fn write_decision_response(
     out.flush()
 }
 
-/// Authorize a request on `stream` with the process-wide token. Writes the refusal (or pairing
-/// redirect) and returns `false` when routing must stop.
+/// Authorize a request on `stream` with the process-wide token and the Web Remote Access setting
+/// `remote_access` (see [`authorize`]). Writes the refusal (or pairing redirect) and returns
+/// `false` when routing must stop.
 pub fn check_request(
     stream: &mut std::net::TcpStream,
     method: &str,
     path: &str,
     headers: &AuthHeaders,
+    remote_access: bool,
 ) -> std::io::Result<bool> {
     let peer = stream.peer_addr()?.ip();
     let port = stream.local_addr()?.port();
@@ -294,7 +305,7 @@ pub fn check_request(
     } else {
         web_token()
     };
-    let decision = authorize(peer, port, method, path, headers, token);
+    let decision = authorize(peer, port, method, path, headers, token, remote_access);
     if decision == AuthDecision::Allow {
         return Ok(true);
     }
