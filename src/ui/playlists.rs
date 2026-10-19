@@ -1223,12 +1223,12 @@ fn render_name_prompt(f: &mut Frame, purpose: &NamePurpose, input: &str, error: 
     };
     match error {
         Some(err) if text_width(err) > usize::from(inner.width) && keys_y >= inner.y + 3 => {
-            // Two rows: the blank one above the keys' row and that row.
-            let area = Rect::new(inner.x, keys_y - 1, inner.width, 2);
-            f.render_widget(
-                Paragraph::new(err).style(theme::error()).wrap(Wrap { trim: true }),
-                area,
-            );
+            // Two rows: the blank one above the keys' row and that row; an error that needs
+            // more ends its second row with `…`.
+            let width = usize::from(inner.width);
+            for (i, line) in kit::wrap_clipped(err, width, 2).iter().enumerate() {
+                buf.set_stringn(inner.x, keys_y - 1 + i as u16, line, width, theme::error());
+            }
         }
         Some(err) => {
             let width = usize::from(inner.width);

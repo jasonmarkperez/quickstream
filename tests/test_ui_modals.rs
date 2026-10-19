@@ -637,7 +637,11 @@ fn help_names_the_seek_step_from_the_settings() {
     common::isolate();
     let (mut app, dir) = modal_app("help_seek_step");
     app.show_help_modal = true;
-    for (step, text) in [(30.0, "Seek -30s / +30s"), (5.0, "Seek -5s / +5s"), (2.5, "Seek -2.5s / +2.5s")] {
+    for (step, text) in [
+        (30.0, "Seek -30s / +30s"),
+        (5.0, "Seek -5s / +5s"),
+        (2.5, "Seek -2.5s / +2.5s"),
+    ] {
         app.settings_mgr.settings.seek_step_seconds = step;
         for (w, h) in [(120, 40), (80, 24)] {
             let buffer = tui::render(&mut app, w, h);

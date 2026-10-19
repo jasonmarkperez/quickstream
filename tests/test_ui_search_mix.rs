@@ -637,7 +637,19 @@ fn search_never_panics_on_small_terminals() {
     common::isolate();
     let (mut app, dir) = test_app("search_small");
     open_search(&mut app, &dir, "halc");
-    for (w, h) in [(70, 24), (40, 12), (20, 6), (90, 10), (120, 12), (8, 4), (1, 1), (2, 2), (1, 3), (10, 1), (3, 3)] {
+    for (w, h) in [
+        (70, 24),
+        (40, 12),
+        (20, 6),
+        (90, 10),
+        (120, 12),
+        (8, 4),
+        (1, 1),
+        (2, 2),
+        (1, 3),
+        (10, 1),
+        (3, 3),
+    ] {
         tui::render(&mut app, w, h);
     }
     let _ = fs::remove_dir_all(&dir);

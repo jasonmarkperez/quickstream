@@ -857,6 +857,47 @@ pub fn clip(text: &str, width: usize) -> String {
     fit(text, width).trim_end_matches(' ').to_string()
 }
 
+/// `text` in at most `rows` lines of at most `width` columns, broken between words (a word wider
+/// than a line is broken anywhere). When it needs more lines, the last one shown ends with `…`,
+/// so the text is never cut without a mark.
+pub fn wrap_clipped(text: &str, width: usize, rows: usize) -> Vec<String> {
+    if width == 0 || rows == 0 {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    let mut used = 0;
+    for word in text.split_whitespace() {
+        let word_width = text_width(word);
+        if used > 0 && used + 1 + word_width > width {
+            lines.push(std::mem::take(&mut line));
+            used = 0;
+        }
+        if used > 0 {
+            line.push(' ');
+            used += 1;
+        }
+        for c in word.chars() {
+            let w = char_width(c);
+            if used + w > width && used > 0 {
+                lines.push(std::mem::take(&mut line));
+                used = 0;
+            }
+            line.push(c);
+            used += w;
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    if lines.len() > rows {
+        let rest = lines[rows - 1..].join(" ");
+        lines.truncate(rows - 1);
+        lines.push(clip(&rest, width));
+    }
+    lines
+}
+
 /// Columns `c` takes in the terminal (2 for wide characters such as CJK).
 pub fn char_width(c: char) -> usize {
     let mut buf = [0u8; 4];

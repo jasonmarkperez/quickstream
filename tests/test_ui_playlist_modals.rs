@@ -292,6 +292,46 @@ fn name_prompt_long_errors_show_whole() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// An error that needs more than the two rows the prompt gives it is cut with `…` at the end
+/// of its last shown row, never mid-text without one.
+#[test]
+fn name_prompt_errors_too_long_for_two_rows_end_with_an_ellipsis() {
+    common::isolate();
+    let (mut app, dir) = test_app("prompt_error_cut");
+    let long_name = "Very Long Playlist Name That Keeps Going And Going Well Past The Field";
+    let message = format!("Still renaming \"{long_name}\" to \"{long_name} Again\", try again in a moment");
+    app.playlists.modal = Some(PlaylistModal::NamePrompt {
+        purpose: NamePurpose::Create,
+        input: "X".to_string(),
+        error: Some(message.clone()),
+    });
+    let short = "A playlist file named \"Latin\" exists but couldn't be loaded";
+    for (w, h, text) in [(120, 40, message.as_str()), (80, 24, message.as_str()), (40, 12, short)] {
+        if let Some(PlaylistModal::NamePrompt { error, .. }) = app.playlists.modal.as_mut() {
+            *error = Some(text.to_string());
+        }
+        let buffer = tui::render(&mut app, w, h);
+        let rect = modal_rect(&buffer);
+        let p = theme::palette();
+        // The rows drawn in ERROR inside the modal, below the name row (the error's rows).
+        let name_y = name_row(&buffer, rect).unwrap();
+        let rows: Vec<String> = (name_y + 2..rect.bottom() - 1)
+            .filter(|&y| {
+                (rect.x + 1..rect.right() - 1).any(|x| buffer[(x, y)].fg == p.error && buffer[(x, y)].symbol() != " ")
+            })
+            .map(|y| inside(&buffer, rect, y).trim().to_string())
+            .collect();
+        assert_eq!(rows.len(), 2, "{w}x{h}: two error rows\n{}", screen(&buffer));
+        assert!(rows[1].ends_with('…'), "{w}x{h}: cut with …: {rows:?}");
+        let shown = format!("{} {}", rows[0], rows[1].trim_end_matches('…'));
+        assert!(
+            text.starts_with(shown.trim_end()),
+            "{w}x{h}: {shown:?} is the message's start"
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn delete_confirmation_is_drawn_in_error_3d() {
     common::isolate();
