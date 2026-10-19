@@ -359,23 +359,32 @@ fn write_undecodable_mp3(path: &Path) {
     fs::write(path, "this is not audio at all\n".repeat(4000)).unwrap();
 }
 
-/// Fake `ffmpeg` executable: appends a line to `log` on every invocation, then runs `body`.
+/// Fake `ffmpeg` executable: appends its arguments to `log` (one line per invocation), then
+/// runs `body`.
 #[cfg(unix)]
 fn fake_ffmpeg(dir: &Path, log: &Path, body: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let script = dir.join("fake-ffmpeg");
     fs::write(
         &script,
-        format!("#!/bin/sh\necho call >> '{}'\n{}\n", log.display(), body),
+        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{}\n", log.display(), body),
     )
     .unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
     script
 }
 
+/// The arguments of each logged invocation of a [`fake_ffmpeg`].
+#[cfg(unix)]
+fn calls(log: &Path) -> Vec<String> {
+    fs::read_to_string(log)
+        .map(|s| s.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
 #[cfg(unix)]
 fn invocations(log: &Path) -> usize {
-    fs::read_to_string(log).map(|s| s.lines().count()).unwrap_or(0)
+    calls(log).len()
 }
 
 #[test]
@@ -570,21 +579,33 @@ fn test_decode_does_not_retry_from_zero_after_timeout() {
     let track = dir.join("track.wav");
     write_wav(&track, &click_track(120.0, 12.0));
     let log = dir.join("calls.log");
+    // Stalls at the seek offset; from offset 0 it answers at once with 10s of audio, so a retry
+    // from 0 would make the decode succeed, whether or not the stalled call got to log before
+    // it was killed (under load it may not have).
+    let body = "case \" $* \" in *\" -ss 0 \"*) head -c 220500 /dev/zero; exit 0 ;; esac\nexec sleep 30";
     let cfg = FfmpegConfig {
-        binary: fake_ffmpeg(&dir, &log, "exec sleep 30"),
-        // Long enough for the fake script to start and log, short enough to keep the test fast.
-        timeout: Duration::from_secs(1),
+        binary: fake_ffmpeg(&dir, &log, body),
+        // Long enough for the fake script to start even on a loaded machine, short enough to
+        // keep the test fast.
+        timeout: Duration::from_secs(3),
     };
 
     let start = Instant::now();
     let out = BpmAnalyzer::decode_pcm_slice_with(&cfg, &track, 30, 20, SAMPLE_RATE, None);
     let elapsed = start.elapsed();
-    assert!(out.is_none());
-    assert_eq!(
-        invocations(&log),
-        1,
-        "a timed-out decode must not be retried from offset 0"
+    let calls = calls(&log);
+    assert!(
+        out.is_none(),
+        "a timed-out decode must not be retried from offset 0 (calls: {:?})",
+        calls
     );
+    assert!(
+        calls.iter().all(|c| !format!(" {} ", c).contains(" -ss 0 ")),
+        "a timed-out decode must not be retried from offset 0 (calls: {:?})",
+        calls
+    );
+    assert!(calls.len() <= 1, "expected at most one decode, got {:?}", calls);
+    // A second decode that also stalled would cost a second timeout.
     assert!(
         elapsed < 2 * cfg.timeout,
         "a stalled file must cost at most one timeout, took {:?}",
