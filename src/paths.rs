@@ -22,9 +22,14 @@ pub fn get_config_dir() -> PathBuf {
         }
     }
     if let Some(base) = directories::BaseDirs::new() {
-        return base.home_dir().join(".config").join("quickstream");
+        return default_config_dir(base.home_dir());
     }
     PathBuf::from(".config").join("quickstream")
+}
+
+/// The config folder when `XDG_CONFIG_HOME` is not set: `~/.config/quickstream`.
+fn default_config_dir(home: &Path) -> PathBuf {
+    home.join(".config").join("quickstream")
 }
 
 /// Get the Quickstream cache directory (~/.cache/quickstream or $XDG_CACHE_HOME/quickstream).
@@ -53,60 +58,59 @@ pub fn get_data_dir() -> PathBuf {
     PathBuf::from(".local").join("share").join("quickstream")
 }
 
-/// Migrate a legacy file to the new target path if target does not already exist.
+/// Migrate a legacy file to the new target path if target does not already exist. Always returns
+/// `target`: when the copy fails the app starts from defaults there, and never writes to `legacy`.
 fn migrate_file(target: &Path, legacy: &Path) -> PathBuf {
-    if target.exists() {
+    if target.exists() || !legacy.exists() {
         return target.to_path_buf();
     }
-    if legacy.exists() {
-        if let Some(parent) = target.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if fs::copy(legacy, target).is_ok() {
-            return target.to_path_buf();
-        }
-        // Fallback to legacy path if copy fails
-        return legacy.to_path_buf();
+    let copied = match target.parent() {
+        Some(parent) => fs::create_dir_all(parent).and_then(|_| fs::copy(legacy, target)),
+        None => fs::copy(legacy, target),
+    };
+    if let Err(e) = copied {
+        crate::log_warn!(
+            "paths",
+            "Couldn't migrate {} to {}: {}",
+            legacy.display(),
+            target.display(),
+            e
+        );
     }
     target.to_path_buf()
 }
 
-/// Get path to configuration file (config.json) with auto-migration.
-pub fn get_config_path() -> PathBuf {
-    let target = get_config_dir().join("config.json");
+/// `name` in the config folder, migrated from the first legacy file that exists: the macOS
+/// `~/Library/Application Support/quickstream/<name>`, then `~/<dotfile>`. Legacy files are only
+/// migrated into the default `~/.config/quickstream`; a folder `XDG_CONFIG_HOME` names (#60)
+/// starts from its own files.
+fn migrated_config_file(name: &str, dotfile: &str) -> PathBuf {
+    let dir = get_config_dir();
+    let target = dir.join(name);
     if target.exists() {
         return target;
     }
-    if let Some(base) = directories::BaseDirs::new() {
-        // First check macOS ~/Library/Application Support/quickstream/config.json
-        let app_support = base.config_dir().join("quickstream").join("config.json");
-        if app_support.exists() {
-            return migrate_file(&target, &app_support);
-        }
-        // Then check legacy ~/.quickstream_config.json
-        let legacy = base.home_dir().join(".quickstream_config.json");
-        return migrate_file(&target, &legacy);
+    let Some(base) = directories::BaseDirs::new() else {
+        return target;
+    };
+    if dir != default_config_dir(base.home_dir()) {
+        return target;
     }
-    target
+    let app_support = base.config_dir().join("quickstream").join(name);
+    if app_support.exists() {
+        return migrate_file(&target, &app_support);
+    }
+    migrate_file(&target, &base.home_dir().join(dotfile))
+}
+
+/// Get path to configuration file (config.json) with auto-migration.
+pub fn get_config_path() -> PathBuf {
+    migrated_config_file("config.json", ".quickstream_config.json")
 }
 
 /// Get path to bookmarks file (bookmarks.json) with auto-migration.
 pub fn get_bookmarks_path() -> PathBuf {
-    let target = get_config_dir().join("bookmarks.json");
-    if target.exists() {
-        return target;
-    }
-    if let Some(base) = directories::BaseDirs::new() {
-        // First check macOS ~/Library/Application Support/quickstream/bookmarks.json
-        let app_support = base.config_dir().join("quickstream").join("bookmarks.json");
-        if app_support.exists() {
-            return migrate_file(&target, &app_support);
-        }
-        // Then check legacy ~/.quickstream_bookmarks.json
-        let legacy = base.home_dir().join(".quickstream_bookmarks.json");
-        return migrate_file(&target, &legacy);
-    }
-    target
+    migrated_config_file("bookmarks.json", ".quickstream_bookmarks.json")
 }
 
 /// Get the playlists folder (playlists/, one `<name>.m3u8` per playlist). Not created here: the

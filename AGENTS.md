@@ -103,7 +103,7 @@ quickstream/
 │   ├── web_access.rs     # Web access control: pairing token, Host/Origin/Content-Type checks, allowed folders
 │   ├── discovery.rs      # SSDP UDP multicast discovery (`SSDP_MULTICAST_ADDR`, 239.255.255.250:1900), XML device parsing
 │   ├── settings.rs       # User preferences model, SETTING_DEFINITIONS (with SettingGroup), named indexes (`setting::HOME_DIR`, …) and SETTING_DISPLAY_ORDER, SettingsContext (bookmarks, music folder, home, web port from the caller), options / cycle_setting / short_value, web_url, cached LAN address (prefetch), lookup_music_dir, config.json persistence
-│   ├── paths.rs          # XDG Base Directory resolution and backward-compatible migration; display_path (`~` for home, original case)
+│   ├── paths.rs          # XDG Base Directory resolution and backward-compatible migration (legacy files copied only into the default ~/.config/quickstream, not when XDG_CONFIG_HOME points elsewhere; a failed copy still returns the new path, never the legacy one); display_path (`~` for home, original case)
 │   └── logger.rs         # Non-blocking rotating file logger (~/.local/share/quickstream/quickstream.log)
 │
 └── tests/                # Integration test suite (Rust)
@@ -116,6 +116,7 @@ quickstream/
     ├── test_now_playing.rs   # Tab [1] Now Playing: numerals, bar, SIGNAL rows/omission, 120×40/100×30/80×24, UP NEXT per mode (repeat-one, loop wrap, stop end, continuous stream), SIGNAL vs UP NEXT at 120×30, same length as the strip, placeholder metadata, pending skip, autopilot, no DB on render
     ├── test_big_digits.rs    # kit::big_digits glyphs (2a style sheet), colon, widths
     ├── test_track_features.rs # Features worker: current track only, stale results dropped, retry, never blocks, shutdown; web BPM/key
+    ├── test_paths_migration.rs # Legacy config migration: none into XDG_CONFIG_HOME, into ~/.config/quickstream when unset, a failed copy never returns a legacy path (HOME a temp dir)
     ├── test_playlists.rs     # M3U8 parse/write round trips, name rules, safe paths, queue planning
     ├── test_playlist_store.rs # Store create/add/remove/move/rename/delete, case-only rename, load skips, file_path_of during a pending rename
     ├── test_playlists_ui.rs  # Tab 5 tab switching, two-pane navigation, rendering, modal hook, help
