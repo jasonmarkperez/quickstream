@@ -256,6 +256,8 @@ fn web_app() -> AppUI {
 fn web_state_until(app: &mut AppUI, cond: impl Fn(&quickstream::web::NowPlayingState) -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
+        // As the event loop does each tick: poll the features worker, then publish.
+        app.poll_track_features();
         app.update_web_state();
         if cond(&app.web_state.read().unwrap()) {
             return true;
@@ -393,4 +395,21 @@ fn test_refresh_interval_is_slow() {
     common::isolate();
     assert!(REFRESH_INTERVAL >= Duration::from_secs(30));
     assert!(REFRESH_INTERVAL > RETRY_INTERVAL);
+}
+
+/// The features worker is polled once per event-loop tick (by the loop itself), not again by
+/// `update_web_state`, which reports what the tick's poll found for the current track.
+#[test]
+fn test_update_web_state_does_not_poll_the_features_worker_again() {
+    common::isolate();
+    let mut app = web_app();
+    let (source, _) = counting_source(124.0);
+    app.set_track_feature_source(source);
+    app.queue.add_track(track(Path::new("/music/a.flac")));
+    let before = app.track_feature_polls();
+    app.update_web_state();
+    app.update_web_state();
+    assert_eq!(app.track_feature_polls(), before, "update_web_state polled the worker");
+    app.poll_track_features();
+    assert_eq!(app.track_feature_polls(), before + 1);
 }

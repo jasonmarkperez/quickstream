@@ -3546,10 +3546,17 @@ impl AppUI {
     }
 
     /// Point the features worker at the current track and take what it has found. Never blocks.
+    /// The event loop calls it once per tick, before `update_web_state`.
     pub fn poll_track_features(&mut self) {
         let track = self.queue.current_track().map(|t| t.filepath.as_path());
         self.track_features.follow(track);
         self.track_features.poll();
+    }
+
+    /// How many times the features worker has been polled (tests check once per tick).
+    #[doc(hidden)]
+    pub fn track_feature_polls(&self) -> u64 {
+        self.track_features.polls()
     }
 
     /// The current track's analysis features, once the worker has found them.
@@ -3567,7 +3574,6 @@ impl AppUI {
         if self.web_server.is_none() {
             return;
         }
-        self.poll_track_features();
         if let Ok(mut state) = self.web_state.write() {
             state.is_playing = self.player.is_playing();
             state.is_paused = self.player.is_paused();
@@ -3636,8 +3642,9 @@ impl AppUI {
                 state.channels = track.channels;
                 state.filepath = Some(track.filepath.clone());
                 state.has_cover = true;
-                // From the features worker: no database read on the UI thread.
-                let feat = self.track_features.features();
+                // What this tick's poll of the features worker found for this track: no
+                // database read on the UI thread, and never the previous track's features.
+                let feat = self.track_features.features_for(&track.filepath);
                 state.bpm = feat.and_then(|f| f.bpm);
                 state.key = feat.and_then(|f| f.display_key());
             } else {

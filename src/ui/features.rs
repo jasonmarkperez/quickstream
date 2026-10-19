@@ -41,6 +41,8 @@ pub struct TrackFeaturesWorker {
     track: Option<PathBuf>,
     /// Features of `track`, once found.
     features: Option<TrackFeatures>,
+    /// How many times [`poll`](Self::poll) has run (tests check it runs once per tick).
+    polls: u64,
 }
 
 impl TrackFeaturesWorker {
@@ -71,6 +73,7 @@ impl TrackFeaturesWorker {
             results,
             track: None,
             features: None,
+            polls: 0,
         }
     }
 
@@ -92,11 +95,17 @@ impl TrackFeaturesWorker {
     /// Take the results the worker has sent, keeping only those for the current track. Never
     /// blocks.
     pub fn poll(&mut self) {
+        self.polls += 1;
         while let Ok((track, features)) = self.results.try_recv() {
             if self.track.as_ref() == Some(&track) {
                 self.features = Some(features);
             }
         }
+    }
+
+    /// How many times [`poll`](Self::poll) has run.
+    pub fn polls(&self) -> u64 {
+        self.polls
     }
 
     /// Features of the current track, if they have been found.
