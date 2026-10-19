@@ -885,3 +885,42 @@ fn test_now_playing_up_next_stays_when_features_arrive_at_120x30() {
     assert!(positions.windows(2).all(|w| w[0] < w[1]), "2b order:\n{screen}");
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Now Playing and the strip on the other tabs take the length from the same place: the
+/// player's when it knows it (the tag length can be an estimate), else the track's own.
+#[test]
+fn test_now_playing_and_the_strip_show_the_same_length() {
+    common::isolate();
+    let (mut app, dir) = np_app("same_length");
+    // The tags say 05:52; mpv says 06:00.
+    app.player = Box::new(common::fake_player::FakePlayer::playing_at(161.0, 360.0));
+    let screen = common::tui::render_text(&mut app, 120, 40);
+    assert!(screen.contains(" / 06:00"), "{screen}");
+    assert!(screen.contains("REMAIN 03:19"), "{screen}");
+    assert!(!screen.contains("05:52"), "{screen}");
+    let screen = common::tui::render_text(&mut app, 80, 24);
+    assert!(screen.contains("06:00") && !screen.contains("05:52"), "{screen}");
+
+    app.active_tab = 1;
+    let buffer = common::tui::render(&mut app, 120, 40);
+    let strip_row = common::tui::rows(&buffer)
+        .into_iter()
+        .rev()
+        .find(|r| r.contains("02:41") && r.contains("VOL"))
+        .expect("strip");
+    assert!(strip_row.contains("06:00"), "{strip_row:?}");
+
+    // The player doesn't know the length yet: both take the track's own.
+    app.player = Box::new(common::fake_player::FakePlayer::playing_at(161.0, 0.0));
+    let strip_row = common::tui::render_text(&mut app, 120, 40)
+        .lines()
+        .rev()
+        .find(|r| r.contains("02:41") && r.contains("VOL"))
+        .map(str::to_string)
+        .expect("strip");
+    assert!(strip_row.contains("05:52"), "{strip_row:?}");
+    app.active_tab = 0;
+    let screen = common::tui::render_text(&mut app, 120, 40);
+    assert!(screen.contains(" / 05:52"), "{screen}");
+    let _ = fs::remove_dir_all(&dir);
+}

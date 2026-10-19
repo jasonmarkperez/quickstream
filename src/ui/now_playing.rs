@@ -290,34 +290,16 @@ impl AppUI {
         summary
     }
 
-    /// The player state as the footnote names it, with the strip's glyphs. A debounced skip has
-    /// moved the queue but not the player yet: `» QUEUED`.
-    fn state_word(&self) -> &'static str {
-        if self.pending_track_skip {
-            "» QUEUED"
-        } else if self.player.is_playing() {
-            "▶ PLAYING"
-        } else if self.player.is_paused() {
-            "‖ PAUSED"
-        } else {
-            "■ STOPPED"
-        }
-    }
-
-    /// Position of `track` (the current one) and its length when known. During a pending skip
-    /// the player still holds the old track, so the target shows from 00:00 with only its own
-    /// length, never the old track's.
-    fn hero_times(&self, track: &AudioMetadata) -> (f64, Option<f64>) {
-        let own = (track.duration_seconds > 0.0).then_some(track.duration_seconds);
-        if self.pending_track_skip {
-            return (0.0, own);
-        }
-        let pos = self
-            .pending_seek_target
-            .unwrap_or_else(|| self.player.position_seconds())
-            .max(0.0);
-        let player = self.player.duration_seconds();
-        (pos, own.or((player > 0.0).then_some(player)))
+    /// The player state as the footnote names it, with the strip's glyph
+    /// ([`AppUI::player_state_glyph`]).
+    fn state_word(&self) -> String {
+        let word = match self.player_state_glyph() {
+            "»" => "QUEUED",
+            "▶" => "PLAYING",
+            "‖" => "PAUSED",
+            _ => "STOPPED",
+        };
+        format!("{} {word}", self.player_state_glyph())
     }
 
     /// The autopilot's mix profile (`DIVERSE SHUFFLE`) while it runs.
@@ -335,7 +317,7 @@ impl AppUI {
         let digits = len.to_string().len().max(2);
         let position = has_track.then(|| format!("{:0digits$}/{len:0digits$}", self.queue.current_index() + 1));
         let mode = queue_mode_note(&self.settings_mgr.settings.queue_mode);
-        let state = self.state_word().to_string();
+        let state = self.state_word();
         if !compact {
             let mut parts: Vec<String> = position.into_iter().map(|p| format!("TRACK {p}")).collect();
             parts.push(format!("QUEUE {mode}"));
@@ -431,7 +413,7 @@ impl AppUI {
         let top = header_rows + body;
         let core = top + 2 + u16::from(!tech.is_empty());
 
-        let (pos, dur) = self.hero_times(&track);
+        let (pos, dur) = self.playback_times();
         let elapsed = kit::duration(pos);
         let numerals = kit::big_digits(&elapsed);
         let bold = theme::ink().add_modifier(Modifier::BOLD);
