@@ -360,6 +360,9 @@ pub struct SettingsManager {
     /// writing on the calling thread.
     persist: Option<crate::persist::PersistHandle>,
     lan_ip: LanIp,
+    /// The port the web server is bound to while it runs (`set_bound_web_port`), which is not
+    /// `web_server_port` when another program held that one. `None` while no server runs.
+    bound_web_port: Option<u16>,
 }
 
 impl Default for SettingsManager {
@@ -383,6 +386,7 @@ impl SettingsManager {
             settings,
             persist: None,
             lan_ip: LanIp::new(default_lan_ip_resolver()),
+            bound_web_port: None,
         }
     }
 
@@ -395,6 +399,12 @@ impl SettingsManager {
     /// thread; the cached address is dropped.
     pub fn set_lan_ip_resolver(&mut self, resolver: impl Fn() -> String + Send + Sync + 'static) {
         self.lan_ip = LanIp::new(Arc::new(resolver));
+    }
+
+    /// Record the port the web server bound (`None` once it stops), for the web server's value
+    /// and address. The app calls this whenever it starts or stops the server.
+    pub fn set_bound_web_port(&mut self, port: Option<u16>) {
+        self.bound_web_port = port;
     }
 
     pub fn load_from(path: &Path) -> Option<Settings> {
@@ -530,8 +540,9 @@ impl SettingsManager {
     }
 
     /// The compact value of setting `index` for the Settings list (`◂ VALUE ▸`, mockup 2e):
-    /// uppercase (`MPV`, `10 S`, `CONTINUOUS (LOOP)`, `ON  :8080`), paths in their own case with
-    /// `~` for home. The same wording labels the choices in `options`.
+    /// uppercase (`MPV`, `10 S`, `CONTINUOUS (LOOP)`, `ON  :8080` with the port the server bound,
+    /// `ON` while none runs), paths in their own case with `~` for home. The same wording labels
+    /// the choices in `options`.
     pub fn short_value(&self, index: usize) -> String {
         self.value(index)
             .map(|value| self.value_label(index, &value))
@@ -549,7 +560,10 @@ impl SettingsManager {
                 other => other.to_uppercase(),
             },
             (5, SettingValue::Bool(pcm)) => if *pcm { "PCM WAV" } else { "OFF" }.to_string(),
-            (6, SettingValue::Bool(true)) => format!("ON  :{}", self.settings.web_server_port),
+            (6, SettingValue::Bool(true)) => match self.bound_web_port {
+                Some(port) => format!("ON  :{}", port),
+                None => "ON".to_string(),
+            },
             (9, SettingValue::Text(key)) if MIX_PROFILES.contains(&key.as_str()) => {
                 mix_profile_for(key).short_name().to_uppercase()
             }
@@ -563,15 +577,16 @@ impl SettingsManager {
         }
     }
 
-    /// The web remote's address while the web server setting is on, in its own case:
-    /// `http://127.0.0.1:<port>` for this computer, or with network access the pairing link
-    /// (LAN address and session token). The LAN address comes from the cache (looked up on a
-    /// worker), so the link is `None` until it is known rather than looked up while drawing.
+    /// The web remote's address while the web server setting is on and the server runs, in its
+    /// own case: `http://127.0.0.1:<port>` for this computer, or with network access the pairing
+    /// link (LAN address and session token), on the port the server bound. The LAN address comes
+    /// from the cache (looked up on a worker), so the link is `None` until it is known rather
+    /// than looked up while drawing.
     pub fn web_url(&self) -> Option<String> {
         if !self.settings.web_server_enabled {
             return None;
         }
-        let port = self.settings.web_server_port;
+        let port = self.bound_web_port?;
         if !self.settings.web_server_lan {
             return Some(format!("http://127.0.0.1:{}", port));
         }

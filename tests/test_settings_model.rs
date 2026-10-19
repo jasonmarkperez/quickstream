@@ -175,7 +175,8 @@ fn short_values_read_as_mockup_2e() {
     assert_eq!(s(&mgr, "default_mix_profile"), "DIVERSE SHUFFLE");
 
     mgr.settings.web_server_enabled = true;
-    mgr.settings.web_server_port = 8080;
+    // The port the server bound (no server runs here).
+    mgr.set_bound_web_port(Some(8080));
     assert_eq!(s(&mgr, "web_server_enabled"), "ON  :8080");
     mgr.settings.queue_mode = "repeat_one".to_string();
     assert_eq!(s(&mgr, "queue_mode"), "REPEAT TRACK");
@@ -205,7 +206,7 @@ fn display_values_keep_their_wording() {
         "Diverse Library Shuffle"
     );
     mgr.settings.web_server_enabled = true;
-    mgr.settings.web_server_port = 8123;
+    mgr.set_bound_web_port(Some(8123));
     assert_eq!(
         mgr.get_display_value(index_of("web_server_enabled")),
         "Enabled (http://127.0.0.1:8123)"
@@ -412,7 +413,7 @@ fn lan_address_is_resolved_off_the_calling_thread_and_cached() {
     let resolver = gated_resolver(&mut mgr, "192.0.2.44");
     mgr.settings.web_server_enabled = true;
     mgr.settings.web_server_lan = true;
-    mgr.settings.web_server_port = 8080;
+    mgr.set_bound_web_port(Some(8080));
     let index = index_of("web_server_enabled");
 
     // While the address is unknown the value leaves it out instead of waiting for it.
@@ -452,7 +453,9 @@ fn web_url_is_the_address_the_display_value_shows() {
     assert_eq!(mgr.web_url(), None);
 
     mgr.settings.web_server_enabled = true;
-    mgr.settings.web_server_port = 8099;
+    // The server bound 8099; the configured port is another.
+    mgr.settings.web_server_port = 8080;
+    mgr.set_bound_web_port(Some(8099));
     assert_eq!(mgr.web_url().as_deref(), Some("http://127.0.0.1:8099"));
     assert_eq!(mgr.get_display_value(web), "Enabled (http://127.0.0.1:8099)");
 
@@ -477,6 +480,8 @@ fn settings_tab_render_never_resolves_the_lan_address() {
     let resolver = gated_resolver(&mut app.settings_mgr, "192.0.2.45");
     app.settings_mgr.settings.web_server_enabled = true;
     app.settings_mgr.settings.web_server_lan = true;
+    // As if the server were running (none is started here).
+    app.settings_mgr.set_bound_web_port(Some(8080));
     app.active_tab = 3;
     // The option panel shows the pairing link while the web server row is selected.
     app.settings_cursor = index_of("web_server_enabled");
@@ -503,4 +508,36 @@ fn settings_tab_render_never_resolves_the_lan_address() {
     let text = common::tui::render_text(&mut app, 120, 40);
     assert!(text.contains("192.0.2.45"), "{}", text);
     assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn web_values_name_the_bound_port_not_the_configured_one() {
+    common::isolate();
+    let mut mgr = manager("bound_port");
+    let web = index_of("web_server_enabled");
+    mgr.settings.web_server_enabled = true;
+    mgr.settings.web_server_port = 8080;
+
+    // No server running: no port or address is made up from the configured one.
+    assert_eq!(mgr.short_value(web), "ON");
+    assert_eq!(mgr.web_url(), None);
+    assert_eq!(mgr.get_display_value(web), "Enabled");
+
+    // 8080 was taken, so the server bound 8090: every value names 8090.
+    mgr.set_bound_web_port(Some(8090));
+    assert_eq!(mgr.short_value(web), "ON  :8090");
+    assert_eq!(mgr.web_url().as_deref(), Some("http://127.0.0.1:8090"));
+    assert_eq!(mgr.get_display_value(web), "Enabled (http://127.0.0.1:8090)");
+    let labels: Vec<String> = mgr
+        .options(web, &[], None)
+        .choices
+        .into_iter()
+        .map(|c| c.label)
+        .collect();
+    assert_eq!(labels, ["OFF", "ON  :8090"]);
+
+    // Stopped again.
+    mgr.set_bound_web_port(None);
+    assert_eq!(mgr.short_value(web), "ON");
+    assert_eq!(mgr.web_url(), None);
 }

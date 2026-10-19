@@ -1146,7 +1146,7 @@ fn test_settings_show_pairing_link_when_lan_access_enabled() {
     common::isolate();
     let mut mgr = quickstream::settings::SettingsManager::new();
     mgr.settings.web_server_enabled = true;
-    mgr.settings.web_server_port = 8080;
+    mgr.set_bound_web_port(Some(8080));
     mgr.settings.web_server_lan = false;
     let local = mgr.get_display_value(6);
     assert!(!local.contains("token"), "{}", local);

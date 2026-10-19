@@ -4,9 +4,9 @@
 //! address and the keys that change it).
 //!
 //! Only what is in memory is drawn: the settings, the Music Homes the app holds
-//! (`AppUI::bookmarks`, never bookmarks.json), the music folder looked up at startup and the
-//! cached LAN address (`SettingsManager::web_url`). The startup home editor stays inline: while
-//! it is open its row shows the typed text with a block cursor.
+//! (`AppUI::bookmarks`, never bookmarks.json), the music folder looked up at startup, the port
+//! the web server bound and the cached LAN address (`SettingsManager::web_url`). The startup
+//! home editor stays inline: while it is open its row shows the typed text with a block cursor.
 
 use ratatui::prelude::*;
 

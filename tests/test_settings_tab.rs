@@ -347,8 +347,10 @@ fn under_110_columns_there_is_no_option_panel_and_the_position_joins_the_footnot
 fn web_address_keeps_its_case_in_the_option_panel_and_the_footnote() {
     common::isolate();
     let mut app = settings_app("web");
-    // Turned on after startup, so no server is started; drawing only reads the setting.
+    // Turned on after startup, so no server is started; drawing only reads the setting and the
+    // port the app recorded for the server.
     app.settings_mgr.settings.web_server_enabled = true;
+    app.settings_mgr.set_bound_web_port(Some(8080));
     app.settings_cursor = WEB_SERVER;
     let buf = tui::render(&mut app, 120, 40);
     assert_eq!(
@@ -371,6 +373,83 @@ fn web_address_keeps_its_case_in_the_option_panel_and_the_footnote() {
     app.settings_cursor = QUEUE_MODE;
     let buf = tui::render(&mut app, 100, 30);
     assert!(!dump(&buf).contains("http://"));
+}
+
+#[test]
+fn web_rows_show_the_port_the_server_bound_not_the_configured_one() {
+    common::isolate();
+    let mut app = settings_app("bound_port");
+    // Another program holds the configured port, so the server moves to another one.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let configured = held.local_addr().unwrap().port();
+    app.settings_mgr.settings.web_server_port = configured;
+    app.settings_cursor = WEB_SERVER;
+    press(&mut app, KeyCode::Right);
+    let bound = app.web_server.as_ref().expect("web server started").port;
+    assert_ne!(bound, configured);
+    let url = format!("http://127.0.0.1:{bound}");
+    assert!(app.status_message.contains(&url), "{}", app.status_message);
+
+    let buf = tui::render(&mut app, 120, 40);
+    let header = tui::row(&buf, row_of(&buf, "QUICKSTREAM"));
+    assert!(header.contains(&format!("WEB :{bound}")), "{header}");
+    assert_eq!(
+        span(&buf, must_row(&buf, WEB_SERVER), VALUE_X, BAR_END_X + 1),
+        format!("◂ ON  :{bound} ▸")
+    );
+    assert!(
+        text_from(&buf, &format!("●   ON  :{bound}"), OPTION_X).is_some(),
+        "\n{}",
+        dump(&buf)
+    );
+    assert!(text_from(&buf, &url, OPTION_X).is_some(), "\n{}", dump(&buf));
+    assert!(!dump(&buf).contains(&format!(":{configured}")), "\n{}", dump(&buf));
+
+    let buf = tui::render(&mut app, 100, 30);
+    let line = span(&buf, label_row(&buf) + 2, 0, 100);
+    assert!(line.starts_with(&format!("{url}  ·  ")), "{line:?}");
+
+    // Turned off: the server stops and no port is shown.
+    press(&mut app, KeyCode::Left);
+    assert!(app.web_server.is_none());
+    let buf = tui::render(&mut app, 120, 40);
+    assert_eq!(
+        span(&buf, must_row(&buf, WEB_SERVER), VALUE_X, BAR_END_X + 1),
+        "◂ OFF ▸"
+    );
+    assert!(text_from(&buf, "○   ON", OPTION_X).is_some(), "\n{}", dump(&buf));
+    assert!(!dump(&buf).contains(&format!(":{bound}")), "\n{}", dump(&buf));
+    drop(held);
+}
+
+#[test]
+fn web_server_started_at_launch_shows_its_bound_port() {
+    let root = common::isolate();
+    let dir = root.join("settings_tab_launch_port");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let configured = held.local_addr().unwrap().port();
+    let mut settings = SettingsManager::with_path(dir.join("config.json"));
+    settings.settings.web_server_enabled = true;
+    settings.settings.web_server_port = configured;
+    let mut app = AppUI::new(Some(dir), settings);
+    app.player = Box::new(FakePlayer::default());
+    app.active_tab = 3;
+    app.settings_cursor = WEB_SERVER;
+    let bound = app.web_server.as_ref().expect("web server started at launch").port;
+    assert_ne!(bound, configured);
+
+    let buf = tui::render(&mut app, 120, 40);
+    assert_eq!(
+        span(&buf, must_row(&buf, WEB_SERVER), VALUE_X, BAR_END_X + 1),
+        format!("◂ ON  :{bound} ▸")
+    );
+    assert!(text_from(&buf, &format!("http://127.0.0.1:{bound}"), OPTION_X).is_some());
+    if let Some(handle) = app.web_server.take() {
+        handle.stop();
+    }
+    drop(held);
 }
 
 // ---------- the startup home editor ----------

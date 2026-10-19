@@ -355,6 +355,7 @@ impl AppUI {
         } else {
             (None, None)
         };
+        settings_mgr.set_bound_web_port(web_server.as_ref().map(|s| s.port));
 
         let (metadata_tx, metadata_rx) = std::sync::mpsc::channel();
         let (queue_add_tx, queue_add_rx) = std::sync::mpsc::channel();
@@ -3133,6 +3134,7 @@ impl AppUI {
             Some(old) => {
                 let port = old.port;
                 old.stop();
+                self.settings_mgr.set_bound_web_port(None);
                 port
             }
             None => self.settings_mgr.settings.web_server_port,
@@ -3146,6 +3148,7 @@ impl AppUI {
                 }
                 self.web_server = Some(handle);
                 self.web_cmd_rx = Some(rx);
+                self.settings_mgr.set_bound_web_port(Some(actual_port));
                 Ok(actual_port)
             }
             Err(e) => {
@@ -3288,6 +3291,7 @@ impl AppUI {
             }
         } else if let Some(handle) = self.web_server.take() {
             handle.stop();
+            self.settings_mgr.set_bound_web_port(None);
             self.web_cmd_rx = None;
             self.status_message = "Stopped web server".to_string();
         }
