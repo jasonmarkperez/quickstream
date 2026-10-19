@@ -29,9 +29,13 @@ pub struct MetadataCache(Arc<CacheShared>);
 #[derive(Debug, Default)]
 struct CacheShared {
     map: std::sync::RwLock<HashMap<PathBuf, AudioMetadata>>,
-    /// Bumped on every insert, so the UI can cache values computed from the map (a folder's
-    /// total length) and recompute them only when tags have arrived.
+    /// Bumped on every insert, so the UI can cache values computed from the map and recompute
+    /// them only when tags have arrived.
     revision: AtomicU64,
+    /// For each folder that has had an insert, the [`revision`](Self::revision) after the last
+    /// insert of a file directly inside it: values computed from one folder's files (its total
+    /// length, its column widths) stay cached while tags arrive for other folders.
+    folders: std::sync::Mutex<HashMap<PathBuf, u64>>,
 }
 
 impl MetadataCache {
@@ -55,17 +59,39 @@ impl MetadataCache {
 
     /// Insert or replace the entry for `meta.filepath`.
     pub fn insert(&self, meta: AudioMetadata) {
+        let folder = meta.filepath.parent().map(Path::to_path_buf);
         self.0
             .map
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(meta.filepath.clone(), meta);
-        self.0.revision.fetch_add(1, Ordering::Release);
+        // After the map, so a reader that sees the new folder revision also sees the entry.
+        let revision = self.0.revision.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Some(folder) = folder {
+            self.0
+                .folders
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(folder, revision);
+        }
     }
 
     /// Changes whenever an entry is inserted or replaced (through any clone).
     pub fn revision(&self) -> u64 {
         self.0.revision.load(Ordering::Acquire)
+    }
+
+    /// Changes whenever an entry for a file directly inside `dir` is inserted or replaced
+    /// (through any clone); inserts elsewhere, subfolders included, leave it alone. `0` until
+    /// the first such insert.
+    pub fn folder_revision(&self, dir: &Path) -> u64 {
+        self.0
+            .folders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(dir)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn len(&self) -> usize {
@@ -87,6 +113,7 @@ impl From<HashMap<PathBuf, AudioMetadata>> for MetadataCache {
         Self(Arc::new(CacheShared {
             map: std::sync::RwLock::new(map),
             revision: AtomicU64::new(0),
+            folders: Default::default(),
         }))
     }
 }

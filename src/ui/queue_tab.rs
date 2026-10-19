@@ -3,9 +3,11 @@
 //!
 //! Rows are mapped from the browser entries and queue tracks at draw time (the stored labels are
 //! left as they are) and only the rows on screen are drawn. What needs a pass over a whole list —
-//! the set of queued paths behind `IN QUEUE`, the queue's and the folder's total length — is
-//! cached and rebuilt only when the queue's or the metadata cache's revision changes, so a frame
-//! never walks a 5,000-entry folder or reads a file.
+//! the set of queued paths behind `IN QUEUE`, the queue's and the folder's total length, and the
+//! column layout (decided from every row, so it doesn't change while scrolling) — is cached and
+//! rebuilt only when the queue's revision or the browsed folder's tags
+//! (`MetadataCache::folder_revision`) change, so a frame never walks a 5,000-entry folder or
+//! reads a file, and tags read for other folders don't make it.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -49,21 +51,57 @@ pub(super) struct QueueTabCache {
     queued_revision: Option<u64>,
     /// How many times the set has been built (tests check it is not rebuilt every frame).
     queued_builds: u64,
-    /// Total length of the queue, per queue revision; `None` when a length is unknown.
-    queue_total: Option<(u64, Option<f64>)>,
-    /// Total length of the audio files in the browsed folder; `None` when a length is unknown.
-    folder_total: Option<(FolderKey, Option<f64>)>,
+    /// The queue's total length and column layout, per queue revision.
+    queue_summary: Option<(u64, QueueSummary)>,
+    /// The browsed folder's total length and column layout.
+    folder_summary: Option<(FolderKey, FolderSummary)>,
+    /// How many times `folder_summary` has been computed.
+    folder_builds: u64,
+    /// Whether a file of the browsed folder is queued, per (`folder_builds`, queue revision).
+    folder_queued: Option<((u64, u64), bool)>,
     /// The home folder, shown as `~` in the library and playlist footnotes (read once).
     pub(super) home: Option<PathBuf>,
 }
 
-/// What the folder total depends on: the folder, its listing and the tags in memory.
+/// What the folder summary depends on: the folder, its listing and the tags of its files.
 #[derive(Debug)]
 struct FolderKey {
     dir: PathBuf,
     scan_id: u64,
     entries: usize,
-    metadata_revision: u64,
+    bookmarks: bool,
+    folder_revision: u64,
+}
+
+/// The browsed folder's total length and what its columns need, from all its files (not only
+/// the rows on screen), so the columns don't change while the list scrolls.
+#[derive(Debug, Clone, Copy)]
+struct FolderSummary {
+    /// `None` when the folder has no audio files or any length is unknown.
+    total: Option<f64>,
+    any_artist: bool,
+    /// Widest format (file extension), before `IN QUEUE` is taken into account.
+    format_cols: usize,
+    duration_cols: usize,
+}
+
+/// The queue's total length and what its columns need, from all its tracks.
+#[derive(Debug, Clone, Copy)]
+struct QueueSummary {
+    /// `None` when the queue is empty or any length is unknown.
+    total: Option<f64>,
+    duration_cols: usize,
+    any_artist: bool,
+}
+
+/// Width of a length column whose longest value is `longest` seconds (0 when none is known):
+/// [`kit::duration`] is never narrower for a longer length.
+pub(super) fn duration_cols(longest: f64) -> usize {
+    if longest > 0.0 {
+        text_width(&kit::duration(longest))
+    } else {
+        0
+    }
 }
 
 impl QueueTabCache {
@@ -175,62 +213,119 @@ impl AppUI {
         self.queue_tab.queued_builds += 1;
     }
 
-    /// Total length of the queue, or `None` when it is empty or any length is unknown.
-    fn queue_total(&mut self) -> Option<f64> {
+    /// The queue's total length and column layout, rebuilt only when the queue changes.
+    fn queue_summary(&mut self) -> QueueSummary {
         let revision = self.queue.revision();
-        if let Some((cached, total)) = self.queue_tab.queue_total {
+        if let Some((cached, summary)) = self.queue_tab.queue_summary {
             if cached == revision {
-                return total;
+                return summary;
             }
         }
         let tracks = self.queue.tracks();
-        let total = (!tracks.is_empty() && tracks.iter().all(|t| t.duration_seconds > 0.0))
-            .then(|| tracks.iter().map(|t| t.duration_seconds).sum());
-        self.queue_tab.queue_total = Some((revision, total));
-        total
+        let all_known = !tracks.is_empty() && tracks.iter().all(|t| t.duration_seconds > 0.0);
+        let longest = tracks.iter().map(|t| t.duration_seconds).fold(0.0, f64::max);
+        let summary = QueueSummary {
+            total: all_known.then(|| self.queue.total_duration_seconds()),
+            duration_cols: duration_cols(longest),
+            any_artist: tracks.iter().any(|t| !t.artist.is_empty()),
+        };
+        self.queue_tab.queue_summary = Some((revision, summary));
+        summary
     }
 
-    /// Total length of the audio files in the browsed folder, from the lengths already in the
-    /// metadata cache: `None` while the folder is being read, in Music Homes, when it has no
-    /// audio files or when any of their lengths is unknown. Recomputed only when the folder, its
-    /// listing or the metadata cache changes.
-    fn folder_total(&mut self) -> Option<f64> {
-        if self.browser_loading || self.in_bookmarks_view {
-            return None;
-        }
-        let (scan_id, entries, metadata_revision) = (
+    /// How many times the browsed folder's summary (total length, column layout) has been
+    /// computed (tests check tags for other folders don't recompute it).
+    #[doc(hidden)]
+    pub fn folder_summary_builds(&self) -> u64 {
+        self.queue_tab.folder_builds
+    }
+
+    /// The browsed folder's total length and column layout, from the tags already in the
+    /// metadata cache. Recomputed only when the folder, its listing or the tags of a file
+    /// directly inside it change ([`MetadataCache::folder_revision`]), never for tags read for
+    /// other folders.
+    ///
+    /// [`MetadataCache::folder_revision`]: crate::library::MetadataCache::folder_revision
+    fn folder_summary(&mut self) -> FolderSummary {
+        let (scan_id, entries, bookmarks, folder_revision) = (
             self.dir_scan_id,
             self.browser_entries.len(),
-            self.metadata_cache.revision(),
+            self.in_bookmarks_view,
+            self.metadata_cache.folder_revision(&self.browser_dir),
         );
-        if let Some((cached, total)) = &self.queue_tab.folder_total {
+        if let Some((cached, summary)) = &self.queue_tab.folder_summary {
             if cached.dir == self.browser_dir
-                && (cached.scan_id, cached.entries, cached.metadata_revision) == (scan_id, entries, metadata_revision)
+                && (cached.scan_id, cached.entries, cached.bookmarks, cached.folder_revision)
+                    == (scan_id, entries, bookmarks, folder_revision)
             {
-                return *total;
+                return *summary;
             }
         }
         let key = FolderKey {
             dir: self.browser_dir.clone(),
             scan_id,
             entries,
-            metadata_revision,
+            bookmarks,
+            folder_revision,
         };
-        let first_file = self.browser_entries.partition_point(|(_, _, is_dir)| *is_dir);
-        let files = &self.browser_entries[first_file..];
-        let total = self.metadata_cache.read_with(|map| {
-            let mut sum = 0.0;
+        let files = self.browser_files();
+        let summary = self.metadata_cache.read_with(|map| {
+            let mut total = Some(0.0);
+            let (mut longest, mut format_cols, mut any_artist) = (0.0_f64, 0, false);
             for (_, path, _) in files {
-                let secs = map.get(path).map(|m| m.duration_seconds).unwrap_or(0.0);
-                if secs <= 0.0 {
-                    return None;
+                let format = path.extension().map(|e| kit::upper(&e.to_string_lossy()));
+                format_cols = format_cols.max(format.as_deref().map(text_width).unwrap_or(0));
+                let meta = map.get(path);
+                any_artist |= meta.is_some_and(|m| !m.artist.is_empty());
+                let secs = meta.map(|m| m.duration_seconds).unwrap_or(0.0);
+                if secs > 0.0 {
+                    longest = longest.max(secs);
+                    total = total.map(|t| t + secs);
+                } else {
+                    total = None;
                 }
-                sum += secs;
             }
-            (!files.is_empty()).then_some(sum)
+            FolderSummary {
+                total: total.filter(|_| !files.is_empty()),
+                any_artist,
+                format_cols,
+                duration_cols: duration_cols(longest),
+            }
         });
-        self.queue_tab.folder_total = Some((key, total));
-        total
+        self.queue_tab.folder_summary = Some((key, summary));
+        self.queue_tab.folder_builds += 1;
+        summary
+    }
+
+    /// The file rows of the browsed folder (they follow the folder rows).
+    fn browser_files(&self) -> &[(String, PathBuf, bool)] {
+        let first_file = self.browser_entries.partition_point(|(_, _, is_dir)| *is_dir);
+        &self.browser_entries[first_file..]
+    }
+
+    /// Whether any file of the browsed folder is queued (its format column then needs room for
+    /// `IN QUEUE`), rebuilt only when the folder summary or the queue changes. Call after
+    /// [`Self::folder_summary`] and [`Self::refresh_queued_paths`].
+    fn folder_has_queued(&mut self) -> bool {
+        let key = (self.queue_tab.folder_builds, self.queue.revision());
+        if let Some((cached, any)) = self.queue_tab.folder_queued {
+            if cached == key {
+                return any;
+            }
+        }
+        let queued = &self.queue_tab.queued;
+        let any = self.browser_files().iter().any(|(_, path, _)| queued.contains(path));
+        self.queue_tab.folder_queued = Some((key, any));
+        any
+    }
+
+    /// Total length of the audio files in the browsed folder: `None` while the folder is being
+    /// read, in Music Homes, when it has no audio files or when any of their lengths is unknown.
+    fn folder_total(&mut self) -> Option<f64> {
+        if self.browser_loading || self.in_bookmarks_view {
+            return None;
+        }
+        self.folder_summary().total
     }
 
     /// Tab 2: the LIBRARY and QUEUE panels (2c). From 90 columns they are 4 columns apart; at
@@ -287,7 +382,9 @@ impl AppUI {
         let len = self.browser_entries.len() + loading_row;
         self.browser_state.select(Some(self.browser_cursor));
         let window = kit::visible_window(&mut self.browser_state, len, usize::from(list.height));
+        let summary = self.folder_summary();
         self.refresh_queued_paths();
+        let any_queued = self.folder_has_queued();
 
         let query = spotlight.as_deref().filter(|q| !q.is_empty());
         // With a query that matches, everything but the matches drops to DIM (3a).
@@ -413,12 +510,15 @@ impl AppUI {
                 .collect()
         });
 
-        // Column widths shared by the visible file rows, so formats and durations line up.
-        let files = || rows.iter().filter_map(|(_, r)| r.file.as_ref());
+        // Columns decided from every file of the folder, so they don't change while scrolling.
         let wide = tier >= WidthTier::Medium;
-        let show_artist = wide && tags && files().any(|c| !c.artist.is_empty());
-        let format_cols = files().map(|c| text_width(&c.format)).max().unwrap_or(0);
-        let duration_cols = files().map(|c| text_width(&c.duration)).max().unwrap_or(0);
+        let show_artist = wide && tags && summary.any_artist;
+        let format_cols = if any_queued {
+            summary.format_cols.max(text_width(IN_QUEUE))
+        } else {
+            summary.format_cols
+        };
+        let duration_cols = summary.duration_cols;
         let index_cols = if wide { INDEX_COLS } else { COMPACT_INDEX_COLS };
 
         for (row_y, (idx, row)) in rows.iter().enumerate() {
@@ -519,15 +619,12 @@ impl AppUI {
     /// The QUEUE panel; returns the rows its list shows.
     fn render_queue_panel(&mut self, f: &mut Frame, area: Rect, tier: WidthTier, compact: bool) -> u16 {
         let len = self.queue.len();
+        let summary = self.queue_summary();
         let footnote = if compact {
             len.to_string()
         } else {
-            let tracks = if len == 1 {
-                "1 TRACK".to_string()
-            } else {
-                format!("{len} TRACKS")
-            };
-            match self.queue_total() {
+            let tracks = kit::upper(&super::playlists::track_count_label(len));
+            match summary.total {
                 Some(total) => format!("{tracks}{SEP}{}", kit::duration(total)),
                 None => tracks,
             }
@@ -590,8 +687,9 @@ impl AppUI {
 
         let digits = len.max(1).to_string().len().max(2);
         let index_cols = digits as u16 + 2;
-        let duration_cols = rows.iter().map(|(_, r)| text_width(&r.duration)).max().unwrap_or(0);
-        let show_artist = tags && tier >= WidthTier::Medium && rows.iter().any(|(_, r)| !r.artist.is_empty());
+        // Columns decided from the whole queue, so they don't change while scrolling.
+        let duration_cols = summary.duration_cols;
+        let show_artist = tags && tier >= WidthTier::Medium && summary.any_artist;
         // Title and artist share what is left about 3:2 (26 and 17 columns in 2c).
         let free = usize::from(list.width)
             .saturating_sub(usize::from(MARKER_COLS + PLAYING_COLS + index_cols) + duration_cols);

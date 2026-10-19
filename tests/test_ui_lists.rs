@@ -727,6 +727,43 @@ fn folder_duration_shows_only_when_every_length_is_known() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Tags arriving for files outside the browsed folder (the queue's metadata pool, autopilot)
+/// leave its cached totals and columns alone; tags for one of its files recompute them once
+/// (PR #68 review: any insert anywhere used to re-sum the whole folder every frame).
+#[test]
+fn folder_summary_is_recomputed_only_for_tags_of_its_own_files() {
+    common::isolate();
+    let (mut app, dir) = lists_app("foldersummary", &[0, 1]);
+    tui::render(&mut app, 120, 40);
+    let builds = app.folder_summary_builds();
+    for i in 0..5 {
+        let elsewhere = dir.join("Sea Glass EP");
+        app.metadata_cache
+            .insert(meta(&elsewhere, &format!("{i}.flac"), "Other", "Someone", 100.0));
+        app.metadata_cache.insert(meta(
+            Path::new("/elsewhere"),
+            &format!("{i}.flac"),
+            "Other",
+            "Someone",
+            100.0,
+        ));
+        tui::render(&mut app, 120, 40);
+    }
+    assert_eq!(app.folder_summary_builds(), builds, "no recompute for other folders");
+
+    let (file, title, artist, secs) = FILES[2];
+    app.metadata_cache.insert(meta(&dir, file, title, artist, secs));
+    tui::render(&mut app, 120, 40);
+    let buf = tui::render(&mut app, 120, 40);
+    assert_eq!(
+        app.folder_summary_builds(),
+        builds + 1,
+        "one recompute for its own file"
+    );
+    assert!(screen(&buf).contains("·  14:12"), "{}", screen(&buf));
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn loading_row_counts_the_items_read_so_far() {
     common::isolate();
@@ -1077,4 +1114,170 @@ fn playlists_under_80_cols_show_only_the_focused_pane() {
     let buf = tui::render(&mut app, 70, 24);
     assert!(starts_with(&buf, "PLAYLISTS"), "{}", screen(&buf));
     let _ = fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Column layout is decided from the whole list, not the rows on screen
+// ---------------------------------------------------------------------------------------------
+
+/// Column of the first `…` (a cut title) in `from..to` of every list row: the rows whose text
+/// there holds `row_text` (so labels and footnotes, cut too, are left out).
+fn cut_columns(buf: &Buffer, from: u16, to: u16, row_text: &str) -> Vec<u16> {
+    (0..buf.area.height)
+        .filter(|&y| span_text(buf, y, from, to).contains(row_text))
+        .filter_map(|y| (from..to).find(|&x| tui::cells(buf, y)[x as usize] == "…"))
+        .collect()
+}
+
+/// Assert `a` and `b` are non-empty and every column in both is the same.
+fn assert_same_cut(a: &[u16], b: &[u16], what: &str) {
+    assert!(!a.is_empty() && !b.is_empty(), "{what}: no cut rows ({a:?}, {b:?})");
+    let first = a[0];
+    assert!(
+        a.iter().chain(b).all(|&x| x == first),
+        "{what}: the title column moved while scrolling ({a:?} vs {b:?})"
+    );
+}
+
+const LONG: &str = "with a title far too long to fit in its column";
+
+/// A queue whose first half has lengths and artists and whose second half doesn't (their tags
+/// not read yet) keeps the same columns when scrolled (PR #68 review).
+#[test]
+fn queue_columns_do_not_change_while_scrolling() {
+    common::isolate();
+    let (mut app, dir) = lists_app("qscroll", &[0, 1, 2]);
+    for i in 0..60 {
+        let known = i < 30;
+        app.queue.add_track(AudioMetadata {
+            filepath: dir.join(format!("q{i:02}.flac")),
+            filename: format!("q{i:02}.flac"),
+            title: format!("Track {i:02} {LONG}"),
+            artist: if known { "Mira Lenz".to_string() } else { String::new() },
+            duration_seconds: if known { 200.0 } else { 0.0 },
+            ..Default::default()
+        });
+    }
+    app.handle_tab_key(KeyCode::Char('l'));
+    app.queue_cursor = 0;
+    let top = tui::render(&mut app, 120, 30);
+    app.queue_cursor = 59;
+    let bottom = tui::render(&mut app, 120, 30);
+    assert!(queue(&top, "TRACK 00").is_some() && queue(&bottom, "TRACK 59").is_some());
+    assert_same_cut(
+        &cut_columns(&top, QUEUE_X, 120, "TRACK "),
+        &cut_columns(&bottom, QUEUE_X, 120, "TRACK "),
+        &format!("{}\n---\n{}", screen(&top), screen(&bottom)),
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The same for the library: tagged files (artist, length) sort after untagged ones, so the
+/// first and last pages differ in what they have.
+#[test]
+fn library_columns_do_not_change_while_scrolling() {
+    common::isolate();
+    let dir = std::env::temp_dir().join(format!("quickstream_lists_libscroll_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let names: Vec<String> = (0..40).map(|i| format!("{i:02} a file name {LONG}.flac")).collect();
+    for name in &names {
+        fs::write(dir.join(name), b"").unwrap();
+    }
+    let mut settings = SettingsManager::with_path(dir.join("config.json"));
+    settings.settings.metadata_view = false;
+    let mut app = AppUI::new(Some(dir.clone()), settings);
+    wait_for_listing(&mut app);
+    for name in &names[20..] {
+        app.metadata_cache
+            .insert(meta(&dir, name, &format!("Song {LONG}"), "Mira Lenz", 200.0));
+    }
+    app.settings_mgr.settings.metadata_view = true;
+    app.update_browser_entry_labels();
+    app.active_tab = 1;
+
+    app.browser_cursor = 0;
+    let top = tui::render(&mut app, 120, 30);
+    app.browser_cursor = app.browser_entries.len() - 1;
+    let bottom = tui::render(&mut app, 120, 30);
+    assert_same_cut(
+        &cut_columns(&top, LIB_X, QUEUE_X - 2, "FLAC"),
+        &cut_columns(&bottom, LIB_X, QUEUE_X - 2, "FLAC"),
+        &format!("{}\n---\n{}", screen(&top), screen(&bottom)),
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Tab 5: the PLAYLISTS count column (one playlist of 100 tracks, the rest of 1) and the tracks
+/// panel's artist and length columns (only the first half of the entries has them) keep their
+/// widths while scrolling.
+#[test]
+fn playlist_columns_do_not_change_while_scrolling() {
+    common::isolate();
+    let dir = std::env::temp_dir().join(format!("quickstream_pl_lists_scroll_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let playlists_dir = quickstream::paths::get_playlists_dir();
+    let _ = fs::remove_dir_all(&playlists_dir);
+    fs::create_dir_all(&playlists_dir).unwrap();
+    for p in 0..40 {
+        let count = if p == 0 { 100 } else { 1 };
+        let entries = (0..count)
+            .map(|i| {
+                let known = i < 50;
+                pl_entry(
+                    &dir,
+                    &format!("p{p}_{i}.flac"),
+                    if known { "Mira Lenz" } else { "" },
+                    &format!("Track {i:02} {LONG}"),
+                    if known { 200 } else { -1 },
+                )
+            })
+            .collect();
+        let name = format!("Playlist {p:02} with a name too long for the panel");
+        let playlist = quickstream::playlist::Playlist { name, entries };
+        fs::write(
+            playlists_dir.join(format!("{}.m3u8", playlist.name)),
+            playlist.to_m3u8(),
+        )
+        .unwrap();
+    }
+    let settings = SettingsManager::with_path(dir.join("config.json"));
+    let mut app = AppUI::new(Some(dir.clone()), settings);
+    let checker: quickstream::ui::playlists::ExistsChecker = std::sync::Arc::new(|p: &Path| Some(p.to_path_buf()));
+    app.playlists.set_exists_checker(checker);
+    app.active_tab = 4;
+    let start = Instant::now();
+    while !app.playlists.store.is_loaded() {
+        assert!(start.elapsed() < Duration::from_secs(5), "playlists did not load");
+        app.poll_playlists();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // PLAYLISTS: the top page has the 100-track playlist, the bottom page doesn't.
+    app.playlists.list_cursor = 0;
+    let top = tui::render(&mut app, 120, 30);
+    app.playlists.list_cursor = 39;
+    let bottom = tui::render(&mut app, 120, 30);
+    assert_same_cut(
+        &cut_columns(&top, PL_X, PL_X + PL_TEXT_W, "PLAYLIST "),
+        &cut_columns(&bottom, PL_X, PL_X + PL_TEXT_W, "PLAYLIST "),
+        &format!("{}\n---\n{}", screen(&top), screen(&bottom)),
+    );
+
+    // Tracks of the 100-track playlist: artists and lengths only in the first half.
+    app.playlists.list_cursor = 0;
+    press(&mut app, KeyCode::Char('l'));
+    app.playlists.track_cursor = 0;
+    let top = tui::render(&mut app, 120, 30);
+    app.playlists.track_cursor = 99;
+    let bottom = tui::render(&mut app, 120, 30);
+    assert!(find_in(&bottom, "TRACK 99", TR_X, 120).is_some(), "{}", screen(&bottom));
+    assert_same_cut(
+        &cut_columns(&top, TR_X, 120, "WITH A TITLE"),
+        &cut_columns(&bottom, TR_X, 120, "WITH A TITLE"),
+        &format!("{}\n---\n{}", screen(&top), screen(&bottom)),
+    );
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&playlists_dir);
 }

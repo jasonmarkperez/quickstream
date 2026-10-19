@@ -137,3 +137,38 @@ fn revision_changes_on_every_insert_and_is_shared_by_clones() {
     let _ = cache.contains(&PathBuf::from("/tmp/a.flac"));
     assert_eq!(cache.revision(), after_one, "reads leave it alone");
 }
+
+/// `folder_revision(dir)` moves only for inserts of files directly inside `dir`, so the UI can
+/// keep a folder's totals while tags arrive for other folders (PR #68 review).
+#[test]
+fn folder_revision_moves_only_for_files_directly_in_the_folder() {
+    common::isolate();
+    let cache = MetadataCache::default();
+    let clone = cache.clone();
+    let dir = PathBuf::from("/music/Mira Lenz");
+    let meta = |path: &str| AudioMetadata {
+        filepath: PathBuf::from(path),
+        ..Default::default()
+    };
+    let start = cache.folder_revision(&dir);
+
+    clone.insert(meta("/music/Other/a.flac"));
+    clone.insert(meta("/music/Mira Lenz/Sub/b.flac"));
+    clone.insert(meta("/music/c.flac"));
+    assert_eq!(
+        cache.folder_revision(&dir),
+        start,
+        "other folders, a subfolder, the parent"
+    );
+
+    clone.insert(meta("/music/Mira Lenz/d.flac"));
+    let after = cache.folder_revision(&dir);
+    assert_ne!(after, start, "a file in the folder, through a clone");
+    clone.insert(meta("/music/Mira Lenz/d.flac"));
+    assert_ne!(cache.folder_revision(&dir), after, "replacing an entry");
+    assert_ne!(
+        cache.folder_revision(&PathBuf::from("/music/Mira Lenz/Sub")),
+        cache.folder_revision(&PathBuf::from("/music/Never Seen")),
+        "the subfolder has its own revision"
+    );
+}

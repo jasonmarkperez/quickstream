@@ -221,9 +221,13 @@ pub struct PlaylistsUi {
     /// Rows each pane showed at the last render: how far PageUp / PageDown move.
     pub list_page_height: usize,
     pub tracks_page_height: usize,
-    /// Known total length of the playlist under the cursor, keyed on the store revision and the
-    /// cursor, so a long playlist is not summed every frame.
-    tracks_total: Option<((u64, usize), Option<i64>)>,
+    /// Known total length and column layout of the playlist under the cursor, keyed on the
+    /// store revision, the cursor and the missing-file checks, so a long playlist is not walked
+    /// every frame and its columns don't change while it scrolls.
+    tracks_summary: Option<((u64, usize, u64), TracksSummary)>,
+    /// Width of the PLAYLISTS panel's track count column, from every playlist, per store
+    /// revision.
+    list_count_cols: Option<(u64, usize)>,
     /// The playlist last created from the name prompt, and the one selected before it: if the
     /// writer then reports the create failed, the cursor goes back there instead of staying on
     /// the row the new playlist had sorted into.
@@ -256,7 +260,8 @@ impl PlaylistsUi {
             tracks_state: ListState::default(),
             list_page_height: 10,
             tracks_page_height: 10,
-            tracks_total: None,
+            tracks_summary: None,
+            list_count_cols: None,
             created_from: None,
             folder_add_creates: HashMap::new(),
         }
@@ -628,25 +633,82 @@ fn tracks_note(count: usize, known_total: Option<i64>) -> String {
     }
 }
 
+/// The playlist under the cursor: the total of its known lengths and what its columns need,
+/// from all its entries (not only the rows on screen).
+#[derive(Debug, Clone, Copy, Default)]
+struct TracksSummary {
+    /// `None` when no length is known.
+    known_total: Option<i64>,
+    /// Width of the length column (`--:--` for a missing file counts too).
+    duration_cols: usize,
+    /// Any entry has an artist or is missing: the artist column (or `MISSING FILE`) shows.
+    any_side: bool,
+}
+
 impl PlaylistsUi {
-    /// Total length of the known lengths of the playlist under the cursor (`None` when none is
-    /// known), recomputed only when the playlists or the cursor change.
-    fn selected_known_total(&mut self) -> Option<i64> {
-        let key = (self.store.revision(), self.list_cursor);
-        if let Some((cached, total)) = self.tracks_total {
+    /// The known total length and column layout of the playlist under the cursor, recomputed
+    /// only when the playlists, the cursor or the missing-file checks change.
+    fn selected_summary(&mut self) -> TracksSummary {
+        let key = (self.store.revision(), self.list_cursor, self.exists_version);
+        if let Some((cached, summary)) = self.tracks_summary {
             if cached == key {
-                return total;
+                return summary;
             }
         }
-        let total = self.selected_playlist().and_then(|playlist| {
-            playlist
-                .entries
-                .iter()
-                .any(|e| e.duration_secs >= 0)
-                .then(|| playlist.total_duration_secs())
-        });
-        self.tracks_total = Some((key, total));
-        total
+        let summary = self
+            .selected_playlist()
+            .map(|playlist| {
+                let (mut longest, mut any_length, mut any_missing, mut any_side) = (0, false, false, false);
+                for entry in &playlist.entries {
+                    if self.is_missing(&entry.path) {
+                        any_missing = true;
+                        any_side = true;
+                    } else {
+                        any_side |= !entry.artist.is_empty();
+                        if entry.duration_secs >= 0 {
+                            any_length = true;
+                            longest = longest.max(entry.duration_secs);
+                        }
+                    }
+                }
+                let length_cols = if any_length {
+                    text_width(&kit::duration(longest as f64))
+                } else {
+                    0
+                };
+                let missing_cols = if any_missing { text_width(MISSING_LENGTH) } else { 0 };
+                TracksSummary {
+                    known_total: playlist
+                        .entries
+                        .iter()
+                        .any(|e| e.duration_secs >= 0)
+                        .then(|| playlist.total_duration_secs()),
+                    duration_cols: length_cols.max(missing_cols),
+                    any_side,
+                }
+            })
+            .unwrap_or_default();
+        self.tracks_summary = Some((key, summary));
+        summary
+    }
+
+    /// Width of the PLAYLISTS panel's track count column: the widest count of any playlist.
+    fn count_cols(&mut self) -> usize {
+        let revision = self.store.revision();
+        if let Some((cached, cols)) = self.list_count_cols {
+            if cached == revision {
+                return cols;
+            }
+        }
+        let cols = self
+            .store
+            .playlists()
+            .iter()
+            .map(|p| p.entries.len().to_string().len())
+            .max()
+            .unwrap_or(0);
+        self.list_count_cols = Some((revision, cols));
+        cols
     }
 
     /// The PLAYLISTS panel: one row per playlist (name, track count), or the loading, failed or
@@ -688,12 +750,9 @@ impl PlaylistsUi {
 
         self.list_state.select(Some(self.list_cursor));
         let window = kit::visible_window(&mut self.list_state, len, usize::from(list.height));
+        // From every playlist, so the column doesn't change while the list scrolls.
+        let count_cols = self.count_cols();
         let playlists = &self.store.playlists()[window.clone()];
-        let count_cols = playlists
-            .iter()
-            .map(|p| p.entries.len().to_string().len())
-            .max()
-            .unwrap_or(0);
         for (row_y, (idx, playlist)) in window.zip(playlists).enumerate() {
             let mark = if idx != self.list_cursor {
                 RowMark::Plain
@@ -733,7 +792,7 @@ impl PlaylistsUi {
         home: Option<&Path>,
     ) -> u16 {
         let focused = self.tracks_focus;
-        let known_total = self.selected_known_total();
+        let summary = self.selected_summary();
         let Some(playlist) = self.store.is_loaded().then(|| self.selected_playlist()).flatten() else {
             let list = kit::panel(
                 f,
@@ -748,7 +807,7 @@ impl PlaylistsUi {
             );
             return list.height;
         };
-        let note = tracks_note(playlist.entries.len(), known_total);
+        let note = tracks_note(playlist.entries.len(), summary.known_total);
         let footnote = (!compact).then(|| {
             let file = crate::playlist::playlist_file_path(self.store.dir(), &playlist.name)
                 .map(|path| queue_tab::display_path(&path, home))
@@ -804,8 +863,9 @@ impl PlaylistsUi {
 
         let digits = len.to_string().len().max(2);
         let index_cols = digits as u16 + 3;
-        let duration_cols = rows.iter().map(|(_, r)| text_width(&r.duration)).max().unwrap_or(0);
-        let show_artist = tier >= WidthTier::Medium && rows.iter().any(|(_, r)| r.missing || !r.artist.is_empty());
+        // Columns decided from the whole playlist, so they don't change while scrolling.
+        let duration_cols = summary.duration_cols;
+        let show_artist = tier >= WidthTier::Medium && summary.any_side;
         // Title and artist share what is left 5:4 (30 and 24 columns in 2f).
         let free = usize::from(list.width).saturating_sub(usize::from(index_cols) + duration_cols);
         let title_cols = (free * 5 / 9) as u16;
