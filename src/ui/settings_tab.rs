@@ -161,7 +161,12 @@ impl AppUI {
                 )
             })
         };
-        let list = kit::panel(
+        // Under 24 rows the blank row under the rule goes when the list would not fit with it,
+        // even without the blank rows between groups (3h); the option panel follows, to stay
+        // level.
+        let header = kit::panel_header_rows(compact, footnote.is_some(), true);
+        let spacer = kit::keeps_spacer(screen.short, list_area.height, header, list_entries(false).len());
+        let list = kit::panel_spaced(
             f,
             list_area,
             PanelSpec {
@@ -171,10 +176,11 @@ impl AppUI {
                 footnote: footnote.map(Line::from),
                 compact,
             },
+            spacer,
         );
         let address_in_panel = options_panel && {
             let option_area = Rect::new(area.x + list_area.width + PANEL_GAP, area.y, OPTION_COLS, area.height);
-            self.render_setting_options(f, option_area, &position, web_url.as_deref(), compact)
+            self.render_setting_options(f, option_area, &position, web_url.as_deref(), compact, spacer)
         };
         // Compact without the option panel the footnote is only the position, and the option
         // panel can be too short for the address: then the web address gets the list's last rows.
@@ -276,12 +282,13 @@ impl AppUI {
         position: &str,
         web_url: Option<&str>,
         compact: bool,
+        spacer: bool,
     ) -> bool {
         let cursor = self.settings_cursor;
         let Some(def) = SETTING_DEFINITIONS.get(cursor) else {
             return false;
         };
-        let list = kit::panel(
+        let list = kit::panel_spaced(
             f,
             area,
             PanelSpec {
@@ -291,6 +298,7 @@ impl AppUI {
                 footnote: Some(Line::from(position.to_string())),
                 compact,
             },
+            spacer,
         );
         let bold = theme::bold();
 

@@ -220,7 +220,11 @@ impl AppUI {
             }
             parts.join(SEP)
         };
-        let list = kit::panel(
+        // Under 24 rows the blank rows under the rule and under the column names go when the
+        // outputs would not all fit with them (3h); the DEVICE panel follows, to stay level.
+        let header = kit::panel_header_rows(compact, true, true);
+        let spacer = kit::keeps_spacer(screen.short, table_area.height, header, devices.len() + 1 + 2);
+        let list = kit::panel_spaced(
             f,
             table_area,
             PanelSpec {
@@ -230,8 +234,9 @@ impl AppUI {
                 footnote: Some(Line::from(footnote)),
                 compact,
             },
+            spacer,
         );
-        self.render_device_table(f, list, &devices, active.as_ref(), scanning);
+        self.render_device_table(f, list, &devices, active.as_ref(), scanning, spacer);
 
         if detail {
             let detail_area = Rect::new(area.x + table_area.width + PANEL_GAP, area.y, DETAIL_COLS, area.height);
@@ -240,7 +245,7 @@ impl AppUI {
                 (Some(dev), Some(act)) => dev.udn == act.udn,
                 _ => false,
             };
-            self.render_device_detail(f, detail_area, selected_device, is_active, compact);
+            self.render_device_detail(f, detail_area, selected_device, is_active, compact, spacer);
         }
     }
 
@@ -254,10 +259,16 @@ impl AppUI {
         devices: &[DLNADevice],
         active: Option<&DLNADevice>,
         scanning: bool,
+        spacer: bool,
     ) {
         let len = devices.len() + 1;
-        // Column names and the blank under them, when there is a row left for the outputs.
-        let header_rows: u16 = if list.height >= 3 { 2 } else { 0 };
+        // Column names and (with `spacer`) the blank under them, when there is a row left for
+        // the outputs.
+        let header_rows: u16 = match (list.height, spacer) {
+            (0..=2, true) | (0..=1, false) => 0,
+            (_, true) => 2,
+            (_, false) => 1,
+        };
         let avail = list.height - header_rows;
         let message = if scanning {
             Some(SEARCHING)
@@ -360,13 +371,14 @@ impl AppUI {
         device: Option<&DLNADevice>,
         is_active: bool,
         compact: bool,
+        spacer: bool,
     ) {
         let footnote = if device.is_some() {
             "DLNA MEDIARENDERER"
         } else {
             "LOCAL PLAYBACK"
         };
-        let list = kit::panel(
+        let list = kit::panel_spaced(
             f,
             area,
             PanelSpec {
@@ -376,6 +388,7 @@ impl AppUI {
                 footnote: Some(Line::from(footnote)),
                 compact,
             },
+            spacer,
         );
 
         let value_cols = usize::from(list.width.saturating_sub(KEY_COLS));

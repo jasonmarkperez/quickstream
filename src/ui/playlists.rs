@@ -582,8 +582,18 @@ impl AppUI {
             queue_tab::split_panes(area, screen.tier, self.playlists.tracks_focus, PLAYLISTS_SHARE);
         let home = self.queue_tab.home.as_deref();
         let ui = &mut self.playlists;
-        let list_rows = list_area.map(|a| ui.render_list_panel(f, a, compact));
-        let track_rows = tracks_area.map(|a| ui.render_tracks_panel(f, a, screen.tier, compact, home));
+        // Under 24 rows both panels give up the blank row under their rule when either list does
+        // not fit with it, so their rows stay lined up.
+        let header = kit::panel_header_rows(compact, true, true);
+        let loaded = ui.store.is_loaded();
+        let list_len = if loaded { ui.store.playlists().len() } else { 0 };
+        let tracks_len = ui.selected_playlist().filter(|_| loaded).map_or(0, |p| p.entries.len());
+        let spacer = [(list_area, list_len), (tracks_area, tracks_len)]
+            .iter()
+            .filter_map(|(pane, len)| pane.map(|a| (a, *len)))
+            .all(|(a, len)| kit::keeps_spacer(screen.short, a.height, header, len));
+        let list_rows = list_area.map(|a| ui.render_list_panel(f, a, compact, spacer));
+        let track_rows = tracks_area.map(|a| ui.render_tracks_panel(f, a, screen.tier, compact, spacer, home));
         // A hidden pane pages by the rows the shown one has: the same panel, a pane-switch away.
         ui.list_page_height = list_rows.or(track_rows).unwrap_or(1).max(1) as usize;
         ui.tracks_page_height = track_rows.or(list_rows).unwrap_or(1).max(1) as usize;
@@ -724,10 +734,10 @@ impl PlaylistsUi {
 
     /// The PLAYLISTS panel: one row per playlist (name, track count), or the loading, failed or
     /// empty message. Returns the rows its list shows.
-    fn render_list_panel(&mut self, f: &mut Frame, area: Rect, compact: bool) -> u16 {
+    fn render_list_panel(&mut self, f: &mut Frame, area: Rect, compact: bool, spacer: bool) -> u16 {
         let count = self.store.is_loaded().then(|| self.store.playlists().len().to_string());
         let focused = !self.tracks_focus;
-        let list = kit::panel(
+        let list = kit::panel_spaced(
             f,
             area,
             PanelSpec {
@@ -738,6 +748,7 @@ impl PlaylistsUi {
                 footnote: (!compact).then(Line::default),
                 compact: false,
             },
+            spacer,
         );
         if !self.store.is_loaded() {
             if self.load_failed {
@@ -800,12 +811,13 @@ impl PlaylistsUi {
         area: Rect,
         tier: WidthTier,
         compact: bool,
+        spacer: bool,
         home: Option<&Path>,
     ) -> u16 {
         let focused = self.tracks_focus;
         let summary = self.selected_summary();
         let Some(playlist) = self.store.is_loaded().then(|| self.selected_playlist()).flatten() else {
-            let list = kit::panel(
+            let list = kit::panel_spaced(
                 f,
                 area,
                 PanelSpec {
@@ -815,6 +827,7 @@ impl PlaylistsUi {
                     footnote: (!compact).then(Line::default),
                     compact: false,
                 },
+                spacer,
             );
             return list.height;
         };
@@ -829,7 +842,7 @@ impl PlaylistsUi {
             let room = usize::from(area.width.saturating_sub(2));
             Line::from(visible_tail(&file, room))
         });
-        let list = kit::panel(
+        let list = kit::panel_spaced(
             f,
             area,
             PanelSpec {
@@ -839,6 +852,7 @@ impl PlaylistsUi {
                 footnote,
                 compact: false,
             },
+            spacer,
         );
         let len = playlist.entries.len();
         if len == 0 {

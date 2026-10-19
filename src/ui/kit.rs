@@ -495,6 +495,12 @@ pub struct PanelSpec<'a> {
 /// it stops 2 columns short of `area`'s right edge, under the ` ▪`, so text lines up with the
 /// right note and a cursor bar ([`list_row`]) can reach one column past it on each side.
 pub fn panel(f: &mut Frame, area: Rect, spec: PanelSpec) -> Rect {
+    panel_spaced(f, area, spec, true)
+}
+
+/// [`panel`], with the blank row before the content only when `spacer`. Under 24 rows spacer
+/// rows are the first to go (3h): a panel whose content would not fit gives that row to it.
+pub fn panel_spaced(f: &mut Frame, area: Rect, spec: PanelSpec, spacer: bool) -> Rect {
     let area = area.intersection(f.area());
     let buf = f.buffer_mut();
     let text_width = area.width.saturating_sub(PANEL_RIGHT_PAD);
@@ -553,8 +559,22 @@ pub fn panel(f: &mut Frame, area: Rect, spec: PanelSpec) -> Rect {
         y += 1;
     }
     // The blank row before the content.
-    y = (y + 1).min(bottom);
+    if spacer {
+        y = (y + 1).min(bottom);
+    }
     Rect::new(area.x, y, text_width, bottom - y)
+}
+
+/// Rows [`panel_spaced`] takes above the content: label, rule, the footnote row (unless
+/// `compact` puts it on the label row) and the blank row when `spacer`.
+pub fn panel_header_rows(compact: bool, footnote: bool, spacer: bool) -> u16 {
+    2 + u16::from(footnote && !compact) + u16::from(spacer)
+}
+
+/// Whether a panel keeps the blank row before its content: always from 24 rows; under 24 rows
+/// (`short`) only while every one of `rows` content rows still fits in `height` with it.
+pub fn keeps_spacer(short: bool, height: u16, header_rows: u16, rows: usize) -> bool {
+    !short || rows <= usize::from(height.saturating_sub(header_rows))
 }
 
 /// `line`'s spans with each span's style applied over `base`.
