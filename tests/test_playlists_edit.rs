@@ -266,7 +266,7 @@ fn test_delete_asks_first_and_clamps_cursor() {
     }
     let view = render_view(&mut app, 100, 30);
     assert!(
-        view.contains("Delete \"Road Trip\" (2 tracks)? y/n"),
+        view.contains("Delete \"Road Trip\" (2 tracks)?"),
         "confirmation text:\n{}",
         view
     );
@@ -294,7 +294,7 @@ fn test_delete_asks_first_and_clamps_cursor() {
     press(&mut app, KeyCode::Char('D'), KeyModifiers::SHIFT);
     let view = render_view(&mut app, 100, 30);
     assert!(
-        view.contains("Delete \"Solo\" (1 track)? y/n"),
+        view.contains("Delete \"Solo\" (1 track)?"),
         "confirmation text:\n{}",
         view
     );
@@ -739,13 +739,17 @@ fn test_failed_rename_shows_an_error_and_restores_the_name() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
-/// The text after `Name: ` on the prompt's row, up to the prompt's right border.
+/// The prompt's field: the text after the 7-column `NAME` label on the prompt's row (the row
+/// whose text inside the left border starts with `NAME`), up to the prompt's right border.
 fn prompt_name_field(view: &str) -> String {
-    let line = view
+    const LABEL: &str = "NAME   ";
+    let after = view
         .lines()
-        .find(|l| l.contains("Name: "))
+        .find_map(|l| {
+            let inside = l.split_once('│')?.1.trim_start();
+            inside.strip_prefix(LABEL)
+        })
         .unwrap_or_else(|| panic!("no name prompt row:\n{view}"));
-    let after = &line[line.find("Name: ").unwrap() + "Name: ".len()..];
     after.split('│').next().unwrap_or("").trim_end().to_string()
 }
 

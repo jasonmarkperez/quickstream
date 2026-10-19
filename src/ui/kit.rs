@@ -319,6 +319,15 @@ pub fn modal_frame(f: &mut Frame, area: Rect, spec: ModalSpec) -> Rect {
     Rect::new(x, top, width, bottom - top)
 }
 
+/// A section rule inside a modal, `────── ▪` in INK, `width` columns from (`x`, `y`), cut to the
+/// buffer.
+pub fn modal_rule(buf: &mut Buffer, x: u16, y: u16, width: u16) {
+    let width = usize::from(width);
+    let rule = width.saturating_sub(2);
+    buf.set_stringn(x, y, "─".repeat(rule), rule, theme::ink());
+    buf.set_stringn(x + rule as u16, y, " ▪", width - rule, theme::ink());
+}
+
 /// Columns between a modal's title chip and its subtitle.
 const SUBTITLE_GAP: usize = 2;
 

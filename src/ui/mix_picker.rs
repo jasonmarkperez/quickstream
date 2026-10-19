@@ -59,10 +59,7 @@ pub(super) fn render(f: &mut Frame, cursor: usize, active: &MixProfile) {
     );
     y += 1;
     if y < bottom {
-        // `────── ▪`
-        let rule = width.saturating_sub(2);
-        buf.set_stringn(inner.x, y, "─".repeat(rule), rule, theme::ink());
-        buf.set_stringn(inner.x + rule as u16, y, " ▪", width - rule, theme::ink());
+        kit::modal_rule(buf, inner.x, y, inner.width);
     }
     y += 2;
 

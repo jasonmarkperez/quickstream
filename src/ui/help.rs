@@ -170,9 +170,7 @@ fn draw_column(f: &mut Frame, area: Rect, sections: &[Section], full: bool) {
         y += 1;
         if full && y < area.bottom() {
             // `────── ▪`, ending 4 columns short of the next column.
-            let rule = width.saturating_sub(6);
-            buf.set_stringn(area.x, y, "─".repeat(rule), rule, theme::ink());
-            buf.set_stringn(area.x + rule as u16, y, " ▪", width - rule, theme::ink());
+            kit::modal_rule(buf, area.x, y, area.width.saturating_sub(4));
             y += 1;
         }
         for (key, desc) in section.keys {

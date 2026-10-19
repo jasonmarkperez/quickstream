@@ -1138,10 +1138,10 @@ fn modals_sit_on_ground_not_the_terminal_default() {
                     continue;
                 }
                 let bg = buffer[(x, y)].bg;
-                // GROUND, keycaps (RULE), cursor rows (INK) and the add picker's highlight (Cyan,
-                // restyled later), never the terminal default or black.
+                // GROUND, keycaps (RULE), cursor rows (INK) and the delete confirmation's ERROR
+                // chip and `Y` keycap, never the terminal default or black.
                 assert!(
-                    [p.ground, p.rule, p.ink, Color::Cyan].contains(&bg),
+                    [p.ground, p.rule, p.ink, p.error].contains(&bg),
                     "{modal:?}: cell ({x}, {y}) has background {bg:?}\n{screen}"
                 );
             }

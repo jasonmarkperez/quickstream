@@ -379,7 +379,7 @@ fn test_playlist_modal_takes_keys_before_global_hotkeys() {
         count: 24,
     });
     let view = render(&mut app, 120, 30);
-    assert!(view.contains("Delete \"Road Trip\" (24 tracks)? y/n"), "{}", view);
+    assert!(view.contains("Delete \"Road Trip\" (24 tracks)?"), "{}", view);
     let quit = app
         .handle_input_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
         .unwrap();
