@@ -793,6 +793,53 @@ fn help_compact_layout_fits_80x24() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Each help section's label with the first key under it.
+const SECTION_FIRST_KEYS: [(&str, &str); 5] = [
+    ("PLAYBACK & AUDIO", "SPC"),
+    ("NAVIGATION & TABS", "N"),
+    ("PLAYLISTS (TAB 5)", "C ⇧R ⇧D"),
+    ("LIBRARY & QUEUE", "ENTER"),
+    ("SEARCH & DISCOVERY", "/"),
+];
+
+/// A column cut short by the height ends on a key: a section's label shows only with its first
+/// key under it (at 80x20 the left column used to end on `PLAYLISTS (TAB 5)` alone).
+#[test]
+fn help_never_ends_a_column_on_a_section_label() {
+    common::isolate();
+    let (mut app, dir) = modal_app("help_orphan_label");
+    app.show_help_modal = true;
+    for (w, h) in [
+        (120, 40),
+        (80, 24),
+        (80, 21),
+        (80, 20),
+        (80, 19),
+        (84, 20),
+        (70, 24),
+        (70, 18),
+    ] {
+        let buffer = tui::render(&mut app, w, h);
+        for (label, key) in SECTION_FIRST_KEYS {
+            let Some((x, y)) = tui::find_text(&buffer, label) else {
+                continue;
+            };
+            // The full layout has a rule under each label.
+            let mut below = y + 1;
+            if buffer[(x, below)].symbol() == "─" {
+                below += 1;
+            }
+            let under: String = (x..(x + 12).min(w)).map(|cx| buffer[(cx, below)].symbol()).collect();
+            assert!(
+                under.trim_start().starts_with(key),
+                "{w}x{h}: {label} with {under:?} under it\n{}",
+                tui::rows(&buffer).join("\n")
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn help_never_panics_on_small_terminals() {
     common::isolate();

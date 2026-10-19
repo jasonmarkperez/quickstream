@@ -178,7 +178,8 @@ pub(super) fn render(f: &mut Frame, screen: Rect, seek_step: f64) {
     draw_footer(f, Rect::new(inner.x, inner.bottom() - 1, inner.width, 1));
 }
 
-/// `sections` from the top of `area`, as many rows as fit.
+/// `sections` from the top of `area`, as many rows as fit. A section's label is drawn only with
+/// room for its first key under it, so a column cut short ends on a key, never on a label.
 fn draw_column(f: &mut Frame, area: Rect, sections: &[Section], full: bool, seek_step: f64) {
     let buf = f.buffer_mut();
     let width = area.width as usize;
@@ -187,12 +188,14 @@ fn draw_column(f: &mut Frame, area: Rect, sections: &[Section], full: bool, seek
         if full && i > 0 {
             y += 1;
         }
-        if y >= area.bottom() {
+        // The label, its rule (full layout) and the first key.
+        let header_rows = if full { 2 } else { 1 };
+        if y + header_rows >= area.bottom() {
             return;
         }
         buf.set_stringn(area.x, y, kit::clip(section.title, width), width, theme::label(true));
         y += 1;
-        if full && y < area.bottom() {
+        if full {
             // `────── ▪`, ending 4 columns short of the next column.
             kit::modal_rule(buf, area.x, y, area.width.saturating_sub(4));
             y += 1;
