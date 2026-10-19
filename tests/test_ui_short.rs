@@ -543,3 +543,64 @@ fn a_key_row_shows_only_whole_keys_at_every_narrow_width() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Big numerals or plain digits is decided from the widest time the track can show (its
+/// length), not the elapsed time, so the hero does not change layout at the hour mark: at 40
+/// columns `59:59` would fit as numerals beside the title but `1:00:00` would not, and a
+/// two-hour track is written plainly the whole way through.
+#[test]
+fn now_playing_keeps_its_time_layout_across_the_hour_mark() {
+    common::isolate();
+    let (mut app, dir) = short_app("np_hour_mark");
+    app.active_tab = 0;
+    let length = 7200.0;
+    app.queue.clear();
+    app.queue.add_track(AudioMetadata {
+        filepath: dir.join(file_name(0)),
+        filename: file_name(0),
+        title: title(0),
+        artist: "Mira Lenz".to_string(),
+        duration_seconds: length,
+        format_name: "flac".to_string(),
+        ..Default::default()
+    });
+    app.queue.set_current_index(0);
+    let mut layouts = Vec::new();
+    for position in [10.0, 3599.0, 3600.0, 7000.0] {
+        app.player = Box::new(FakePlayer {
+            volume: 65,
+            backend: Some("mpv"),
+            ..FakePlayer::playing_at(position, length)
+        });
+        let buffer = tui::render(&mut app, 40, 12);
+        let screen = tui::rows(&buffer).join("\n");
+        layouts.push((position, screen.contains('┏'), screen));
+    }
+    for (position, big, screen) in &layouts {
+        assert!(!big, "at {position} s the two-hour track is written plainly\n{screen}");
+    }
+    // Wide enough for `1:00:00` as numerals: the title beside them stays put across the hour.
+    let title_at = |app: &mut AppUI, position: f64| {
+        app.player = Box::new(FakePlayer::playing_at(position, length));
+        let buffer = tui::render(app, 50, 12);
+        let screen = tui::rows(&buffer).join("\n");
+        assert!(screen.contains('┏'), "numerals at 50 columns\n{screen}");
+        tui::find_text(&buffer, "TRACK 01").unwrap_or_else(|| panic!("title\n{screen}"))
+    };
+    assert_eq!(title_at(&mut app, 3599.0), title_at(&mut app, 3600.0));
+    // A track under an hour keeps the numerals at the same size.
+    app.queue.clear();
+    app.queue.add_track(AudioMetadata {
+        filepath: dir.join(file_name(1)),
+        filename: file_name(1),
+        title: title(1),
+        duration_seconds: 3599.0,
+        format_name: "flac".to_string(),
+        ..Default::default()
+    });
+    app.queue.set_current_index(0);
+    app.player = Box::new(FakePlayer::playing_at(10.0, 3599.0));
+    let screen = tui::render_text(&mut app, 40, 12);
+    assert!(screen.contains('┏'), "{screen}");
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -502,8 +502,11 @@ impl AppUI {
         let hero = self.hero_panel(f, hero_rect, true, compact, spacer);
         // Under 110 columns the title goes beside the numerals; when they leave it too little
         // room the time is written in plain digits instead, with the title and artist under it,
-        // rather than numerals cut at the edge.
-        let numerals_cols = kit::big_digits_width(&elapsed) as u16;
+        // rather than numerals cut at the edge. Decided from the widest time the track shows
+        // (its length, `1:00:00` and up from an hour), not the elapsed time, so the layout and
+        // the title's place hold for the whole track, across the hour mark and while seeking.
+        let widest = dur.map_or(0, |d| kit::big_digits_width(&kit::duration(d)));
+        let numerals_cols = kit::big_digits_width(&elapsed).max(widest) as u16;
         let big = full || hero.width >= numerals_cols + TITLE_GAP + MIN_TITLE_COLS;
         // From 110 columns `/ 05:52` (regular DIM) follows the numerals' bottom row. Each row is
         // drawn once, as spans: a line style would leave BOLD on the whole row.
