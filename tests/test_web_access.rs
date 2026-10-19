@@ -1200,11 +1200,26 @@ fn test_app_publishes_remote_access_setting_to_web_state() {
     let mut app = web_app(dir.clone(), None);
     assert!(!app.web_state.read().unwrap().remote_access);
 
+    // AppUI::new publishes it before any server starts: Web Remote Access on means nothing
+    // while the web server is off (a renderer would start the server on the LAN).
+    let mut settings_mgr = quickstream::settings::SettingsManager::new();
+    settings_mgr.settings.web_server_enabled = false;
+    settings_mgr.settings.web_server_lan = true;
+    let idle = quickstream::ui::AppUI::new(Some(dir.clone()), settings_mgr);
+    assert!(idle.web_server.is_none());
+    assert!(!idle.web_state.read().unwrap().remote_access);
+
     // Toggled while the server runs: the web thread's gate follows on the next publish.
     app.settings_mgr.settings.web_server_lan = true;
     app.update_web_state();
     assert!(app.web_state.read().unwrap().remote_access);
 
+    // Web server turned off while a renderer keeps it running: no remote control either.
+    app.settings_mgr.settings.web_server_enabled = false;
+    app.update_web_state();
+    assert!(!app.web_state.read().unwrap().remote_access);
+
+    app.settings_mgr.settings.web_server_enabled = true;
     app.settings_mgr.settings.web_server_lan = false;
     app.update_web_state();
     assert!(!app.web_state.read().unwrap().remote_access);

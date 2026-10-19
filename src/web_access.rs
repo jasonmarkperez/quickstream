@@ -3,9 +3,9 @@
 //! - Network (non-loopback) peers need the session token, sent as the `qs_token_<port>` cookie (set by
 //!   opening the pairing link `/?token=<token>`) or an `Authorization: Bearer` header. `/stream/*`
 //!   is exempt: DLNA renderers cannot authenticate, and it only serves registered files.
-//! - While Web Remote Access (`web_server_lan`) is off, network peers get only `/stream/*`, even
-//!   with a valid token: a remote renderer makes the server listen on the LAN regardless of the
-//!   setting, and a phone paired earlier keeps its token.
+//! - While Web Remote Access (`web_server_lan`) or the web server itself is off, network peers get
+//!   only `/stream/*`, even with a valid token: a remote renderer makes the server listen on the
+//!   LAN regardless of those settings, and a phone paired earlier keeps its token.
 //! - Loopback peers need no token, but the `Host` header must name the loopback address on every
 //!   route (including `/stream/*`), which blocks DNS rebinding.
 //! - State-changing requests need `Content-Type: application/json` (a cross-site form or
@@ -137,8 +137,8 @@ fn is_loopback_host(host: &str, port: u16) -> bool {
 }
 
 /// Decide whether a request may proceed. `server_port` is the port the request arrived on;
-/// `remote_access` is the Web Remote Access setting (`web_server_lan`), which network peers need
-/// for every route but `/stream/*`.
+/// `remote_access` is `Settings::web_remote_access` (Web Remote Access and the web server both
+/// on), which network peers need for every route but `/stream/*`.
 pub fn authorize(
     peer: IpAddr,
     server_port: u16,
@@ -286,8 +286,8 @@ pub fn write_decision_response(
     out.flush()
 }
 
-/// Authorize a request on `stream` with the process-wide token and the Web Remote Access setting
-/// `remote_access` (see [`authorize`]). Writes the refusal (or pairing redirect) and returns
+/// Authorize a request on `stream` with the process-wide token and `remote_access` (see
+/// [`authorize`]). Writes the refusal (or pairing redirect) and returns
 /// `false` when routing must stop.
 pub fn check_request(
     stream: &mut std::net::TcpStream,

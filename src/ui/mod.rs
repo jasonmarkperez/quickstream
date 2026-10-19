@@ -384,7 +384,7 @@ impl AppUI {
         let device_manager = DeviceManager::new();
 
         let web_state = std::sync::Arc::new(std::sync::RwLock::new(crate::web::NowPlayingState {
-            remote_access: settings_mgr.settings.web_server_lan,
+            remote_access: settings_mgr.settings.web_remote_access(),
             ..Default::default()
         }));
         let (web_server, web_cmd_rx) = if settings_mgr.settings.web_server_enabled {
@@ -3243,7 +3243,7 @@ impl AppUI {
         };
         // update_web_state skips its publish while no server runs: the setting may have changed.
         if let Ok(mut state) = self.web_state.write() {
-            state.remote_access = self.settings_mgr.settings.web_server_lan;
+            state.remote_access = self.settings_mgr.settings.web_remote_access();
         }
         let (tx, rx) = std::sync::mpsc::channel();
         match crate::web::WebServer::start_with_bind(bind, port, self.web_state.clone(), tx) {
@@ -3806,7 +3806,7 @@ impl AppUI {
             state.current_browser_dir = self.browser_dir.to_string_lossy().to_string();
             state.allowed_roots = self.web_allowed_roots();
             state.bookmarks = self.bookmarks.clone();
-            state.remote_access = self.settings_mgr.settings.web_server_lan;
+            state.remote_access = self.settings_mgr.settings.web_remote_access();
             state.is_autopilot = self.autopilot_dir.is_some();
             state.autopilot_dir = self.autopilot_dir.as_ref().map(|d| d.to_string_lossy().to_string());
             state.active_mix_profile = self.active_mix_profile.name();

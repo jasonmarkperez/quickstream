@@ -177,8 +177,9 @@ pub struct NowPlayingState {
     /// bookmarks.json. Never sent with `/api/status`.
     #[serde(skip)]
     pub bookmarks: Vec<String>,
-    /// The Web Remote Access setting (`web_server_lan`). While it is off, network peers get only
-    /// `/stream/*` (`web_access::authorize`), even when a renderer has the server on the LAN.
+    /// `Settings::web_remote_access` (Web Remote Access and the web server both on). While it is
+    /// off, network peers get only `/stream/*` (`web_access::authorize`), even when a renderer has
+    /// the server on the LAN.
     /// Off until the UI publishes it. Never sent to clients.
     #[serde(skip)]
     pub remote_access: bool,

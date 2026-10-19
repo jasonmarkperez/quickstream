@@ -76,6 +76,12 @@ impl Settings {
     pub fn mix_profile(&self) -> crate::analysis::MixProfile {
         mix_profile_for(&self.default_mix_profile)
     }
+
+    /// Whether other devices on the network may use the web remote: Web Remote Access on, and the
+    /// web server itself on (a renderer keeps the server running, on the LAN, while it is off).
+    pub fn web_remote_access(&self) -> bool {
+        self.web_server_enabled && self.web_server_lan
+    }
 }
 
 /// The mix profile a `default_mix_profile` key names (`diverse` for an unknown key).
