@@ -475,7 +475,7 @@ fn add_picker_matches_3e() {
     assert_eq!(buffer[(new_x, rows[3])].fg, p.mid);
 
     // Footer after a blank row.
-    let keys_y = modal_row(&buffer, rect, " ENTER  ADD     J K  MOVE     ESC  CANCEL").expect("footer");
+    let keys_y = modal_row(&buffer, rect, " ENTER  ADD     J K  SELECT     ESC  CANCEL").expect("footer");
     assert_eq!(keys_y, rows[3] + 2);
     let _ = fs::remove_dir_all(&dir);
 }

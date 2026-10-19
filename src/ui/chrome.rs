@@ -7,9 +7,10 @@
 use ratatui::prelude::*;
 
 use super::kit::{self, spans_width, text_width, KeyHint};
-use super::playlists::PlaylistModal;
+use super::playlists::{self, PlaylistModal};
 use super::screen::{Screen, WidthTier};
-use super::{theme, AppUI};
+use super::{help, mix_picker, search_view, theme, AppUI};
+use crate::analysis::MixProfile;
 
 /// Columns left blank at each side of the screen.
 const GUTTER: u16 = 2;
@@ -502,39 +503,26 @@ impl AppUI {
     /// search, mix picker, playlist modals); none offers `? KEYS`, since no modal opens help
     /// (the name prompt and the search query take `?` as text).
     fn modal_key_hints(&self) -> Option<Vec<KeyHint>> {
+        // Each modal's own footer keys, in the footer's words, plus the keys it leaves out.
         if self.show_help_modal {
-            return Some(vec![KeyHint::new("ESC", "CLOSE", TOP)]);
+            return Some(help::footer_hints());
         }
-        if self.search_modal.is_some() {
-            return Some(vec![
-                KeyHint::new("↑↓", "SELECT", 6),
-                KeyHint::new("ENTER", "ADD & CLOSE", 8),
-                KeyHint::new("TAB", "ADD", 7),
-                KeyHint::new("⇧TAB", "ADD ALL", 5),
-                KeyHint::new("ESC", "CLOSE", TOP),
-            ]);
+        if let Some(search) = &self.search_modal {
+            let mut hints = vec![KeyHint::new("↑↓", "SELECT", 1)];
+            hints.extend(search_view::footer_hints(search.filtered.len()));
+            return Some(hints);
         }
         if self.show_mix_picker_modal {
-            return Some(vec![
-                KeyHint::new("J K", "SELECT", 6),
-                KeyHint::new("ENTER", "START", 8),
-                KeyHint::new("1-5", "PROFILE", 7),
-                KeyHint::new("ESC", "CLOSE", TOP),
-            ]);
+            let mut hints = mix_picker::footer_hints();
+            let profiles = MixProfile::picker_profiles().len();
+            let at = hints.len() - 1;
+            hints.insert(at, KeyHint::new(format!("1-{profiles}"), "PROFILE", 2));
+            return Some(hints);
         }
         let hints = match self.playlists.modal.as_ref()? {
-            PlaylistModal::NamePrompt { .. } => {
-                vec![KeyHint::new("ENTER", "SAVE", TOP), KeyHint::new("ESC", "CANCEL", TOP)]
-            }
-            // Only `y` deletes; any other key keeps the playlist.
-            PlaylistModal::ConfirmDelete { .. } => {
-                vec![KeyHint::new("Y", "DELETE", TOP), KeyHint::new("ANY KEY", "CANCEL", TOP)]
-            }
-            PlaylistModal::AddPicker { .. } => vec![
-                KeyHint::new("J K", "SELECT", 6),
-                KeyHint::new("ENTER", "ADD", 8),
-                KeyHint::new("ESC", "CANCEL", TOP),
-            ],
+            PlaylistModal::NamePrompt { .. } => playlists::name_prompt_hints(),
+            PlaylistModal::ConfirmDelete { .. } => playlists::confirm_delete_hints(),
+            PlaylistModal::AddPicker { .. } => playlists::add_picker_hints(),
         };
         Some(hints)
     }

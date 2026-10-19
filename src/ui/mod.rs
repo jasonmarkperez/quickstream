@@ -3772,12 +3772,14 @@ impl AppUI {
         if let Some(strip) = layout.strip {
             self.render_strip(f, strip, &screen);
         }
-        self.render_key_row(f, layout.keys, &screen);
 
-        // A modal is drawn over the screen dimmed to RULE on GROUND.
+        // A modal is drawn over the screen dimmed to RULE on GROUND, except the key row, drawn
+        // after the dimming: it shows the modal's keys and the status message (search's `Tab`
+        // says what it added only there).
         if self.modal_open() {
             kit::dim_buffer(f.buffer_mut(), area);
         }
+        self.render_key_row(f, layout.keys, &screen);
         if let Some(ref mut modal) = self.search_modal {
             search_view::render(f, modal, self.queue_tab.home.as_deref());
         } else if self.playlists.modal.is_some() {

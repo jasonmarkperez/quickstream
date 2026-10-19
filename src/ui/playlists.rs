@@ -1160,6 +1160,25 @@ const PICKER_MIN_LIST_ROWS: u16 = 3;
 /// What the delete confirmation says happens (3d): only the playlist's own file goes.
 const DELETE_NOTE: &str = "The .m3u8 file is removed. Audio files are not touched.";
 
+/// The name prompt's keys, in its footer and the screen's key row alike.
+pub(super) fn name_prompt_hints() -> Vec<KeyHint> {
+    vec![KeyHint::new("ENTER", "SAVE", 1), KeyHint::new("ESC", "CANCEL", 1)]
+}
+
+/// The delete confirmation's keys: only `y` deletes; any other key keeps the playlist.
+pub(super) fn confirm_delete_hints() -> Vec<KeyHint> {
+    vec![KeyHint::new("Y", "DELETE", 2), KeyHint::new("ANY KEY", "CANCEL", 1)]
+}
+
+/// The add picker's keys.
+pub(super) fn add_picker_hints() -> Vec<KeyHint> {
+    vec![
+        KeyHint::new("ENTER", "ADD", 3),
+        KeyHint::new("J K", "SELECT", 2),
+        KeyHint::new("ESC", "CANCEL", 3),
+    ]
+}
+
 /// The name prompt and the delete confirmation: centred, [`PROMPT_WIDTH`] wide, compact when the
 /// screen is too short for the full frame.
 fn prompt_frame(f: &mut Frame, spec: ModalSpec) -> Rect {
@@ -1231,7 +1250,7 @@ fn render_name_prompt(f: &mut Frame, purpose: &NamePurpose, input: &str, error: 
             buf.set_stringn(inner.x, keys_y, kit::clip(err, width), width, theme::error());
         }
         None => {
-            let hints = [KeyHint::new("ENTER", "SAVE", 1), KeyHint::new("ESC", "CANCEL", 1)];
+            let hints = name_prompt_hints();
             buf.set_line(inner.x, keys_y, &kit::key_row(&hints, inner.width, None), inner.width);
         }
     }
@@ -1266,8 +1285,7 @@ fn render_confirm_delete(f: &mut Frame, name: &str, count: usize) {
     };
     // Too narrow for both (under about 44 columns), `ANY KEY CANCEL` goes; the screen's key
     // row still shows it.
-    let hints = [KeyHint::new("Y", "DELETE", 2), KeyHint::new("ANY KEY", "CANCEL", 1)];
-    let mut line = kit::key_row(&hints, inner.width, None);
+    let mut line = kit::key_row(&confirm_delete_hints(), inner.width, None);
     // The `Y` keycap is ERROR, like the chip.
     if let Some(keycap) = line.spans.first_mut() {
         keycap.style = theme::chip(true);
@@ -1351,12 +1369,7 @@ fn render_add_picker(f: &mut Frame, store: &PlaylistStore, state: &mut ListState
     }
 
     if inner.height > 2 {
-        let hints = [
-            KeyHint::new("ENTER", "ADD", 3),
-            KeyHint::new("J K", "MOVE", 2),
-            KeyHint::new("ESC", "CANCEL", 3),
-        ];
-        let line = kit::key_row(&hints, inner.width, None);
+        let line = kit::key_row(&add_picker_hints(), inner.width, None);
         f.buffer_mut().set_line(inner.x, inner.bottom() - 1, &line, inner.width);
     }
 }

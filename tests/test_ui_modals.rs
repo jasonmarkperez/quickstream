@@ -389,8 +389,36 @@ fn close_modals(app: &mut AppUI) {
     app.playlists.modal = None;
 }
 
+/// The key row: the last row with text.
+fn key_row(buffer: &Buffer) -> u16 {
+    (0..buffer.area.height)
+        .rev()
+        .find(|&y| !tui::row(buffer, y).trim().is_empty())
+        .unwrap_or_else(|| panic!("no key row\n{}", tui::rows(buffer).join("\n")))
+}
+
+/// Whether the key row `y` is drawn as usual: keycaps INK on RULE, labels MID, nothing in the
+/// dimmed RULE-on-GROUND.
+fn assert_key_row_undimmed(buffer: &Buffer, y: u16, what: &str) {
+    let p = theme::palette();
+    let row = tui::row(buffer, y);
+    let mut keycaps = 0;
+    for x in 0..buffer.area.width {
+        let cell = &buffer[(x, y)];
+        if cell.symbol().trim().is_empty() {
+            continue;
+        }
+        assert_ne!(cell.fg, p.rule, "{what}: ({x}, {y}) drawn dimmed: {row:?}");
+        if cell.bg == p.rule {
+            assert_eq!(cell.fg, p.ink, "{what}: keycap ({x}, {y}): {row:?}");
+            keycaps += 1;
+        }
+    }
+    assert!(keycaps > 0, "{what}: keycaps drawn: {row:?}");
+}
+
 #[test]
-fn every_modal_dims_the_screen_under_it() {
+fn every_modal_dims_the_screen_under_it_but_not_the_key_row() {
     common::isolate();
     let (mut app, dir) = modal_app("dim_all");
     app.active_tab = 1;
@@ -401,16 +429,15 @@ fn every_modal_dims_the_screen_under_it() {
         // row (the last row with text) sit outside every modal at 120x40.
         let header = tui::find_row(&buffer, "QUICKSTREAM").expect("header");
         let tabs = tui::find_row(&buffer, "1 NOW PLAYING").expect("tab row");
-        let keys = (0..40)
-            .rev()
-            .find(|&y| !tui::row(&buffer, y).trim().is_empty())
-            .unwrap_or_else(|| panic!("{modal:?}: no key row"));
+        let keys = key_row(&buffer);
         assert!(header < 4 && tabs < 4 && keys > 36, "{modal:?}: {header} {tabs} {keys}");
-        for y in [header, tabs, keys] {
+        for y in [header, tabs] {
             for x in 0..120 {
                 assert_dimmed(&buffer, x, y, &format!("{modal:?} row {y}"));
             }
         }
+        // The key row shows the modal's keys and the status, so it stays as it is drawn.
+        assert_key_row_undimmed(&buffer, keys, &format!("{modal:?}"));
         close_modals(&mut app);
     }
 
@@ -419,6 +446,33 @@ fn every_modal_dims_the_screen_under_it() {
     let styles = tui::text_styles(&buffer, "QUICKSTREAM").unwrap();
     assert!(styles.iter().all(|s| s.fg == Some(theme::palette().ink)), "{styles:?}");
     assert!(styles.iter().all(|s| s.add_modifier.contains(Modifier::BOLD)));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The status message stays readable while a modal is open: search's `Tab` adds a track and
+/// says so only there, and errors keep their ERROR colour.
+#[test]
+fn the_status_message_shows_undimmed_under_a_modal() {
+    common::isolate();
+    let (mut app, dir) = modal_app("status_under_modal");
+    app.active_tab = 1;
+    let p = theme::palette();
+    for modal in MODALS {
+        for (status, colour) in [
+            ("Added to queue: Halcyon Drift", p.mid),
+            ("Couldn't read /Volumes/Music/Gone", p.error),
+        ] {
+            open_modal(&mut app, modal);
+            app.status_message = status.to_string();
+            let buffer = tui::render(&mut app, 120, 40);
+            let keys = key_row(&buffer);
+            let (x, y) = tui::find_text(&buffer, &status[..12])
+                .unwrap_or_else(|| panic!("{modal:?}: {status:?} not shown\n{}", tui::rows(&buffer).join("\n")));
+            assert_eq!(y, keys, "{modal:?}: on the key row");
+            assert_eq!(buffer[(x, y)].fg, colour, "{modal:?}: {status:?}");
+            close_modals(&mut app);
+        }
+    }
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -497,7 +551,14 @@ fn help_dims_every_cell_outside_it() {
     for (w, h) in [(120, 40), (80, 24)] {
         let buffer = tui::render(&mut app, w, h);
         let rect = modal_rect(&buffer);
-        for y in 0..h {
+        // At 80x24 the compact help covers the key row; at 120x40 the key row is under it.
+        let keys = key_row(&buffer);
+        let keys_shown = keys >= rect.bottom();
+        assert_eq!(keys_shown, (w, h) == (120, 40), "{w}x{h}");
+        if keys_shown {
+            assert_key_row_undimmed(&buffer, keys, &format!("{w}x{h}"));
+        }
+        for y in (0..h).filter(|&y| !keys_shown || y != keys) {
             for x in 0..w {
                 if !rect.contains((x, y).into()) {
                     assert_dimmed(&buffer, x, y, &format!("{w}x{h}"));
@@ -702,10 +763,11 @@ fn help_full_layout_at_120x40_matches_2g() {
     // The second column starts halfway.
     let (lx, _) = tui::find_text(&buffer, "LIBRARY & QUEUE").unwrap();
     assert_eq!(lx, sx + 44);
-    // Footer `? OR ESC CLOSE` against the right, above the bottom padding row.
+    // Footer `? ESC CLOSE` (the key row's words) against the right, above the bottom padding
+    // row.
     let footer = &rows[rows.len() - 3];
     assert!(
-        footer.trim_end_matches(['│', ' ']).ends_with(" ?  OR  ESC  CLOSE"),
+        footer.trim_end_matches(['│', ' ']).ends_with(" ? ESC  CLOSE"),
         "{footer:?}"
     );
     let _ = fs::remove_dir_all(&dir);

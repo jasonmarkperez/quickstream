@@ -1,17 +1,17 @@
 //! Help modal (`?`, mockup 2g): every key the handlers act on, in two columns of sections.
 //!
 //! Full layout (96 x 32, from 32 rows and 88 columns): a title row with the version, each section
-//! under a label and a rule, and a `? OR ESC CLOSE` footer. Compact layout (at most 22 rows, so it
+//! under a label and a rule, and a `? ESC CLOSE` footer. Compact layout (at most 22 rows, so it
 //! fits 80x24): the title in the top border, sections with no rules or blank rows between them.
 //! Both stay inside the screen's 2-column gutters, except at 80-83 columns, where the compact
 //! layout takes 80 columns so every description stays whole; under 80 the longest are cut with
 //! `…`.
 
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::Frame;
 
-use super::kit::{self, ModalSpec};
+use super::kit::{self, KeyHint, ModalSpec};
 use super::theme;
 
 /// One section of the help: its label and its keys (keycap text, description).
@@ -228,15 +228,16 @@ fn draw_key(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, width: usize, key
     }
 }
 
-/// ` ? ` OR ` ESC ` CLOSE against the right of `area`.
+/// The help's keys: ` ? ESC ` CLOSE (either key closes it). The footer and the screen's key row
+/// both show these.
+pub(super) fn footer_hints() -> Vec<KeyHint> {
+    vec![KeyHint::new("? ESC", "CLOSE", 1)]
+}
+
+/// [`footer_hints`] against the right of `area`.
 fn draw_footer(f: &mut Frame, area: Rect) {
-    let spans = vec![
-        Span::styled(" ? ", theme::keycap()),
-        Span::styled(" OR ", theme::mid()),
-        Span::styled(" ESC ", theme::keycap()),
-        Span::styled(" CLOSE", theme::mid()),
-    ];
-    let width = kit::spans_width(&spans) as u16;
+    let line = kit::key_row(&footer_hints(), area.width, None);
+    let width = line.width() as u16;
     let x = area.right().saturating_sub(width).max(area.x);
-    f.buffer_mut().set_line(x, area.y, &Line::from(spans), area.right() - x);
+    f.buffer_mut().set_line(x, area.y, &line, area.right() - x);
 }

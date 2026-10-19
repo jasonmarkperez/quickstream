@@ -34,6 +34,16 @@ const GLYPH_COLS: u16 = 3;
 /// Rows a profile takes: its title row and its description.
 const PROFILE_ROWS: u16 = 2;
 
+/// The picker's footer keys; the screen's key row shows the same ones, plus `1-5 PROFILE`. Too
+/// narrow for every key, `J K` then `ENTER` go, so `ESC  CANCEL` always shows whole.
+pub(super) fn footer_hints() -> Vec<KeyHint> {
+    vec![
+        KeyHint::new("J K", "SELECT", 2),
+        KeyHint::new("ENTER", "START MIX", 3),
+        KeyHint::new("ESC", "CANCEL", 4),
+    ]
+}
+
 /// Draw the mix picker centred on the screen; `cursor` is the highlighted row, `active` the
 /// profile in use and `list` the scroll position when not every profile fits.
 pub(super) fn render(f: &mut Frame, cursor: usize, active: &MixProfile, list: &mut ListState) {
@@ -130,14 +140,8 @@ pub(super) fn render(f: &mut Frame, cursor: usize, active: &MixProfile, list: &m
         y += PROFILE_ROWS - 1 + gap;
     }
 
-    // Too narrow for every key, `J K` then `ENTER` go, so `ESC  CANCEL` always shows whole.
     if inner.height > footer_rows {
-        let hints = [
-            KeyHint::new("J K", "SELECT", 2),
-            KeyHint::new("ENTER", "START MIX", 3),
-            KeyHint::new("ESC", "CANCEL", 4),
-        ];
-        let line = kit::key_row(&hints, inner.width, None);
+        let line = kit::key_row(&footer_hints(), inner.width, None);
         f.buffer_mut().set_line(inner.x, bottom - 1, &line, inner.width);
     }
 }

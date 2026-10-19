@@ -369,14 +369,19 @@ fn wrap_path(path: &str, width: usize) -> Vec<String> {
 }
 
 /// ` ENTER  ADD & CLOSE    TAB  ADD TO QUEUE    ⇧TAB  ADD ALL (4)    ESC  CANCEL`; too narrow
-/// for all of them, `⇧TAB`, `TAB`, then `ENTER` go, so `ESC  CANCEL` always shows whole.
-fn draw_footer(f: &mut Frame, area: Rect, matches: usize) {
-    let hints = [
+/// for all of them, `⇧TAB`, `TAB`, then `ENTER` go, so `ESC  CANCEL` always shows whole. The
+/// screen's key row shows the same keys, plus `↑↓ SELECT`.
+pub(super) fn footer_hints(matches: usize) -> Vec<KeyHint> {
+    vec![
         KeyHint::new("ENTER", "ADD & CLOSE", 3),
         KeyHint::new("TAB", "ADD TO QUEUE", 2),
         KeyHint::new("⇧TAB", format!("ADD ALL ({})", grouped(matches)), 1),
         KeyHint::new("ESC", "CANCEL", 4),
-    ];
-    let line = kit::key_row(&hints, area.width, None);
+    ]
+}
+
+/// [`footer_hints`] in `area`.
+fn draw_footer(f: &mut Frame, area: Rect, matches: usize) {
+    let line = kit::key_row(&footer_hints(matches), area.width, None);
     f.buffer_mut().set_line(area.x, area.y, &line, area.width);
 }
