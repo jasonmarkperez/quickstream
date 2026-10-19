@@ -124,73 +124,74 @@ pub const SETTING_DEFINITIONS: &[SettingDefinition] = &[
     SettingDefinition {
         key: "metadata_view",
         label: "File List Display",
-        description: "Display extracted ID3/FLAC tag metadata (Artist - Title) instead of filenames.",
+        description: "Show titles and artists from the tags in lists, or the file names.",
         group: SettingGroup::Library,
     },
     SettingDefinition {
         key: "player_backend",
         label: "Local Playback Engine",
-        description: "Audio player binary used for local playback (mpv with IPC or ffplay).",
+        description: "The program that plays audio on this computer. If mpv fails, ffplay plays.",
         group: SettingGroup::Playback,
     },
     SettingDefinition {
         key: "seek_step_seconds",
         label: "Seek Jump Interval",
-        description: "Amount of time to jump forward/backward when using Shift+Arrow keys.",
+        description: "How far [ and ] (or ⇧← ⇧→) seek back or forward.",
         group: SettingGroup::Playback,
     },
     SettingDefinition {
         key: "volume_step",
         label: "Volume Step Size",
-        description: "Percentage to increase or decrease volume per hotkey press (+/-).",
+        description: "How much + and − change the volume.",
         group: SettingGroup::Playback,
     },
     SettingDefinition {
         key: "queue_mode",
         label: "Queue Playback Mode",
-        description: "Playback behavior when reaching the end of the queue.",
+        description: "What plays when a track ends, and whether the queue loops or stops at its end.",
         group: SettingGroup::Playback,
     },
     SettingDefinition {
         key: "force_transcode",
         label: "Audio Transcoding",
-        description: "Transcode audio into 16-bit PCM WAV via ffmpeg for legacy DLNA renderers.",
+        description: "Not used yet: meant to send 16-bit PCM WAV to older DLNA renderers.",
         group: SettingGroup::Playback,
     },
     SettingDefinition {
         key: "web_server_enabled",
         label: "Now Playing Web Server",
-        description: "Run local HTTP server (metadata, cover art & remote control) on configured port.",
+        description: "Serves the now-playing page and the web remote over HTTP.",
         group: SettingGroup::Web,
     },
     SettingDefinition {
         key: "home_dir",
         label: "Startup Home Directory",
-        description: "Default directory loaded on startup instead of current working directory.",
+        description: "The folder the library opens at startup, instead of the launch folder.",
         group: SettingGroup::Library,
     },
     SettingDefinition {
         key: "gapless_autopilot",
         label: "Gapless Continuous Stream",
-        description: "Seamlessly splice tracks into a single DLNA PCM stream (Roon-style gapless playback).",
+        description: "On a DLNA renderer, autopilot plays as one gapless PCM stream.",
         group: SettingGroup::Playback,
     },
     SettingDefinition {
         key: "default_mix_profile",
         label: "Autopilot Mix Algorithm",
-        description: "Intelligent mix style: Diverse Shuffle, DJ BPM Flow, Chillout, Workout, or Groove.",
+        description: "The mix profile autopilot starts with. M picks one for this session.",
         group: SettingGroup::Library,
     },
     SettingDefinition {
         key: "online_enrichment",
         label: "Online Tag Enrichment",
-        description: "Fetch community genre tags and similarity graphs from Last.fm (cached locally, library read-only).",
+        description: "Not used yet: meant to add Last.fm genre tags (needs an API key).",
         group: SettingGroup::Library,
     },
     SettingDefinition {
         key: "web_server_lan",
         label: "Web Remote Access",
-        description: "Allow phones and other devices on your network to open the web remote. DLNA speakers always get network access while active.",
+        description:
+            "Lets phones and other devices on your network open the web remote. DLNA renderers always can while in use.",
         group: SettingGroup::Web,
     },
 ];
@@ -331,6 +332,10 @@ impl LanIp {
             let (shared, resolver) = (self.state.clone(), self.resolver.clone());
             let spawned = std::thread::Builder::new().name("lan-ip".into()).spawn(move || {
                 let ip = resolver();
+                // The pairing link built from this address carries the session token, which
+                // is read from (or first written to) a file: load it here, off the caller's
+                // thread, before the address is published.
+                let _ = crate::web_access::web_token();
                 let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
                 state.ip = Some(ip);
                 state.resolved_at = Some(Instant::now());
@@ -558,6 +563,27 @@ impl SettingsManager {
         }
     }
 
+    /// The web remote's address while the web server setting is on, in its own case:
+    /// `http://127.0.0.1:<port>` for this computer, or with network access the pairing link
+    /// (LAN address and session token). The LAN address comes from the cache (looked up on a
+    /// worker), so the link is `None` until it is known rather than looked up while drawing.
+    pub fn web_url(&self) -> Option<String> {
+        if !self.settings.web_server_enabled {
+            return None;
+        }
+        let port = self.settings.web_server_port;
+        if !self.settings.web_server_lan {
+            return Some(format!("http://127.0.0.1:{}", port));
+        }
+        // Other devices need the pairing link; it carries the session token.
+        let ip = self.lan_ip.get()?;
+        Some(crate::web_access::pairing_url(
+            &ip,
+            port,
+            crate::web_access::web_token(),
+        ))
+    }
+
     pub fn get_display_value(&self, index: usize) -> String {
         match index {
             0 => if self.settings.metadata_view {
@@ -587,28 +613,11 @@ impl SettingsManager {
                 "Direct Stream (Auto)"
             }
             .to_string(),
-            6 => {
-                if !self.settings.web_server_enabled {
-                    "Disabled".to_string()
-                } else if self.settings.web_server_lan {
-                    // Other devices need the pairing link; it carries the session token. The
-                    // LAN address comes from the cache (looked up on a worker), and is left out
-                    // until it is known rather than looked up while drawing.
-                    match self.lan_ip.get() {
-                        Some(ip) => {
-                            let link = crate::web_access::pairing_url(
-                                &ip,
-                                self.settings.web_server_port,
-                                crate::web_access::web_token(),
-                            );
-                            format!("Enabled ({})", link)
-                        }
-                        None => "Enabled".to_string(),
-                    }
-                } else {
-                    format!("Enabled (http://127.0.0.1:{})", self.settings.web_server_port)
-                }
-            }
+            6 if !self.settings.web_server_enabled => "Disabled".to_string(),
+            6 => match self.web_url() {
+                Some(url) => format!("Enabled ({})", url),
+                None => "Enabled".to_string(),
+            },
             7 => match self.settings.home_dir {
                 Some(ref h) => paths::display_path(Path::new(h), user_home()),
                 None => "Default (Launch Directory)".to_string(),

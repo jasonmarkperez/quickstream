@@ -443,6 +443,34 @@ fn lan_address_is_resolved_off_the_calling_thread_and_cached() {
 }
 
 #[test]
+fn web_url_is_the_address_the_display_value_shows() {
+    common::isolate();
+    let mut mgr = manager("web_url");
+    let resolver = gated_resolver(&mut mgr, "192.0.2.46");
+    let web = index_of("web_server_enabled");
+    mgr.settings.web_server_enabled = false;
+    assert_eq!(mgr.web_url(), None);
+
+    mgr.settings.web_server_enabled = true;
+    mgr.settings.web_server_port = 8099;
+    assert_eq!(mgr.web_url().as_deref(), Some("http://127.0.0.1:8099"));
+    assert_eq!(mgr.get_display_value(web), "Enabled (http://127.0.0.1:8099)");
+
+    // Network access: the pairing link once the address is known, nothing before.
+    mgr.settings.web_server_lan = true;
+    assert_eq!(mgr.web_url(), None);
+    assert_eq!(mgr.get_display_value(web), "Enabled");
+    resolver.release.send(()).unwrap();
+    assert!(wait_for(|| mgr.web_url().is_some()));
+    let url = mgr.web_url().unwrap();
+    assert_eq!(
+        url,
+        quickstream::web_access::pairing_url("192.0.2.46", 8099, quickstream::web_access::web_token())
+    );
+    assert_eq!(mgr.get_display_value(web), format!("Enabled ({url})"));
+}
+
+#[test]
 fn settings_tab_render_never_resolves_the_lan_address() {
     common::isolate();
     let mut app = test_app("lan_render");
@@ -450,6 +478,8 @@ fn settings_tab_render_never_resolves_the_lan_address() {
     app.settings_mgr.settings.web_server_enabled = true;
     app.settings_mgr.settings.web_server_lan = true;
     app.active_tab = 3;
+    // The option panel shows the pairing link while the web server row is selected.
+    app.settings_cursor = index_of("web_server_enabled");
 
     let start = Instant::now();
     let text = common::tui::render_text(&mut app, 120, 40);
@@ -459,7 +489,7 @@ fn settings_tab_render_never_resolves_the_lan_address() {
     assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
     let row = text
         .lines()
-        .find(|l| l.contains("Now Playing Web Server"))
+        .find(|l| l.contains("NOW PLAYING WEB SERVER"))
         .expect("web server row");
     assert!(!row.contains("http://"), "{}", row);
     assert!(wait_for(|| resolver.calls.load(Ordering::SeqCst) == 1));

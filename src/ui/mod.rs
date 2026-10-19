@@ -19,6 +19,7 @@ pub mod playlists;
 mod queue_tab;
 pub mod screen;
 pub mod search;
+mod settings_tab;
 pub mod tag_reads;
 pub mod theme;
 pub mod workers;
@@ -3721,52 +3722,6 @@ impl AppUI {
         } else if self.show_help_modal {
             self.render_help_modal(f);
         }
-    }
-
-    fn render_settings_tab(&mut self, f: &mut Frame, area: Rect) {
-        let mut block = Block::default().borders(Borders::ALL).title(" APPLICATION SETTINGS ");
-
-        if self.editing_home_dir.is_some() {
-            block = block.title_bottom(Span::styled(
-                " [Enter] Save Path   [Esc] Cancel Editing   [Backspace] Delete ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ));
-        } else if self.settings_cursor == 7 {
-            block = block.title_bottom(Span::styled(
-                " [Enter / e] Edit Path   [c] Clear   [←/→] Cycle Presets   [↑/↓] Navigate ",
-                Style::default().fg(Color::DarkGray),
-            ));
-        } else {
-            block = block.title_bottom(Span::styled(
-                " [Enter / Space / ←/→] Change   [↑/↓] Navigate ",
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-
-        let items: Vec<ListItem> = SETTING_DEFINITIONS
-            .iter()
-            .enumerate()
-            .map(|(idx, defn)| {
-                if idx == 7 && self.editing_home_dir.is_some() {
-                    let edit_val = self.editing_home_dir.as_deref().unwrap_or("");
-                    let text = format!("{:<28} : [ {}█ ]", defn.label, edit_val);
-                    ListItem::new(text).style(theme::cursor())
-                } else {
-                    let val_str = self.settings_mgr.get_display_value(idx);
-                    let text = format!("{:<28} : {}", defn.label, val_str);
-                    let style = if idx == self.settings_cursor {
-                        theme::cursor()
-                    } else {
-                        Style::default().fg(Color::White)
-                    };
-                    ListItem::new(text).style(style)
-                }
-            })
-            .collect();
-
-        self.settings_state.select(Some(self.settings_cursor));
-        let list = List::new(items).block(block);
-        f.render_stateful_widget(list, area, &mut self.settings_state);
     }
 
     fn render_search_modal(modal: &mut SearchModalState, f: &mut Frame) {

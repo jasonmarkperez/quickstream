@@ -467,14 +467,19 @@ impl AppUI {
                 vec![KeyHint::new("ENTER", "SAVE", TOP), KeyHint::new("ESC", "CANCEL", TOP)]
             }
             3 => {
-                // Enter on Startup Home Directory opens its editor; on the rest it cycles.
-                let enter = if self.settings_cursor == 7 { "EDIT" } else { "CHANGE" };
-                vec![
+                // Enter on Startup Home Directory opens its editor and `c` clears it; on the
+                // rest Enter cycles.
+                let home = self.settings_cursor == 7;
+                let mut hints = vec![
                     KeyHint::new("J K", "SELECT", 6),
                     KeyHint::new("← →", "CHANGE", 8),
-                    KeyHint::new("ENTER", enter, 7),
-                    help(),
-                ]
+                    KeyHint::new("ENTER", if home { "EDIT" } else { "CHANGE" }, 7),
+                ];
+                if home {
+                    hints.push(KeyHint::new("C", "CLEAR", 5));
+                }
+                hints.push(help());
+                hints
             }
             4 if self.playlists.tracks_focus => vec![
                 KeyHint::new("H L", "PANE", 7),
