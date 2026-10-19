@@ -209,7 +209,12 @@ fn fit_signal_rows(rows: Vec<(&'static str, String)>, n: usize) -> Vec<(&'static
     if rows.len() <= n {
         return rows;
     }
-    let rank = |label: &str| SIGNAL_VALUE_ORDER.iter().position(|l| *l == label).unwrap_or(usize::MAX);
+    let rank = |label: &str| {
+        SIGNAL_VALUE_ORDER
+            .iter()
+            .position(|l| *l == label)
+            .unwrap_or(usize::MAX)
+    };
     let mut ranks: Vec<usize> = rows.iter().map(|(label, _)| rank(label)).collect();
     ranks.sort_unstable();
     let cutoff = ranks.get(n.wrapping_sub(1)).copied();

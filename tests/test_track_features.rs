@@ -374,8 +374,12 @@ fn test_worker_picks_up_changed_features_without_a_track_change() {
         calls2.fetch_add(1, Ordering::SeqCst);
         Some(features(path, *bpm2.lock().unwrap()))
     });
-    let mut worker =
-        TrackFeaturesWorker::spawn_with_intervals(&mut workers, source, Duration::from_millis(10), Duration::from_millis(20));
+    let mut worker = TrackFeaturesWorker::spawn_with_intervals(
+        &mut workers,
+        source,
+        Duration::from_millis(10),
+        Duration::from_millis(20),
+    );
     let track = PathBuf::from("/music/a.flac");
     worker.follow(Some(&track));
     assert!(poll_until(&mut worker, |w| w.features().and_then(|f| f.bpm) == Some(100.0)));

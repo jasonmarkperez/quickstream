@@ -783,8 +783,7 @@ fn test_now_playing_total_after_the_numerals_is_regular_dim() {
 fn up_next_lines(app: &mut AppUI, w: u16, h: u16) -> Vec<String> {
     let buffer = common::tui::render(app, w, h);
     let rows = common::tui::rows(&buffer);
-    let y = common::tui::find_row(&buffer, "UP NEXT")
-        .unwrap_or_else(|| panic!("no UP NEXT:\n{}", rows.join("\n")));
+    let y = common::tui::find_row(&buffer, "UP NEXT").unwrap_or_else(|| panic!("no UP NEXT:\n{}", rows.join("\n")));
     rows[y as usize..].iter().map(|r| r.trim().to_string()).collect()
 }
 
@@ -808,11 +807,17 @@ fn test_now_playing_end_of_queue_follows_the_queue_mode() {
     assert!(first > wrap, "{lines:#?}");
     app.settings_mgr.settings.queue_mode = "stop".to_string();
     let lines = up_next_lines(&mut app, 120, 40);
-    assert!(line_with(&lines, "END OF QUEUE  ·  PLAYBACK STOPS AFTER THIS TRACK").is_some(), "{lines:#?}");
+    assert!(
+        line_with(&lines, "END OF QUEUE  ·  PLAYBACK STOPS AFTER THIS TRACK").is_some(),
+        "{lines:#?}"
+    );
     // Repeat-one replays the track when it ends.
     app.settings_mgr.settings.queue_mode = "repeat_one".to_string();
     let lines = up_next_lines(&mut app, 120, 40);
-    assert!(line_with(&lines, "REPEAT ONE  ·  THIS TRACK REPEATS").is_some(), "{lines:#?}");
+    assert!(
+        line_with(&lines, "REPEAT ONE  ·  THIS TRACK REPEATS").is_some(),
+        "{lines:#?}"
+    );
     assert!(line_with(&lines, "STOPS").is_none(), "{lines:#?}");
 
     // So does loop with a single track.
@@ -820,7 +825,10 @@ fn test_now_playing_end_of_queue_follows_the_queue_mode() {
     app.queue.add_track(track(&dir, "Halcyon Drift", "Mira Lenz", 352.0));
     app.settings_mgr.settings.queue_mode = "loop".to_string();
     let lines = up_next_lines(&mut app, 120, 40);
-    assert!(line_with(&lines, "END OF QUEUE  ·  REPEATS THIS TRACK").is_some(), "{lines:#?}");
+    assert!(
+        line_with(&lines, "END OF QUEUE  ·  REPEATS THIS TRACK").is_some(),
+        "{lines:#?}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -832,7 +840,10 @@ fn test_now_playing_up_next_in_repeat_one_lists_no_later_tracks() {
     app.settings_mgr.settings.queue_mode = "repeat_one".to_string();
     for (w, h) in [(120, 40), (80, 24)] {
         let lines = up_next_lines(&mut app, w, h);
-        assert!(line_with(&lines, "REPEAT ONE  ·  THIS TRACK REPEATS").is_some(), "{w}x{h}: {lines:#?}");
+        assert!(
+            line_with(&lines, "REPEAT ONE  ·  THIS TRACK REPEATS").is_some(),
+            "{w}x{h}: {lines:#?}"
+        );
         for later in ["GLASS HARBOUR", "NORTHBOUND", "SALT LINES"] {
             assert!(line_with(&lines, later).is_none(), "{w}x{h}: {later}: {lines:#?}");
         }
@@ -982,10 +993,12 @@ fn test_now_playing_up_next_stays_when_features_arrive_at_120x30() {
         assert!(signal_row(&lines, label).is_some(), "{label}:\n{screen}");
     }
     assert!(signal_row(&lines, "SIZE").is_none(), "{screen}");
-    let shown: Vec<&str> = ["FORMAT", "RATE", "BITRATE", "CHANNELS", "GENRE", "BPM", "KEY", "ENERGY", "SIZE"]
-        .into_iter()
-        .filter(|l| signal_row(&lines, l).is_some())
-        .collect();
+    let shown: Vec<&str> = [
+        "FORMAT", "RATE", "BITRATE", "CHANNELS", "GENRE", "BPM", "KEY", "ENERGY", "SIZE",
+    ]
+    .into_iter()
+    .filter(|l| signal_row(&lines, l).is_some())
+    .collect();
     let positions: Vec<usize> = shown
         .iter()
         .map(|l| lines.iter().position(|r| r.starts_with(&format!("{l} "))).unwrap())
@@ -1053,9 +1066,7 @@ fn test_now_playing_up_next_format_treats_high_bitrate_m4a_as_lossless() {
         aac.bitrate_kbps = 256;
     }
     let lines = up_next_lines(&mut app, 120, 40);
-    let row = |title: &str| {
-        lines[line_with(&lines, title).unwrap_or_else(|| panic!("{title}: {lines:#?}"))].clone()
-    };
+    let row = |title: &str| lines[line_with(&lines, title).unwrap_or_else(|| panic!("{title}: {lines:#?}"))].clone();
     let alac = row("GLASS HARBOUR");
     assert!(alac.contains("M4A 44.1") && !alac.contains("M4A 900"), "{alac:?}");
     let aac = row("NORTHBOUND");

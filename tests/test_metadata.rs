@@ -189,9 +189,21 @@ fn test_audio_properties_leave_unread_channels_unknown() {
     assert_eq!(props.channels, 0, "no channel count is made up");
     assert_eq!(props.bitrate_kbps, 320);
     assert_eq!(props.sample_rate_hz, 44_100);
-    assert!((props.duration_seconds - 100.0).abs() < 1e-9, "{}", props.duration_seconds);
+    assert!(
+        (props.duration_seconds - 100.0).abs() < 1e-9,
+        "{}",
+        props.duration_seconds
+    );
 
-    let read = FileProperties::new(Duration::from_secs(200), None, Some(900), Some(48_000), None, Some(1), None);
+    let read = FileProperties::new(
+        Duration::from_secs(200),
+        None,
+        Some(900),
+        Some(48_000),
+        None,
+        Some(1),
+        None,
+    );
     let props = audio_properties(&read, 4_000_000);
     assert_eq!(props.channels, 1);
     assert_eq!(props.duration_seconds, 200.0);
@@ -200,7 +212,12 @@ fn test_audio_properties_leave_unread_channels_unknown() {
     let nothing = FileProperties::new(Duration::ZERO, None, None, None, None, None, None);
     let props = audio_properties(&nothing, 4_000_000);
     assert_eq!(
-        (props.duration_seconds, props.bitrate_kbps, props.sample_rate_hz, props.channels),
+        (
+            props.duration_seconds,
+            props.bitrate_kbps,
+            props.sample_rate_hz,
+            props.channels
+        ),
         (0.0, 0, 0, 0)
     );
 }
