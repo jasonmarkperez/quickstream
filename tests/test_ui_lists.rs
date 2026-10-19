@@ -998,6 +998,31 @@ fn missing_file_rows_read_missing_file_in_error_with_no_length() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// While a rename is unsettled the file still has its old name, and the footnote says so; once
+/// the writer has reported the rename done it shows the new name (PR #68 review).
+#[test]
+fn playlist_footnote_names_the_old_file_until_a_rename_is_settled() {
+    common::isolate();
+    let (mut app, dir) = playlists_app("footnoterename");
+    app.playlists.store.rename("Late Drives", "Night Drives").unwrap();
+    let buf = tui::render(&mut app, 120, 40);
+    let shown = screen(&buf);
+    assert!(find_in(&buf, "NIGHT DRIVES", TR_X, TR_X + 1).is_some(), "{shown}");
+    assert!(find_in(&buf, "Late Drives.m3u8", TR_X, 120).is_some(), "{shown}");
+
+    let start = Instant::now();
+    loop {
+        app.poll_playlists();
+        let buf = tui::render(&mut app, 120, 40);
+        if find_in(&buf, "Night Drives.m3u8", TR_X, 120).is_some() {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(5), "{}", screen(&buf));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn playlist_footnote_is_the_file_path_in_its_own_case() {
     common::isolate();

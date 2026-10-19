@@ -673,6 +673,27 @@ impl PlaylistStore {
         }
     }
 
+    /// The file that holds playlist `name`, as far as the store knows: while a rename of it is
+    /// unsettled (the writer hasn't reported it done; see
+    /// [`has_write_failures`](Self::has_write_failures)), the name it was renamed from, which the
+    /// file keeps until the writer moves it, and which the undo restores if the move fails.
+    /// Otherwise its own name. `None` for an unknown name or one whose file would land outside the
+    /// playlists folder. Cheap: a playlist has at most one rename of its own pending.
+    pub fn file_path_of(&self, name: &str) -> Option<PathBuf> {
+        let playlist = self.get(name)?;
+        let file_name = self
+            .ids
+            .get(&playlist.name)
+            .and_then(|id| {
+                self.pending
+                    .values()
+                    .find(|p| p.playlist == *id && p.from.is_some())
+                    .and_then(|p| p.from.as_deref())
+            })
+            .unwrap_or(&playlist.name);
+        playlist_file_path(&self.dir, file_name)
+    }
+
     /// Id of the playlist called exactly `name`, giving it one if it has none.
     fn id_for(&mut self, name: &str) -> u64 {
         match self.ids.get(name) {

@@ -1567,3 +1567,25 @@ fn test_revision_changes_when_a_failed_write_is_undone() {
     assert_eq!(store.poll_write_failures().len(), 1);
     assert_ne!(store.revision(), before);
 }
+
+/// `file_path_of` is where the playlist's file is as far as the store knows: while its own
+/// rename is unsettled, still the name it was renamed from; once the writer reports it done,
+/// the new name (PR #68 review: tab 5's footnote showed the new name too early).
+#[test]
+fn test_file_path_of_names_the_old_file_while_a_rename_is_pending() {
+    common::isolate();
+    let dir = scratch("file_path_of");
+    let (worker, mut store) = open_store(&dir);
+    store.create("Old").unwrap();
+    assert!(worker.flush());
+    assert!(!store.has_write_failures());
+    assert_eq!(store.file_path_of("Old"), Some(dir.join("Old.m3u8")));
+
+    store.rename("Old", "New").unwrap();
+    // The writer may already be done, but its report hasn't been read: the store can't know.
+    assert_eq!(store.file_path_of("New"), Some(dir.join("Old.m3u8")));
+    assert!(worker.flush());
+    assert!(!store.has_write_failures());
+    assert_eq!(store.file_path_of("New"), Some(dir.join("New.m3u8")));
+    assert_eq!(store.file_path_of("Missing"), None);
+}

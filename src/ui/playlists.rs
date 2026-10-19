@@ -809,7 +809,10 @@ impl PlaylistsUi {
         };
         let note = tracks_note(playlist.entries.len(), summary.known_total);
         let footnote = (!compact).then(|| {
-            let file = crate::playlist::playlist_file_path(self.store.dir(), &playlist.name)
+            // Where the file is: under its old name while a rename is unsettled.
+            let file = self
+                .store
+                .file_path_of(&playlist.name)
                 .map(|path| queue_tab::display_path(&path, home))
                 .unwrap_or_default();
             let room = usize::from(area.width.saturating_sub(2));
