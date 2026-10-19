@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use quickstream::analysis::TrackFeatures;
 use quickstream::metadata::AudioMetadata;
 use quickstream::settings::SettingsManager;
-use quickstream::ui::features::{FeatureSource, TrackFeaturesWorker, RETRY_INTERVAL};
+use quickstream::ui::features::{FeatureSource, TrackFeaturesWorker, REFRESH_INTERVAL, RETRY_INTERVAL};
 use quickstream::ui::workers::WorkerRegistry;
 use quickstream::ui::AppUI;
 
@@ -357,4 +357,40 @@ fn test_features_for_answers_only_for_the_followed_track() {
     assert!(worker.features_for(&b).is_none());
     worker.stop();
     assert_eq!(workers.join_all(Duration::from_secs(2)), 0);
+}
+
+/// While a track stays current its features are read again now and then, so a re-analysis
+/// (new BPM, key or year stored for the same file) shows without a track change.
+#[test]
+fn test_worker_picks_up_changed_features_without_a_track_change() {
+    common::isolate();
+    let mut workers = WorkerRegistry::new();
+    let bpm = Arc::new(Mutex::new(100.0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (bpm2, calls2) = (bpm.clone(), calls.clone());
+    let source: FeatureSource = Arc::new(move |path: &Path| {
+        calls2.fetch_add(1, Ordering::SeqCst);
+        Some(features(path, *bpm2.lock().unwrap()))
+    });
+    let mut worker =
+        TrackFeaturesWorker::spawn_with_intervals(&mut workers, source, Duration::from_millis(10), Duration::from_millis(20));
+    let track = PathBuf::from("/music/a.flac");
+    worker.follow(Some(&track));
+    assert!(poll_until(&mut worker, |w| w.features().and_then(|f| f.bpm) == Some(100.0)));
+
+    *bpm.lock().unwrap() = 128.0;
+    assert!(
+        poll_until(&mut worker, |w| w.features().and_then(|f| f.bpm) == Some(128.0)),
+        "the new BPM was never picked up"
+    );
+    assert!(calls.load(Ordering::SeqCst) >= 2);
+    worker.stop();
+    assert_eq!(workers.join_all(Duration::from_secs(2)), 0);
+}
+
+#[test]
+fn test_refresh_interval_is_slow() {
+    common::isolate();
+    assert!(REFRESH_INTERVAL >= Duration::from_secs(30));
+    assert!(REFRESH_INTERVAL > RETRY_INTERVAL);
 }
