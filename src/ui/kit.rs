@@ -147,6 +147,13 @@ pub fn fit_top_hints(hints: &[KeyHint], width: usize) -> Vec<KeyHint> {
     hints
 }
 
+/// A key row of whole keys only, `width` columns wide: [`key_row`] of [`fit_top_hints`], for a
+/// modal's footer or a panel's keys, so a keycap never shows without its whole label however
+/// narrow the row is.
+pub fn whole_key_row<'a>(hints: &[KeyHint], width: u16) -> Line<'a> {
+    key_row(&fit_top_hints(hints, usize::from(width)), width, None)
+}
+
 /// A key row `width` columns wide: the hints from the left, 4 columns apart, and `right` (a status
 /// message or the volume meter) against the right edge.
 ///

@@ -382,6 +382,6 @@ pub(super) fn footer_hints(matches: usize) -> Vec<KeyHint> {
 
 /// [`footer_hints`] in `area`.
 fn draw_footer(f: &mut Frame, area: Rect, matches: usize) {
-    let line = kit::key_row(&footer_hints(matches), area.width, None);
+    let line = kit::whole_key_row(&footer_hints(matches), area.width);
     f.buffer_mut().set_line(area.x, area.y, &line, area.width);
 }

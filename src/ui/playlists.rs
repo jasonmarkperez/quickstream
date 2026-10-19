@@ -1296,7 +1296,7 @@ fn render_name_prompt(f: &mut Frame, purpose: &NamePurpose, input: &str, error: 
         }
         None => {
             let hints = name_prompt_hints();
-            buf.set_line(inner.x, keys_y, &kit::key_row(&hints, inner.width, None), inner.width);
+            buf.set_line(inner.x, keys_y, &kit::whole_key_row(&hints, inner.width), inner.width);
         }
     }
 }
@@ -1415,7 +1415,7 @@ fn render_add_picker(f: &mut Frame, store: &PlaylistStore, state: &mut ListState
     }
 
     if inner.height > 2 {
-        let line = kit::key_row(&add_picker_hints(), inner.width, None);
+        let line = kit::whole_key_row(&add_picker_hints(), inner.width);
         f.buffer_mut().set_line(inner.x, inner.bottom() - 1, &line, inner.width);
     }
 }

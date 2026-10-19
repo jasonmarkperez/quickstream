@@ -604,3 +604,89 @@ fn now_playing_keeps_its_time_layout_across_the_hour_mark() {
     assert!(screen.contains('┏'), "{screen}");
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Every keycap on `rows` of `buffer` (cells in the keycap colour) is one of `hints`' keys and is followed
+/// by its whole label: a modal's footer, like the screen's key row, never shows a keycap without
+/// its label, or a label cut short.
+fn assert_whole_keys(buffer: &Buffer, rows: std::ops::Range<u16>, hints: &[quickstream::ui::kit::KeyHint], what: &str) {
+    let p = theme::palette();
+    let keycap = |x: usize, y: u16| {
+        let cell = &buffer[(x as u16, y)];
+        cell.bg == p.rule && cell.fg == p.ink
+    };
+    let w = buffer.area.width;
+    for y in rows {
+        let cells = tui::cells(buffer, y);
+        let row = cells.concat();
+        let mut x = 0;
+        while x < usize::from(w) {
+            if !keycap(x, y) {
+                x += 1;
+                continue;
+            }
+            let start = x;
+            while x < usize::from(w) && keycap(x, y) {
+                x += 1;
+            }
+            let keys = cells[start..x].concat();
+            let hint = hints
+                .iter()
+                .find(|h| format!(" {} ", h.keys) == keys)
+                .unwrap_or_else(|| panic!("{what}: keycap {keys:?} on row {y} is no whole key of {hints:?}: {row:?}"));
+            let label = format!(" {}", hint.label);
+            assert!(
+                cells[x..].concat().starts_with(&label),
+                "{what}: keycap {keys:?} on row {y} without its whole label {label:?}: {row:?}\n{}",
+                tui::rows(buffer).join("\n")
+            );
+        }
+    }
+}
+
+/// The modals' own footers at every width from 1 to 60 columns keep only whole keys (each
+/// keycap with its whole label), as the screen's key row does.
+#[test]
+fn modal_footers_show_only_whole_keys_at_every_narrow_width() {
+    common::isolate();
+    let (mut app, dir) = short_app("modal_footer_widths");
+    app.status_message.clear();
+    app.active_tab = 0;
+    for modal in 0..6 {
+        match modal {
+            0 => app.show_help_modal = true,
+            1 => app.show_mix_picker_modal = true,
+            2 => app.open_fuzzy_search(),
+            3 => press_open(&mut app, 'c'),
+            4 => press_open(&mut app, 'D'),
+            _ => press_open(&mut app, 'L'),
+        }
+        for h in [24, 12] {
+            for w in 1..=60u16 {
+                let buffer = tui::render(&mut app, w, h);
+                let hints = app.tab_key_hints();
+                // The footer is on the rows just above the modal's bottom border: the last one
+                // in the help (whose own keycaps, above it, are no hints), up to the third last
+                // in the playlist prompts. A modal cut too small for its border has no footer.
+                let Some(bottom) = (0..h).rev().find(|&y| tui::row(&buffer, y).contains('└')) else {
+                    continue;
+                };
+                let first = if modal == 0 {
+                    bottom - 1
+                } else {
+                    bottom.saturating_sub(3)
+                };
+                let what = format!("modal {modal} at {w}x{h}");
+                assert_whole_keys(&buffer, first..bottom, &hints, &what);
+                // The screen's key row too.
+                assert_whole_keys(&buffer, h - 1..h, &hints, &what);
+            }
+        }
+        app.show_help_modal = false;
+        app.show_mix_picker_modal = false;
+        if let Some(mut search) = app.search_modal.take() {
+            search.close();
+        }
+        app.playlists.modal = None;
+    }
+    let _ = fs::remove_dir_all(&dir);
+}

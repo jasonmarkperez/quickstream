@@ -289,6 +289,27 @@ fn fit_top_hints_keeps_only_whole_hints() {
     assert!(kit::fit_top_hints(&[hint("ENTER", "SAVE", 1)], 9).is_empty());
 }
 
+/// `kit::whole_key_row`: a modal footer's row of whole keys only. Where `key_row` keeps its top
+/// hints even when they are cut at the edge, it keeps only those that fit whole.
+#[test]
+fn whole_key_row_keeps_only_whole_keys() {
+    common::isolate();
+    let hints = vec![hint("ENTER", "SAVE", 1), hint("ESC", "CANCEL", 1)];
+    // ` ENTER ` ` SAVE` (12), 4 columns, ` ESC ` ` CANCEL` (12).
+    assert_eq!(
+        line_text(&kit::whole_key_row(&hints, 28)).trim_end(),
+        " ENTER  SAVE     ESC  CANCEL"
+    );
+    for width in [27u16, 20, 12] {
+        let line = kit::whole_key_row(&hints, width);
+        assert_eq!(line_width(&line), usize::from(width));
+        assert_eq!(line_text(&line).trim_end(), " ENTER  SAVE", "{width}");
+    }
+    for width in [11u16, 1, 0] {
+        assert_eq!(line_text(&kit::whole_key_row(&hints, width)).trim(), "", "{width}");
+    }
+}
+
 #[test]
 fn top_priority_width_measures_the_hints_never_dropped() {
     common::isolate();

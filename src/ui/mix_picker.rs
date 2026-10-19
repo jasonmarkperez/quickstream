@@ -141,7 +141,7 @@ pub(super) fn render(f: &mut Frame, cursor: usize, active: &MixProfile, list: &m
     }
 
     if inner.height > footer_rows {
-        let line = kit::key_row(&footer_hints(), inner.width, None);
+        let line = kit::whole_key_row(&footer_hints(), inner.width);
         f.buffer_mut().set_line(inner.x, bottom - 1, &line, inner.width);
     }
 }

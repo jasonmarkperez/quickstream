@@ -399,7 +399,7 @@ impl AppUI {
                 .filter(|h| h.keys != "J K" && h.keys != "?")
                 .collect();
             let row = Rect::new(list.x, list.y + keys_dy, list.width, 1);
-            f.render_widget(kit::key_row(&hints, list.width, None), row);
+            f.render_widget(kit::whole_key_row(&hints, list.width), row);
         }
         web_url.is_some()
     }
