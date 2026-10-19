@@ -227,6 +227,13 @@ fn signal_row(lines: &[String], label: &str) -> Option<String> {
     lines.iter().find(|l| l.starts_with(&format!("{label} "))).cloned()
 }
 
+/// The screen below the header, whose clock (`HH:MM`) could read like any length.
+fn below_header(buffer: &Buffer) -> String {
+    let rows = common::tui::rows(buffer);
+    let header = common::tui::find_row(buffer, "QUICKSTREAM").expect("header") as usize;
+    rows[header + 1..].join("\n")
+}
+
 /// The row holding the hero progress bar (`▕`; Now Playing has no strip).
 fn bar_row(buffer: &Buffer) -> u16 {
     common::tui::find_row(buffer, "▕").unwrap_or_else(|| panic!("no bar:\n{}", common::tui::rows(buffer).join("\n")))
@@ -603,7 +610,7 @@ fn test_now_playing_shows_a_pending_skip_as_queued_from_its_start() {
     app.pending_track_skip = true;
     for (w, h) in [(120, 40), (80, 24)] {
         let buffer = common::tui::render(&mut app, w, h);
-        let screen = common::tui::rows(&buffer).join("\n");
+        let screen = below_header(&buffer);
         assert!(screen.contains("» QUEUED"), "{w}x{h}:\n{screen}");
         assert!(!screen.contains("▶ PLAYING"), "{w}x{h}:\n{screen}");
         assert!(screen.contains("GLASS HARBOUR"), "{w}x{h}:\n{screen}");
@@ -628,7 +635,7 @@ fn test_now_playing_pending_skip_never_shows_the_old_tracks_duration() {
     app.queue.set_current_index(1);
     app.pending_track_skip = true;
     let buffer = common::tui::render(&mut app, 120, 40);
-    let screen = common::tui::rows(&buffer).join("\n");
+    let screen = below_header(&buffer);
     assert!(screen.contains("» QUEUED"), "{screen}");
     assert!(numerals_at(&buffer, "00:00").is_some(), "from 00:00:\n{screen}");
     assert!(!screen.contains("05:00"), "the old duration is not shown:\n{screen}");
@@ -1015,11 +1022,11 @@ fn test_now_playing_and_the_strip_show_the_same_length() {
     let (mut app, dir) = np_app("same_length");
     // The tags say 05:52; mpv says 06:00.
     app.player = Box::new(common::fake_player::FakePlayer::playing_at(161.0, 360.0));
-    let screen = common::tui::render_text(&mut app, 120, 40);
+    let screen = below_header(&common::tui::render(&mut app, 120, 40));
     assert!(screen.contains(" / 06:00"), "{screen}");
     assert!(screen.contains("REMAIN 03:19"), "{screen}");
     assert!(!screen.contains("05:52"), "{screen}");
-    let screen = common::tui::render_text(&mut app, 80, 24);
+    let screen = below_header(&common::tui::render(&mut app, 80, 24));
     assert!(screen.contains("06:00") && !screen.contains("05:52"), "{screen}");
 
     app.active_tab = 1;
@@ -1096,4 +1103,41 @@ fn test_now_playing_compact_footnote_keeps_the_state_when_very_narrow() {
     let label = rows.iter().find(|r| r.contains("NOW PLA")).expect("label row");
     assert!(label.contains('»'), "{label:?}");
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// A track queued before its tags are read has no artist or album. Its stored features (with a
+/// year) can arrive first; UP NEXT and the elapsed row must not depend on them either.
+#[test]
+fn test_now_playing_layout_ignores_the_features_year_of_an_untagged_track() {
+    common::isolate();
+    for mode in ["loop", "stop", "repeat_one"] {
+        let (mut before, dir_before) = np_app(&format!("year_layout_a_{mode}"));
+        let (mut after, dir_after) = np_app(&format!("year_layout_b_{mode}"));
+        for (app, dir) in [(&mut before, &dir_before), (&mut after, &dir_after)] {
+            let placeholder = quickstream::metadata::fallback_metadata(&dir.join("Halcyon Drift.flac"));
+            app.queue.clear();
+            app.queue.add_track(placeholder);
+            app.queue.add_track(track(dir, "Glass Harbour", "Mira Lenz", 258.0));
+            app.queue.add_track(track(dir, "Salt Lines", "The Quiet Ward", 227.0));
+            app.settings_mgr.settings.queue_mode = mode.to_string();
+        }
+        after.set_track_feature_source(fixed_features());
+        after.poll_track_features();
+        wait_for_features(&mut after);
+        for w in [110u16, 120, 140] {
+            for h in 18..=34u16 {
+                let a = common::tui::render_text(&mut before, w, h);
+                let b = common::tui::render_text(&mut after, w, h);
+                for label in ["UP NEXT", "ELAPSED"] {
+                    assert_eq!(
+                        a.contains(label),
+                        b.contains(label),
+                        "{mode} {w}x{h}: {label}\nbefore:\n{a}\nafter:\n{b}"
+                    );
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&dir_before);
+        let _ = fs::remove_dir_all(&dir_after);
+    }
 }

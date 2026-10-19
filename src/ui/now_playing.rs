@@ -423,12 +423,15 @@ impl AppUI {
         // the SIGNAL rows when there are more), a blank, the bar, the tech line (under 110
         // columns), the elapsed row, then UP NEXT.
         // SIGNAL rows beyond the hero's own come last: the layout is decided with the hero's
-        // rows alone, so UP NEXT and the elapsed row never depend on whether features have
-        // arrived, and SIGNAL gets the rows left over (its least useful rows cut first).
+        // rows alone (and without the features' year), so UP NEXT and the elapsed row never
+        // depend on whether features have arrived, and SIGNAL gets the rows left over (its least
+        // useful rows cut first).
         let header_rows: u16 = if compact { 3 } else { 4 };
         let height = area.height;
         let hero_body = if full {
-            let has_meta = artist.is_some() || album.is_some() || year.is_some();
+            // The year comes with the features, so it doesn't count: a track without artist or
+            // album shows it only when SIGNAL's rows have made the hero tall enough.
+            let has_meta = artist.is_some() || album.is_some();
             5 + u16::from(has_meta)
         } else {
             3
