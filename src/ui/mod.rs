@@ -11,6 +11,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 mod chrome;
+pub mod features;
 pub mod kit;
 pub mod playlists;
 mod queue_tab;
@@ -270,6 +271,8 @@ pub struct AppUI {
     pub analysis_db: crate::analysis::AnalysisDatabase,
     /// Background BPM/key/energy analysis of discovered tracks (stops and joins on drop).
     pub analysis_worker: crate::analysis::worker::AnalysisWorker,
+    /// Reads the current track's analysis features off the UI thread.
+    track_features: features::TrackFeaturesWorker,
     pub active_mix_profile: crate::analysis::MixProfile,
     pub show_mix_picker_modal: bool,
     pub mix_picker_cursor: usize,
@@ -351,6 +354,9 @@ impl AppUI {
         let analysis_db = crate::analysis::AnalysisDatabase::open_default()
             .unwrap_or_else(|_| crate::analysis::AnalysisDatabase::open_in_memory().unwrap());
         let active_mix_profile = settings_mgr.settings.mix_profile();
+        let mut workers = WorkerRegistry::new();
+        let track_features =
+            features::TrackFeaturesWorker::spawn(&mut workers, features::database_source(analysis_db.clone()));
 
         let mut app = Self {
             active_tab: 1,
@@ -388,7 +394,7 @@ impl AppUI {
             queue_metadata_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             queue_metadata_attempted: std::collections::HashSet::new(),
             tag_reads,
-            workers: WorkerRegistry::new(),
+            workers,
             browser_state: ListState::default(),
             queue_state: ListState::default(),
             devices_state: ListState::default(),
@@ -413,6 +419,7 @@ impl AppUI {
             autopilot_run_mode: AutopilotRunMode::Fresh,
             autopilot_added_count: 0,
             analysis_worker: crate::analysis::worker::AnalysisWorker::spawn(analysis_db.clone(), 1),
+            track_features,
             analysis_db,
             active_mix_profile,
             show_mix_picker_modal: false,
@@ -1557,6 +1564,7 @@ impl AppUI {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.playlists.stop_checks();
+        self.track_features.stop();
         // Dropping the inbox wakes queue metadata workers blocked waiting for work.
         self.queue_metadata_tx = None;
         if let Some(mut modal) = self.search_modal.take() {
@@ -1640,6 +1648,8 @@ impl AppUI {
 
             // Process remote web commands
             self.handle_web_commands();
+
+            self.poll_track_features();
 
             // Synchronize web server live state
             self.update_web_state();
@@ -3520,10 +3530,29 @@ impl AppUI {
         roots
     }
 
+    /// Point the features worker at the current track and take what it has found. Never blocks.
+    pub fn poll_track_features(&mut self) {
+        let track = self.queue.current_track().map(|t| t.filepath.as_path());
+        self.track_features.follow(track);
+        self.track_features.poll();
+    }
+
+    /// The current track's analysis features, once the worker has found them.
+    pub fn track_features(&self) -> Option<&crate::analysis::TrackFeatures> {
+        self.track_features.features()
+    }
+
+    /// Read track features from `source` instead of the analysis database (test seam). The old
+    /// worker is stopped and a new one started.
+    pub fn set_track_feature_source(&mut self, source: features::FeatureSource) {
+        self.track_features = features::TrackFeaturesWorker::spawn(&mut self.workers, source);
+    }
+
     pub fn update_web_state(&mut self) {
         if self.web_server.is_none() {
             return;
         }
+        self.poll_track_features();
         if let Ok(mut state) = self.web_state.write() {
             state.is_playing = self.player.is_playing();
             state.is_paused = self.player.is_paused();
@@ -3592,13 +3621,10 @@ impl AppUI {
                 state.channels = track.channels;
                 state.filepath = Some(track.filepath.clone());
                 state.has_cover = true;
-                if let Some(feat) = self.analysis_db.get_features(&track.filepath) {
-                    state.bpm = feat.bpm;
-                    state.key = feat.display_key();
-                } else {
-                    state.bpm = None;
-                    state.key = None;
-                }
+                // From the features worker: no database read on the UI thread.
+                let feat = self.track_features.features();
+                state.bpm = feat.and_then(|f| f.bpm);
+                state.key = feat.and_then(|f| f.display_key());
             } else {
                 state.title = "No Track Loaded".to_string();
                 state.artist = String::new();
