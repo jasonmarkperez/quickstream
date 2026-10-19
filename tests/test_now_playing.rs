@@ -1032,3 +1032,33 @@ fn test_now_playing_and_the_strip_show_the_same_length() {
     assert!(screen.contains(" / 05:52"), "{screen}");
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// An M4A can hold ALAC (lossless) as well as AAC: at a lossless bitrate its UP NEXT format
+/// column shows the sample rate, like FLAC; at an AAC bitrate the bitrate.
+#[test]
+fn test_now_playing_up_next_format_treats_high_bitrate_m4a_as_lossless() {
+    common::isolate();
+    let (mut app, dir) = np_app("m4a_alac");
+    app.settings_mgr.settings.queue_mode = "stop".to_string();
+    {
+        let alac = app.queue.track_mut(1).unwrap();
+        alac.format_name = "m4a".to_string();
+        alac.sample_rate_hz = 44_100;
+        alac.bitrate_kbps = 900;
+    }
+    {
+        let aac = app.queue.track_mut(2).unwrap();
+        aac.format_name = "M4A".to_string();
+        aac.sample_rate_hz = 44_100;
+        aac.bitrate_kbps = 256;
+    }
+    let lines = up_next_lines(&mut app, 120, 40);
+    let row = |title: &str| {
+        lines[line_with(&lines, title).unwrap_or_else(|| panic!("{title}: {lines:#?}"))].clone()
+    };
+    let alac = row("GLASS HARBOUR");
+    assert!(alac.contains("M4A 44.1") && !alac.contains("M4A 900"), "{alac:?}");
+    let aac = row("NORTHBOUND");
+    assert!(aac.contains("M4A 256"), "{aac:?}");
+    let _ = fs::remove_dir_all(&dir);
+}

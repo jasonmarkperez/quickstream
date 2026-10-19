@@ -62,7 +62,13 @@ const EMPTY_HINT: &str =
     "Press Space to play active queue, or navigate to [2] Queue & Library to browse your collection.";
 
 /// Formats whose bitrate says more than their sample rate in the Up Next format column.
-const LOSSY_FORMATS: [&str; 6] = ["mp3", "aac", "m4a", "ogg", "opus", "wma"];
+const LOSSY_FORMATS: [&str; 7] = ["mp3", "aac", "m4a", "mp4", "ogg", "opus", "wma"];
+
+/// Containers that hold either a lossy codec (AAC) or a lossless one (ALAC). The codec isn't in
+/// the metadata, so the bitrate decides: above this it is taken as lossless (AAC tops out
+/// around 320 kbps; ALAC at 44.1 kHz runs about 700–1000).
+const LOSSY_OR_LOSSLESS: [&str; 2] = ["m4a", "mp4"];
+const LOSSLESS_MIN_KBPS: u32 = 500;
 
 /// What the Up Next summary was built for: the queue revision, the queue mode and whether the
 /// UPnP continuous stream was playing.
@@ -109,14 +115,17 @@ fn channels_label(channels: u8) -> String {
     }
 }
 
-/// The Up Next format column: the format and its sample rate in kHz (`FLAC 96`), or its bitrate
-/// for lossy formats (`MP3 320`); empty without a format.
+/// The Up Next format column: the format and its sample rate in kHz (`FLAC 96`, and an M4A or
+/// MP4 above [`LOSSLESS_MIN_KBPS`], likely ALAC), or its bitrate for lossy formats (`MP3 320`);
+/// empty without a format.
 fn format_badge(track: &AudioMetadata) -> String {
     if track.format_name.is_empty() {
         return String::new();
     }
     let format = kit::upper(&track.format_name);
-    let lossy = LOSSY_FORMATS.contains(&track.format_name.to_lowercase().as_str());
+    let name = track.format_name.to_lowercase();
+    let lossless_bitrate = LOSSY_OR_LOSSLESS.contains(&name.as_str()) && track.bitrate_kbps > LOSSLESS_MIN_KBPS;
+    let lossy = LOSSY_FORMATS.contains(&name.as_str()) && !lossless_bitrate;
     let detail = if lossy && track.bitrate_kbps > 0 {
         track.bitrate_kbps.to_string()
     } else if track.sample_rate_hz > 0 {
