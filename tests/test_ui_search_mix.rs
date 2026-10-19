@@ -637,8 +637,24 @@ fn search_never_panics_on_small_terminals() {
     common::isolate();
     let (mut app, dir) = test_app("search_small");
     open_search(&mut app, &dir, "halc");
-    for (w, h) in [(70, 24), (40, 12), (20, 6), (90, 10), (120, 12), (8, 4)] {
+    for (w, h) in [(70, 24), (40, 12), (20, 6), (90, 10), (120, 12), (8, 4), (1, 1), (2, 2), (1, 3), (10, 1), (3, 3)] {
         tui::render(&mut app, w, h);
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// However short the screen, from 3 rows the search shows at least its frame and query row, so
+/// it never looks frozen under the dimmed screen.
+#[test]
+fn search_keeps_its_query_row_on_very_short_screens() {
+    common::isolate();
+    let (mut app, dir) = test_app("search_tiny");
+    open_search(&mut app, &dir, "halc");
+    for (w, h) in [(40, 3), (40, 4), (60, 5), (120, 6)] {
+        let buffer = tui::render(&mut app, w, h);
+        let text = screen(&buffer);
+        assert!(text.contains("QUERY  halc"), "{w}x{h}\n{text}");
+        assert!(text.contains(" SEARCH "), "{w}x{h}: chip\n{text}");
     }
     let _ = fs::remove_dir_all(&dir);
 }

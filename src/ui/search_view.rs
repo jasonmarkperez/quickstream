@@ -20,9 +20,13 @@ use crate::metadata::AudioMetadata;
 
 /// The modal's largest size: 100 columns as mockup 2h, and 32 rows as the help, which leaves the
 /// tab row and key row in view at 120x40. It shrinks to leave 2 columns and 2 rows of the screen
-/// around it.
+/// around it, but never under [`MIN_HEIGHT`] rows.
 const MAX_WIDTH: u16 = 100;
 const MAX_HEIGHT: u16 = 32;
+
+/// The fewest rows the modal takes (shrunk to the screen when shorter): the compact frame's
+/// borders and the query row.
+const MIN_HEIGHT: u16 = 3;
 
 /// Screens this tall get the full frame (title row, padding, the rule under the query); shorter
 /// ones the compact frame.
@@ -50,7 +54,9 @@ const DETAIL_DROP_ORDER: [&str; 4] = ["SIZE", "CHANNELS", "BITRATE", "RATE"];
 pub(super) fn render(f: &mut Frame, modal: &mut SearchModalState, home: Option<&Path>) {
     let screen = f.area();
     let full = screen.height >= FULL_MIN_ROWS;
-    let area = kit::modal_area(screen, MAX_WIDTH, screen.height.saturating_sub(4).min(MAX_HEIGHT));
+    // At least the compact frame and the query row, however short the screen.
+    let height = screen.height.saturating_sub(4).clamp(MIN_HEIGHT, MAX_HEIGHT);
+    let area = kit::modal_area(screen, MAX_WIDTH, height);
     let root = display_path(&modal.root_dir, home);
     let note = modal.is_scanning.then(|| {
         let elapsed = modal.scan_start.map(|start| start.elapsed()).unwrap_or_default();
