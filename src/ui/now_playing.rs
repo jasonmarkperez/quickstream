@@ -417,19 +417,19 @@ impl AppUI {
             area.width
         };
         let hero = self.hero_panel(f, Rect::new(area.x, area.y, hero_width, top.min(height)), true, compact);
+        // From 110 columns `/ 05:52` (regular DIM) follows the numerals' bottom row. Each row is
+        // drawn once, as spans: a line style would leave BOLD on the whole row.
+        let total = dur.filter(|_| full).map(|d| format!(" / {}", kit::duration(d)));
         for (dy, row) in numerals.iter().enumerate() {
-            line_at(f, hero, dy as u16, Line::styled(row.clone(), bold));
+            let mut spans = vec![Span::styled(row.clone(), bold)];
+            if dy == 2 {
+                spans.extend(total.as_ref().map(|t| Span::styled(t.clone(), theme::dim())));
+            }
+            line_at(f, hero, dy as u16, Line::from(spans));
         }
         let hero_cols = usize::from(hero.width);
         if full {
-            // `/ 05:52` after the numerals' bottom row; the title and artist line below them.
-            if let Some(dur) = dur {
-                let line = Line::from(vec![
-                    Span::styled(numerals[2].clone(), bold),
-                    Span::styled(format!(" / {}", kit::duration(dur)), theme::dim()),
-                ]);
-                line_at(f, hero, 2, line);
-            }
+            // The title and the artist line below the numerals.
             line_at(f, hero, 4, Line::styled(kit::clip(&title, hero_cols), bold));
             let meta: Vec<String> = [artist, album, year].into_iter().flatten().collect();
             let meta = kit::clip(&meta.join(META_SEP), hero_cols);
@@ -567,9 +567,14 @@ impl AppUI {
         let tracks = self.queue.tracks();
         let digits = tracks.len().to_string().len().max(2);
         if summary.remaining == 0 {
-            let text = if self.settings_mgr.settings.queue_mode == "loop" && tracks.len() > 1 {
+            // What plays when this track ends (`PlaybackQueue::next_track`): repeat-one, and loop
+            // over a single track, replay it.
+            let mode = self.settings_mgr.settings.queue_mode.as_str();
+            let text = if mode == "loop" && tracks.len() > 1 {
                 let first = kit::upper(tracks[0].display_title());
                 format!("END OF QUEUE{SEP}LOOPS TO {:0digits$}  {first}", 1)
+            } else if mode == "repeat_one" || mode == "loop" {
+                format!("END OF QUEUE{SEP}REPEATS THIS TRACK")
             } else {
                 format!("END OF QUEUE{SEP}PLAYBACK STOPS AFTER THIS TRACK")
             };

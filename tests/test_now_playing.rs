@@ -753,3 +753,101 @@ fn test_now_playing_signal_rows_never_push_the_bar_off_a_short_screen() {
     assert!(screen.contains("FORMAT"), "{screen}");
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_now_playing_total_after_the_numerals_is_regular_dim() {
+    common::isolate();
+    let (mut app, dir) = np_app("total_style");
+    let buffer = common::tui::render(&mut app, 120, 40);
+    let styles = common::tui::text_styles(&buffer, " / 05:52")
+        .unwrap_or_else(|| panic!("no total:\n{}", common::tui::rows(&buffer).join("\n")));
+    for style in styles {
+        assert_eq!(style.fg, theme::dim().fg, "DIM");
+        assert!(
+            !style.add_modifier.contains(ratatui::style::Modifier::BOLD),
+            "regular weight, as in 2b: {style:?}"
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// What UP NEXT says on the last track in each queue mode.
+#[test]
+fn test_now_playing_end_of_queue_follows_the_queue_mode() {
+    common::isolate();
+    let (mut app, dir) = np_app("end_of_queue");
+    app.queue.set_current_index(3);
+    let up_next = |app: &mut AppUI| {
+        let screen = common::tui::render_text(app, 120, 40);
+        screen
+            .lines()
+            .find(|r| r.contains("END OF QUEUE"))
+            .unwrap_or_else(|| panic!("no END OF QUEUE:\n{screen}"))
+            .to_string()
+    };
+
+    app.settings_mgr.settings.queue_mode = "loop".to_string();
+    assert!(up_next(&mut app).contains("LOOPS TO 01  HALCYON DRIFT"));
+    app.settings_mgr.settings.queue_mode = "stop".to_string();
+    assert!(up_next(&mut app).contains("PLAYBACK STOPS AFTER THIS TRACK"));
+    // Repeat-one replays the track when it ends.
+    app.settings_mgr.settings.queue_mode = "repeat_one".to_string();
+    let line = up_next(&mut app);
+    assert!(line.contains("REPEATS THIS TRACK"), "{line:?}");
+    assert!(!line.contains("STOPS"), "{line:?}");
+
+    // So does loop with a single track.
+    app.queue.clear();
+    app.queue.add_track(track(&dir, "Halcyon Drift", "Mira Lenz", 352.0));
+    app.settings_mgr.settings.queue_mode = "loop".to_string();
+    let line = up_next(&mut app);
+    assert!(line.contains("REPEATS THIS TRACK"), "{line:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A file whose tags couldn't be read (or haven't been yet) has only placeholder metadata: the
+/// tab shows its format and size, takes its length from the player, and makes nothing up.
+#[test]
+fn test_now_playing_unread_tags_show_no_made_up_signal() {
+    common::isolate();
+    let (mut app, dir) = np_app("unread_tags");
+    let current = dir.join("02 - cjk.ogg");
+    let next = dir.join("03 - other.ogg");
+    fs::write(&current, vec![0x55u8; 40_000]).unwrap();
+    fs::write(&next, vec![0x55u8; 40_000]).unwrap();
+    app.queue.clear();
+    app.queue.add_track(quickstream::metadata::fallback_metadata(&current));
+    app.queue.add_track(quickstream::metadata::fallback_metadata(&next));
+    // mpv knows the real length.
+    app.player = Box::new(common::fake_player::FakePlayer::playing_at(4.0, 8.0));
+
+    let buffer = common::tui::render(&mut app, 120, 40);
+    let rows = common::tui::rows(&buffer);
+    let screen = rows.join("\n");
+    let lines = signal_lines(&buffer);
+    assert!(
+        signal_row(&lines, "FORMAT").is_some_and(|r| r.contains("OGG")),
+        "{screen}"
+    );
+    assert!(signal_row(&lines, "SIZE").is_some(), "{screen}");
+    for label in ["RATE", "BITRATE", "CHANNELS"] {
+        assert!(signal_row(&lines, label).is_none(), "{label} made up:\n{screen}");
+    }
+    let (_, y) = numerals_at(&buffer, "00:04").expect("numerals");
+    assert!(
+        rows[y as usize + 2].contains("/ 00:08"),
+        "the player's length:\n{screen}"
+    );
+    assert!(screen.contains("ELAPSED 00:04   REMAIN 00:04"), "{screen}");
+    let bar = common::tui::row(&buffer, bar_row(&buffer));
+    assert!(bar.trim_end().ends_with("50%"), "{bar:?}");
+    let other = rows.iter().find(|r| r.contains("03 - OTHER")).expect("up next row");
+    assert!(other.contains("OGG") && !other.contains("320"), "{other:?}");
+
+    // Under 110 columns the tech line has only the format.
+    let buffer = common::tui::render(&mut app, 100, 30);
+    let rows = common::tui::rows(&buffer);
+    let tech = rows[bar_row(&buffer) as usize + 1].trim().to_string();
+    assert_eq!(tech, "OGG", "{}", rows.join("\n"));
+    let _ = fs::remove_dir_all(&dir);
+}

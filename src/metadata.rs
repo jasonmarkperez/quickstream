@@ -264,6 +264,8 @@ pub fn extract_metadata(path: &Path) -> anyhow::Result<AudioMetadata> {
 }
 
 /// Create fast fallback metadata directly from filepath and file size without reading tags.
+/// The audio properties (length, bitrate, sample rate, channels) stay 0, meaning unknown: they
+/// are shown and stored only once the tags are read, never guessed.
 pub fn fallback_metadata(path: &Path) -> AudioMetadata {
     let filename = path
         .file_name()
@@ -279,11 +281,6 @@ pub fn fallback_metadata(path: &Path) -> AudioMetadata {
         .unwrap_or("UNKNOWN")
         .to_uppercase();
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let duration_seconds = if file_size > 0 {
-        (file_size as f64 * 8.0) / (320.0 * 1000.0)
-    } else {
-        0.0
-    };
 
     AudioMetadata {
         filepath: path.to_path_buf(),
@@ -293,11 +290,8 @@ pub fn fallback_metadata(path: &Path) -> AudioMetadata {
         album: String::new(),
         genre: String::new(),
         format_name: ext,
-        duration_seconds,
         file_size,
-        bitrate_kbps: 320,
-        sample_rate_hz: 44100,
-        channels: 2,
+        ..Default::default()
     }
 }
 
