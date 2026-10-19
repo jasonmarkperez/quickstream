@@ -339,15 +339,21 @@ impl AppUI {
         let (library_area, queue_area) = split_panes(area, screen.tier, self.queue_focus, (1, 2));
         // Under 24 rows both panels give up the blank row under their rule when either list does
         // not fit with it, so their rows stay lined up. The spotlight query keeps its own row.
-        let library_rows = (
-            kit::panel_header_rows(compact && self.browser_spotlight.is_none(), true, true),
-            self.browser_entries.len() + usize::from(self.browser_loading),
+        let spacer = kit::keeps_spacer(
+            screen.short,
+            &[
+                kit::PanelFit {
+                    area: library_area,
+                    header_rows: kit::panel_header_rows(compact && self.browser_spotlight.is_none(), true, false),
+                    rows: self.browser_entries.len() + usize::from(self.browser_loading),
+                },
+                kit::PanelFit {
+                    area: queue_area,
+                    header_rows: kit::panel_header_rows(compact, true, false),
+                    rows: self.queue.len(),
+                },
+            ],
         );
-        let queue_rows = (kit::panel_header_rows(compact, true, true), self.queue.len());
-        let spacer = [(library_area, library_rows), (queue_area, queue_rows)]
-            .iter()
-            .filter_map(|(pane, rows)| pane.map(|a| (a, rows)))
-            .all(|(a, (header, len))| kit::keeps_spacer(screen.short, a.height, *header, *len));
         let library_rows = library_area.map(|a| self.render_library_panel(f, a, screen.tier, compact, spacer));
         let queue_rows = queue_area.map(|a| self.render_queue_panel(f, a, screen.tier, compact, spacer));
         // A hidden pane pages by the rows the shown one has: the same panel, a pane-switch away.

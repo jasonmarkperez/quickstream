@@ -182,6 +182,18 @@ fn url_path(url: &str) -> String {
         .unwrap_or_else(|| url.to_string())
 }
 
+/// The line under the outputs: searching while a scan runs, else nothing found when no renderer
+/// was.
+fn table_message(scanning: bool, no_renderers: bool) -> Option<&'static str> {
+    if scanning {
+        Some(SEARCHING)
+    } else if no_renderers {
+        Some(NONE_FOUND)
+    } else {
+        None
+    }
+}
+
 impl AppUI {
     /// Tab 3: OUTPUT DEVICES and, from 110 columns, the DEVICE panel (2d). Under 110 columns the
     /// selected renderer's maker and model join the footnote (3h); at 80–89 columns, or under 24
@@ -221,9 +233,22 @@ impl AppUI {
             parts.join(SEP)
         };
         // Under 24 rows the blank rows under the rule and under the column names go when the
-        // outputs would not all fit with them (3h); the DEVICE panel follows, to stay level.
-        let header = kit::panel_header_rows(compact, true, true);
-        let spacer = kit::keeps_spacer(screen.short, table_area.height, header, devices.len() + 1 + 2);
+        // table would not fit with them (3h): the column names and their blank row, a row per
+        // output, and the scanning or nothing-found line after its blank row. The DEVICE panel
+        // follows, to stay level.
+        let message_rows = if table_message(scanning, devices.is_empty()).is_some() {
+            2
+        } else {
+            0
+        };
+        let spacer = kit::keeps_spacer(
+            screen.short,
+            &[kit::PanelFit {
+                area: Some(table_area),
+                header_rows: kit::panel_header_rows(compact, true, false),
+                rows: 2 + devices.len() + 1 + message_rows,
+            }],
+        );
         let list = kit::panel_spaced(
             f,
             table_area,
@@ -270,13 +295,7 @@ impl AppUI {
             (_, false) => 1,
         };
         let avail = list.height - header_rows;
-        let message = if scanning {
-            Some(SEARCHING)
-        } else if devices.is_empty() {
-            Some(NONE_FOUND)
-        } else {
-            None
-        };
+        let message = table_message(scanning, devices.is_empty());
         // The message (after a blank row) only when every output still gets a row.
         let message_rows: u16 = if message.is_some() && usize::from(avail) >= len + 2 {
             2

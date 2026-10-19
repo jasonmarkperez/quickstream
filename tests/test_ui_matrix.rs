@@ -3,7 +3,9 @@
 //! three playlists, one with a missing file) at every size the Telemetry layouts are designed
 //! for, plus two tiny ones drawn only to show they don't panic. Each case is checked for the
 //! chrome's guarantees; a failing check names the tab or modal and the size, and every failure
-//! of a run is listed together.
+//! of a run is listed together. Edge states (empty, loading, failed, scanning, nothing found, the
+//! web address under the Settings list) are drawn at short sizes too: no message is cut while the
+//! blank row under its panel's rule is kept.
 
 mod common;
 
@@ -546,6 +548,257 @@ fn every_tab_and_modal_keeps_the_chrome_at_every_size() {
         close(&mut app);
     }
     let _ = fs::remove_dir_all(&dir);
+    assert!(
+        failures.is_empty(),
+        "{} failing cases:\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}
+
+/// A state whose panel shows a message or extra rows besides its list (review of #73: each was
+/// counted short when deciding whether a short terminal keeps the blank row under the rule).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Edge {
+    /// Now Playing with nothing loaded: `NO TRACK LOADED` and the hint.
+    NowPlayingEmpty,
+    /// Tab 5 with no playlists: the wrapped `No playlists yet…`.
+    PlaylistsEmpty,
+    /// Tab 5 before the load finishes.
+    PlaylistsLoading,
+    /// Tab 5 when the folder can't be listed: the wrapped ERROR message.
+    PlaylistsFailed,
+    /// Tab 5's tracks pane on an empty playlist.
+    PlaylistEmptyTracks,
+    /// Tab 3 with no renderers: `NO RENDERERS FOUND` after a blank row.
+    DevicesNoneFound,
+    /// Tab 3 scanning with no renderers yet: `SEARCHING FOR …` after a blank row.
+    DevicesScanning,
+    /// Tab 4 on the web server row while it runs: the web address under the list.
+    SettingsWebRow,
+}
+
+const EDGES: [Edge; 8] = [
+    Edge::NowPlayingEmpty,
+    Edge::PlaylistsEmpty,
+    Edge::PlaylistsLoading,
+    Edge::PlaylistsFailed,
+    Edge::PlaylistEmptyTracks,
+    Edge::DevicesNoneFound,
+    Edge::DevicesScanning,
+    Edge::SettingsWebRow,
+];
+
+/// Every size the short-terminal rules are drawn at (`SIZES` of test_ui_short, the matrix's
+/// short ones and a few around them).
+const SHORT_SIZES: [(u16, u16); 18] = [
+    (120, 22),
+    (120, 21),
+    (120, 20),
+    (120, 16),
+    (120, 12),
+    (100, 14),
+    (85, 12),
+    (80, 23),
+    (80, 22),
+    (80, 21),
+    (80, 20),
+    (80, 16),
+    (80, 12),
+    (60, 10),
+    (40, 12),
+    (40, 7),
+    (40, 6),
+    (20, 8),
+];
+
+impl Edge {
+    /// Sizes with room for everything `edge_app` lists once the blank rows go.
+    fn fits(self) -> &'static [(u16, u16)] {
+        match self {
+            Edge::NowPlayingEmpty => &[(40, 12), (40, 6)],
+            Edge::DevicesNoneFound | Edge::DevicesScanning => &[(60, 10), (40, 12)],
+            Edge::SettingsWebRow => &[(80, 21), (120, 21)],
+            _ => &[(80, 16), (40, 12)],
+        }
+    }
+}
+
+/// An app in `edge`, on its tab, and the texts its panel shows when there is room: each must
+/// read whole (wrapped or not) whenever the blank row under the rule is kept.
+fn edge_app(edge: Edge) -> (AppUI, PathBuf, Vec<String>) {
+    let dir = std::env::temp_dir().join(format!("quickstream_matrix_edge_{:?}_{}", edge, std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    // A fresh playlists folder per case: no playlists unless the case writes one.
+    let playlists = paths::get_playlists_dir();
+    let _ = fs::remove_dir_all(&playlists);
+    if edge == Edge::PlaylistEmptyTracks {
+        fs::create_dir_all(&playlists).unwrap();
+        fs::write(playlists.join("Blank.m3u8"), "#EXTM3U\n").unwrap();
+    }
+    let settings = SettingsManager::with_path(dir.join("config.json"));
+    let mut app = AppUI::new(Some(dir.clone()), settings);
+    app.player = Box::new(FakePlayer {
+        volume: 65,
+        backend: Some("mpv"),
+        ..FakePlayer::default()
+    });
+    let start = Instant::now();
+    while app.browser_loading || !app.playlists.store.is_loaded() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "folder or playlists did not load"
+        );
+        app.poll_background_dir_scan();
+        app.poll_playlists();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    *app.device_manager.devices.lock().unwrap() = Vec::new();
+    *app.device_manager.is_scanning.lock().unwrap() = false;
+
+    let texts: Vec<&str> = match edge {
+        Edge::NowPlayingEmpty => {
+            app.active_tab = 0;
+            // Its start: at 20 columns the line itself is wider than the panel.
+            vec!["NO TRACK", "Press Space"]
+        }
+        Edge::PlaylistsEmpty => {
+            app.active_tab = 4;
+            vec!["No playlists yet. Press c to create one, or L on any track."]
+        }
+        Edge::PlaylistsLoading => {
+            app.active_tab = 4;
+            app.playlists.store =
+                quickstream::playlist_store::PlaylistStore::new(dir.join("not loaded"), app.persistence.handle());
+            vec!["Loading playlists…"]
+        }
+        Edge::PlaylistsFailed => {
+            app.active_tab = 4;
+            // A file where the folder should be: listing it fails.
+            let file = dir.join("not a folder");
+            fs::write(&file, b"").unwrap();
+            app.playlists.store = quickstream::playlist_store::PlaylistStore::new(file, app.persistence.handle());
+            app.start_playlist_load();
+            let start = Instant::now();
+            while !app.playlists.load_failed() {
+                assert!(start.elapsed() < Duration::from_secs(5), "load did not fail");
+                app.poll_playlists();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            app.status_message.clear();
+            vec!["Couldn't load playlists. Restart Quickstream to try again."]
+        }
+        Edge::PlaylistEmptyTracks => {
+            app.active_tab = 4;
+            app.playlists.tracks_focus = true;
+            vec!["Empty. Press L on a track in tab 2 to add it."]
+        }
+        Edge::DevicesNoneFound => {
+            app.active_tab = 2;
+            vec!["NO RENDERERS"]
+        }
+        Edge::DevicesScanning => {
+            app.active_tab = 2;
+            *app.device_manager.is_scanning.lock().unwrap() = true;
+            vec!["SEARCHING"]
+        }
+        Edge::SettingsWebRow => {
+            // The web server on from its row, loopback only (no firewall prompt).
+            app.active_tab = 3;
+            app.settings_mgr.settings.web_server_lan = false;
+            app.settings_mgr.settings.web_server_port = 0;
+            app.settings_cursor = setting::WEB_SERVER_ENABLED;
+            press(&mut app, KeyCode::Right);
+            let port = app.web_port().expect("web server started");
+            app.status_message.clear();
+            return (
+                app,
+                dir,
+                vec![
+                    "PLAYBACK".to_string(),
+                    "WEB REM".to_string(),
+                    format!("http://127.0.0.1:{port}"),
+                ],
+            );
+        }
+    };
+    (app, dir, texts.into_iter().map(String::from).collect())
+}
+
+/// Whether `text` reads on screen, maybe wrapped over the rows below its first word (whitespace
+/// is ignored, so a wrapped line or a URL broken at the edge still matches).
+fn reads(buffer: &Buffer, text: &str) -> bool {
+    let squeeze = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let wanted = squeeze(text);
+    let first: String = text
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(4)
+        .collect();
+    (0..buffer.area.height).any(|y| {
+        let row = tui::cells(buffer, y);
+        (0..buffer.area.width).any(|x| {
+            if !row[usize::from(x)..].concat().starts_with(&first) {
+                return false;
+            }
+            let below: String = (y..buffer.area.height)
+                .map(|cy| tui::cells(buffer, cy)[usize::from(x)..].concat())
+                .collect();
+            squeeze(&below).starts_with(&wanted)
+        })
+    })
+}
+
+/// Whether the row under the first panel rule is blank (the spacer row kept).
+fn spacer_kept(buffer: &Buffer) -> Option<bool> {
+    let rule = tui::find_row(buffer, "────")?;
+    Some(tui::row(buffer, rule + 1).trim().is_empty())
+}
+
+/// Under 24 rows a panel keeps the blank row under its rule only while everything it shows
+/// still fits with it: a message (empty, loading, failed, scanning, nothing found) or the web
+/// address under the Settings list counts as rows too, so it is never cut while that row stays
+/// blank. Where it fits without the blank row, it shows whole.
+#[test]
+fn no_message_is_cut_while_its_spacer_row_is_kept() {
+    common::isolate();
+    let mut failures = Vec::new();
+    for edge in EDGES {
+        let (mut app, dir, texts) = edge_app(edge);
+        for (w, h) in SHORT_SIZES {
+            let case = format!("{edge:?} at {w}x{h}");
+            let buffer = match try_render(&mut app, w, h) {
+                Ok(buffer) => buffer,
+                Err(message) => {
+                    failures.push(format!("{case}: panicked: {message}"));
+                    continue;
+                }
+            };
+            let cut: Vec<&String> = texts.iter().filter(|t| !reads(&buffer, t)).collect();
+            if spacer_kept(&buffer) == Some(true) && !cut.is_empty() {
+                failures.push(format!(
+                    "{case}: blank row kept but {cut:?} cut\n{}",
+                    tui::rows(&buffer).join("\n")
+                ));
+            }
+        }
+        // Room for everything once the blank row goes.
+        for &(w, h) in edge.fits() {
+            let buffer = tui::render(&mut app, w, h);
+            let cut: Vec<&String> = texts.iter().filter(|t| !reads(&buffer, t)).collect();
+            if !cut.is_empty() {
+                failures.push(format!(
+                    "{edge:?} at {w}x{h}: {cut:?} not shown\n{}",
+                    tui::rows(&buffer).join("\n")
+                ));
+            }
+        }
+        drop(app);
+        let _ = fs::remove_dir_all(&dir);
+    }
     assert!(
         failures.is_empty(),
         "{} failing cases:\n\n{}",

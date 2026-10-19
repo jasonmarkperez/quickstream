@@ -582,16 +582,34 @@ impl AppUI {
             queue_tab::split_panes(area, screen.tier, self.playlists.tracks_focus, PLAYLISTS_SHARE);
         let home = self.queue_tab.home.as_deref();
         let ui = &mut self.playlists;
-        // Under 24 rows both panels give up the blank row under their rule when either list does
-        // not fit with it, so their rows stay lined up.
-        let header = kit::panel_header_rows(compact, true, true);
-        let loaded = ui.store.is_loaded();
-        let list_len = if loaded { ui.store.playlists().len() } else { 0 };
-        let tracks_len = ui.selected_playlist().filter(|_| loaded).map_or(0, |p| p.entries.len());
-        let spacer = [(list_area, list_len), (tracks_area, tracks_len)]
-            .iter()
-            .filter_map(|(pane, len)| pane.map(|a| (a, *len)))
-            .all(|(a, len)| kit::keeps_spacer(screen.short, a.height, header, len));
+        // Under 24 rows both panels give up the blank row under their rule when either one's
+        // rows (its list, or its wrapped message) do not fit with it, so their rows stay level.
+        let header_rows = kit::panel_header_rows(compact, true, false);
+        let width = |area: Option<Rect>| area.map_or(0, kit::panel_text_width);
+        let list_rows = match ui.list_message() {
+            Some((text, _)) => kit::message_rows(&text, width(list_area)),
+            None => ui.store.playlists().len(),
+        };
+        let tracks_rows = match ui.store.is_loaded().then(|| ui.selected_playlist()).flatten() {
+            Some(playlist) if playlist.entries.is_empty() => kit::message_rows(EMPTY_PLAYLIST, width(tracks_area)),
+            Some(playlist) => playlist.entries.len(),
+            None => 0,
+        };
+        let spacer = kit::keeps_spacer(
+            screen.short,
+            &[
+                kit::PanelFit {
+                    area: list_area,
+                    header_rows,
+                    rows: list_rows,
+                },
+                kit::PanelFit {
+                    area: tracks_area,
+                    header_rows,
+                    rows: tracks_rows,
+                },
+            ],
+        );
         let list_rows = list_area.map(|a| ui.render_list_panel(f, a, compact, spacer));
         let track_rows = tracks_area.map(|a| ui.render_tracks_panel(f, a, screen.tier, compact, spacer, home));
         // A hidden pane pages by the rows the shown one has: the same panel, a pane-switch away.
@@ -625,6 +643,12 @@ const PLAYLISTS_SHARE: (u16, u16) = (23, 56);
 
 /// Width of the PLAYLISTS panel's marker column (`▸`).
 const MARKER_COLS: u16 = 2;
+
+/// The PLAYLISTS panel with no playlists.
+const NO_PLAYLISTS: &str = "No playlists yet. Press c to create one, or L on any track.";
+
+/// The tracks panel of a playlist with no tracks.
+const EMPTY_PLAYLIST: &str = "Empty. Press L on a track in tab 2 to add it.";
 
 /// Shown in the artist column of an entry whose file was not found (2f).
 const MISSING_FILE: &str = "MISSING FILE";
@@ -732,6 +756,25 @@ impl PlaylistsUi {
         cols
     }
 
+    /// What the PLAYLISTS panel shows in place of its rows, and in what style: the loading or
+    /// failed message, or the empty one; `None` when there are playlists to list.
+    fn list_message(&self) -> Option<(String, Style)> {
+        if !self.store.is_loaded() {
+            return Some(if self.load_failed {
+                (
+                    format!("{LOAD_FAILED}. Restart Quickstream to try again."),
+                    theme::error(),
+                )
+            } else {
+                ("Loading playlists…".to_string(), theme::mid())
+            });
+        }
+        self.store
+            .playlists()
+            .is_empty()
+            .then(|| (NO_PLAYLISTS.to_string(), theme::mid()))
+    }
+
     /// The PLAYLISTS panel: one row per playlist (name, track count), or the loading, failed or
     /// empty message. Returns the rows its list shows.
     fn render_list_panel(&mut self, f: &mut Frame, area: Rect, compact: bool, spacer: bool) -> u16 {
@@ -750,25 +793,11 @@ impl PlaylistsUi {
             },
             spacer,
         );
-        if !self.store.is_loaded() {
-            if self.load_failed {
-                let text = format!("{LOAD_FAILED}. Restart Quickstream to try again.");
-                panel_message(f, list, &text, theme::error());
-            } else {
-                panel_message(f, list, "Loading playlists…", theme::mid());
-            }
+        if let Some((text, style)) = self.list_message() {
+            panel_message(f, list, &text, style);
             return list.height;
         }
         let len = self.store.playlists().len();
-        if len == 0 {
-            panel_message(
-                f,
-                list,
-                "No playlists yet. Press c to create one, or L on any track.",
-                theme::mid(),
-            );
-            return list.height;
-        }
 
         self.list_state.select(Some(self.list_cursor));
         let window = kit::visible_window(&mut self.list_state, len, usize::from(list.height));
@@ -856,7 +885,7 @@ impl PlaylistsUi {
         );
         let len = playlist.entries.len();
         if len == 0 {
-            panel_message(f, list, "Empty. Press L on a track in tab 2 to add it.", theme::mid());
+            panel_message(f, list, EMPTY_PLAYLIST, theme::mid());
             return list.height;
         }
 

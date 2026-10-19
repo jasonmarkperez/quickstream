@@ -403,11 +403,21 @@ impl AppUI {
         let screen = Screen::new(f.area());
         let compact = screen.short || screen.tier <= WidthTier::Compact;
         let Some(track) = self.queue.current_track().cloned() else {
-            let content = self.hero_panel(f, area, false, compact, true);
+            // `NO TRACK LOADED`, a blank row and the hint; under 24 rows both blank rows (this
+            // one and the one under the rule) go when the three rows do not fit with them.
+            let spacer = kit::keeps_spacer(
+                screen.short,
+                &[kit::PanelFit {
+                    area: Some(area),
+                    header_rows: kit::panel_header_rows(compact, true, false),
+                    rows: 3,
+                }],
+            );
+            let content = self.hero_panel(f, area, false, compact, spacer);
             let bold = theme::bold();
             line_at(f, content, 0, Line::styled("NO TRACK LOADED", bold));
             let hint = kit::clip(EMPTY_HINT, usize::from(content.width));
-            line_at(f, content, 2, Line::styled(hint, theme::dim()));
+            line_at(f, content, 1 + u16::from(spacer), Line::styled(hint, theme::dim()));
             return;
         };
         let summary = self.up_next_summary();
@@ -450,7 +460,16 @@ impl AppUI {
             let base_core = header_rows + hero_body + 1 + u16::from(spacer) + u16::from(!tech.is_empty());
             (header_rows, hero_body, base_core)
         };
-        let spacer = !screen.short || rows_for(true).2 < height;
+        // Everything under the header with the spacers kept, the elapsed row included.
+        let (spaced_header, _, spaced_core) = rows_for(true);
+        let spacer = kit::keeps_spacer(
+            screen.short,
+            &[kit::PanelFit {
+                area: Some(area),
+                header_rows: kit::panel_header_rows(compact, true, false),
+                rows: usize::from(spaced_core + 1 - spaced_header),
+            }],
+        );
         let (header_rows, hero_body, base_core) = rows_for(spacer);
         let bar_gap = u16::from(spacer);
         // UP NEXT's rows: up to MIN_UP_NEXT_ROWS tracks (or the end-of-queue note when none),

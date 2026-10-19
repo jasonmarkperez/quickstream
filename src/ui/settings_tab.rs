@@ -79,6 +79,12 @@ fn wrapped(lines: Vec<Line<'_>>, width: u16) -> (Paragraph<'_>, u16) {
     (paragraph, u16::try_from(rows).unwrap_or(u16::MAX))
 }
 
+/// Rows the web address takes under a list `width` columns wide when there is room: one, or
+/// two when it is wider than the list ([`web_address_rows`]).
+fn address_rows_wanted(url: &str, width: u16) -> u16 {
+    wrapped(vec![Line::raw(url)], width).1.clamp(1, 2)
+}
+
 /// The web address in DIM at the bottom of `list` (where neither the footnote nor the option
 /// panel has room for it): on one row, or on two when it is wider than the list, leaving the list
 /// at least one row (the cursor's); its start is cut with `…` only when the rows it gets are too
@@ -87,8 +93,7 @@ fn web_address_rows(f: &mut Frame, list: Rect, url: &str) -> Rect {
     if list.width == 0 {
         return list;
     }
-    let (_, needed) = wrapped(vec![Line::raw(url)], list.width);
-    let max_rows = needed.clamp(1, 2).min(list.height.saturating_sub(1));
+    let max_rows = address_rows_wanted(url, list.width).min(list.height.saturating_sub(1));
     if max_rows == 0 {
         return list;
     }
@@ -162,10 +167,31 @@ impl AppUI {
             })
         };
         // Under 24 rows the blank row under the rule goes when the list would not fit with it,
-        // even without the blank rows between groups (3h); the option panel follows, to stay
-        // level.
-        let header = kit::panel_header_rows(compact, footnote.is_some(), true);
-        let spacer = kit::keeps_spacer(screen.short, list_area.height, header, list_entries(false).len());
+        // even without the blank rows between groups, together with the web address when it
+        // goes under the list (3h); the option panel follows, to stay level.
+        let header_rows = kit::panel_header_rows(compact, footnote.is_some(), false);
+        let address_rows = web_url.as_deref().map_or(0, |url| {
+            let under_list = if options_panel {
+                // Under the list only when the option panel (with its blank row) can't hold it.
+                let panel_rows = area.height.saturating_sub(kit::panel_header_rows(compact, true, true));
+                wrapped(vec![Line::raw(url)], OPTION_COLS - kit::PANEL_RIGHT_PAD).1 > panel_rows
+            } else {
+                compact
+            };
+            if under_list {
+                address_rows_wanted(url, kit::panel_text_width(list_area))
+            } else {
+                0
+            }
+        });
+        let spacer = kit::keeps_spacer(
+            screen.short,
+            &[kit::PanelFit {
+                area: Some(list_area),
+                header_rows,
+                rows: list_entries(false).len() + usize::from(address_rows),
+            }],
+        );
         let list = kit::panel_spaced(
             f,
             list_area,

@@ -12,7 +12,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::ListState;
+use ratatui::widgets::{ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::theme;
@@ -571,10 +571,44 @@ pub fn panel_header_rows(compact: bool, footnote: bool, spacer: bool) -> u16 {
     2 + u16::from(footnote && !compact) + u16::from(spacer)
 }
 
-/// Whether a panel keeps the blank row before its content: always from 24 rows; under 24 rows
-/// (`short`) only while every one of `rows` content rows still fits in `height` with it.
-pub fn keeps_spacer(short: bool, height: u16, header_rows: u16, rows: usize) -> bool {
-    !short || rows <= usize::from(height.saturating_sub(header_rows))
+/// The columns [`panel_spaced`] leaves for the content of a panel drawn in `area`.
+pub fn panel_text_width(area: Rect) -> u16 {
+    area.width.saturating_sub(PANEL_RIGHT_PAD)
+}
+
+/// Rows `text` takes wrapped at spaces in `width` columns (as a `Paragraph` with
+/// `Wrap { trim: true }` draws it), for a message in a panel.
+pub fn message_rows(text: &str, width: u16) -> usize {
+    if width == 0 {
+        return usize::MAX;
+    }
+    Paragraph::new(text).wrap(Wrap { trim: true }).line_count(width)
+}
+
+/// One panel's part in [`keeps_spacer`].
+#[derive(Clone, Copy, Debug)]
+pub struct PanelFit {
+    /// Where the panel is drawn; `None` for a pane not shown, which takes no part.
+    pub area: Option<Rect>,
+    /// Rows above the content without the blank row: [`panel_header_rows`] with `spacer` false.
+    pub header_rows: u16,
+    /// Every content row the panel draws with the blank row kept: its list, and any message
+    /// (wrapped, [`message_rows`]), note or rows under the list it adds.
+    pub rows: usize,
+}
+
+/// Whether the panels drawn side by side keep the blank row before their content (spacer rows
+/// go first, 3h): always from 24 rows; under 24 rows (`short`) only while every row each panel
+/// draws still fits under its header with it. Panels side by side decide together, so their
+/// rows stay level.
+pub fn keeps_spacer(short: bool, panels: &[PanelFit]) -> bool {
+    !short
+        || panels.iter().all(|panel| {
+            panel.area.is_none_or(|area| {
+                let room = area.height.saturating_sub(panel.header_rows + 1);
+                panel.rows <= usize::from(room)
+            })
+        })
 }
 
 /// `line`'s spans with each span's style applied over `base`.
