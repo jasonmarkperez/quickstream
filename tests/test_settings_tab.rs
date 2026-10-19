@@ -666,3 +666,118 @@ fn narrow_settings_tab_does_not_panic_and_keeps_the_cursor_row_visible() {
     }
     app.editing_home_dir = None;
 }
+
+#[test]
+fn web_address_shows_at_every_width_while_a_web_row_is_selected() {
+    common::isolate();
+    let mut app = settings_app("web_every_width");
+    let port = start_loopback_web(&mut app);
+    let url = format!("http://127.0.0.1:{port}");
+    app.status_message.clear();
+    // Compact (under 90 columns, or under 24 rows) and wide-but-short layouts included.
+    for (w, h) in [
+        (120, 40),
+        (120, 20),
+        (100, 30),
+        (100, 20),
+        (85, 30),
+        (80, 24),
+        (60, 24),
+        (40, 24),
+    ] {
+        for cursor in [WEB_SERVER, WEB_LAN] {
+            app.settings_cursor = cursor;
+            let buf = tui::render(&mut app, w, h);
+            let (x, y) = tui::find_text(&buf, &url)
+                .unwrap_or_else(|| panic!("{w}x{h}, row {cursor}: no {url}:\n{}", dump(&buf)));
+            assert_eq!(tui::cell_style(&buf, x, y).fg, Some(P.dim), "{w}x{h}");
+        }
+        app.settings_cursor = QUEUE_MODE;
+        let buf = tui::render(&mut app, w, h);
+        assert!(!dump(&buf).contains("http://"), "{w}x{h}:\n{}", dump(&buf));
+    }
+}
+
+#[test]
+fn compact_pairing_link_wraps_and_is_cut_from_the_start_only_when_it_cannot_fit() {
+    common::isolate();
+    let mut app = settings_app("web_pairing_compact");
+    let port = start_loopback_web(&mut app);
+    // Network access on in the settings only (the server stays on loopback).
+    app.settings_mgr.settings.web_server_lan = true;
+    app.settings_mgr.set_lan_ip_resolver(|| "192.0.2.60".to_string());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while app.settings_mgr.web_url(Some(port)).is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let link = app.settings_mgr.web_url(Some(port)).expect("pairing link");
+    assert!(link.contains("?token="), "{link}");
+    app.status_message.clear();
+    app.settings_cursor = WEB_SERVER;
+    let token = quickstream::web_access::web_token();
+
+    // 80 columns: one row, whole.
+    let buf = tui::render(&mut app, 80, 24);
+    assert!(tui::find_text(&buf, &link).is_some(), "{link}\n{}", dump(&buf));
+
+    // Narrower than the link: two rows, whole once joined.
+    let buf = tui::render(&mut app, 50, 24);
+    let rows = tui::rows(&buf);
+    let at = rows
+        .iter()
+        .position(|r| r.trim_start().starts_with("http://192.0.2.60"))
+        .unwrap_or_else(|| panic!("no link row:\n{}", dump(&buf)));
+    let joined = format!("{}{}", rows[at].trim(), rows[at + 1].trim());
+    assert_eq!(joined, link, "\n{}", dump(&buf));
+
+    // Wider than two rows: the start is cut with `…`, the token's end still shows.
+    let buf = tui::render(&mut app, 30, 24);
+    let text = dump(&buf);
+    let rows = tui::rows(&buf);
+    let at = rows
+        .iter()
+        .position(|r| r.trim_start().starts_with('…'))
+        .unwrap_or_else(|| panic!("no cut link row:\n{text}"));
+    let joined = format!("{}{}", rows[at].trim(), rows[at + 1].trim());
+    assert!(joined.ends_with(token), "{joined}\n{text}");
+    assert!(link.ends_with(joined.trim_start_matches('…')), "{joined}");
+}
+
+#[test]
+fn a_long_startup_home_keeps_its_last_folder() {
+    common::isolate();
+    let mut app = settings_app("long_home");
+    let path = "/Volumes/Music/Classical/Deutsche Grammophon/Berliner Philharmoniker/Herbert von Karajan";
+    app.settings_mgr.settings.home_dir = Some(path.to_string());
+    for (w, h) in [(120, 40), (100, 30), (80, 24), (60, 24)] {
+        // Selected: `◂ …/Herbert von Karajan ▸`, its start cut.
+        app.settings_cursor = HOME_DIR;
+        let buf = tui::render(&mut app, w, h);
+        let row = must_row(&buf, HOME_DIR);
+        let value = tui::row(&buf, row);
+        // (At 60 columns only the end of the last folder fits.)
+        let last = if w >= 80 {
+            "Herbert von Karajan ▸"
+        } else {
+            "Karajan ▸"
+        };
+        assert!(
+            value.contains("◂ …") && value.trim_end().ends_with(last),
+            "{w}x{h}: {value:?}"
+        );
+        // Not selected: cut from the start too.
+        app.settings_cursor = QUEUE_MODE;
+        let buf = tui::render(&mut app, w, h);
+        let value = tui::row(&buf, must_row(&buf, HOME_DIR));
+        assert!(
+            value.contains('…') && value.trim_end().ends_with("Herbert von Karajan"),
+            "{w}x{h}: {value:?}"
+        );
+    }
+    // `LAUNCH DIRECTORY` is no path: too wide, its end is cut.
+    app.settings_mgr.settings.home_dir = None;
+    app.settings_cursor = QUEUE_MODE;
+    let buf = tui::render(&mut app, 30, 24);
+    let value = tui::row(&buf, row_of(&buf, "STARTUP"));
+    assert!(value.contains("LAUNCH") && !value.contains("…H DIRECTORY"), "{value:?}");
+}

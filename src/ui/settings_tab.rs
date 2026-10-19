@@ -10,6 +10,7 @@
 //! home editor stays inline: while it is open its row shows the typed text with a block cursor.
 
 use ratatui::prelude::*;
+use ratatui::widgets::{Paragraph, Wrap};
 
 use super::kit::{self, text_width, Col, PanelSpec, RowMark};
 use super::queue_tab::{display_path, SEP};
@@ -69,56 +70,45 @@ fn position_note(index: usize) -> String {
     format!("{pos:02} / {n:02}")
 }
 
-/// `text` broken into lines of at most `width` columns at spaces; a word wider than a line is
-/// broken where it reaches the edge.
-fn wrap_words(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        let sep = usize::from(!line.is_empty());
-        if text_width(&line) + sep + text_width(word) <= width {
-            if sep == 1 {
-                line.push(' ');
-            }
-            line.push_str(word);
-            continue;
-        }
-        if !line.is_empty() {
-            lines.push(std::mem::take(&mut line));
-        }
-        let mut pieces = wrap_chars(word, width);
-        line = pieces.pop().unwrap_or_default();
-        lines.extend(pieces);
-    }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    lines
+/// `lines` as ratatui wraps them in `width` columns (at spaces; a word wider than a line, such as
+/// a URL, is broken at the edge), and how many rows that takes, so what follows can be placed
+/// under it.
+fn wrapped(lines: Vec<Line<'_>>, width: u16) -> (Paragraph<'_>, u16) {
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true });
+    let rows = paragraph.line_count(width);
+    (paragraph, u16::try_from(rows).unwrap_or(u16::MAX))
 }
 
-/// `text` broken into lines of at most `width` columns anywhere (a URL has no spaces).
-fn wrap_chars(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = vec![String::new()];
-    let mut used = 0;
-    for c in text.chars() {
-        let w = kit::char_width(c);
-        if used + w > width && used > 0 {
-            lines.push(String::new());
-            used = 0;
-        }
-        lines.last_mut().expect("never empty").push(c);
-        used += w;
+/// The web address in DIM at the bottom of `list` (compact layouts, where neither the footnote
+/// nor an option panel has room for it): on one row, or on two when it is wider than the list
+/// and the list has rows to spare; its start is cut with `…` only when even that is too narrow.
+/// Returns the rows left for the list above it.
+fn web_address_rows(f: &mut Frame, list: Rect, url: &str) -> Rect {
+    let max_rows: u16 = if list.height >= 8 { 2 } else { 1 };
+    if list.height <= max_rows || list.width == 0 {
+        return list;
     }
-    lines
+    let shown = kit::visible_tail(url, usize::from(list.width) * usize::from(max_rows));
+    let (paragraph, rows) = wrapped(vec![Line::styled(shown, theme::dim())], list.width);
+    let rows = rows.min(max_rows);
+    let area = Rect {
+        y: list.bottom() - rows,
+        height: rows,
+        ..list
+    };
+    f.render_widget(paragraph, area.intersection(f.area()));
+    Rect {
+        height: list.height - rows,
+        ..list
+    }
 }
 
 impl AppUI {
     /// Tab 4: SETTINGS and, from 110 columns, the option panel (2e). Under 110 columns the
     /// position (`05 / 12`) joins the footnote, and on a web row the web address takes the
     /// config file's place there (3h); at 80–89 columns, or under 24 rows, the footnote shrinks
-    /// to the position on the label row.
+    /// to the position on the label row and the web address goes under the list
+    /// ([`web_address_rows`]), so it shows at every width.
     pub(super) fn render_settings_tab(&mut self, f: &mut Frame, area: Rect) {
         let screen = Screen::new(f.area());
         let compact = screen.tier < WidthTier::Medium || screen.short;
@@ -177,6 +167,12 @@ impl AppUI {
                 compact,
             },
         );
+        // Compact without the option panel the footnote is only the position, so the web address
+        // gets the list's last rows.
+        let list = match &web_url {
+            Some(url) if compact && !options_panel => web_address_rows(f, list, url),
+            _ => list,
+        };
         self.render_settings_list(f, list);
 
         if options_panel {
@@ -225,15 +221,29 @@ impl AppUI {
                 }
                 Entry::Setting(index) => {
                     let selected = index == cursor;
+                    // A path is cut from its start (`…/Karajan`), as in the editor and the
+                    // footnote, so its last folder shows; other values (`LAUNCH DIRECTORY`
+                    // too) from their end.
+                    let path = index == setting::HOME_DIR && self.settings_mgr.settings.home_dir.is_some();
+                    let fit = |value: &str, width: usize| {
+                        if path {
+                            kit::visible_tail(value, width)
+                        } else {
+                            kit::clip(value, width)
+                        }
+                    };
                     let value = match (&self.editing_home_dir, selected) {
                         (Some(input), true) if index == setting::HOME_DIR => {
                             format!("{}█", kit::visible_tail(input, value_cols.saturating_sub(1)))
                         }
                         (_, true) if value_cols >= 5 => {
                             let value = self.settings_mgr.short_value(index, &self.settings_context());
-                            format!("◂ {} ▸", kit::clip(&value, value_cols - 4))
+                            format!("◂ {} ▸", fit(&value, value_cols - 4))
                         }
-                        _ => self.settings_mgr.short_value(index, &self.settings_context()),
+                        _ => fit(
+                            &self.settings_mgr.short_value(index, &self.settings_context()),
+                            value_cols,
+                        ),
                     };
                     let cols = [
                         Col::fixed(kit::upper(SETTING_DEFINITIONS[index].label), label_cols, theme::mid()),
@@ -266,23 +276,19 @@ impl AppUI {
                 compact,
             },
         );
-        let width = usize::from(list.width);
-        let height = usize::from(list.height);
         let bold = theme::ink().add_modifier(Modifier::BOLD);
-        let mut rows: Vec<Vec<Col>> = Vec::new();
 
+        // The choices (each on one row), or while editing what the field takes.
         let editing = cursor == setting::HOME_DIR && self.editing_home_dir.is_some();
+        let mut text = Vec::new();
+        let mut choice_rows: u16 = 0;
         if editing {
-            rows.extend(
-                wrap_words(EDIT_HELP, width)
-                    .into_iter()
-                    .map(|line| vec![Col::flex(line, theme::ink())]),
-            );
+            text.push(Line::styled(EDIT_HELP, theme::ink()));
         } else {
             let options = self.settings_mgr.options(cursor, &self.settings_context());
             // Too many choices for the panel: the ones around the current choice.
             let len = options.choices.len();
-            let shown = len.min(height);
+            let shown = len.min(usize::from(list.height));
             let first = options.current.unwrap_or(0).saturating_sub(shown / 2).min(len - shown);
             for (i, choice) in options.choices.into_iter().enumerate().skip(first).take(shown) {
                 let (mark, style) = if options.current == Some(i) {
@@ -290,37 +296,35 @@ impl AppUI {
                 } else {
                     (Col::fixed("○", MARK_COLS, theme::mid()), theme::mid())
                 };
-                rows.push(vec![mark, Col::flex(choice.label, style)]);
+                let row = Rect::new(list.x, list.y + choice_rows, list.width, 1);
+                kit::list_row(f, row, &[mark, Col::flex(choice.label, style)], RowMark::Plain);
+                choice_rows += 1;
             }
         }
-        rows.push(Vec::new());
-        rows.extend(
-            wrap_words(def.description, width)
-                .into_iter()
-                .map(|line| vec![Col::flex(line, theme::mid())]),
-        );
+        // Then, after a blank row, the description and the web address on the web rows, wrapped.
+        text.push(Line::default());
+        text.push(Line::styled(def.description, theme::mid()));
         if let Some(url) = web_url {
-            rows.push(Vec::new());
-            rows.extend(
-                wrap_chars(url, width)
-                    .into_iter()
-                    .map(|line| vec![Col::flex(line, theme::dim())]),
-            );
+            text.push(Line::default());
+            text.push(Line::styled(url, theme::dim()));
         }
+        let (paragraph, text_rows) = wrapped(text, list.width);
+        let text_area = Rect {
+            y: list.y + choice_rows,
+            height: list.height - choice_rows,
+            ..list
+        };
+        f.render_widget(paragraph, text_area.intersection(f.area()));
 
-        for (dy, cols) in rows.iter().take(height).enumerate() {
-            let row = Rect::new(list.x, list.y + dy as u16, list.width, 1);
-            kit::list_row(f, row, cols, RowMark::Plain);
-        }
         // The keys that change this setting, as the key row shows them, after a blank row.
-        let keys_dy = rows.len() + 1;
-        if !editing && keys_dy < height {
+        let keys_dy = choice_rows.saturating_add(text_rows).saturating_add(1);
+        if !editing && keys_dy < list.height {
             let hints: Vec<_> = self
                 .tab_key_hints()
                 .into_iter()
                 .filter(|h| h.keys != "J K" && h.keys != "?")
                 .collect();
-            let row = Rect::new(list.x, list.y + keys_dy as u16, list.width, 1);
+            let row = Rect::new(list.x, list.y + keys_dy, list.width, 1);
             f.render_widget(kit::key_row(&hints, list.width, None), row);
         }
     }
