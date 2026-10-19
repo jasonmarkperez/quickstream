@@ -10,7 +10,7 @@
 //! reads a file, and tags read for other folders don't make it.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ratatui::prelude::*;
 
@@ -182,16 +182,7 @@ pub(super) fn split_panes(
     )
 }
 
-/// `path` with the home folder shown as `~`, in its original case (resolution 2).
-pub(super) fn display_path(path: &Path, home: Option<&Path>) -> String {
-    if let Some(rest) = home.and_then(|home| path.strip_prefix(home).ok()) {
-        if rest.as_os_str().is_empty() {
-            return "~".to_string();
-        }
-        return format!("~/{}", rest.display());
-    }
-    path.display().to_string()
-}
+pub(super) use crate::paths::display_path;
 
 /// Char range of the first occurrence of `query` in `text`, both compared in UPPERCASE (as the
 /// rows are drawn).

@@ -1152,7 +1152,13 @@ fn test_settings_show_pairing_link_when_lan_access_enabled() {
     assert!(!local.contains("token"), "{}", local);
 
     mgr.settings.web_server_lan = true;
-    let lan = mgr.get_display_value(6);
+    // The LAN address is looked up on a worker; the link shows once it is known.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut lan = mgr.get_display_value(6);
+    while !lan.contains("http://") && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        lan = mgr.get_display_value(6);
+    }
     let token = quickstream::web_access::web_token();
     assert!(lan.contains(&format!(":8080/?token={}", token)), "{}", lan);
     assert!(lan.contains("http://"), "{}", lan);

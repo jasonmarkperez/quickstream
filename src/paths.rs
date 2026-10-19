@@ -3,6 +3,17 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// `path` with the home folder shown as `~`, in its original case (Telemetry resolution 2).
+pub fn display_path(path: &Path, home: Option<&Path>) -> String {
+    if let Some(rest) = home.and_then(|home| path.strip_prefix(home).ok()) {
+        if rest.as_os_str().is_empty() {
+            return "~".to_string();
+        }
+        return format!("~/{}", rest.display());
+    }
+    path.display().to_string()
+}
+
 /// Get the Quickstream configuration directory (~/.config/quickstream or $XDG_CONFIG_HOME/quickstream).
 pub fn get_config_dir() -> PathBuf {
     if let Ok(val) = std::env::var("XDG_CONFIG_HOME") {

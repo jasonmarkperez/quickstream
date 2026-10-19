@@ -32,7 +32,7 @@ use crate::player::local::LocalPlayer;
 use crate::player::worker::AsyncPlayer;
 use crate::player::AudioPlayer;
 use crate::queue::PlaybackQueue;
-use crate::settings::{SettingsManager, SETTING_DEFINITIONS};
+use crate::settings::{SettingsManager, SETTING_DEFINITIONS, SETTING_DISPLAY_ORDER};
 
 #[derive(Clone, Debug, Default)]
 pub struct CachedDir {
@@ -324,6 +324,9 @@ impl AppUI {
         let cwd = std::path::absolute(&cwd).unwrap_or(cwd);
         let backend = settings_mgr.settings.player_backend.clone();
         let bookmarks = Self::load_bookmarks();
+        // Look the music folder up now, at startup, so cycling the startup home on the Settings
+        // tab never does (on Linux it reads user-dirs.dirs).
+        crate::settings::music_dir();
         // Discovery starts in run(): SSDP opens a socket on all interfaces, which tests that
         // only construct the app should not do (macOS firewall prompts).
         let device_manager = DeviceManager::new();
@@ -378,7 +381,7 @@ impl AppUI {
             pending_parent_restore: None,
             queue_cursor: 0,
             devices_cursor: 0,
-            settings_cursor: 0,
+            settings_cursor: SETTING_DISPLAY_ORDER[0],
             bookmarks,
             in_bookmarks_view: false,
             show_help_modal: false,
@@ -2256,7 +2259,7 @@ impl AppUI {
             }
             (KeyCode::Char('v'), KeyModifiers::NONE) => {
                 if self.active_tab == 0 || self.active_tab == 1 {
-                    self.settings_mgr.cycle_setting(0, true);
+                    self.settings_mgr.cycle_setting(0, true, &self.bookmarks);
                     self.update_browser_entry_labels();
                     self.status_message = format!(
                         "Display mode: {}",
@@ -2678,33 +2681,27 @@ impl AppUI {
             3 => {
                 // Settings Tab
                 match (code, modifiers) {
+                    // The cursor holds a setting index and moves in the order the tab lists
+                    // the settings (grouped), wrapping at either end.
                     (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
-                        if self.settings_cursor > 0 {
-                            self.settings_cursor -= 1;
-                        } else {
-                            self.settings_cursor = SETTING_DEFINITIONS.len() - 1;
-                        }
+                        self.settings_cursor = crate::settings::step_in_display_order(self.settings_cursor, false);
                     }
                     (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
-                        if self.settings_cursor + 1 < SETTING_DEFINITIONS.len() {
-                            self.settings_cursor += 1;
-                        } else {
-                            self.settings_cursor = 0;
-                        }
+                        self.settings_cursor = crate::settings::step_in_display_order(self.settings_cursor, true);
                     }
                     (KeyCode::PageUp, _)
                     | (KeyCode::Home, _)
                     | (KeyCode::Char('g'), KeyModifiers::NONE)
                     | (KeyCode::Char('K'), _)
                     | (KeyCode::Up, KeyModifiers::SHIFT) => {
-                        self.settings_cursor = 0;
+                        self.settings_cursor = SETTING_DISPLAY_ORDER[0];
                     }
                     (KeyCode::PageDown, _)
                     | (KeyCode::End, _)
                     | (KeyCode::Char('G'), _)
                     | (KeyCode::Char('J'), _)
                     | (KeyCode::Down, KeyModifiers::SHIFT) => {
-                        self.settings_cursor = SETTING_DEFINITIONS.len() - 1;
+                        self.settings_cursor = SETTING_DISPLAY_ORDER[SETTING_DISPLAY_ORDER.len() - 1];
                     }
                     (KeyCode::Char('e'), KeyModifiers::NONE) if self.settings_cursor == 7 => {
                         let curr = self.settings_mgr.settings.home_dir.clone().unwrap_or_default();
@@ -2745,7 +2742,8 @@ impl AppUI {
     }
 
     pub fn cycle_and_apply_setting(&mut self, forward: bool) {
-        self.settings_mgr.cycle_setting(self.settings_cursor, forward);
+        self.settings_mgr
+            .cycle_setting(self.settings_cursor, forward, &self.bookmarks);
         if self.settings_cursor == 0 {
             self.update_browser_entry_labels();
         } else if self.settings_cursor == 1 {
