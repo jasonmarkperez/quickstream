@@ -13,6 +13,7 @@ use ratatui::widgets::*;
 mod chrome;
 mod devices_tab;
 pub mod features;
+mod help;
 pub mod kit;
 mod now_playing;
 pub mod playlists;
@@ -3799,6 +3800,10 @@ impl AppUI {
         }
         self.render_key_row(f, layout.keys, &screen);
 
+        // A modal is drawn over the screen dimmed to RULE on GROUND.
+        if self.modal_open() {
+            kit::dim_buffer(f.buffer_mut(), area);
+        }
         if let Some(ref mut modal) = self.search_modal {
             Self::render_search_modal(modal, f);
         } else if self.playlists.modal.is_some() {
@@ -3808,6 +3813,14 @@ impl AppUI {
         } else if self.show_help_modal {
             self.render_help_modal(f);
         }
+    }
+
+    /// Whether a modal (search, playlist prompt or picker, mix picker, help) is open.
+    fn modal_open(&self) -> bool {
+        self.search_modal.is_some()
+            || self.playlists.modal.is_some()
+            || self.show_mix_picker_modal
+            || self.show_help_modal
     }
 
     fn render_search_modal(modal: &mut SearchModalState, f: &mut Frame) {
@@ -4004,102 +4017,12 @@ impl AppUI {
     }
 
     fn render_help_modal(&self, f: &mut Frame) {
-        let area = modal_rect_with_height(f.area(), HELP_MODAL_HEIGHT);
-        kit::clear(f.buffer_mut(), area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                " QUICKSTREAM KEYBOARD CHEAT-SHEET ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ))
-            .border_style(Style::default().fg(Color::Cyan))
-            .style(theme::base());
-        f.render_widget(block, area);
-
-        let inner = if area.height >= 17 {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(15),   // 2-column key list
-                    Constraint::Length(1), // Footer instruction
-                ])
-                .margin(1)
-                .split(area)
-        } else {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1)])
-                .margin(1)
-                .split(area)
-        };
-
-        if inner.is_empty() {
-            return;
-        }
-
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(inner[0]);
-
-        if cols.len() < 2 {
-            return;
-        }
-
-        // Left Column: Playback & Navigation. Both columns must fit the 19 rows an 80x24
-        // terminal leaves for the key list, and each description fits in 27 columns there
-        // (38 per column, less the key field).
-        let left_lines = vec![
-            Self::help_section_header("PLAYBACK & AUDIO"),
-            Self::help_key_line("Space", "Play / Pause"),
-            Self::help_key_line("s", "Stop playback"),
-            Self::help_key_line("← / →", "Previous / Next track"),
-            Self::help_key_line("[ / ]", "Seek -10s / +10s"),
-            Self::help_key_line("+ / -", "Volume Up / Down"),
-            Line::from(""),
-            Self::help_section_header("NAVIGATION & TABS"),
-            Self::help_key_line("n", "Toggle Now Playing ↔ Queue"),
-            Self::help_key_line("1 - 5", "Tab: Now/Queue/Dev/Set/PL"),
-            Self::help_key_line("h / l", "Focus panes (tabs 2 & 5)"),
-            Self::help_key_line("j / k", "Move Up / Down (wraps)"),
-            Self::help_key_line("J / K", "Page (2) / Move track (5)"),
-            Self::help_key_line("g / G", "Jump to Start / End"),
-            Self::help_key_line("PgUp/PgDn", "Page Up / Down (tabs 2 & 5)"),
-            Self::help_key_line("Bksp", "Go up to parent dir"),
-            Self::help_section_header("PLAYLISTS (TAB 5)"),
-            Self::help_key_line("c / R / D", "New / Rename / Delete"),
-            Self::help_key_line("Enter/a", "Open/Play / Queue playlist"),
-        ];
-        f.render_widget(Paragraph::new(left_lines), cols[0]);
-
-        // Right Column: Library & Search (descriptions <= 27 chars, as on the left)
-        let right_lines = vec![
-            Self::help_section_header("LIBRARY & QUEUE"),
-            Self::help_key_line("Enter", "Open / Queue / Play"),
-            Self::help_key_line("p", "Autopilot (adds if playing)"),
-            Self::help_key_line("P", "Autopilot Reshuffle (next+)"),
-            Self::help_key_line("M", "Mix Picker modal (vibe/BPM)"),
-            Self::help_key_line("r", "Seed Radio / Rescan dev"),
-            Self::help_key_line("Z / z", "Shuffle current queue"),
-            Self::help_key_line("a", "Add all songs in folder"),
-            Self::help_key_line("L", "Add to playlist"),
-            Self::help_key_line("d / x", "Remove track / bookmark"),
-            Self::help_key_line("c", "Clear queue (queue pane)"),
-            Self::help_key_line("b", "Bookmark folder in Homes"),
-            Self::help_key_line("H", "Set folder as startup home"),
-            Self::help_key_line("~", "Jump to startup home dir"),
-            Self::help_key_line("v", "Toggle tags vs filenames"),
-            Line::from(""),
-            Self::help_section_header("SEARCH & DISCOVERY"),
-            Self::help_key_line("/", "Spotlight jump in folder"),
-            Self::help_key_line("f", "Full library fuzzy search"),
-        ];
-        f.render_widget(Paragraph::new(right_lines), cols[1]);
+        let screen = f.area();
+        help::render(f, screen);
     }
 
     fn render_mix_picker_modal(&self, f: &mut Frame) {
-        let area = help_modal_rect(f.area());
+        let area = mix_picker_rect(f.area());
         kit::clear(f.buffer_mut(), area);
 
         let block = Block::default()
@@ -4218,23 +4141,6 @@ impl AppUI {
         ]);
         f.render_widget(Paragraph::new(footer_line).alignment(Alignment::Center), inner[2]);
     }
-
-    fn help_section_header(title: &str) -> Line<'static> {
-        Line::from(vec![Span::styled(
-            format!("── {} ──", title),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )])
-    }
-
-    fn help_key_line(key: &str, desc: &str) -> Line<'static> {
-        Line::from(vec![
-            Span::styled(
-                format!(" {:<width$} ", key, width = HELP_KEY_WIDTH),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(desc.to_string(), Style::default().fg(Color::White)),
-        ])
-    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -4257,16 +4163,9 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn help_modal_rect(r: Rect) -> Rect {
+fn mix_picker_rect(r: Rect) -> Rect {
     modal_rect_with_height(r, 20)
 }
-
-/// Width of the help modal's key field: the longest key, `c / R / D`. A longer key would push
-/// its description out of line with the rest of the column.
-const HELP_KEY_WIDTH: usize = 9;
-
-/// Rows of the help modal: the key list, its footer and the border must fit.
-const HELP_MODAL_HEIGHT: u16 = 30;
 
 /// Centered modal up to 90 columns wide and `height` rows tall, shrunk to fit small terminals.
 fn modal_rect_with_height(r: Rect, height: u16) -> Rect {

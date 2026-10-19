@@ -397,7 +397,7 @@ fn test_help_modal_lists_tab_5_navigation() {
     assert!(app.show_help_modal);
 
     let view = render(&mut app, 100, 40);
-    assert!(view.contains("1 - 5"), "{}", view);
+    assert!(view.contains("1–5"), "{}", view);
     assert!(view.contains("PLAYLISTS (TAB 5)"), "{}", view);
     assert!(view.contains("Focus panes (tabs 2 & 5)"), "{}", view);
     assert!(view.contains("Open/Play / Queue playlist"), "{}", view);
@@ -420,8 +420,8 @@ fn test_help_modal_fits_tab_5_keys_at_80x24() {
     let view = render(&mut app, 80, 24);
     for text in [
         "PLAYLISTS (TAB 5)",
-        "R / D",
-        "Enter/a",
+        "C ⇧R ⇧D",
+        "↵ A",
         "New / Rename / Delete",
         "Open/Play / Queue playlist",
         "Focus panes (tabs 2 & 5)",

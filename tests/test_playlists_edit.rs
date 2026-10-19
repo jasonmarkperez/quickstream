@@ -487,7 +487,7 @@ fn test_help_modal_lists_playlist_editing_keys() {
     assert!(app.show_help_modal);
 
     let view = render_view(&mut app, 120, 60);
-    for text in ["c / R / D", "New / Rename / Delete", "Page (2) / Move track (5)"] {
+    for text in ["C ⇧R ⇧D", "New / Rename / Delete", "⇧J ⇧K", "Page (2) / Move track (5)"] {
         assert!(view.contains(text), "help should list {:?}:\n{}", text, view);
     }
     // Small terminals still render without panicking.

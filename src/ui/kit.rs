@@ -217,6 +217,127 @@ pub fn clear(buf: &mut Buffer, area: Rect) {
     buf.set_style(area, theme::base());
 }
 
+/// Dim `area` (clipped to the buffer) under a modal: every cell keeps its text but is drawn in RULE
+/// on GROUND, with no bold, underline or other modifier.
+pub fn dim_buffer(buf: &mut Buffer, area: Rect) {
+    let area = area.intersection(buf.area);
+    let p = theme::palette();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buf[(x, y)];
+            cell.set_fg(p.rule).set_bg(p.ground);
+            cell.modifier = Modifier::empty();
+        }
+    }
+}
+
+/// A `width` x `height` rectangle centred in `area`, shrunk to fit it: never larger than `area`
+/// and never outside it, whatever the sizes.
+pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    )
+}
+
+/// What [`modal_frame`] draws around a modal.
+#[derive(Clone, Debug, Default)]
+pub struct ModalSpec<'a> {
+    /// The title chip's text (` KEYS `), drawn as given.
+    pub title: &'a str,
+    /// At the right end of the title row, in DIM unless its spans say otherwise.
+    pub note: Option<Line<'a>>,
+    /// Border and title chip in ERROR (errors and the delete confirmation).
+    pub error: bool,
+    /// For short terminals: the title sits in the top border and the padding is 1 column and no
+    /// rows, instead of a title row of its own with 3 columns / 1 row of padding.
+    pub compact: bool,
+}
+
+/// Columns and rows of padding inside a modal's border.
+const MODAL_PAD_X: u16 = 3;
+const MODAL_PAD_Y: u16 = 1;
+const COMPACT_MODAL_PAD_X: u16 = 1;
+
+/// A modal's title chip: ` TITLE ` in reverse video, or on ERROR.
+pub fn modal_title(title: &str, error: bool) -> Span<'static> {
+    Span::styled(format!(" {title} "), theme::chip(error))
+}
+
+/// Draw a modal's frame over `area` and return the area left for its content.
+///
+/// The area is cleared ([`clear`]), then gets a thin border (DIM, or ERROR) and the title chip
+/// with the note against the right edge. Full: a padding row, the title row, a blank row, then the
+/// content, 3 columns in from the border, with a padding row at the bottom. Compact: the chip and
+/// note sit in the top border and the content starts right under it, 1 column in. Small areas
+/// drop what doesn't fit; the returned area may be empty.
+pub fn modal_frame(f: &mut Frame, area: Rect, spec: ModalSpec) -> Rect {
+    let area = area.intersection(f.area());
+    let buf = f.buffer_mut();
+    clear(buf, area);
+    if area.is_empty() {
+        return area;
+    }
+    let border_style = if spec.error { theme::error() } else { theme::dim() };
+    ratatui::widgets::Widget::render(
+        ratatui::widgets::Block::bordered().border_style(border_style),
+        area,
+        buf,
+    );
+    if area.width < 2 || area.height < 2 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+
+    let chip = modal_title(spec.title, spec.error);
+    let note = spec.note.as_ref().map(|line| styled_over(line, theme::dim()));
+    let (pad_x, title_y, top) = if spec.compact {
+        // `┌─ TITLE ─── NOTE ─┐`: one `─` and a space on each side.
+        (COMPACT_MODAL_PAD_X, area.y, area.y + 1)
+    } else {
+        (MODAL_PAD_X, area.y + 1 + MODAL_PAD_Y, area.y + 1 + MODAL_PAD_Y + 2)
+    };
+    let pad_x = pad_x.min((area.width - 2) / 2);
+    let row_x = area.x + 1 + if spec.compact { 1 } else { pad_x };
+    let row_right = area.right() - 1 - if spec.compact { 1 } else { pad_x };
+    if title_y < area.bottom() - 1 || spec.compact {
+        draw_title_row(buf, row_x, row_right, title_y, chip, note, spec.compact);
+    }
+
+    let bottom = area.bottom() - 1 - if spec.compact { 0 } else { MODAL_PAD_Y };
+    let x = area.x + 1 + pad_x;
+    let width = area.width - 2 - 2 * pad_x;
+    if top >= bottom || width == 0 {
+        return Rect::new(x, top.min(area.bottom()), 0, 0);
+    }
+    Rect::new(x, top, width, bottom - top)
+}
+
+/// The chip from `left` and the note ending at `right` on row `y`, the note dropped (then the chip
+/// cut) when they don't both fit. Compact rows put a space around each, over the border.
+fn draw_title_row(buf: &mut Buffer, left: u16, right: u16, y: u16, chip: Span, note: Option<Vec<Span>>, compact: bool) {
+    let room = right.saturating_sub(left) as usize;
+    if room == 0 {
+        return;
+    }
+    let chip_width = chip.width().min(room);
+    buf.set_stringn(left, y, &chip.content, chip_width, chip.style);
+    let Some(mut note) = note else { return };
+    if compact {
+        note.insert(0, Span::styled(" ", theme::dim()));
+        note.push(Span::styled(" ", theme::dim()));
+    }
+    let note_width = spans_width(&note);
+    // At least a column between the chip and the note.
+    if chip_width + 1 + note_width <= room {
+        let x = right - note_width as u16;
+        buf.set_line(x, y, &Line::from(note), note_width as u16);
+    }
+}
+
 /// `VOL ▮▮▮▮▮▮▮▯▯▯▯ 65`: 11 cells, filled in INK, empty in DIM, the number in bold INK.
 pub fn volume_meter(vol: u8) -> Vec<Span<'static>> {
     let filled = (vol.min(100) as usize * VOLUME_CELLS + 50) / 100;

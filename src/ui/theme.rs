@@ -130,6 +130,17 @@ pub fn cursor() -> Style {
     Style::new().fg(p.ground).bg(p.ink).add_modifier(Modifier::BOLD)
 }
 
+/// A modal's title chip (` KEYS `): reverse video like [`cursor`], or GROUND on ERROR for an error
+/// or the delete confirmation.
+pub fn chip(error: bool) -> Style {
+    if error {
+        let p = palette();
+        Style::new().fg(p.ground).bg(p.error).add_modifier(Modifier::BOLD)
+    } else {
+        cursor()
+    }
+}
+
 /// A key name in a key hint (` SPC `).
 pub fn keycap() -> Style {
     let p = palette();
