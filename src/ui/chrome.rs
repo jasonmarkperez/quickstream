@@ -535,6 +535,9 @@ impl AppUI {
             hints = kit::top_hints(&hints, COMPACT_KEYS);
         }
         let width = usize::from(area.width);
+        // Too narrow even for the never-dropped keys (Now Playing's `N QUEUE` and `? KEYS` need
+        // 21 columns): only whole keys are drawn, never a keycap without its label.
+        let hints = kit::fit_top_hints(&hints, width);
         let meter = (self.active_tab == 0).then(|| {
             let vol = self.player.volume();
             if screen.tier >= WidthTier::Medium {
@@ -546,6 +549,8 @@ impl AppUI {
                 ]
             }
         });
+        // The meter is shown whole or not at all: beside the never-dropped keys it must fit.
+        let meter = meter.filter(|m| kit::top_priority_width(&hints) + PART_GAP + spans_width(m) <= width);
 
         let right = match (self.status_span(), meter) {
             (None, meter) => meter,

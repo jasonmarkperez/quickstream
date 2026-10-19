@@ -464,3 +464,41 @@ fn list_row_underlines_scattered_characters() {
     // H A L and the C of CHORUS; the first and last A of ADA (at column 20).
     assert_eq!(marked, vec![0, 1, 2, 11, 20, 22]);
 }
+
+/// `kit::keeps_spacer`: always from 24 rows; under 24 rows only while every panel side by side
+/// fits all its rows under its header and the blank row. A pane not shown takes no part.
+#[test]
+fn keeps_spacer_counts_every_row_of_every_shown_panel() {
+    common::isolate();
+    let area = Rect::new(0, 0, 40, 10);
+    // Label, rule and footnote: 3 rows, then the blank row: 6 rows left.
+    let fit = |area: Option<Rect>, rows: usize| kit::PanelFit {
+        area,
+        header_rows: kit::panel_header_rows(false, true, false),
+        rows,
+    };
+    assert_eq!(kit::panel_header_rows(false, true, false), 3);
+    assert!(kit::keeps_spacer(true, &[fit(Some(area), 6)]));
+    assert!(!kit::keeps_spacer(true, &[fit(Some(area), 7)]));
+    assert!(
+        kit::keeps_spacer(false, &[fit(Some(area), 70)]),
+        "not short: always kept"
+    );
+    // Side by side: one panel that does not fit takes the blank row from both.
+    assert!(!kit::keeps_spacer(true, &[fit(Some(area), 2), fit(Some(area), 7)]));
+    // A hidden pane does not count.
+    assert!(kit::keeps_spacer(true, &[fit(Some(area), 2), fit(None, 70)]));
+    assert!(!kit::keeps_spacer(true, &[fit(Some(Rect::new(0, 0, 40, 2)), 1)]));
+}
+
+/// `kit::message_rows` counts the rows a message wraps to as a trimmed `Paragraph` draws it.
+#[test]
+fn message_rows_count_wrapped_rows() {
+    common::isolate();
+    let text = "No playlists yet. Press c to create one, or L on any track.";
+    assert_eq!(kit::message_rows(text, 80), 1);
+    assert_eq!(kit::message_rows(text, 36), 2);
+    assert_eq!(kit::message_rows(text, 14), 5);
+    assert_eq!(kit::message_rows(text, 0), usize::MAX, "no room at all: never fits");
+    assert_eq!(kit::panel_text_width(Rect::new(0, 0, 40, 5)), 38);
+}

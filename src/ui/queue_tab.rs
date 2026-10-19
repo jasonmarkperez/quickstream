@@ -337,15 +337,32 @@ impl AppUI {
         let screen = Screen::new(f.area());
         let compact = screen.tier < WidthTier::Medium || screen.short;
         let (library_area, queue_area) = split_panes(area, screen.tier, self.queue_focus, (1, 2));
-        let library_rows = library_area.map(|a| self.render_library_panel(f, a, screen.tier, compact));
-        let queue_rows = queue_area.map(|a| self.render_queue_panel(f, a, screen.tier, compact));
+        // Under 24 rows both panels give up the blank row under their rule when either list does
+        // not fit with it, so their rows stay lined up. The spotlight query keeps its own row.
+        let spacer = kit::keeps_spacer(
+            screen.short,
+            &[
+                kit::PanelFit {
+                    area: library_area,
+                    header_rows: kit::panel_header_rows(compact && self.browser_spotlight.is_none(), true, false),
+                    rows: self.browser_entries.len() + usize::from(self.browser_loading),
+                },
+                kit::PanelFit {
+                    area: queue_area,
+                    header_rows: kit::panel_header_rows(compact, true, false),
+                    rows: self.queue.len(),
+                },
+            ],
+        );
+        let library_rows = library_area.map(|a| self.render_library_panel(f, a, screen.tier, compact, spacer));
+        let queue_rows = queue_area.map(|a| self.render_queue_panel(f, a, screen.tier, compact, spacer));
         // A hidden pane pages by the rows the shown one has: the same panel, a pane-switch away.
         self.browser_page_height = library_rows.or(queue_rows).unwrap_or(1).max(1) as usize;
         self.queue_page_height = queue_rows.or(library_rows).unwrap_or(1).max(1) as usize;
     }
 
     /// The LIBRARY panel; returns the rows its list shows.
-    fn render_library_panel(&mut self, f: &mut Frame, area: Rect, tier: WidthTier, compact: bool) -> u16 {
+    fn render_library_panel(&mut self, f: &mut Frame, area: Rect, tier: WidthTier, compact: bool, spacer: bool) -> u16 {
         let text_cols = usize::from(area.width.saturating_sub(2));
         let tags = self.settings_mgr.settings.metadata_view;
         let spotlight = self.browser_spotlight.clone();
@@ -367,7 +384,7 @@ impl AppUI {
         } else {
             "FILES"
         };
-        let list = kit::panel(
+        let list = kit::panel_spaced(
             f,
             area,
             PanelSpec {
@@ -377,6 +394,7 @@ impl AppUI {
                 footnote: Some(footnote),
                 compact,
             },
+            spacer,
         );
 
         let loading_row = usize::from(self.browser_loading);
@@ -618,7 +636,7 @@ impl AppUI {
     }
 
     /// The QUEUE panel; returns the rows its list shows.
-    fn render_queue_panel(&mut self, f: &mut Frame, area: Rect, tier: WidthTier, compact: bool) -> u16 {
+    fn render_queue_panel(&mut self, f: &mut Frame, area: Rect, tier: WidthTier, compact: bool, spacer: bool) -> u16 {
         let len = self.queue.len();
         let summary = self.queue_summary();
         let footnote = if compact {
@@ -631,7 +649,7 @@ impl AppUI {
             }
         };
         let note = queue_mode_note(&self.settings_mgr.settings.queue_mode);
-        let list = kit::panel(
+        let list = kit::panel_spaced(
             f,
             area,
             PanelSpec {
@@ -641,6 +659,7 @@ impl AppUI {
                 footnote: Some(Line::from(footnote)),
                 compact,
             },
+            spacer,
         );
 
         self.queue_state.select(Some(self.queue_cursor));

@@ -4,8 +4,9 @@
 //! the elapsed time in big numerals, then title, artist, album and year) with the SIGNAL panel
 //! beside it from 110 columns; the progress bar across the whole width; elapsed and remaining
 //! time with the file's path; then UP NEXT. Under 110 columns SIGNAL becomes a one-line tech
-//! summary under the bar and the title moves beside the numerals. When rows run short, UP NEXT
-//! goes first, then the elapsed row.
+//! summary under the bar and the title moves beside the numerals (or, too narrow for both, the
+//! time is written in plain digits with the title under it). When rows run short, UP NEXT goes
+//! first, then (under 24 rows) the spacer rows, then the elapsed row.
 //!
 //! Only data already in memory is drawn: the queue's tags and the features the features worker
 //! has found for the current track ([`TrackFeaturesWorker::features_for`]). A field without data
@@ -38,6 +39,10 @@ const SIGNAL_LABEL_COLS: u16 = 10;
 
 /// Columns between the numerals and the title beside them (under 110 columns, 3f).
 const TITLE_GAP: u16 = 5;
+
+/// The title keeps at least this many columns beside the numerals, or the time is written in
+/// plain digits with the title under it.
+const MIN_TITLE_COLS: u16 = 10;
 
 /// Separator of the artist / album / year line.
 const META_SEP: &str = "  /  ";
@@ -372,12 +377,12 @@ impl AppUI {
     }
 
     /// The NOW PLAYING panel header; returns the area left for its content.
-    fn hero_panel(&self, f: &mut Frame, area: Rect, has_track: bool, compact: bool) -> Rect {
+    fn hero_panel(&self, f: &mut Frame, area: Rect, has_track: bool, compact: bool, spacer: bool) -> Rect {
         // The label, the 2 columns between it and the footnote, the 2 under the rule's ` ▪`.
         let room = usize::from(area.width).saturating_sub(text_width("NOW PLAYING") + 4);
         let footnote = self.hero_footnote(has_track, compact, room);
         let profile = self.autopilot_profile().map(|p| format!("AUTOPILOT · {p}"));
-        kit::panel(
+        kit::panel_spaced(
             f,
             area,
             PanelSpec {
@@ -387,6 +392,7 @@ impl AppUI {
                 footnote: Some(Line::from(footnote)),
                 compact,
             },
+            spacer,
         )
     }
 
@@ -397,11 +403,21 @@ impl AppUI {
         let screen = Screen::new(f.area());
         let compact = screen.short || screen.tier <= WidthTier::Compact;
         let Some(track) = self.queue.current_track().cloned() else {
-            let content = self.hero_panel(f, area, false, compact);
+            // `NO TRACK LOADED`, a blank row and the hint; under 24 rows both blank rows (this
+            // one and the one under the rule) go when the three rows do not fit with them.
+            let spacer = kit::keeps_spacer(
+                screen.short,
+                &[kit::PanelFit {
+                    area: Some(area),
+                    header_rows: kit::panel_header_rows(compact, true, false),
+                    rows: 3,
+                }],
+            );
+            let content = self.hero_panel(f, area, false, compact, spacer);
             let bold = theme::bold();
             line_at(f, content, 0, Line::styled("NO TRACK LOADED", bold));
             let hint = kit::clip(EMPTY_HINT, usize::from(content.width));
-            line_at(f, content, 2, Line::styled(hint, theme::dim()));
+            line_at(f, content, 1 + u16::from(spacer), Line::styled(hint, theme::dim()));
             return;
         };
         let summary = self.up_next_summary();
@@ -426,17 +442,36 @@ impl AppUI {
         // rows alone (and without the features' year), so UP NEXT and the elapsed row never
         // depend on whether features have arrived, and SIGNAL gets the rows left over (its least
         // useful rows cut first).
-        let header_rows: u16 = if compact { 3 } else { 4 };
+        // Spacer rows (the blank under the rule, the one before the bar and, from 110 columns,
+        // the one between the numerals and the title) go first under 24 rows, before the
+        // elapsed row would (3h): `spacer` is false when the hero and the elapsed row do not fit
+        // with them.
         let height = area.height;
-        let hero_body = if full {
+        let has_meta = artist.is_some() || album.is_some();
+        let rows_for = |spacer: bool| {
+            let header_rows = kit::panel_header_rows(compact, true, spacer);
             // The year comes with the features, so it doesn't count: a track without artist or
             // album shows it only when SIGNAL's rows have made the hero tall enough.
-            let has_meta = artist.is_some() || album.is_some();
-            5 + u16::from(has_meta)
-        } else {
-            3
+            let hero_body = if full {
+                4 + u16::from(spacer) + u16::from(has_meta)
+            } else {
+                3
+            };
+            let base_core = header_rows + hero_body + 1 + u16::from(spacer) + u16::from(!tech.is_empty());
+            (header_rows, hero_body, base_core)
         };
-        let base_core = header_rows + hero_body + 2 + u16::from(!tech.is_empty());
+        // Everything under the header with the spacers kept, the elapsed row included.
+        let (spaced_header, _, spaced_core) = rows_for(true);
+        let spacer = kit::keeps_spacer(
+            screen.short,
+            &[kit::PanelFit {
+                area: Some(area),
+                header_rows: kit::panel_header_rows(compact, true, false),
+                rows: usize::from(spaced_core + 1 - spaced_header),
+            }],
+        );
+        let (header_rows, hero_body, base_core) = rows_for(spacer);
+        let bar_gap = u16::from(spacer);
         // UP NEXT's rows: up to MIN_UP_NEXT_ROWS tracks (or the end-of-queue note when none),
         // plus loop mode's `LOOPS TO 01` row when the list wraps among them.
         let listed = summary.remaining.min(usize::from(MIN_UP_NEXT_ROWS));
@@ -450,7 +485,7 @@ impl AppUI {
         let body = hero_body.max((signal.len() as u16).min(hero_body + spare));
         let signal = fit_signal_rows(signal, usize::from(body));
         let top = header_rows + body;
-        let core = top + 2 + u16::from(!tech.is_empty());
+        let core = top + bar_gap + 1 + u16::from(!tech.is_empty());
 
         let (pos, dur) = self.playback_times();
         let elapsed = kit::duration(pos);
@@ -463,33 +498,52 @@ impl AppUI {
         } else {
             area.width
         };
-        let hero = self.hero_panel(f, Rect::new(area.x, area.y, hero_width, top.min(height)), true, compact);
+        let hero_rect = Rect::new(area.x, area.y, hero_width, top.min(height));
+        let hero = self.hero_panel(f, hero_rect, true, compact, spacer);
+        // Under 110 columns the title goes beside the numerals; when they leave it too little
+        // room the time is written in plain digits instead, with the title and artist under it,
+        // rather than numerals cut at the edge. Decided from the widest time the track shows
+        // (its length, `1:00:00` and up from an hour), not the elapsed time, so the layout and
+        // the title's place hold for the whole track, across the hour mark and while seeking.
+        let widest = dur.map_or(0, |d| kit::big_digits_width(&kit::duration(d)));
+        let numerals_cols = kit::big_digits_width(&elapsed).max(widest) as u16;
+        let big = full || hero.width >= numerals_cols + TITLE_GAP + MIN_TITLE_COLS;
         // From 110 columns `/ 05:52` (regular DIM) follows the numerals' bottom row. Each row is
         // drawn once, as spans: a line style would leave BOLD on the whole row.
         let total = dur.filter(|_| full).map(|d| format!(" / {}", kit::duration(d)));
-        for (dy, row) in numerals.iter().enumerate() {
-            let mut spans = vec![Span::styled(row.clone(), bold)];
-            if dy == 2 {
-                spans.extend(total.as_ref().map(|t| Span::styled(t.clone(), theme::dim())));
+        if big {
+            for (dy, row) in numerals.iter().enumerate() {
+                let mut spans = vec![Span::styled(row.clone(), bold)];
+                if dy == 2 {
+                    spans.extend(total.as_ref().map(|t| Span::styled(t.clone(), theme::dim())));
+                }
+                line_at(f, hero, dy as u16, Line::from(spans));
             }
-            line_at(f, hero, dy as u16, Line::from(spans));
         }
         let hero_cols = usize::from(hero.width);
         if full {
             // The title and the artist line below the numerals.
-            line_at(f, hero, 4, Line::styled(kit::clip(&title, hero_cols), bold));
+            let title_dy = 3 + u16::from(spacer);
+            line_at(f, hero, title_dy, Line::styled(kit::clip(&title, hero_cols), bold));
             let meta: Vec<String> = [artist, album, year].into_iter().flatten().collect();
             let meta = kit::clip(&meta.join(META_SEP), hero_cols);
-            line_at(f, hero, 5, Line::styled(meta, theme::mid()));
+            line_at(f, hero, title_dy + 1, Line::styled(meta, theme::mid()));
             self.render_signal_panel(
                 f,
                 Rect::new(area.x + hero_width + PANEL_GAP, area.y, SIGNAL_COLS, top.min(height)),
                 &signal,
                 compact,
+                spacer,
             );
+        } else if !big {
+            // The time, the title and the artist, one per row.
+            let lines = [(elapsed.clone(), bold), (title, bold)].into_iter();
+            for (dy, (text, style)) in lines.chain(artist.map(|a| (a, theme::mid()))).enumerate() {
+                line_at(f, hero, dy as u16, Line::styled(kit::clip(&text, hero_cols), style));
+            }
         } else {
             // Title, artist, and album with year beside the numerals (3f).
-            let x = hero.x + kit::big_digits_width(&elapsed) as u16 + TITLE_GAP;
+            let x = hero.x + numerals_cols + TITLE_GAP;
             let beside = Rect::new(x, hero.y, hero.right().saturating_sub(x), hero.height);
             let album_year: Vec<String> = [album, year].into_iter().flatten().collect();
             let mut lines = vec![(title, bold)];
@@ -527,10 +581,10 @@ impl AppUI {
         };
         let mut bar = kit::progress_bar(width.saturating_sub(2 + reserve), ratio);
         bar.extend(after);
-        line_at(f, rows, top + 1, Line::from(bar));
+        line_at(f, rows, top + bar_gap, Line::from(bar));
         if !tech.is_empty() {
             let line = joined_to_fit(&tech, TECH_SEP, width);
-            line_at(f, rows, top + 2, Line::styled(line, theme::dim()));
+            line_at(f, rows, top + bar_gap + 1, Line::styled(line, theme::dim()));
         }
         if show_info {
             let mut info = format!("ELAPSED {elapsed}");
@@ -560,9 +614,16 @@ impl AppUI {
 
     /// The SIGNAL panel (from 110 columns): `SOURCE <output>` in the footnote, then a row per
     /// field that has data.
-    fn render_signal_panel(&self, f: &mut Frame, area: Rect, rows: &[(&'static str, String)], compact: bool) {
+    fn render_signal_panel(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        rows: &[(&'static str, String)],
+        compact: bool,
+        spacer: bool,
+    ) {
         let source = format!("SOURCE {}", self.output_label());
-        let list = kit::panel(
+        let list = kit::panel_spaced(
             f,
             area,
             PanelSpec {
@@ -572,6 +633,7 @@ impl AppUI {
                 footnote: Some(Line::from(source)),
                 compact,
             },
+            spacer,
         );
         for (dy, (label, value)) in rows.iter().enumerate().take(usize::from(list.height)) {
             let cols = [

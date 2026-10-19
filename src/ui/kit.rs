@@ -12,7 +12,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::ListState;
+use ratatui::widgets::{ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::theme;
@@ -126,6 +126,32 @@ pub fn top_priority_width(hints: &[KeyHint]) -> usize {
     };
     let widths: Vec<usize> = hints.iter().filter(|h| h.priority == top).map(KeyHint::width).collect();
     widths.iter().sum::<usize>() + KEY_GAP * widths.len().saturating_sub(1)
+}
+
+/// The hints a key row `width` columns wide can show whole, before [`key_row`] trims to its
+/// right part: while the hints with the highest priority (which [`key_row`] never drops) are too
+/// wide together, the rightmost of them gives way; once none of them fits, the next priority
+/// takes their place. So a keycap never shows without its label, and when not even one hint
+/// fits whole the row has none.
+pub fn fit_top_hints(hints: &[KeyHint], width: usize) -> Vec<KeyHint> {
+    let mut hints = hints.to_vec();
+    while top_priority_width(&hints) > width {
+        let top = hints.iter().map(|h| h.priority).max().unwrap_or_default();
+        match hints.iter().rposition(|h| h.priority == top) {
+            Some(last) => {
+                hints.remove(last);
+            }
+            None => break,
+        }
+    }
+    hints
+}
+
+/// A key row of whole keys only, `width` columns wide: [`key_row`] of [`fit_top_hints`], for a
+/// modal's footer or a panel's keys, so a keycap never shows without its whole label however
+/// narrow the row is.
+pub fn whole_key_row<'a>(hints: &[KeyHint], width: u16) -> Line<'a> {
+    key_row(&fit_top_hints(hints, usize::from(width)), width, None)
 }
 
 /// A key row `width` columns wide: the hints from the left, 4 columns apart, and `right` (a status
@@ -495,6 +521,12 @@ pub struct PanelSpec<'a> {
 /// it stops 2 columns short of `area`'s right edge, under the ` ▪`, so text lines up with the
 /// right note and a cursor bar ([`list_row`]) can reach one column past it on each side.
 pub fn panel(f: &mut Frame, area: Rect, spec: PanelSpec) -> Rect {
+    panel_spaced(f, area, spec, true)
+}
+
+/// [`panel`], with the blank row before the content only when `spacer`. Under 24 rows spacer
+/// rows are the first to go (3h): a panel whose content would not fit gives that row to it.
+pub fn panel_spaced(f: &mut Frame, area: Rect, spec: PanelSpec, spacer: bool) -> Rect {
     let area = area.intersection(f.area());
     let buf = f.buffer_mut();
     let text_width = area.width.saturating_sub(PANEL_RIGHT_PAD);
@@ -553,8 +585,56 @@ pub fn panel(f: &mut Frame, area: Rect, spec: PanelSpec) -> Rect {
         y += 1;
     }
     // The blank row before the content.
-    y = (y + 1).min(bottom);
+    if spacer {
+        y = (y + 1).min(bottom);
+    }
     Rect::new(area.x, y, text_width, bottom - y)
+}
+
+/// Rows [`panel_spaced`] takes above the content: label, rule, the footnote row (unless
+/// `compact` puts it on the label row) and the blank row when `spacer`.
+pub fn panel_header_rows(compact: bool, footnote: bool, spacer: bool) -> u16 {
+    2 + u16::from(footnote && !compact) + u16::from(spacer)
+}
+
+/// The columns [`panel_spaced`] leaves for the content of a panel drawn in `area`.
+pub fn panel_text_width(area: Rect) -> u16 {
+    area.width.saturating_sub(PANEL_RIGHT_PAD)
+}
+
+/// Rows `text` takes wrapped at spaces in `width` columns (as a `Paragraph` with
+/// `Wrap { trim: true }` draws it), for a message in a panel.
+pub fn message_rows(text: &str, width: u16) -> usize {
+    if width == 0 {
+        return usize::MAX;
+    }
+    Paragraph::new(text).wrap(Wrap { trim: true }).line_count(width)
+}
+
+/// One panel's part in [`keeps_spacer`].
+#[derive(Clone, Copy, Debug)]
+pub struct PanelFit {
+    /// Where the panel is drawn; `None` for a pane not shown, which takes no part.
+    pub area: Option<Rect>,
+    /// Rows above the content without the blank row: [`panel_header_rows`] with `spacer` false.
+    pub header_rows: u16,
+    /// Every content row the panel draws with the blank row kept: its list, and any message
+    /// (wrapped, [`message_rows`]), note or rows under the list it adds.
+    pub rows: usize,
+}
+
+/// Whether the panels drawn side by side keep the blank row before their content (spacer rows
+/// go first, 3h): always from 24 rows; under 24 rows (`short`) only while every row each panel
+/// draws still fits under its header with it. Panels side by side decide together, so their
+/// rows stay level.
+pub fn keeps_spacer(short: bool, panels: &[PanelFit]) -> bool {
+    !short
+        || panels.iter().all(|panel| {
+            panel.area.is_none_or(|area| {
+                let room = area.height.saturating_sub(panel.header_rows + 1);
+                panel.rows <= usize::from(room)
+            })
+        })
 }
 
 /// `line`'s spans with each span's style applied over `base`.
