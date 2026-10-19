@@ -331,7 +331,7 @@ fn modal_frame_never_panics_at_tiny_sizes() {
 // The tab under a modal is dimmed
 // ---------------------------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Modal {
     Help,
     MixPicker,
@@ -423,6 +423,73 @@ fn every_modal_dims_the_screen_under_it() {
 }
 
 #[test]
+fn every_modal_keeps_the_gutters() {
+    common::isolate();
+    // However narrow the screen, a modal leaves the 2-column gutters on both sides alone.
+    let (mut app, dir) = modal_app("gutters");
+    app.active_tab = 1;
+    for modal in MODALS {
+        open_modal(&mut app, modal);
+        for (w, h) in [
+            (120, 40),
+            (100, 30),
+            (85, 30),
+            (84, 24),
+            (83, 24),
+            (80, 24),
+            (70, 24),
+            (80, 20),
+            (40, 12),
+        ] {
+            let buffer = tui::render(&mut app, w, h);
+            let rect = modal_rect(&buffer);
+            if modal == Modal::Help && (80..84).contains(&w) {
+                // The one exception: at 80-83 columns the help takes 80, the gutters included,
+                // because only then is every description whole (the 80x24 guarantee).
+                assert_eq!((rect.x, rect.width), ((w - 80) / 2, 80), "{w}x{h}: {rect:?}");
+                continue;
+            }
+            assert!(
+                rect.x >= 2 && rect.right() <= w - 2,
+                "{modal:?} at {w}x{h}: {rect:?}\n{}",
+                tui::rows(&buffer).join("\n")
+            );
+        }
+        close_modals(&mut app);
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn modal_area_is_centred_inside_the_gutters() {
+    common::isolate();
+    // Wide enough: the asked size, centred.
+    assert_eq!(
+        kit::modal_area(Rect::new(0, 0, 120, 40), 96, 32),
+        Rect::new(12, 4, 96, 32)
+    );
+    // Narrower than the modal plus the gutters: 2 columns left on each side.
+    assert_eq!(
+        kit::modal_area(Rect::new(0, 0, 85, 30), 96, 22),
+        Rect::new(2, 4, 81, 22)
+    );
+    assert_eq!(
+        kit::modal_area(Rect::new(0, 0, 80, 24), 84, 17),
+        Rect::new(2, 3, 76, 17)
+    );
+    // Taller than the screen: clamped to it.
+    assert_eq!(
+        kit::modal_area(Rect::new(0, 0, 40, 12), 84, 17),
+        Rect::new(2, 0, 36, 12)
+    );
+    // Tiny screens: no panic, never outside.
+    for area in [Rect::new(0, 0, 0, 0), Rect::new(0, 0, 3, 1), Rect::new(3, 2, 4, 1)] {
+        let r = kit::modal_area(area, 96, 32);
+        assert!(area.union(r) == area || r.is_empty(), "{r:?} outside {area:?}");
+    }
+}
+
+#[test]
 fn help_dims_every_cell_outside_it() {
     common::isolate();
     let (mut app, dir) = modal_app("dim_help");
@@ -488,19 +555,37 @@ const HELP_SECTIONS: [&str; 5] = [
     "SEARCH & DISCOVERY",
 ];
 
-/// Each key with its description, whole, on one row inside the modal: the keycap first, in the
-/// keycap style, then the description in MID, 10 columns after the key field starts.
-fn assert_help_lists_every_key(buffer: &Buffer, size: &str) {
+/// Each key with its description on one row inside the modal: the keycap first, in the keycap
+/// style, then the description in MID, 10 columns after the key field starts. `whole`: every
+/// description in full; otherwise a description may be cut, ending in `…`.
+fn assert_help_lists_every_key(buffer: &Buffer, size: &str, whole: bool) {
     let p = theme::palette();
     let rect = modal_rect(buffer);
     let rows = rect_rows(buffer, rect);
     for (key, desc) in HELP_KEYS {
-        let (y, row) = rows
+        // The description, or (when cuts are allowed) its longest start that is drawn with `…`.
+        let shown = if whole {
+            vec![desc.to_string()]
+        } else {
+            let chars: Vec<char> = desc.chars().collect();
+            let mut forms = vec![desc.to_string()];
+            forms.extend(
+                (8..chars.len())
+                    .rev()
+                    .map(|n| format!("{}…", chars[..n].iter().collect::<String>())),
+            );
+            forms
+        };
+        let (y, row, text) = shown
             .iter()
-            .enumerate()
-            .find(|(_, row)| row.contains(desc))
+            .find_map(|text| {
+                rows.iter()
+                    .enumerate()
+                    .find(|(_, row)| row.contains(text.as_str()))
+                    .map(|(y, row)| (y, row, text))
+            })
             .unwrap_or_else(|| panic!("{size}: {desc:?} missing\n{}", rows.join("\n")));
-        let desc_col = row[..row.find(desc).unwrap()].chars().count();
+        let desc_col = row[..row.find(text.as_str()).unwrap()].chars().count();
         let field: String = row.chars().take(desc_col).collect::<Vec<_>>()[desc_col - 10..]
             .iter()
             .collect();
@@ -519,12 +604,14 @@ fn assert_help_lists_every_key(buffer: &Buffer, size: &str) {
             "{size}: {section:?}"
         );
     }
-    // Nothing cut short.
-    assert!(
-        !rows.iter().any(|r| r.contains('…')),
-        "{size}: clipped\n{}",
-        rows.join("\n")
-    );
+    if whole {
+        // Nothing cut short.
+        assert!(
+            !rows.iter().any(|r| r.contains('…')),
+            "{size}: clipped\n{}",
+            rows.join("\n")
+        );
+    }
 }
 
 #[test]
@@ -532,10 +619,14 @@ fn help_lists_every_key_with_its_description_at_120x40_and_80x24() {
     common::isolate();
     let (mut app, dir) = modal_app("help_keys");
     app.show_help_modal = true;
-    for (w, h) in [(120, 40), (80, 24), (100, 40), (96, 32)] {
+    for (w, h) in [(120, 40), (80, 24), (100, 40), (96, 32), (88, 32), (84, 24), (83, 24)] {
         let buffer = tui::render(&mut app, w, h);
-        assert_help_lists_every_key(&buffer, &format!("{w}x{h}"));
+        assert_help_lists_every_key(&buffer, &format!("{w}x{h}"), true);
     }
+    // Narrower, inside the gutters, every key is still listed, the longest descriptions cut
+    // with `…`.
+    let buffer = tui::render(&mut app, 70, 24);
+    assert_help_lists_every_key(&buffer, "70x24", false);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -605,7 +696,12 @@ fn help_compact_layout_fits_80x24() {
     let buffer = tui::render(&mut app, 80, 24);
     let rect = modal_rect(&buffer);
     assert!(rect.height <= 22, "{rect:?}");
-    assert!(rect.width <= 80);
+    // 80 columns wide: the gutters are the room every description needs whole.
+    assert_eq!((rect.x, rect.width), (0, 80), "{rect:?}");
+    // From 84 columns it keeps them.
+    let buffer = tui::render(&mut app, 84, 24);
+    let rect = modal_rect(&buffer);
+    assert_eq!((rect.x, rect.width), (2, 80), "{rect:?}");
     // The title sits in the top border.
     let rows = rect_rows(&buffer, rect);
     assert!(rows[0].starts_with("┌─ KEYS "), "{:?}", rows[0]);

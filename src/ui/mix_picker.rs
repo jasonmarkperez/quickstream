@@ -4,6 +4,7 @@
 
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
+use ratatui::widgets::ListState;
 use ratatui::Frame;
 
 use super::kit::{self, Col, KeyHint, ModalSpec, RowMark};
@@ -19,7 +20,8 @@ const WIDTH: u16 = 84;
 const FULL_HEIGHT: u16 = 6 + 3 + 5 * 3 - 1 + 2;
 
 /// Compact (short terminals, 80x24): the title in the border, no padding or blank rows between
-/// the profiles.
+/// the profiles. Shorter screens drop the subtitle, its rule and the blank rows too, and scroll
+/// the profiles to keep the cursor's in view.
 const COMPACT_HEIGHT: u16 = 2 + 3 + 5 * 2 + 2;
 
 /// Columns of the index (`1`) and of the `●`/`○` before a profile's title; its description lines
@@ -27,12 +29,16 @@ const COMPACT_HEIGHT: u16 = 2 + 3 + 5 * 2 + 2;
 const INDEX_COLS: u16 = 3;
 const GLYPH_COLS: u16 = 3;
 
-/// Draw the mix picker centred on the screen; `cursor` is the highlighted row and `active` the
-/// profile in use.
-pub(super) fn render(f: &mut Frame, cursor: usize, active: &MixProfile) {
+/// Rows a profile takes: its title row and its description.
+const PROFILE_ROWS: u16 = 2;
+
+/// Draw the mix picker centred on the screen; `cursor` is the highlighted row, `active` the
+/// profile in use and `list` the scroll position when not every profile fits.
+pub(super) fn render(f: &mut Frame, cursor: usize, active: &MixProfile, list: &mut ListState) {
     let screen = f.area();
     let full = screen.height >= FULL_HEIGHT;
-    let area = kit::centered(screen, WIDTH, if full { FULL_HEIGHT } else { COMPACT_HEIGHT });
+    let tight = !full && screen.height < COMPACT_HEIGHT;
+    let area = kit::modal_area(screen, WIDTH, if full { FULL_HEIGHT } else { COMPACT_HEIGHT });
     let inner = kit::modal_frame(
         f,
         area,
@@ -49,24 +55,35 @@ pub(super) fn render(f: &mut Frame, cursor: usize, active: &MixProfile) {
     let bottom = inner.bottom();
     let mut y = inner.y;
 
-    let buf = f.buffer_mut();
-    buf.set_stringn(
-        inner.x,
-        y,
-        kit::clip("Sequences the queue with DJ spacing and transitions.", width),
-        width,
-        theme::mid(),
-    );
-    y += 1;
-    if y < bottom {
-        kit::modal_rule(buf, inner.x, y, inner.width);
+    if !tight {
+        let buf = f.buffer_mut();
+        buf.set_stringn(
+            inner.x,
+            y,
+            kit::clip("Sequences the queue with DJ spacing and transitions.", width),
+            width,
+            theme::mid(),
+        );
+        y += 1;
+        if y < bottom {
+            kit::modal_rule(buf, inner.x, y, inner.width);
+        }
+        y += 2;
     }
-    y += 2;
 
-    // The footer takes the last row, after a blank one.
-    let rows_bottom = bottom.saturating_sub(2);
+    // The footer takes the last row (after a blank one unless tight).
+    let footer_rows = if tight { 1 } else { 2 };
+    let rows_bottom = bottom.saturating_sub(footer_rows);
+    // As many whole profiles as fit (at least the cursor's title), scrolled to the cursor.
+    let gap = if full { 1 } else { 0 };
+    let list_rows = rows_bottom.saturating_sub(y);
+    let fit = ((list_rows + gap) / (PROFILE_ROWS + gap)).max(list_rows.min(1));
+    let profiles = MixProfile::picker_profiles();
+    list.select(Some(cursor));
+    let window = kit::visible_window(list, profiles.len(), fit as usize);
     let active_index = active.picker_index();
-    for (index, profile) in MixProfile::picker_profiles().iter().enumerate() {
+    for index in window {
+        let profile = &profiles[index];
         if y >= rows_bottom {
             break;
         }
@@ -103,14 +120,15 @@ pub(super) fn render(f: &mut Frame, cursor: usize, active: &MixProfile) {
                 style,
             );
         }
-        y += if full { 2 } else { 1 };
+        y += PROFILE_ROWS - 1 + gap;
     }
 
-    if inner.height > 2 {
+    // Too narrow for every key, `J K` then `ENTER` go, so `ESC  CANCEL` always shows whole.
+    if inner.height > footer_rows {
         let hints = [
             KeyHint::new("J K", "SELECT", 2),
             KeyHint::new("ENTER", "START MIX", 3),
-            KeyHint::new("ESC", "CANCEL", 3),
+            KeyHint::new("ESC", "CANCEL", 4),
         ];
         let line = kit::key_row(&hints, inner.width, None);
         f.buffer_mut().set_line(inner.x, bottom - 1, &line, inner.width);

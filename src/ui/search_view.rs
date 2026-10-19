@@ -37,6 +37,12 @@ const PANEL_GAP: u16 = 4;
 /// The TRACK panel's label column (`DURATION` and a space).
 const DETAIL_LABEL_COLS: usize = 10;
 
+/// Rows a panel header takes (label, rule, blank row), and the fewest list rows the matches keep
+/// with their header. With less room (short terminals) the matches go right under the query row,
+/// with no blank row, no RANKED MATCHES header and no TRACK panel.
+const PANEL_HEADER_ROWS: u16 = 3;
+const MIN_LIST_ROWS: u16 = 3;
+
 /// What the TRACK panel drops first when it is short of rows, most expendable first.
 const DETAIL_DROP_ORDER: [&str; 4] = ["SIZE", "CHANNELS", "BITRATE", "RATE"];
 
@@ -44,11 +50,7 @@ const DETAIL_DROP_ORDER: [&str; 4] = ["SIZE", "CHANNELS", "BITRATE", "RATE"];
 pub(super) fn render(f: &mut Frame, modal: &mut SearchModalState, home: Option<&Path>) {
     let screen = f.area();
     let full = screen.height >= FULL_MIN_ROWS;
-    let area = kit::centered(
-        screen,
-        screen.width.saturating_sub(4).min(MAX_WIDTH),
-        screen.height.saturating_sub(4).min(MAX_HEIGHT),
-    );
+    let area = kit::modal_area(screen, MAX_WIDTH, screen.height.saturating_sub(4).min(MAX_HEIGHT));
     let root = display_path(&modal.root_dir, home);
     let note = modal.is_scanning.then(|| {
         let elapsed = modal.scan_start.map(|start| start.elapsed()).unwrap_or_default();
@@ -82,16 +84,20 @@ pub(super) fn render(f: &mut Frame, modal: &mut SearchModalState, home: Option<&
         y += 1;
     }
     // A blank row, then the panels down to the footer (after a blank row in the full layout).
-    y += 1;
     let footer_rows = if full { 2 } else { 1 };
     let bottom = inner.bottom().saturating_sub(footer_rows);
-    if y < bottom {
-        let panels = Rect::new(inner.x, y, inner.width, bottom - y);
+    let room = bottom.saturating_sub(y);
+    if room >= 1 + PANEL_HEADER_ROWS + MIN_LIST_ROWS {
+        let panels = Rect::new(inner.x, y + 1, inner.width, room - 1);
         let (list, detail) = split(panels, screen.width >= DETAIL_MIN_COLS);
         draw_matches(f, list, modal);
         if let Some(detail) = detail {
             draw_detail(f, detail, modal.selected_track(), home);
         }
+    } else if room > 0 {
+        // Too short for the headers: the matches alone, right under the query row.
+        let width = inner.width.saturating_sub(kit::PANEL_RIGHT_PAD);
+        draw_match_rows(f, Rect::new(inner.x, y, width, room), modal);
     }
     if inner.height > footer_rows {
         draw_footer(
@@ -172,6 +178,11 @@ fn draw_matches(f: &mut Frame, area: Rect, modal: &mut SearchModalState) {
             ..Default::default()
         },
     );
+    draw_match_rows(f, content, modal);
+}
+
+/// The match rows in `content` (or `No tracks match your query.`).
+fn draw_match_rows(f: &mut Frame, content: Rect, modal: &mut SearchModalState) {
     if content.is_empty() {
         return;
     }
@@ -357,13 +368,14 @@ fn wrap_path(path: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// ` ENTER  ADD & CLOSE    TAB  ADD TO QUEUE    ⇧TAB  ADD ALL (4)    ESC  CANCEL`.
+/// ` ENTER  ADD & CLOSE    TAB  ADD TO QUEUE    ⇧TAB  ADD ALL (4)    ESC  CANCEL`; too narrow
+/// for all of them, `⇧TAB`, `TAB`, then `ENTER` go, so `ESC  CANCEL` always shows whole.
 fn draw_footer(f: &mut Frame, area: Rect, matches: usize) {
     let hints = [
         KeyHint::new("ENTER", "ADD & CLOSE", 3),
         KeyHint::new("TAB", "ADD TO QUEUE", 2),
         KeyHint::new("⇧TAB", format!("ADD ALL ({})", grouped(matches)), 1),
-        KeyHint::new("ESC", "CANCEL", 3),
+        KeyHint::new("ESC", "CANCEL", 4),
     ];
     let line = kit::key_row(&hints, area.width, None);
     f.buffer_mut().set_line(area.x, area.y, &line, area.width);

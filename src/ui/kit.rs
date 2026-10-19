@@ -244,6 +244,16 @@ pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
+/// Columns a modal leaves of the screen on each side: the screen's gutters.
+pub const MODAL_MARGIN: u16 = 2;
+
+/// Where a `width` x `height` modal goes on `screen`: [`centered`], narrowed to leave
+/// [`MODAL_MARGIN`] columns on each side when the screen is narrower than the modal.
+pub fn modal_area(screen: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(screen.width.saturating_sub(2 * MODAL_MARGIN));
+    centered(screen, width, height)
+}
+
 /// What [`modal_frame`] draws around a modal.
 #[derive(Clone, Debug, Default)]
 pub struct ModalSpec<'a> {
@@ -264,7 +274,7 @@ pub struct ModalSpec<'a> {
 /// Columns and rows of padding inside a modal's border.
 const MODAL_PAD_X: u16 = 3;
 const MODAL_PAD_Y: u16 = 1;
-const COMPACT_MODAL_PAD_X: u16 = 1;
+pub(super) const COMPACT_MODAL_PAD_X: u16 = 1;
 
 /// A modal's title chip: ` TITLE ` in reverse video, or on ERROR.
 pub fn modal_title(title: &str, error: bool) -> Span<'static> {

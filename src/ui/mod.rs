@@ -297,6 +297,8 @@ pub struct AppUI {
     pub active_mix_profile: crate::analysis::MixProfile,
     pub show_mix_picker_modal: bool,
     pub mix_picker_cursor: usize,
+    /// The mix picker's scroll position on screens too short for every profile (reset on open).
+    mix_picker_list: ListState,
     /// Writes bookmarks and settings off the UI thread; flushed and joined on drop.
     pub persistence: crate::persist::PersistenceWorker,
     /// Tab 5: playlist store, cursors and the playlist modals.
@@ -459,6 +461,7 @@ impl AppUI {
             active_mix_profile,
             show_mix_picker_modal: false,
             mix_picker_cursor: 0,
+            mix_picker_list: ListState::default(),
             persistence,
             playlists,
             clock: kit::ClockCache::new(),
@@ -2361,6 +2364,7 @@ impl AppUI {
             (KeyCode::Char('M'), _) | (KeyCode::Char('m'), KeyModifiers::SHIFT) => {
                 self.show_mix_picker_modal = !self.show_mix_picker_modal;
                 self.mix_picker_cursor = self.active_mix_profile.picker_index();
+                self.mix_picker_list = ListState::default();
             }
             (KeyCode::Char('L'), _) | (KeyCode::Char('l'), KeyModifiers::SHIFT) => {
                 self.open_add_picker();
@@ -3813,8 +3817,13 @@ impl AppUI {
         help::render(f, screen);
     }
 
-    fn render_mix_picker_modal(&self, f: &mut Frame) {
-        mix_picker::render(f, self.mix_picker_cursor, &self.active_mix_profile);
+    fn render_mix_picker_modal(&mut self, f: &mut Frame) {
+        mix_picker::render(
+            f,
+            self.mix_picker_cursor,
+            &self.active_mix_profile,
+            &mut self.mix_picker_list,
+        );
     }
 }
 

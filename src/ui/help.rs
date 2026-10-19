@@ -1,8 +1,11 @@
 //! Help modal (`?`, mockup 2g): every key the handlers act on, in two columns of sections.
 //!
-//! Full layout (96 x 32, from 32 rows and 84 columns): a title row with the version, each section
+//! Full layout (96 x 32, from 32 rows and 88 columns): a title row with the version, each section
 //! under a label and a rule, and a `? OR ESC CLOSE` footer. Compact layout (at most 22 rows, so it
 //! fits 80x24): the title in the top border, sections with no rules or blank rows between them.
+//! Both stay inside the screen's 2-column gutters, except at 80-83 columns, where the compact
+//! layout takes 80 columns so every description stays whole; under 80 the longest are cut with
+//! `…`.
 
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -83,9 +86,14 @@ const KEY_FIELD: u16 = 10;
 const DESC_MAX: u16 = 27;
 /// Width of the full layout.
 const FULL_WIDTH: u16 = 96;
-/// Narrowest screen for the full layout: border, 3 columns of padding each side, and two columns
+/// Narrowest box for the full layout: border, 3 columns of padding each side, and two columns
 /// that each hold a key field, the longest description and a blank column.
 const FULL_MIN_WIDTH: u16 = 2 + 2 * 3 + 2 * (KEY_FIELD + DESC_MAX + 1);
+/// Narrowest box whose compact layout shows every description whole: as above, with the compact
+/// frame's padding. 80, so the help fits an 80-column terminal whole.
+const WHOLE_MIN_WIDTH: u16 = 2 + 2 * kit::COMPACT_MODAL_PAD_X + 2 * (KEY_FIELD + DESC_MAX + 1);
+
+const _: () = assert!(WHOLE_MIN_WIDTH == 80, "the compact help must fit 80 columns whole");
 
 /// Rows a column of `sections` takes: with a rule under each label and a blank row between
 /// sections (full), or neither (compact).
@@ -123,11 +131,18 @@ const COMPACT_HEIGHT: u16 = 2 + max(column_rows(&LEFT, false), column_rows(&RIGH
 const _: () = assert!(FULL_HEIGHT <= 32, "the full help must fit 32 rows");
 const _: () = assert!(COMPACT_HEIGHT <= 22, "the compact help must fit an 80x24 terminal");
 
-/// Draw the help modal centred on `screen`.
+/// Draw the help modal centred on `screen`, inside its gutters ([`kit::modal_area`]), except on
+/// 80-83 column screens: there the gutters are what keeps every description whole, so the help
+/// takes [`WHOLE_MIN_WIDTH`] columns.
 pub(super) fn render(f: &mut Frame, screen: Rect) {
-    let full = screen.height >= FULL_HEIGHT && screen.width >= FULL_MIN_WIDTH;
+    let room = screen.width.saturating_sub(2 * kit::MODAL_MARGIN);
+    let full = screen.height >= FULL_HEIGHT && room >= FULL_MIN_WIDTH;
     let height = if full { FULL_HEIGHT } else { COMPACT_HEIGHT };
-    let area = kit::centered(screen, FULL_WIDTH, height);
+    let area = if room < WHOLE_MIN_WIDTH && screen.width >= WHOLE_MIN_WIDTH {
+        kit::centered(screen, WHOLE_MIN_WIDTH, height)
+    } else {
+        kit::modal_area(screen, FULL_WIDTH, height)
+    };
     let inner = kit::modal_frame(
         f,
         area,

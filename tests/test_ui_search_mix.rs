@@ -578,6 +578,60 @@ fn search_with_no_matches_says_so() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// One row has the cursor bar, and it shows the start of the selected track's title.
+fn assert_cursor_on_selection(app: &AppUI, buffer: &Buffer, what: &str) {
+    let selected = app.search_modal.as_ref().unwrap().selected_track().unwrap();
+    let title: String = kit::upper(selected.display_title()).chars().take(10).collect();
+    // The query row's block cursor is INK too.
+    let bars: Vec<String> = cursor_rows(buffer)
+        .into_iter()
+        .filter(|r| !r.contains("QUERY"))
+        .collect();
+    assert!(
+        bars.len() == 1 && bars[0].contains(&title),
+        "{what}: {title:?} {bars:?}\n{}",
+        screen(buffer)
+    );
+}
+
+#[test]
+fn search_shows_its_matches_on_short_terminals() {
+    common::isolate();
+    let (mut app, dir) = test_app("search_short");
+    open_search(&mut app, &dir, "halc");
+    for (w, h) in [(40, 12), (80, 12), (100, 12), (70, 10)] {
+        app.search_modal.as_mut().unwrap().home();
+        let buffer = tui::render(&mut app, w, h);
+        let text = screen(&buffer);
+        assert!(text.contains("4 / 6 MATCHED"), "{w}x{h}\n{text}");
+        // Match rows are drawn, the selected one under the cursor bar.
+        let matches = tui::rows(&buffer).iter().filter(|r| r.contains("HAL")).count();
+        assert!(matches >= 2, "{w}x{h}: {matches} match rows\n{text}");
+        assert_cursor_on_selection(&app, &buffer, &format!("{w}x{h} first"));
+        // The last match scrolls into view.
+        app.search_modal.as_mut().unwrap().end();
+        let buffer = tui::render(&mut app, w, h);
+        assert_cursor_on_selection(&app, &buffer, &format!("{w}x{h} last"));
+        // The footer's keys are whole: Esc always, never a cut label.
+        let row = row_of(&buffer, " ESC ");
+        assert!(row.contains(" ESC  CANCEL"), "{w}x{h}: {row:?}");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mix_picker_footer_keeps_esc_whole_when_narrow() {
+    common::isolate();
+    let (mut app, dir) = test_app("mix_narrow_footer");
+    press(&mut app, KeyCode::Char('M'));
+    for (w, h) in [(40, 12), (40, 24), (36, 30)] {
+        let buffer = tui::render(&mut app, w, h);
+        let row = row_of(&buffer, " ESC ");
+        assert!(row.contains(" ESC  CANCEL"), "{w}x{h}: {row:?}");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn search_never_panics_on_small_terminals() {
     common::isolate();
@@ -808,6 +862,56 @@ fn mix_picker_keys_are_unchanged() {
     press(&mut app, KeyCode::Char('2'));
     assert_eq!(app.active_mix_profile, MixProfile::picker_profiles()[1]);
     app.reset_playback_session();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The text of the rows with the cursor bar (INK background) inside the modal.
+fn cursor_rows(buffer: &Buffer) -> Vec<String> {
+    let p = theme::palette();
+    (0..buffer.area.height)
+        .filter(|&y| {
+            let row = tui::row(buffer, y);
+            row.contains('│') && (0..buffer.area.width).any(|x| buffer[(x, y)].bg == p.ink)
+        })
+        .map(|y| tui::row(buffer, y))
+        .collect()
+}
+
+#[test]
+fn mix_picker_scrolls_to_the_cursor_on_short_terminals() {
+    common::isolate();
+    let (mut app, dir) = test_app("mix_short");
+    let rows = expected_rows();
+    for (w, h) in [(40, 12), (80, 12), (84, 16), (70, 10), (80, 8)] {
+        press(&mut app, KeyCode::Char('M'));
+        assert_eq!(app.mix_picker_cursor, 0);
+        // Down through every profile, then once more to wrap to the first.
+        for step in 0..=rows.len() {
+            let cursor = step % rows.len();
+            assert_eq!(app.mix_picker_cursor, cursor);
+            let buffer = tui::render(&mut app, w, h);
+            let bars = cursor_rows(&buffer);
+            // The title's start: the narrowest screens cut it.
+            let title: String = rows[cursor].0.chars().take(8).collect();
+            assert!(
+                bars.len() == 1 && bars[0].contains(&title),
+                "{w}x{h} cursor {cursor}: {bars:?}\n{}",
+                screen(&buffer)
+            );
+            press(&mut app, KeyCode::Char('j'));
+        }
+        // Back to the first profile; k from there wraps to the last, which scrolls into view.
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.mix_picker_cursor, 0);
+        tui::render(&mut app, w, h);
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.mix_picker_cursor, rows.len() - 1);
+        let buffer = tui::render(&mut app, w, h);
+        let last: String = rows[rows.len() - 1].0.chars().take(8).collect();
+        let bars = cursor_rows(&buffer);
+        assert!(bars.len() == 1 && bars[0].contains(&last), "{w}x{h}: {bars:?}");
+        press(&mut app, KeyCode::Esc);
+    }
     let _ = fs::remove_dir_all(&dir);
 }
 

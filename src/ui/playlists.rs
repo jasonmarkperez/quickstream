@@ -1136,9 +1136,6 @@ const PROMPT_WIDTH: u16 = 64;
 /// Width of the add picker (3e).
 const PICKER_WIDTH: u16 = 52;
 
-/// Columns the playlist modals leave of the screen on each side.
-const MODAL_MARGIN: u16 = 2;
-
 /// Rows a full modal frame takes: the borders, a padding row at the top and bottom, the title
 /// row and the blank row under it. A compact frame (title in the border) takes the borders only.
 const FRAME_ROWS: u16 = 6;
@@ -1163,20 +1160,13 @@ const PICKER_MIN_LIST_ROWS: u16 = 3;
 /// What the delete confirmation says happens (3d): only the playlist's own file goes.
 const DELETE_NOTE: &str = "The .m3u8 file is removed. Audio files are not touched.";
 
-/// Where a playlist modal `width` columns wide goes: centred, with a margin of
-/// [`MODAL_MARGIN`] columns on each side when the screen is narrower than the modal.
-fn playlist_modal_area(screen: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(screen.width.saturating_sub(2 * MODAL_MARGIN));
-    kit::centered(screen, width, height)
-}
-
 /// The name prompt and the delete confirmation: centred, [`PROMPT_WIDTH`] wide, compact when the
 /// screen is too short for the full frame.
 fn prompt_frame(f: &mut Frame, spec: ModalSpec) -> Rect {
     let screen = f.area();
     let full = screen.height >= FRAME_ROWS + PROMPT_ROWS;
     let frame_rows = if full { FRAME_ROWS } else { COMPACT_FRAME_ROWS };
-    let area = playlist_modal_area(screen, PROMPT_WIDTH, frame_rows + PROMPT_ROWS);
+    let area = kit::modal_area(screen, PROMPT_WIDTH, frame_rows + PROMPT_ROWS);
     kit::modal_frame(f, area, ModalSpec { compact: !full, ..spec })
 }
 
@@ -1304,7 +1294,7 @@ fn render_add_picker(f: &mut Frame, store: &PlaylistStore, state: &mut ListState
     } else {
         COMPACT_FRAME_ROWS + COMPACT_PICKER_ROWS
     };
-    let area = playlist_modal_area(screen, PICKER_WIDTH, (around + rows).min(max_height));
+    let area = kit::modal_area(screen, PICKER_WIDTH, (around + rows).min(max_height));
     let inner = kit::modal_frame(
         f,
         area,
