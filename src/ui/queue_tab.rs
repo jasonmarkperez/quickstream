@@ -141,6 +141,16 @@ struct QueueRow {
     duration: String,
 }
 
+/// The queue mode setting as the panels name it (`LOOP`, `STOP AT END`, `REPEAT ONE`).
+pub(super) fn queue_mode_note(mode: &str) -> String {
+    match mode {
+        "loop" => "LOOP".to_string(),
+        "stop" => "STOP AT END".to_string(),
+        "repeat_one" => "REPEAT ONE".to_string(),
+        other => kit::upper(other),
+    }
+}
+
 /// `text` right-aligned in `width` columns.
 pub(super) fn right_aligned(text: &str, width: usize) -> String {
     format!("{}{}", " ".repeat(width.saturating_sub(text_width(text))), text)
@@ -629,12 +639,7 @@ impl AppUI {
                 None => tracks,
             }
         };
-        let note = match self.settings_mgr.settings.queue_mode.as_str() {
-            "loop" => "LOOP".to_string(),
-            "stop" => "STOP AT END".to_string(),
-            "repeat_one" => "REPEAT ONE".to_string(),
-            other => kit::upper(other),
-        };
+        let note = queue_mode_note(&self.settings_mgr.settings.queue_mode);
         let list = kit::panel(
             f,
             area,

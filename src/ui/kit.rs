@@ -25,7 +25,7 @@ const VOLUME_CELLS: usize = 11;
 
 /// Columns at the right of a panel kept clear of text: the rule's ` ▪` sits there, and the cursor
 /// bar reaches one column into it.
-const PANEL_RIGHT_PAD: u16 = 2;
+pub(super) const PANEL_RIGHT_PAD: u16 = 2;
 
 /// Columns between a panel label and its right note.
 const LABEL_GAP: usize = 2;

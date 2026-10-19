@@ -341,3 +341,20 @@ fn test_app_shutdown_joins_the_features_worker() {
     assert_eq!(app.shutdown_workers(Duration::from_secs(2)), 0);
     assert_eq!(app.live_worker_count(), 0);
 }
+
+#[test]
+fn test_features_for_answers_only_for_the_followed_track() {
+    common::isolate();
+    let mut workers = WorkerRegistry::new();
+    let (source, _calls) = counting_source(112.0);
+    let mut worker = TrackFeaturesWorker::spawn(&mut workers, source);
+    let a = PathBuf::from("/music/a.flac");
+    let b = PathBuf::from("/music/b.flac");
+    worker.follow(Some(&a));
+    assert!(poll_until(&mut worker, |w| w.features_for(&a).is_some()));
+    assert_eq!(worker.features_for(&a).and_then(|f| f.bpm), Some(112.0));
+    // Asked about another track (the current one changed before the next follow): nothing.
+    assert!(worker.features_for(&b).is_none());
+    worker.stop();
+    assert_eq!(workers.join_all(Duration::from_secs(2)), 0);
+}

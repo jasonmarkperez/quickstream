@@ -87,6 +87,17 @@ impl TrackFeaturesWorker {
         self.features.as_ref()
     }
 
+    /// Features of `track` if it is the track followed and they have been found. The renderer
+    /// asks this way, so a frame drawn after the current track changed, before the next
+    /// [`follow`](Self::follow), never shows the previous track's features.
+    pub fn features_for(&self, track: &Path) -> Option<&TrackFeatures> {
+        if self.track.as_deref() == Some(track) {
+            self.features.as_ref()
+        } else {
+            None
+        }
+    }
+
     /// Tell the worker thread to exit (it finishes a read in progress first). Further calls to
     /// [`follow`](Self::follow) only record the track.
     pub fn stop(&mut self) {

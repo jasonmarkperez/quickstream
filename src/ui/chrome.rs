@@ -170,7 +170,7 @@ fn spread<'a>(mut left: Vec<Span<'a>>, right: Vec<Span<'a>>, width: usize) -> Li
 
 impl AppUI {
     /// The output the header names: `LOCAL/MPV`, or `DLNA/<RENDERER>`.
-    fn output_label(&self) -> String {
+    pub(super) fn output_label(&self) -> String {
         match self.device_manager.get_active_device() {
             Some(device) => format!("DLNA/{}", kit::upper(&device.friendly_name)),
             None => format!("LOCAL/{}", kit::upper(&self.local_backend())),
