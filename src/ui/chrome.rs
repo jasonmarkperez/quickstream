@@ -275,9 +275,11 @@ impl AppUI {
 
     /// Elapsed time and length of the current track, as the strip and Now Playing show them. The
     /// position is a pending seek's target, else the player's. The length is the player's when
-    /// it knows it (the tag length may be an estimate), else the track's own; `None` when
-    /// neither is known. During a pending skip the player still holds the old track, so the
-    /// target shows from 00:00 with only its own length, never the old track's.
+    /// it knows it (the tag length may be an estimate) and is playing or paused, else the
+    /// track's own; `None` when neither is known. A stopped player keeps the last track's
+    /// length, which may not be the current track's (it was removed from the queue, or the
+    /// queue cleared and refilled). During a pending skip the player still holds the old track,
+    /// so the target shows from 00:00 with only its own length, never the old track's.
     pub(super) fn playback_times(&self) -> (f64, Option<f64>) {
         let own = self
             .queue
@@ -291,8 +293,9 @@ impl AppUI {
             .pending_seek_target
             .unwrap_or_else(|| self.player.position_seconds())
             .max(0.0);
-        let player = self.player.duration_seconds();
-        (pos, (player > 0.0).then_some(player).or(own))
+        let loaded = self.player.is_playing() || self.player.is_paused();
+        let player = Some(self.player.duration_seconds()).filter(|d| loaded && *d > 0.0);
+        (pos, player.or(own))
     }
 
     /// The mini player strip (tabs 2–5): state and title (and artist from 90 columns) on the

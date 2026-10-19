@@ -1141,3 +1141,26 @@ fn test_now_playing_layout_ignores_the_features_year_of_an_untagged_track() {
         let _ = fs::remove_dir_all(&dir_after);
     }
 }
+
+/// Stopped, the player still holds the old track's length: when another track becomes current
+/// without playing (the old one removed from the queue), its own length shows, not the old one.
+#[test]
+fn test_now_playing_stopped_player_never_shows_the_old_tracks_length() {
+    common::isolate();
+    let (mut app, dir) = np_app("stopped_length");
+    let _ = app.player.stop();
+    assert!(app.remove_queue_track(0).is_some());
+    let screen = below_header(&common::tui::render(&mut app, 120, 40));
+    assert!(screen.contains("GLASS HARBOUR"), "{screen}");
+    assert!(screen.contains(" / 04:18"), "{screen}");
+    assert!(!screen.contains("05:52"), "{screen}");
+    app.active_tab = 1;
+    let strip = common::tui::render_text(&mut app, 120, 40)
+        .lines()
+        .rev()
+        .find(|r| r.contains("VOL"))
+        .map(str::to_string)
+        .expect("strip");
+    assert!(strip.contains("04:18") && !strip.contains("05:52"), "{strip:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
