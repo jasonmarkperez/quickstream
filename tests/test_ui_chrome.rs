@@ -1212,6 +1212,46 @@ fn key_row_shows_the_open_modals_keys_instead_of_the_tabs() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The delete confirmation's footer drops `ANY KEY CANCEL` when the modal is too narrow for it,
+/// so on a narrow screen the key row must keep both keys: a status message is cut instead of
+/// `ANY KEY CANCEL`, which would then show nowhere.
+#[test]
+fn narrow_delete_confirmation_keeps_any_key_cancel_beside_a_status() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("delete_keys_narrow");
+    app.active_tab = 4;
+    open_modal(&mut app, Modal::ConfirmDelete);
+    for status in [
+        "Nothing is playing",
+        "Couldn't rename \"Old\" to \"New\": permission denied",
+    ] {
+        app.status_message = status.to_string();
+        for width in [40, 44, 50] {
+            let buffer = tui::render(&mut app, width, 24);
+            let rows = tui::rows(&buffer).join("\n");
+            let y = (0..24)
+                .rev()
+                .find(|&y| tui::row(&buffer, y).contains(" Y  DELETE"))
+                .unwrap_or_else(|| panic!("{width}: no key row\n{rows}"));
+            let row = tui::row(&buffer, y);
+            assert!(
+                row.contains(" ANY KEY  CANCEL"),
+                "{width} cols, status {status:?}: ANY KEY CANCEL dropped from the key row: {row:?}\n{rows}"
+            );
+            // The modal's footer shows it whole or not at all, never cut.
+            let footer_y = (0..y)
+                .find(|&y| tui::row(&buffer, y).contains(" Y  DELETE"))
+                .unwrap_or_else(|| panic!("{width}: no modal footer\n{rows}"));
+            let footer = tui::row(&buffer, footer_y);
+            assert!(
+                !footer.contains(" ANY") || footer.contains(" ANY KEY  CANCEL"),
+                "{width} cols: footer cuts ANY KEY CANCEL: {footer:?}\n{rows}"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The keys in row `y` between columns `left` and `right` as (keycap, label) pairs: each run
 /// of keycap cells (RULE background) and the text after it, up to the next keycap.
 fn key_pairs(buffer: &ratatui::buffer::Buffer, y: u16, left: u16, right: u16) -> Vec<(String, String)> {

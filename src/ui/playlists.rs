@@ -1165,9 +1165,11 @@ pub(super) fn name_prompt_hints() -> Vec<KeyHint> {
     vec![KeyHint::new("ENTER", "SAVE", 1), KeyHint::new("ESC", "CANCEL", 1)]
 }
 
-/// The delete confirmation's keys: only `y` deletes; any other key keeps the playlist.
+/// The delete confirmation's keys: only `y` deletes; any other key keeps the playlist. Both
+/// have the same priority, so the screen's key row never drops either (a status is cut
+/// instead); the modal's own footer leaves out `ANY KEY CANCEL` when it is too narrow.
 pub(super) fn confirm_delete_hints() -> Vec<KeyHint> {
-    vec![KeyHint::new("Y", "DELETE", 2), KeyHint::new("ANY KEY", "CANCEL", 1)]
+    vec![KeyHint::new("Y", "DELETE", 1), KeyHint::new("ANY KEY", "CANCEL", 1)]
 }
 
 /// The add picker's keys.
@@ -1283,9 +1285,13 @@ fn render_confirm_delete(f: &mut Frame, name: &str, count: usize) {
     let Some(keys_y) = prompt_keys_row(inner) else {
         return;
     };
-    // Too narrow for both (under about 44 columns), `ANY KEY CANCEL` goes; the screen's key
-    // row still shows it.
-    let mut line = kit::key_row(&confirm_delete_hints(), inner.width, None);
+    // Too narrow for both (under about 42 columns), `ANY KEY CANCEL` goes; the screen's key
+    // row, which never drops it, still shows it.
+    let mut hints = confirm_delete_hints();
+    if kit::top_priority_width(&hints) > usize::from(inner.width) {
+        hints.truncate(1);
+    }
+    let mut line = kit::key_row(&hints, inner.width, None);
     // The `Y` keycap is ERROR, like the chip.
     if let Some(keycap) = line.spans.first_mut() {
         keycap.style = theme::chip(true);
