@@ -711,14 +711,18 @@ fn mix_profile_text_comes_from_the_profile_data() {
     }
     for profile in &profiles {
         assert!(!profile.description().is_empty());
-        assert_eq!(
-            profile.picker_index(),
-            profiles.iter().position(|p| p == profile).unwrap()
-        );
+        let row = profiles.iter().position(|p| p == profile).unwrap();
+        assert_eq!(profile.picker_index(), row);
+        assert_eq!(profile.picker_row(), Some(row), "listed: its own row");
     }
-    // Profiles the picker doesn't list put the cursor on a row it does.
-    assert_eq!(MixProfile::SeedRadio(PathBuf::from("/a.mp3")).picker_index(), 0);
-    assert_eq!(MixProfile::MoodVibe(MoodType::Focus).picker_index(), 4);
+    // Profiles the picker doesn't list have no row of their own, and put the cursor on the
+    // closest row it does list.
+    let seed = MixProfile::SeedRadio(PathBuf::from("/a.mp3"));
+    let focus = MixProfile::MoodVibe(MoodType::Focus);
+    assert_eq!(seed.picker_row(), None);
+    assert_eq!(focus.picker_row(), None);
+    assert_eq!(seed.picker_index(), 0);
+    assert_eq!(focus.picker_index(), 4);
 }
 
 #[test]
@@ -785,6 +789,40 @@ fn mix_picker_marks_the_current_profile() {
             }
         }
     }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Seed Radio (`r`) and Focus (web mood) aren't listed: the cursor starts on the closest row,
+/// but no row is marked `●` / `ACTIVE`, and the title row names the profile in use.
+#[test]
+fn mix_picker_marks_no_row_active_for_a_profile_it_does_not_list() {
+    common::isolate();
+    let (mut app, dir) = test_app("mix_unlisted");
+    for (profile, cursor, name) in [
+        (MixProfile::SeedRadio(PathBuf::from("/a.mp3")), 0, "NOW: SEED RADIO"),
+        (MixProfile::MoodVibe(MoodType::Focus), 4, "NOW: FOCUS"),
+    ] {
+        app.active_mix_profile = profile;
+        app.show_mix_picker_modal = false;
+        press(&mut app, KeyCode::Char('M'));
+        assert_eq!(app.mix_picker_cursor, cursor, "cursor on the closest row");
+        for (w, h) in [(120, 40), (80, 24)] {
+            let buffer = tui::render(&mut app, w, h);
+            for (title, _) in expected_rows() {
+                let row = row_of(&buffer, &title);
+                assert!(row.contains('○') && !row.contains('●'), "{w}x{h}: {row:?}");
+                assert!(!row.contains("ACTIVE"), "{w}x{h}: {row:?}");
+            }
+            let title_row = row_of(&buffer, " AUTOPILOT MIX ");
+            assert!(title_row.contains(name), "{w}x{h}: {title_row:?}");
+        }
+    }
+    // A listed profile: no `NOW:` note.
+    app.active_mix_profile = MixProfile::DiverseShuffle;
+    app.show_mix_picker_modal = false;
+    press(&mut app, KeyCode::Char('M'));
+    let buffer = tui::render(&mut app, 120, 40);
+    assert!(!screen(&buffer).contains("NOW:"), "{}", screen(&buffer));
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -862,6 +900,33 @@ fn mix_picker_keys_are_unchanged() {
     press(&mut app, KeyCode::Char('2'));
     assert_eq!(app.active_mix_profile, MixProfile::picker_profiles()[1]);
     app.reset_playback_session();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The picker's keys follow `MixProfile::picker_profiles`: `k` from the first row wraps to the
+/// last, each digit from 1 to the number of profiles picks that profile, other digits do nothing.
+#[test]
+fn mix_picker_keys_follow_the_profile_list() {
+    common::isolate();
+    let (mut app, dir) = test_app("mix_key_range");
+    let profiles = MixProfile::picker_profiles();
+    let count = profiles.len();
+    press(&mut app, KeyCode::Char('M'));
+    press(&mut app, KeyCode::Char('k'));
+    assert_eq!(app.mix_picker_cursor, count - 1);
+    for c in ['0', char::from_digit(count as u32 + 1, 10).unwrap(), '9'] {
+        press(&mut app, KeyCode::Char(c));
+        assert!(app.show_mix_picker_modal, "{c} is not a profile: the picker stays open");
+        assert_eq!(app.active_mix_profile, MixProfile::DiverseShuffle, "{c}");
+    }
+    press(&mut app, KeyCode::Esc);
+    for (i, profile) in profiles.iter().enumerate() {
+        press(&mut app, KeyCode::Char('M'));
+        press(&mut app, KeyCode::Char(char::from_digit(i as u32 + 1, 10).unwrap()));
+        assert!(!app.show_mix_picker_modal);
+        assert_eq!(&app.active_mix_profile, profile, "key {}", i + 1);
+        app.reset_playback_session();
+    }
     let _ = fs::remove_dir_all(&dir);
 }
 

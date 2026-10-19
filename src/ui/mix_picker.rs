@@ -1,9 +1,12 @@
 //! The autopilot mix picker (`M`, mockup 2i): one row per profile the picker offers
 //! ([`MixProfile::picker_profiles`]), its text taken from the profile itself (title, description
-//! with the BPM range from the code), `●` on the profile in use and `○` on the others.
+//! with the BPM range from the code), `●` and `ACTIVE` on the profile in use and `○` on the others.
+//! A profile in use that the picker doesn't list (Seed Radio, Focus) marks no row; the title row
+//! names it instead (`NOW: SEED RADIO`).
 
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
+use ratatui::text::Line;
 use ratatui::widgets::ListState;
 use ratatui::Frame;
 
@@ -39,11 +42,17 @@ pub(super) fn render(f: &mut Frame, cursor: usize, active: &MixProfile, list: &m
     let full = screen.height >= FULL_HEIGHT;
     let tight = !full && screen.height < COMPACT_HEIGHT;
     let area = kit::modal_area(screen, WIDTH, if full { FULL_HEIGHT } else { COMPACT_HEIGHT });
+    // Only the profile's own row is marked; one the picker doesn't list is named in the title row.
+    let active_row = active.picker_row();
+    let note = active_row
+        .is_none()
+        .then(|| Line::from(format!("NOW: {}", kit::upper(active.short_name()))));
     let inner = kit::modal_frame(
         f,
         area,
         ModalSpec {
             title: "AUTOPILOT MIX",
+            note,
             compact: !full,
             ..Default::default()
         },
@@ -81,13 +90,12 @@ pub(super) fn render(f: &mut Frame, cursor: usize, active: &MixProfile, list: &m
     let profiles = MixProfile::picker_profiles();
     list.select(Some(cursor));
     let window = kit::visible_window(list, profiles.len(), fit as usize);
-    let active_index = active.picker_index();
     for index in window {
         let profile = &profiles[index];
         if y >= rows_bottom {
             break;
         }
-        let is_active = index == active_index;
+        let is_active = active_row == Some(index);
         let (glyph, glyph_style, title_style) = if is_active {
             ("●", bold_ink(), bold_ink())
         } else {

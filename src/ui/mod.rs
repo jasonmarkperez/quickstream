@@ -2061,41 +2061,26 @@ impl AppUI {
                 self.player.stop()?;
                 return Ok(true);
             }
+            // One row per profile the picker lists; digits 1 to that count pick a profile.
+            let count = crate::analysis::MixProfile::picker_profiles().len();
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('M') => {
                     self.show_mix_picker_modal = false;
                     return Ok(false);
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    if self.mix_picker_cursor > 0 {
-                        self.mix_picker_cursor -= 1;
-                    } else {
-                        self.mix_picker_cursor = 4;
-                    }
+                    self.mix_picker_cursor = (self.mix_picker_cursor + count - 1) % count;
                     return Ok(false);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.mix_picker_cursor = (self.mix_picker_cursor + 1) % 5;
+                    self.mix_picker_cursor = (self.mix_picker_cursor + 1) % count;
                     return Ok(false);
                 }
-                KeyCode::Char('1') => {
-                    self.apply_mix_picker_selection(0);
-                    return Ok(false);
-                }
-                KeyCode::Char('2') => {
-                    self.apply_mix_picker_selection(1);
-                    return Ok(false);
-                }
-                KeyCode::Char('3') => {
-                    self.apply_mix_picker_selection(2);
-                    return Ok(false);
-                }
-                KeyCode::Char('4') => {
-                    self.apply_mix_picker_selection(3);
-                    return Ok(false);
-                }
-                KeyCode::Char('5') => {
-                    self.apply_mix_picker_selection(4);
+                KeyCode::Char(c) => {
+                    match c.to_digit(10).map(|d| d as usize) {
+                        Some(d) if (1..=count).contains(&d) => self.apply_mix_picker_selection(d - 1),
+                        _ => {}
+                    }
                     return Ok(false);
                 }
                 KeyCode::Enter => {

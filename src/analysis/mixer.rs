@@ -249,16 +249,27 @@ impl MixProfile {
         ]
     }
 
-    /// The mix picker row for this profile: its own row, or for a profile the picker doesn't
-    /// list, the closest one (Seed Radio: Diverse Shuffle; Focus: Late Night Groove).
-    pub fn picker_index(&self) -> usize {
+    /// This profile's own row in the mix picker, or `None` for a profile the picker doesn't list
+    /// (Seed Radio, Focus). Only this row is marked as the profile in use.
+    pub fn picker_row(&self) -> Option<usize> {
         match self {
-            MixProfile::DiverseShuffle | MixProfile::SeedRadio(_) => 0,
-            MixProfile::BpmFlow { .. } => 1,
-            MixProfile::MoodVibe(MoodType::Chill) => 2,
-            MixProfile::MoodVibe(MoodType::Workout) => 3,
-            MixProfile::MoodVibe(MoodType::Groove | MoodType::Focus) => 4,
+            MixProfile::DiverseShuffle => Some(0),
+            MixProfile::BpmFlow { .. } => Some(1),
+            MixProfile::MoodVibe(MoodType::Chill) => Some(2),
+            MixProfile::MoodVibe(MoodType::Workout) => Some(3),
+            MixProfile::MoodVibe(MoodType::Groove) => Some(4),
+            MixProfile::MoodVibe(MoodType::Focus) | MixProfile::SeedRadio(_) => None,
         }
+    }
+
+    /// The row the mix picker's cursor starts on: [`Self::picker_row`], or for a profile the
+    /// picker doesn't list, the closest one (Seed Radio: Diverse Shuffle; Focus: Late Night
+    /// Groove).
+    pub fn picker_index(&self) -> usize {
+        self.picker_row().unwrap_or(match self {
+            MixProfile::MoodVibe(MoodType::Focus) => 4,
+            _ => 0,
+        })
     }
 
     /// The name as the mix picker lists it: [`Self::name`], without the `Mood:` prefix.
