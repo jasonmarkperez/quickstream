@@ -663,6 +663,10 @@ pub struct ContinuousStreamController {
     pub target_seek: Arc<Mutex<Option<f64>>>,
     pub active_child: Arc<Mutex<Option<std::process::Child>>>,
     session: Mutex<Option<ContinuousSession>>,
+    /// The track being decoded: its queue index and path. Set with `current_duration` held, so
+    /// the two always name the same track (lock order: the web state, then `current_duration`,
+    /// then this).
+    decoding: Mutex<Option<(usize, PathBuf)>>,
 }
 
 impl ContinuousStreamController {
@@ -726,7 +730,41 @@ impl ContinuousStreamController {
     /// clamp that needs it) shows without waiting for the next track. Returns whether it was
     /// learned now.
     pub fn learn_duration(&self, state: &mut NowPlayingState, index: usize, path: &Path) -> bool {
+        let current = self.current_duration.lock().unwrap();
+        Self::learn_duration_locked(current, state, index, path)
+    }
+
+    /// The stream has started `index` (`path`) with `duration` (0 when unknown): set both
+    /// together, so a length learned from the published queue is always the one of the track
+    /// being decoded.
+    fn start_track(&self, index: usize, path: &Path, duration: f64) {
         let mut current = self.current_duration.lock().unwrap();
+        *current = duration;
+        *self.decoding.lock().unwrap() = Some((index, path.to_path_buf()));
+    }
+
+    /// Whoever publishes the queue into `state` (the UI's `update_web_state`) offers the stream
+    /// the lengths it now knows: if the track being decoded started with an unknown length and
+    /// `state`'s queue has it at the same index and path, it is learned now, whatever the stream's
+    /// socket is doing (a renderer reading at real time can keep the stream's writer blocked
+    /// for seconds). Never blocks on the socket. Returns whether it was learned now.
+    pub fn learn_published_duration(&self, state: &mut NowPlayingState) -> bool {
+        if !self.is_active.load(Ordering::SeqCst) {
+            return false;
+        }
+        let current = self.current_duration.lock().unwrap();
+        let Some((index, path)) = self.decoding.lock().unwrap().clone() else {
+            return false;
+        };
+        Self::learn_duration_locked(current, state, index, &path)
+    }
+
+    fn learn_duration_locked(
+        mut current: std::sync::MutexGuard<'_, f64>,
+        state: &mut NowPlayingState,
+        index: usize,
+        path: &Path,
+    ) -> bool {
         if *current > 0.0 {
             return false;
         }
@@ -2531,7 +2569,7 @@ pub fn serve_continuous_stream(
         };
 
         *controller.current_track_index.lock().unwrap() = track_index;
-        *controller.current_duration.lock().unwrap() = track_duration;
+        controller.start_track(track_index, &track_path, track_duration);
         *controller.current_position.lock().unwrap() = 0.0;
 
         let start_pos = controller.target_seek.lock().unwrap().take().unwrap_or(0.0);

@@ -3675,6 +3675,11 @@ impl AppUI {
                     is_current: idx == self.queue.current_index(),
                 })
                 .collect();
+            // A track the continuous stream started with an unknown length takes it from the
+            // queue as soon as it is published here, not only when the stream next writes.
+            if let Some(ws) = &self.web_server {
+                ws.stream_state().continuous.learn_published_duration(&mut state);
+            }
 
             let active_dev = self.device_manager.get_active_device();
             let mut devices = Vec::new();
