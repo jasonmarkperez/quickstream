@@ -480,7 +480,7 @@ impl AppUI {
             let folders = self
                 .browser_entries
                 .iter()
-                .filter(|(_, p, is_dir)| *is_dir && p.as_os_str() != MUSIC_HOMES)
+                .filter(|entry| super::is_subfolder_entry(entry))
                 .count();
             (format!("TYPE TO JUMP ({folders} SUBFOLDERS)"), theme::mid())
         } else if matches.is_empty() {

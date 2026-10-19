@@ -1367,6 +1367,9 @@ impl AppUI {
         }
     }
 
+    /// Indices of the subfolders whose name matches the spotlight query (prefix matches
+    /// first). Only real subfolders (and, in Music Homes, the homes) take part: never the `..`
+    /// row, which the LIBRARY panel draws as `PARENT` / `FILE SYSTEM`, nor the Music Homes row.
     pub fn spotlight_matches(&self) -> Vec<usize> {
         let query = match &self.browser_spotlight {
             Some(q) if !q.is_empty() => q.to_lowercase(),
@@ -1376,10 +1379,11 @@ impl AppUI {
         let mut prefix_matches = Vec::new();
         let mut substring_matches = Vec::new();
 
-        for (idx, (name, path, is_dir)) in self.browser_entries.iter().enumerate() {
-            if !*is_dir || path.to_string_lossy() == "___MUSIC_HOMES___" {
+        for (idx, entry) in self.browser_entries.iter().enumerate() {
+            if !is_subfolder_entry(entry) {
                 continue;
             }
+            let name = &entry.0;
             let clean_name = name
                 .strip_prefix("📁 ")
                 .and_then(|s| s.strip_suffix('/'))
@@ -4606,6 +4610,12 @@ fn modal_rect_with_height(r: Rect, height: u16) -> Rect {
 
 /// Status line while the browser spotlight is open.
 const SPOTLIGHT_HINT: &str = "Spotlight: type to jump to subfolder (Esc to exit, Enter to open)";
+
+/// Whether a browser entry is a folder the spotlight can jump to: a subfolder (or a bookmarked
+/// Music Home), labelled `📁 name/`. The `..` row and the `★ Music Homes` row are not.
+pub(crate) fn is_subfolder_entry((label, _, is_dir): &(String, PathBuf, bool)) -> bool {
+    *is_dir && label.starts_with("📁 ")
+}
 
 #[cfg(test)]
 mod terminal_tests {

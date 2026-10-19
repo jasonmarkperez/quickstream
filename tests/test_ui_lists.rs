@@ -551,6 +551,48 @@ fn spotlight_underlines_matches_and_dims_the_rest() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The `..` row (drawn `PARENT` / `FILE SYSTEM`) and the Music Homes row are not subfolders:
+/// the spotlight never matches them by their stored labels (`.. [Parent Directory]`,
+/// `.. [Back to File System]`) and the subfolder count leaves them out (PR #68 review).
+#[test]
+fn spotlight_matches_and_counts_only_real_subfolders() {
+    common::isolate();
+    let (mut app, dir) = lists_app("spotparent", &[0, 1, 2]);
+    app.open_spotlight();
+    let buf = tui::render(&mut app, 120, 40);
+    let shown = screen(&buf);
+    assert!(shown.contains("TYPE TO JUMP (3 SUBFOLDERS)"), "{shown}");
+
+    let start = app.browser_cursor;
+    for query in ["dir", "ent", "par", ".."] {
+        app.browser_spotlight = Some(query.to_string());
+        assert_eq!(app.spotlight_matches(), Vec::<usize>::new(), "{query}");
+        app.jump_spotlight_to_first_match();
+        assert_eq!(app.browser_cursor, start, "{query} must not jump to ..");
+        let buf = tui::render(&mut app, 120, 40);
+        assert!(
+            screen(&buf).contains("NO MATCHING SUBFOLDERS"),
+            "{query}: {}",
+            screen(&buf)
+        );
+    }
+
+    // Music Homes: `..` reads `FILE SYSTEM`; only the homes themselves are subfolders.
+    app.bookmarks = vec![dir.join("Sea Glass EP").to_string_lossy().to_string()];
+    app.in_bookmarks_view = true;
+    app.refresh_browser();
+    app.browser_spotlight = Some(String::new());
+    let buf = tui::render(&mut app, 120, 40);
+    assert!(screen(&buf).contains("TYPE TO JUMP (1 SUBFOLDERS)"), "{}", screen(&buf));
+    for query in ["back", "file", "sys"] {
+        app.browser_spotlight = Some(query.to_string());
+        assert_eq!(app.spotlight_matches(), Vec::<usize>::new(), "{query}");
+    }
+    app.browser_spotlight = Some("sea".to_string());
+    assert_eq!(app.spotlight_matches().len(), 1);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn spotlight_keeps_its_footnote_row_on_compact_screens() {
     common::isolate();
