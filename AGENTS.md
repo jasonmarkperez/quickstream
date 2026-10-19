@@ -58,7 +58,7 @@ This guide is intended for AI coding agents and automated development tools work
 quickstream/
 ├── Cargo.toml            # Package manifest and Rust crate dependencies
 ├── src/
-│   ├── main.rs           # CLI argument parsing (clap), startup flags, signal traps, app bootstrap (theme::init from COLORTERM)
+│   ├── main.rs           # CLI argument parsing (clap), startup flags, signal traps, app bootstrap (theme::init from COLORTERM / TERM / NO_COLOR)
 │   ├── lib.rs            # Library entrypoint and module exports
 │   │
 │   ├── ui/               # Terminal User Interface (Ratatui + Crossterm), see section 3
@@ -75,7 +75,7 @@ quickstream/
 │   │   ├── search_view.rs # Search modal (2h): query row + counts, SCANNING note, RANKED MATCHES (visible rows only), TRACK panel from 90 columns; headerless matches on short screens
 │   │   ├── mix_picker.rs # Mix picker (2i): rows from MixProfile::picker_profiles (title, description), ●/○, DIM 1–5; scrolls to the cursor on short screens
 │   │   ├── help.rs       # Help modal (2g): key sections as data, full 96×32 layout or compact (≤ 22 rows, title in the border), inside the gutters (80 columns wide at 80–83)
-│   │   ├── theme.rs      # Telemetry colour tokens: ColorDepth (COLORTERM: RGB or 256-colour greys), Palette, theme::init (once, at startup), style constructors (`bold()` is the one bold INK style)
+│   │   ├── theme.rs      # Telemetry colour tokens: ColorDepth (COLORTERM / TERM / NO_COLOR: RGB, 256-colour greys, named ANSI colours or Mono), Palette (TRUECOLOR / INDEXED / BASIC / MONO, styles as methods), theme::init (once, at startup), style constructors (`bold()` is the one bold INK style)
 │   │   ├── kit.rs        # Key row, volume meter, progress bar, panel header (panel/PanelSpec; panel_spaced / keeps_spacer with a PanelFit per panel, panel_text_width, message_rows for short terminals), visible_window, list_row columns (underlined characters: Col::underline / underline_chars), width-aware fit / clip / visible_tail / wrap_clipped, duration (MM:SS / H:MM:SS), big_digits (3-row numerals), spinner (clock-driven `⣾` frames), ClockCache, modal pieces: clear, dim_buffer, centered, modal_area (centred inside the 2-column gutters, MODAL_MARGIN), modal_frame/ModalSpec (subtitle after the chip), modal_title, modal_rule (`────── ▪`)
 │   │   ├── chrome.rs     # Screen chrome: ChromeLayout rows, header, tab row (tab_titles), strip (player_state_glyph, playback_times), key row (tab_key_hints, modal_key_hints, status message)
 │   │   └── screen.rs     # WidthTier (<80 / 80–89 / 90–109 / ≥110) and Screen (tier, short) per frame
@@ -126,8 +126,9 @@ quickstream/
     ├── test_ui_search_mix.rs # Search modal (2h) at 120×40 / 100×30 / 80×24: counts, SCANNING, underlined matches (only in the field a word ranked on), no rescans or match work on redraw, cursor, TRACK panel only from 90 columns, fields without data left out; mix picker (2i) rows from MixProfile data, ● on the current profile (none, and a `NOW:` note, for Seed Radio / Focus), keys unchanged and following the profile list; short screens (40×12, 80×12, 70×10): search draws its matches (no headers) with the cursor in view, the mix picker scrolls to the cursor, both footers keep `ESC CANCEL` whole
     ├── test_settings_model.rs # Settings groups and display order, named indexes match their keys, options vs cycle_setting, short values, bookmarks from memory, j/k order + wrap, LAN address off the render path and looked up early (startup, web rows), web_url, values name the context's web port (none without a server) and the app's running server, home from the context, music folder from its worker (left out until found), the pairing link added to the status once known (not over a newer status; the LAN-binding end-to-end test is `#[ignore]`)
     ├── test_settings_tab.rs  # Tab 4 Settings (2e): grouped order + headings, cursor bar + ◂ ▸, config path footnote, option panel ●/○ + descriptions at 120 / none at 100, startup home choices from memory, web address case, bound web port (not the configured one) in the value, option panel and footnote, inline home editor (q is text), web address at every width (compact rows: one, two, start cut), whole on short terminals (option panel from 110 columns, two compact rows under it), long startup home cut from its start, key row vs handlers, 120×40/100×30/80×24, scrolling, narrow widths
-    ├── test_ui_chrome.rs     # Theme palettes, key row trimming (fit_top_hints / whole_key_row: only whole hints), meters, text fitting, width tiers; rendered chrome; each modal's footer keys in the key row in the same words
+    ├── test_ui_chrome.rs     # Theme palettes (colour depth from COLORTERM / TERM / NO_COLOR, BASIC tokens apart on 8 backgrounds, MONO all `Reset` with reverse / bold / faint), key row trimming (fit_top_hints / whole_key_row: only whole hints), meters, text fitting, width tiers; rendered chrome; each modal's footer keys in the key row in the same words
     ├── test_ui_theme_init.rs # theme::init picks the palette once per process (own binary, so the other UI tests keep the TRUECOLOR default)
+    ├── test_ui_theme_mono.rs # Mono (NO_COLOR, own binary): every tab and modal drawn without colour, cursor bar / tab and modal chips / keycaps / search's block cursor in reverse video, the screen under a modal faint, crossterm output under NO_COLOR never resets attributes mid-frame
     ├── test_ui_playlist_modals.rs # Name prompt (3b; 3c error replaces the keys, in ERROR; long errors wrap), delete confirm (3d: ERROR border, chip, Y keycap; long names keep the count), add picker (3e; 40 playlists scroll with the cursor visible) at 120×40 / 80×24 / 40×12 and tiny sizes
     ├── test_ui_modals.rs     # Modal frame (dim_buffer, centered, modal_frame: DIM/ERROR border, title chip, subtitle, padding, compact, tiny sizes), the screen dimmed under every modal except the key row (its keys and status stay readable), every modal inside the 2-column gutters at 120×40 … 40×12 (kit::modal_area; the help takes 80 columns at 80–83), help at 120×40 (2g) / 80×24 (compact) / small sizes, every help key and description (whole from 80 columns)
     ├── test_ui_panels.rs     # Panel header rows/colours, compact footnote, visible_window vs ratatui List, list_row columns, cursor, ▸ in its own column, keeps_spacer (every shown panel, hidden panes ignored), message_rows
@@ -158,26 +159,32 @@ The TUI is the Telemetry design: style sheet 2a, screens 2b–2i at 120×40, sta
   - the clock through `kit::ClockCache` (read at most once a second), the LAN address from its cache
   - work over a whole list is cached per revision (`PlaybackQueue::revision`, `PlaylistStore::revision`, `MetadataCache::folder_revision`), and only the visible rows are laid out (`kit::visible_window`), so a frame never walks a 5,000-entry folder.
 - **Never make data up.** A field without data is left out: no bit depth (sample rate in kHz only), no folder child counts, no inactive renderer's volume, a length only when known.
-- **Styles come from `ui::theme` only.** No `Color::` outside `theme.rs`, no `Modifier::REVERSED` (the cursor's colours are explicit), no ratatui `Clear` (it leaves the terminal's default background; use `kit::clear`), no borders on panes (only modal frames have one).
+- **Styles come from `ui::theme` only.** No `Color::` outside `theme.rs`, no `Modifier::REVERSED` (the cursor's colours are explicit; the one exception is `theme.rs` in the Mono depth, which has no colours to name, 3.2), no ratatui `Clear` (it leaves the terminal's default background; use `kit::clear`), no borders on panes (only modal frames have one).
 - **Case.** Labels, titles, artists and values are UPPERCASE through `kit::upper` (full Unicode mapping: `ß` → `SS`, so text can get longer). Kept in their own case: paths (`paths::display_path`, `~` for home), file names in Filenames mode, typed text, the web address and pairing link, status messages, and the sentences of panel messages and modal bodies.
 - **Width-aware text.** Pad and cut by display width with `kit::fit` / `kit::clip` / `kit::visible_tail` / `kit::wrap_clipped` (CJK takes 2 columns; a wide character that would straddle a cut is dropped and the gap padded), so columns stay aligned. Paths are cut from their start with `…` (`visible_tail`) so the last folder shows; other text from its end.
 - **Durations.** Every length and position (list rows, totals, the strip, Now Playing) is `kit::duration`: `MM:SS` under an hour, `H:MM:SS` from an hour (`1:15:00`).
 
 ### 3.2 Theme (`src/ui/theme.rs`)
 
-| Token | Used for | RGB | 256-colour |
-|---|---|---|---|
-| GROUND | background of every cell | `#141413` | 234 |
-| INK | primary text, focus, cursor bar | `#E8E8E4` | 254 |
-| MID | secondary text, unfocused labels | `#9A9A95` | 247 |
-| DIM | indices, notes, footnotes | `#5F5F5B` | 240 |
-| RULE | rules, keycap background, the screen under a modal | `#2E2E2C` | 236 |
-| ERROR | errors and the delete confirmation only | `#ED7473` | 210 |
+| Token | Used for | RGB | 256-colour | Basic (8/16) | Mono |
+|---|---|---|---|---|---|
+| GROUND | background of every cell | `#141413` | 234 | Black | terminal's own |
+| INK | primary text, focus, cursor bar | `#E8E8E4` | 254 | White (bright) | terminal's own |
+| MID | secondary text, unfocused labels | `#9A9A95` | 247 | Gray | terminal's own |
+| DIM | indices, notes, footnotes | `#5F5F5B` | 240 | DarkGray | faint |
+| RULE | rules, keycap background, the screen under a modal | `#2E2E2C` | 236 | Blue | faint |
+| ERROR | errors and the delete confirmation only | `#ED7473` | 210 | Red | bold |
 
-- **Colour depth:** `ColorDepth::from_colorterm` maps `COLORTERM` `truecolor` or `24bit` (any case) to `TrueColor` (RGB); anything else, or no value, is `Indexed` (the nearest 256-colour greys).
-  - `main.rs` calls `theme::init(ColorDepth::detect())` once at startup (a `OnceLock`: only the first call counts).
-  - Until then, and in tests, `theme::palette()` is `Palette::TRUECOLOR`. `tests/test_ui_theme_init.rs` tests `init` in its own binary.
-- **Styles:** `base()` INK on GROUND (every cell), `ink()` `mid()` `dim()` `rule()` `error()`, `bold()` (the one bold INK style), `label(focused)` (bold INK, else MID), `cursor()` (GROUND on INK, bold: the cursor bar and the active tab chip), `chip(error)` (a modal's title chip, GROUND on ERROR when `error`), `keycap()` (INK on RULE).
+- **Colour depth:** `ColorDepth::from_env(COLORTERM, TERM, no_color)`, in this order:
+  - `Mono` when `NO_COLOR` is set and not empty (`ColorDepth::no_color`, as crossterm reads it; crossterm then writes no colours).
+  - `TrueColor` (RGB) for `COLORTERM` `truecolor` or `24bit` (any case; `ColorDepth::from_colorterm`), whatever `TERM` says.
+  - `Basic` (the named ANSI colours) for a `TERM` that shows only 8 or 16: `linux` (and `screen.linux`), `cons25`, `xterm-color`, `*-16color`, `*-8color`, the `vt100` / `ansi` / `dumb` families (never a `*256color` entry).
+  - Otherwise `Indexed` (the nearest 256-colour greys), plain `xterm`, `screen` and `tmux` included.
+  - `main.rs` calls `theme::init(ColorDepth::detect())` (reads the three variables) once at startup (a `OnceLock`: only the first call counts).
+  - Until then, and in tests, `theme::palette()` is `Palette::TRUECOLOR`. `tests/test_ui_theme_init.rs` tests `init` in its own binary, `tests/test_ui_theme_mono.rs` the Mono screen in its own.
+- **Basic:** the backgrounds (GROUND, RULE, INK under the cursor, ERROR under the delete chip) are normal ANSI colours, so they stay apart where bright backgrounds turn normal (the Linux console). RULE is blue: a bright-black RULE dropped to black there and keycaps vanished.
+- **Mono:** every token is `Color::Reset`, so a frame never changes colour from cell to cell (under `NO_COLOR` crossterm's colour command is an empty `ESC[;m`, which also resets bold and reverse video). Attributes carry what colour would: the cursor, chips and keycaps in reverse video, ERROR bold, DIM / RULE / the screen under a modal faint.
+- **Styles** (the free functions are `palette()`'s `Palette` methods): `base()` INK on GROUND (every cell), `ink()` `mid()` `dim()` `rule()` `error()`, `bold()` (the one bold INK style), `label(focused)` (bold INK, else MID), `cursor()` (GROUND on INK, bold: the cursor bar, the active tab chip, a block cursor; Mono: reverse video, bold, never faint), `chip(error)` (a modal's title chip, GROUND on ERROR when `error`; Mono: reverse video, bold), `keycap()` (INK on RULE; Mono: reverse video), `dimmed()` (the screen under a modal: RULE on GROUND; Mono: faint).
 
 ### 3.3 Screen layout (`src/ui/chrome.rs`, `src/ui/screen.rs`)
 - `render` fills every cell with `theme::base()`, takes `Screen::new(area)` once per frame (`tier`, `short`), then places the parts with `ChromeLayout`.
@@ -430,7 +437,7 @@ The dashboard's `Playlists` tab uses the same store and code as tab `[5]`.
 
 ### 3.6 Modals
 - **One at a time:** help (`?`), search (`f`), mix picker (`M`), and the playlist modals (name prompt, delete confirmation, add picker). `AppUI::modal_open` says whether one is open.
-- **Dimming:** `AppUI::render` first dims the whole screen under the modal (`kit::dim_buffer`: fg RULE, bg GROUND, no modifiers), except the key row, which it draws after dimming. The modal's keys and the status message (e.g. search's `Tab` confirmation `Added to queue: …`, or an ERROR status) stay readable; a modal tall enough to reach the key row still covers it.
+- **Dimming:** `AppUI::render` first dims the whole screen under the modal (`kit::dim_buffer` with `theme::dimmed()`: fg RULE, bg GROUND, no modifiers; faint in Mono), except the key row, which it draws after dimming. The modal's keys and the status message (e.g. search's `Tab` confirmation `Added to queue: …`, or an ERROR status) stay readable; a modal tall enough to reach the key row still covers it.
 - **Frame:** `kit::modal_frame(f, area, ModalSpec { title, subtitle, note, error, compact })` clears the area with `kit::clear` and returns the content area.
   - Thin border in DIM (ERROR when `error`); reverse-video title chip (` KEYS `, `kit::modal_title`; GROUND on ERROR when `error`); the subtitle 2 columns after the chip, in MID and its own case (start cut with `…`, dropped before the note); the note against the right edge in DIM.
   - Full: a padding row, the title row, a blank row, content 3 columns in, a padding row at the bottom.
