@@ -133,6 +133,7 @@ pub(super) fn render(f: &mut Frame, screen: Rect) {
         area,
         ModalSpec {
             title: "KEYS",
+            subtitle: None,
             note: Some(Line::from(format!("QUICKSTREAM {}", env!("CARGO_PKG_VERSION")))),
             error: false,
             compact: !full,

@@ -249,6 +249,9 @@ pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
 pub struct ModalSpec<'a> {
     /// The title chip's text (` KEYS `), drawn as given.
     pub title: &'a str,
+    /// After the chip, in MID and in its own case (a path, such as the folder searched). When it
+    /// doesn't fit, its start is cut with `…`; it goes before the note does.
+    pub subtitle: Option<&'a str>,
     /// At the right end of the title row, in DIM unless its spans say otherwise.
     pub note: Option<Line<'a>>,
     /// Border and title chip in ERROR (errors and the delete confirmation).
@@ -304,7 +307,7 @@ pub fn modal_frame(f: &mut Frame, area: Rect, spec: ModalSpec) -> Rect {
     let row_x = area.x + 1 + if spec.compact { 1 } else { pad_x };
     let row_right = area.right() - 1 - if spec.compact { 1 } else { pad_x };
     if title_y < area.bottom() - 1 || spec.compact {
-        draw_title_row(buf, row_x, row_right, title_y, chip, note, spec.compact);
+        draw_title_row(buf, row_x, row_right, title_y, chip, spec.subtitle, note, spec.compact);
     }
 
     let bottom = area.bottom() - 1 - if spec.compact { 0 } else { MODAL_PAD_Y };
@@ -316,26 +319,61 @@ pub fn modal_frame(f: &mut Frame, area: Rect, spec: ModalSpec) -> Rect {
     Rect::new(x, top, width, bottom - top)
 }
 
-/// The chip from `left` and the note ending at `right` on row `y`, the note dropped (then the chip
-/// cut) when they don't both fit. Compact rows put a space around each, over the border.
-fn draw_title_row(buf: &mut Buffer, left: u16, right: u16, y: u16, chip: Span, note: Option<Vec<Span>>, compact: bool) {
+/// Columns between a modal's title chip and its subtitle.
+const SUBTITLE_GAP: usize = 2;
+
+/// The narrowest a subtitle is drawn (`…` and a few characters); with less room it is left out.
+const SUBTITLE_MIN: usize = 4;
+
+/// The chip from `left`, the subtitle after it and the note ending at `right` on row `y`. When
+/// they don't all fit, the subtitle is cut from its start, then dropped, then the note is dropped
+/// and the chip cut. Compact rows put a space around the note and subtitle, over the border.
+#[allow(clippy::too_many_arguments)]
+fn draw_title_row(
+    buf: &mut Buffer,
+    left: u16,
+    right: u16,
+    y: u16,
+    chip: Span,
+    subtitle: Option<&str>,
+    note: Option<Vec<Span>>,
+    compact: bool,
+) {
     let room = right.saturating_sub(left) as usize;
     if room == 0 {
         return;
     }
     let chip_width = chip.width().min(room);
     buf.set_stringn(left, y, &chip.content, chip_width, chip.style);
-    let Some(mut note) = note else { return };
-    if compact {
-        note.insert(0, Span::styled(" ", theme::dim()));
-        note.push(Span::styled(" ", theme::dim()));
+    let mut note_x = right as usize;
+    if let Some(mut note) = note {
+        if compact {
+            note.insert(0, Span::styled(" ", theme::dim()));
+            note.push(Span::styled(" ", theme::dim()));
+        }
+        let note_width = spans_width(&note);
+        // At least a column between the chip and the note.
+        if chip_width + 1 + note_width <= room {
+            let x = right - note_width as u16;
+            buf.set_line(x, y, &Line::from(note), note_width as u16);
+            note_x = x as usize;
+        }
     }
-    let note_width = spans_width(&note);
-    // At least a column between the chip and the note.
-    if chip_width + 1 + note_width <= room {
-        let x = right - note_width as u16;
-        buf.set_line(x, y, &Line::from(note), note_width as u16);
+    let Some(subtitle) = subtitle.filter(|s| !s.is_empty()) else {
+        return;
+    };
+    // In the border (compact) a space each side keeps it off the `─`; otherwise 2 columns after
+    // the chip, and at least one before the note.
+    let (gap, pad) = if compact { (1, 1) } else { (SUBTITLE_GAP, 0) };
+    let x = left as usize + chip_width + gap;
+    let sub_room = note_x.saturating_sub(x + 1 + 2 * pad);
+    if sub_room < SUBTITLE_MIN {
+        return;
     }
+    let text = visible_tail(subtitle, sub_room);
+    let text = if compact { format!(" {text} ") } else { text };
+    let width = text_width(&text);
+    buf.set_stringn(x as u16, y, &text, width, theme::mid());
 }
 
 /// `VOL ▮▮▮▮▮▮▮▯▯▯▯ 65`: 11 cells, filled in INK, empty in DIM, the number in bold INK.
@@ -587,8 +625,9 @@ pub struct Col<'a> {
     pub text: Cow<'a, str>,
     pub width: ColWidth,
     pub style: Style,
-    /// Characters of `text` (char indices) drawn underlined, e.g. a spotlight match.
-    pub underline: Option<Range<usize>>,
+    /// Characters of `text` (char index ranges) drawn underlined, e.g. a spotlight match or the
+    /// characters a fuzzy search matched.
+    pub underline: Vec<Range<usize>>,
 }
 
 impl<'a> Col<'a> {
@@ -597,7 +636,7 @@ impl<'a> Col<'a> {
             text: text.into(),
             width: ColWidth::Fixed(width),
             style,
-            underline: None,
+            underline: Vec::new(),
         }
     }
 
@@ -606,7 +645,7 @@ impl<'a> Col<'a> {
             text: text.into(),
             width: ColWidth::Flex,
             style,
-            underline: None,
+            underline: Vec::new(),
         }
     }
 
@@ -615,14 +654,21 @@ impl<'a> Col<'a> {
             text: text.into(),
             width: ColWidth::Auto,
             style,
-            underline: None,
+            underline: Vec::new(),
         }
     }
 
     /// Underline the characters `range` (char indices into the text). Characters cut off by the
     /// column's `…` are not drawn, so neither is their underline.
     pub fn underline(mut self, range: Range<usize>) -> Self {
-        self.underline = Some(range);
+        self.underline.push(range);
+        self
+    }
+
+    /// Underline each of the characters `indices` (char indices into the text), e.g. where a
+    /// fuzzy query matched.
+    pub fn underline_chars(mut self, indices: impl IntoIterator<Item = usize>) -> Self {
+        self.underline.extend(indices.into_iter().map(|i| i..i + 1));
         self
     }
 }
@@ -674,8 +720,9 @@ pub fn list_row(f: &mut Frame, area: Rect, cols: &[Col], mark: RowMark) {
             format!("{} ", fit(text, width - 1))
         };
         buf.set_stringn(x, area.y, shown, width, col.style);
-        if let (Some(range), false) = (&col.underline, i == 0 && mark == RowMark::Marker) {
-            underline_chars(buf, x, area.y, text, budget, range);
+        let marker_drawn = i == 0 && mark == RowMark::Marker;
+        if !col.underline.is_empty() && !marker_drawn {
+            underline_chars(buf, x, area.y, text, budget, &col.underline);
         }
         x += width as u16;
     }
@@ -686,21 +733,22 @@ pub fn list_row(f: &mut Frame, area: Rect, cols: &[Col], mark: RowMark) {
     }
 }
 
-/// Underline, in the row at (`x`, `y`), the characters `range` of `text` as [`fit`] draws it in
-/// `budget` columns: only the characters kept before a `…`.
-fn underline_chars(buf: &mut Buffer, x: u16, y: u16, text: &str, budget: usize, range: &Range<usize>) {
+/// Underline, in the row at (`x`, `y`), the characters in `ranges` of `text` as [`fit`] draws it
+/// in `budget` columns: only the characters kept before a `…`.
+fn underline_chars(buf: &mut Buffer, x: u16, y: u16, text: &str, budget: usize, ranges: &[Range<usize>]) {
     let kept = if text_width(text) <= budget {
         usize::MAX
     } else {
         cut(text, budget.saturating_sub(1)).0.chars().count()
     };
+    let end = ranges.iter().map(|r| r.end).max().unwrap_or(0);
     let mut cx = x;
     for (i, c) in text.chars().enumerate() {
-        if i >= kept || i >= range.end {
+        if i >= kept || i >= end {
             break;
         }
         let w = char_width(c) as u16;
-        if i >= range.start {
+        if ranges.iter().any(|r| r.contains(&i)) {
             for dx in 0..w.max(1) {
                 if let Some(cell) = buf.cell_mut((cx + dx, y)) {
                     cell.modifier.insert(Modifier::UNDERLINED);

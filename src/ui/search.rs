@@ -46,7 +46,6 @@ pub struct SearchModalState {
     pub scan_receiver: Option<Receiver<Vec<AudioMetadata>>>,
     pub stop_flag: Option<Arc<AtomicBool>>,
     pub scan_start: Option<std::time::Instant>,
-    pub spinner_frame: usize,
     last_filter_at: Option<std::time::Instant>,
     filter_pending: bool,
 }
@@ -80,7 +79,6 @@ impl SearchModalState {
             scan_receiver,
             stop_flag,
             scan_start,
-            spinner_frame: 0,
             last_filter_at: None,
             filter_pending: false,
         };
@@ -201,12 +199,6 @@ impl SearchModalState {
                 }
             }
         }
-        self.spinner_frame = (self.spinner_frame + 1) % 10;
-    }
-
-    pub fn spinner_char(&self) -> &'static str {
-        const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        SPINNERS[self.spinner_frame % SPINNERS.len()]
     }
 
     pub fn close(&mut self) {
@@ -417,6 +409,34 @@ impl SearchModalState {
     pub fn all_filtered_tracks(&self) -> Vec<AudioMetadata> {
         self.filtered.iter().map(|(_, t)| t.clone()).collect()
     }
+}
+
+/// The characters to underline in a ranked match row: char indices into `title` and `artist` as
+/// the row draws them (UPPERCASE). Each token of `query` is marked in the field it matches best,
+/// with the boosts the ranking gives (a title match over an artist match); a token matched only
+/// in the album, file name or path marks nothing. Cheap enough for the visible rows each frame.
+pub fn row_match_indices(query: &str, title: &str, artist: &str) -> (Vec<usize>, Vec<usize>) {
+    let matcher = SkimMatcherV2::default();
+    let mut in_title = Vec::new();
+    let mut in_artist = Vec::new();
+    for token in query.split_whitespace() {
+        let token = token.to_uppercase();
+        let best = |text: &str, boost: i64| {
+            if text.is_empty() {
+                return None;
+            }
+            matcher
+                .fuzzy_indices(text, &token)
+                .map(|(score, indices)| (score + boost, indices))
+        };
+        match (best(title, 30), best(artist, 20)) {
+            (Some((t, indices)), Some((a, _))) if t >= a => in_title.extend(indices),
+            (Some((_, indices)), None) => in_title.extend(indices),
+            (_, Some((_, indices))) => in_artist.extend(indices),
+            (None, None) => {}
+        }
+    }
+    (in_title, in_artist)
 }
 
 /// Score a single isolated metadata field against a token.

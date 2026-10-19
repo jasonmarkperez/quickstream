@@ -613,7 +613,7 @@ fn test_help_modal_descriptions_line_up() {
 #[test]
 fn test_mix_picker_first_option_row_is_not_overdrawn() {
     common::isolate();
-    // Issue #59: a leftover footer drew "Press [?], [Esc], or [q] to close" over the `[1]` row.
+    // Issue #59: a leftover footer drew "Press [?], [Esc], or [q] to close" over the first row.
     let temp_dir = fresh_dirs("mix_picker");
     let mut app = new_app(&temp_dir);
     app.handle_input_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT))
@@ -623,15 +623,15 @@ fn test_mix_picker_first_option_row_is_not_overdrawn() {
     for (width, height) in [(80, 24), (120, 40)] {
         let view = render(&mut app, width, height);
         assert!(!view.contains("to close"), "{view}");
-        // Skip the tab bar, whose first label also starts with `[1]`.
-        let row = view
-            .lines()
-            .skip(1)
-            .find(|l| l.contains("[1]"))
-            .unwrap_or_else(|| panic!("no [1] row at {width}x{height}:\n{view}"));
+        let lines: Vec<&str> = view.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("DIVERSE ARTISTS SHUFFLE"))
+            .unwrap_or_else(|| panic!("no first row at {width}x{height}:\n{view}"));
+        let (row, description) = (lines[at], lines[at + 1]);
         assert!(
-            row.contains("[1] Diverse Artists Shuffle") && row.contains("— Fair random sampling"),
-            "[1] row overdrawn at {width}x{height}: {row:?}"
+            row.contains("1  ●  DIVERSE ARTISTS SHUFFLE") && description.contains("Fair random sampling"),
+            "first row overdrawn at {width}x{height}: {row:?} / {description:?}"
         );
     }
 

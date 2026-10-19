@@ -15,11 +15,13 @@ mod devices_tab;
 pub mod features;
 mod help;
 pub mod kit;
+mod mix_picker;
 mod now_playing;
 pub mod playlists;
 mod queue_tab;
 pub mod screen;
 pub mod search;
+mod search_view;
 mod settings_tab;
 pub mod tag_reads;
 pub mod theme;
@@ -2358,16 +2360,7 @@ impl AppUI {
             }
             (KeyCode::Char('M'), _) | (KeyCode::Char('m'), KeyModifiers::SHIFT) => {
                 self.show_mix_picker_modal = !self.show_mix_picker_modal;
-                self.mix_picker_cursor = match &self.active_mix_profile {
-                    crate::analysis::MixProfile::DiverseShuffle => 0,
-                    crate::analysis::MixProfile::BpmFlow { .. } => 1,
-                    crate::analysis::MixProfile::MoodVibe(m) => match m {
-                        crate::analysis::MoodType::Chill => 2,
-                        crate::analysis::MoodType::Workout => 3,
-                        crate::analysis::MoodType::Groove | crate::analysis::MoodType::Focus => 4,
-                    },
-                    crate::analysis::MixProfile::SeedRadio(_) => 0,
-                };
+                self.mix_picker_cursor = self.active_mix_profile.picker_index();
             }
             (KeyCode::Char('L'), _) | (KeyCode::Char('l'), KeyModifiers::SHIFT) => {
                 self.open_add_picker();
@@ -3132,16 +3125,8 @@ impl AppUI {
 
     pub fn apply_mix_picker_selection(&mut self, index: usize) {
         self.show_mix_picker_modal = false;
-        self.active_mix_profile = match index {
-            1 => crate::analysis::MixProfile::BpmFlow {
-                target_bpm: 120.0,
-                tolerance: 0.15,
-            },
-            2 => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Chill),
-            3 => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Workout),
-            4 => crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Groove),
-            _ => crate::analysis::MixProfile::DiverseShuffle,
-        };
+        let profiles = crate::analysis::MixProfile::picker_profiles();
+        self.active_mix_profile = profiles.get(index).unwrap_or(&profiles[0]).clone();
         let profile_name = self.active_mix_profile.name();
         let scan_dir = if self.browser_dir.exists() && !self.in_bookmarks_view {
             self.browser_dir.clone()
@@ -3805,7 +3790,7 @@ impl AppUI {
             kit::dim_buffer(f.buffer_mut(), area);
         }
         if let Some(ref mut modal) = self.search_modal {
-            Self::render_search_modal(modal, f);
+            search_view::render(f, modal, self.queue_tab.home.as_deref());
         } else if self.playlists.modal.is_some() {
             self.render_playlist_modal(f);
         } else if self.show_mix_picker_modal {
@@ -3823,323 +3808,13 @@ impl AppUI {
             || self.show_help_modal
     }
 
-    fn render_search_modal(modal: &mut SearchModalState, f: &mut Frame) {
-        let area = centered_rect(84, 80, f.area());
-        kit::clear(f.buffer_mut(), area);
-
-        let dir_name = modal
-            .root_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| modal.root_dir.to_string_lossy().to_string());
-
-        let outer_block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" [🔍 Fuzzy Search: {}] ", dir_name))
-            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
-        let inner_area = outer_block.inner(area);
-        f.render_widget(outer_block, area);
-
-        let vertical = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3), // Search input bar
-                Constraint::Min(5),    // Results and detail split
-                Constraint::Length(3), // Action legend bar
-            ])
-            .split(inner_area);
-
-        // 1. Search Query Input Bar
-        let match_count = modal.filtered.len();
-        let total_count = modal.all_tracks.len();
-        let scan_badge = if modal.is_scanning {
-            format!(" [Scanning... {}]", modal.spinner_char())
-        } else {
-            String::new()
-        };
-        let query_title = format!(
-            " Search Query ({} of {} tracks matched){} ",
-            match_count, total_count, scan_badge
-        );
-        let input_block = Block::default()
-            .borders(Borders::ALL)
-            .title(query_title)
-            .border_style(Style::default().fg(Color::Cyan));
-        let query_text = format!("🔍 {}█", modal.query);
-        let input_widget = Paragraph::new(query_text)
-            .block(input_block)
-            .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
-        f.render_widget(input_widget, vertical[0]);
-
-        // 2. Split Workspace: Results list on Left, Track detail card on Right
-        let content_split = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(vertical[1]);
-
-        // Results list
-        let results_items: Vec<ListItem> = modal
-            .filtered
-            .iter()
-            .enumerate()
-            .map(|(idx, (_, track))| {
-                let label = track.format_display_label(true);
-                let style = if idx == modal.selected_index {
-                    theme::cursor()
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                ListItem::new(label).style(style)
-            })
-            .collect();
-
-        let results_block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Ranked Matches ")
-            .border_style(Style::default().fg(Color::DarkGray));
-        let results_list = List::new(results_items).block(results_block);
-        f.render_stateful_widget(results_list, content_split[0], &mut modal.list_state);
-
-        // Track detail card
-        let detail_block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Track Details ")
-            .border_style(Style::default().fg(Color::DarkGray));
-
-        if let Some(track) = modal.selected_track() {
-            let rel_path = track
-                .filepath
-                .strip_prefix(&modal.root_dir)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| track.filepath.to_string_lossy().to_string());
-
-            let detail_lines = vec![
-                Line::from(vec![
-                    Span::styled("Title:    ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        track.display_title(),
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("Artist:   ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        if track.artist.is_empty() {
-                            "<Unknown>"
-                        } else {
-                            &track.artist
-                        },
-                        Style::default().fg(Color::White),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("Album:    ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        if track.album.is_empty() {
-                            "<Unknown>"
-                        } else {
-                            &track.album
-                        },
-                        Style::default().fg(Color::White),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("Duration: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(track.formatted_duration(), Style::default().fg(Color::Cyan)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Format:   ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!(
-                            "{} ({} kbps, {} Hz)",
-                            track.format_name, track.bitrate_kbps, track.sample_rate_hz
-                        ),
-                        Style::default().fg(Color::Green),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("Channels: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        if track.channels > 0 {
-                            track.channels.to_string()
-                        } else {
-                            "<Unknown>".to_string()
-                        },
-                        Style::default().fg(Color::White),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("Size:     ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("{:.2} MB", track.file_size as f64 / 1_048_576.0),
-                        Style::default().fg(Color::White),
-                    ),
-                ]),
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    "Relative Path:",
-                    Style::default().fg(Color::DarkGray),
-                )]),
-                Line::from(vec![Span::styled(rel_path, Style::default().fg(Color::Blue))]),
-            ];
-            let detail_p = Paragraph::new(detail_lines).block(detail_block);
-            f.render_widget(detail_p, content_split[1]);
-        } else {
-            let empty_p = Paragraph::new("No tracks match your query.")
-                .block(detail_block)
-                .style(Style::default().fg(Color::DarkGray));
-            f.render_widget(empty_p, content_split[1]);
-        }
-
-        // 3. Action legend bar
-        let action_spans = vec![
-            Span::styled(
-                " [Enter] ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("Add & Close  │  "),
-            Span::styled(
-                " [Tab] ",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("Add to Queue  │  "),
-            Span::styled(
-                " [Shift+Tab] ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!("Add All ({})  │  ", match_count)),
-            Span::styled(" [Esc] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            Span::raw("Cancel"),
-        ];
-        let action_block = Block::default().borders(Borders::ALL);
-        let action_p = Paragraph::new(Line::from(action_spans)).block(action_block);
-        f.render_widget(action_p, vertical[2]);
-    }
-
     fn render_help_modal(&self, f: &mut Frame) {
         let screen = f.area();
         help::render(f, screen);
     }
 
     fn render_mix_picker_modal(&self, f: &mut Frame) {
-        let area = mix_picker_rect(f.area());
-        kit::clear(f.buffer_mut(), area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                " ⚡ AUTOPILOT MIX PROFILE SELECTOR ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ))
-            .border_style(Style::default().fg(Color::Cyan))
-            .style(theme::base());
-        f.render_widget(block, area);
-
-        let inner = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // Subtitle
-                Constraint::Min(10),   // Options list
-                Constraint::Length(2), // Footer instruction
-            ])
-            .margin(1)
-            .split(area);
-
-        if inner.len() < 3 {
-            return;
-        }
-
-        let header_p = Paragraph::new(Line::from(vec![Span::styled(
-            "Select a mix profile to sequence cohesive playlists with DJ spacing & transitions:",
-            Style::default().fg(Color::DarkGray),
-        )]));
-        f.render_widget(header_p, inner[0]);
-
-        let options = [
-            (
-                "Diverse Artists Shuffle",
-                "Fair random sampling across all artists (prevents cluster bias)",
-            ),
-            (
-                "BPM Flow (~120 BPM)",
-                "Cohesive tempo gradient with harmonic Camelot wheel transitions",
-            ),
-            (
-                "Chill & Ambient",
-                "Downtempo, acoustic, lofi & low energy vibes (60-95 BPM)",
-            ),
-            (
-                "Workout & High Energy",
-                "Dance, electronic, rock & upbeat vibes (124-145 BPM)",
-            ),
-            (
-                "Late Night Groove",
-                "Soul, funk, disco, house & groove vibes (110-128 BPM)",
-            ),
-        ];
-
-        let mut lines = Vec::new();
-        for (idx, (title, desc)) in options.iter().enumerate() {
-            let is_cursor = idx == self.mix_picker_cursor;
-            let is_active = matches!(
-                (&self.active_mix_profile, idx),
-                (crate::analysis::MixProfile::DiverseShuffle, 0)
-                    | (crate::analysis::MixProfile::BpmFlow { .. }, 1)
-                    | (
-                        crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Chill),
-                        2
-                    )
-                    | (
-                        crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Workout),
-                        3
-                    )
-                    | (
-                        crate::analysis::MixProfile::MoodVibe(crate::analysis::MoodType::Groove),
-                        4
-                    )
-            );
-
-            let prefix = if is_cursor { " ▶ " } else { "   " };
-            let active_marker = if is_active { " [ACTIVE] " } else { "          " };
-
-            let num_key = format!("[{}] ", idx + 1);
-
-            let line_style = if is_cursor {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(prefix, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::styled(num_key, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("{:<26}", title), line_style),
-                Span::styled(
-                    active_marker,
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("— {}", desc), Style::default().fg(Color::DarkGray)),
-            ]));
-            lines.push(Line::from(""));
-        }
-
-        f.render_widget(Paragraph::new(lines), inner[1]);
-
-        let footer_line = Line::from(vec![
-            Span::styled(
-                " [1-5 / Enter] ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("Select & Launch   ", Style::default().fg(Color::White)),
-            Span::styled(" [r] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("Seed Radio on Track   ", Style::default().fg(Color::White)),
-            Span::styled(
-                " [Esc / q] ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("Close", Style::default().fg(Color::White)),
-        ]);
-        f.render_widget(Paragraph::new(footer_line).alignment(Alignment::Center), inner[2]);
+        mix_picker::render(f, self.mix_picker_cursor, &self.active_mix_profile);
     }
 }
 
@@ -4161,21 +3836,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
-}
-
-fn mix_picker_rect(r: Rect) -> Rect {
-    modal_rect_with_height(r, 20)
-}
-
-/// Centered modal up to 90 columns wide and `height` rows tall, shrunk to fit small terminals.
-fn modal_rect_with_height(r: Rect, height: u16) -> Rect {
-    let max_w = if r.width >= 96 { 90 } else { r.width.saturating_sub(2) };
-    let target_width = max_w.min(r.width);
-    let target_height = height.min(r.height.saturating_sub(2)).min(r.height);
-
-    let x = r.x + (r.width.saturating_sub(target_width)) / 2;
-    let y = r.y + (r.height.saturating_sub(target_height)) / 2;
-    Rect::new(x, y, target_width, target_height)
 }
 
 /// Status line while the browser spotlight is open.

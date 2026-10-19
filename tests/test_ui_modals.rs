@@ -136,6 +136,7 @@ fn modal_frame_draws_a_dim_border_and_a_reverse_video_title_chip() {
             Rect::new(5, 2, 50, 12),
             ModalSpec {
                 title: "KEYS",
+                subtitle: None,
                 note: Some(Line::from("QUICKSTREAM 1.0")),
                 error: false,
                 compact: false,
@@ -204,6 +205,7 @@ fn modal_frame_error_border_and_chip_in_error_colour() {
             Rect::new(0, 0, 40, 10),
             ModalSpec {
                 title: "DELETE",
+                subtitle: None,
                 note: None,
                 error: true,
                 compact: false,
@@ -228,6 +230,7 @@ fn compact_modal_frame_puts_the_title_in_the_border() {
             Rect::new(0, 0, 60, 12),
             ModalSpec {
                 title: "KEYS",
+                subtitle: None,
                 note: Some(Line::from("QUICKSTREAM 1.0")),
                 error: false,
                 compact: true,
@@ -242,6 +245,64 @@ fn compact_modal_frame_puts_the_title_in_the_border() {
 }
 
 #[test]
+fn modal_frame_subtitle_follows_the_chip_and_is_cut_from_its_start() {
+    common::isolate();
+    let p = theme::palette();
+    let spec = |compact| ModalSpec {
+        title: "SEARCH",
+        subtitle: Some("~/Music/Mira Lenz/Low Tide Atlas"),
+        note: Some(Line::from(vec![Span::styled("SCANNING ⣾", theme::mid())])),
+        error: false,
+        compact,
+    };
+    // Room for everything: chip, 2 columns, the subtitle in MID, the note at the right.
+    let buffer = draw_with(80, 8, theme::base(), |f| {
+        kit::modal_frame(f, f.area(), spec(false));
+    });
+    let row = tui::row(&buffer, 2);
+    assert!(row.contains(" SEARCH   ~/Music/Mira Lenz/Low Tide Atlas"), "{row:?}");
+    assert!(row.contains("SCANNING ⣾   │"), "{row:?}");
+    let (x, y) = tui::find_text(&buffer, "~/Music").unwrap();
+    assert_eq!(buffer[(x, y)].fg, p.mid);
+    assert_eq!(buffer[(x - 1, y)].bg, p.ground, "a gap after the chip");
+
+    // Narrow: the start of the subtitle goes, the note stays.
+    let buffer = draw_with(44, 8, theme::base(), |f| {
+        kit::modal_frame(f, f.area(), spec(false));
+    });
+    let row = tui::row(&buffer, 2);
+    assert!(row.contains("…") && row.contains("Atlas"), "{row:?}");
+    assert!(!row.contains("~/Music"), "{row:?}");
+    assert!(row.contains("SCANNING ⣾"), "{row:?}");
+
+    // Compact: in the top border, spaced off the `─`.
+    let buffer = draw_with(80, 8, theme::base(), |f| {
+        kit::modal_frame(f, f.area(), spec(true));
+    });
+    let top = tui::row(&buffer, 0);
+    assert!(
+        top.starts_with("┌─ SEARCH ─ ~/Music/Mira Lenz/Low Tide Atlas ─"),
+        "{top:?}"
+    );
+    assert!(top.ends_with(" SCANNING ⣾ ─┐"), "{top:?}");
+
+    // No room for the note: the subtitle takes its place.
+    let buffer = draw_with(26, 8, theme::base(), |f| {
+        kit::modal_frame(f, f.area(), spec(false));
+    });
+    let row = tui::row(&buffer, 2);
+    assert!(row.contains(" SEARCH   …") && row.contains("Atlas"), "{row:?}");
+    assert!(!row.contains("SCANNING"), "{row:?}");
+
+    // No room at all: left out.
+    let buffer = draw_with(20, 8, theme::base(), |f| {
+        kit::modal_frame(f, f.area(), spec(false));
+    });
+    let row = tui::row(&buffer, 2);
+    assert!(!row.contains('~') && !row.contains("Atlas"), "{row:?}");
+}
+
+#[test]
 fn modal_frame_never_panics_at_tiny_sizes() {
     common::isolate();
     for (w, h) in [(1, 1), (2, 2), (3, 3), (8, 4), (12, 6)] {
@@ -253,6 +314,7 @@ fn modal_frame_never_panics_at_tiny_sizes() {
                     f.area(),
                     ModalSpec {
                         title: "SEARCH",
+                        subtitle: None,
                         note: Some(Line::from(vec![Span::raw("SCANNING ⣾")])),
                         error: false,
                         compact,

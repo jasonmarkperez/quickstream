@@ -38,6 +38,16 @@ impl MoodType {
         }
     }
 
+    /// What the mood plays, for the mix picker (its BPM range is added from [`Self::bpm_range`]).
+    pub fn description(&self) -> &'static str {
+        match self {
+            MoodType::Chill => "Downtempo, acoustic, lofi & low energy vibes",
+            MoodType::Workout => "Dance, electronic, rock & upbeat vibes",
+            MoodType::Focus => "Instrumental, synthwave, minimalist & piano",
+            MoodType::Groove => "Soul, funk, disco, house & groove vibes",
+        }
+    }
+
     pub fn bpm_range(&self) -> (f64, f64) {
         match self {
             MoodType::Chill => (60.0, 98.0),
@@ -222,6 +232,54 @@ impl MixProfile {
                 let name = path.file_stem().unwrap_or_default().to_string_lossy();
                 format!("Seed Radio ({})", name)
             }
+        }
+    }
+
+    /// The profiles the mix picker (`M`) lists, in its order: keys `1`–`5`.
+    pub fn picker_profiles() -> [MixProfile; 5] {
+        [
+            MixProfile::DiverseShuffle,
+            MixProfile::BpmFlow {
+                target_bpm: 120.0,
+                tolerance: 0.15,
+            },
+            MixProfile::MoodVibe(MoodType::Chill),
+            MixProfile::MoodVibe(MoodType::Workout),
+            MixProfile::MoodVibe(MoodType::Groove),
+        ]
+    }
+
+    /// The mix picker row for this profile: its own row, or for a profile the picker doesn't
+    /// list, the closest one (Seed Radio: Diverse Shuffle; Focus: Late Night Groove).
+    pub fn picker_index(&self) -> usize {
+        match self {
+            MixProfile::DiverseShuffle | MixProfile::SeedRadio(_) => 0,
+            MixProfile::BpmFlow { .. } => 1,
+            MixProfile::MoodVibe(MoodType::Chill) => 2,
+            MixProfile::MoodVibe(MoodType::Workout) => 3,
+            MixProfile::MoodVibe(MoodType::Groove | MoodType::Focus) => 4,
+        }
+    }
+
+    /// The name as the mix picker lists it: [`Self::name`], without the `Mood:` prefix.
+    pub fn title(&self) -> String {
+        match self {
+            MixProfile::MoodVibe(mood) => mood.name().to_string(),
+            _ => self.name(),
+        }
+    }
+
+    /// One line on what the profile does, for the mix picker. A mood's ends with its BPM range,
+    /// from [`MoodType::bpm_range`].
+    pub fn description(&self) -> String {
+        match self {
+            MixProfile::DiverseShuffle => "Fair random sampling across all artists (prevents cluster bias)".to_string(),
+            MixProfile::BpmFlow { .. } => "Cohesive tempo gradient with harmonic Camelot wheel transitions".to_string(),
+            MixProfile::MoodVibe(mood) => {
+                let (lo, hi) = mood.bpm_range();
+                format!("{} ({lo:.0}-{hi:.0} BPM)", mood.description())
+            }
+            MixProfile::SeedRadio(_) => "Radio station seeded by a chosen track".to_string(),
         }
     }
 

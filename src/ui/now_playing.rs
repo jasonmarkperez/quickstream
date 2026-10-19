@@ -99,7 +99,7 @@ struct UpNextSummary {
 }
 
 /// A sample rate in kHz: `96`, `44.1`.
-fn khz(hz: u32) -> String {
+pub(super) fn khz(hz: u32) -> String {
     if hz.is_multiple_of(1000) {
         (hz / 1000).to_string()
     } else {
@@ -107,7 +107,7 @@ fn khz(hz: u32) -> String {
     }
 }
 
-fn channels_label(channels: u8) -> String {
+pub(super) fn channels_label(channels: u8) -> String {
     match channels {
         1 => "MONO".to_string(),
         2 => "STEREO".to_string(),
