@@ -52,6 +52,16 @@ fn settings_app(tag: &str) -> AppUI {
     app
 }
 
+/// Turn the web server on from its row, as the user does, on a port the OS picks, and return the
+/// port it bound. Network access stays off, so it binds loopback only (no firewall prompt).
+fn start_loopback_web(app: &mut AppUI) -> u16 {
+    app.settings_mgr.settings.web_server_lan = false;
+    app.settings_mgr.settings.web_server_port = 0;
+    app.settings_cursor = WEB_SERVER;
+    press(app, KeyCode::Right);
+    app.web_port().expect("web server started")
+}
+
 fn press(app: &mut AppUI, code: KeyCode) -> bool {
     app.handle_input_key(KeyEvent::new(code, KeyModifiers::NONE)).unwrap()
 }
@@ -347,17 +357,16 @@ fn under_110_columns_there_is_no_option_panel_and_the_position_joins_the_footnot
 fn web_address_keeps_its_case_in_the_option_panel_and_the_footnote() {
     common::isolate();
     let mut app = settings_app("web");
-    // Turned on after startup, so no server is started; drawing only reads the setting and the
-    // port the app recorded for the server.
-    app.settings_mgr.settings.web_server_enabled = true;
-    app.settings_mgr.set_bound_web_port(Some(8080));
-    app.settings_cursor = WEB_SERVER;
+    let port = start_loopback_web(&mut app);
+    let url = format!("http://127.0.0.1:{port}");
+    // (Turning it on put the address in the status line too.)
+    app.status_message.clear();
     let buf = tui::render(&mut app, 120, 40);
     assert_eq!(
         span(&buf, must_row(&buf, WEB_SERVER), VALUE_X, BAR_END_X + 1),
-        "◂ ON  :8080 ▸"
+        format!("◂ ON  :{port} ▸")
     );
-    let (x, y) = text_from(&buf, "http://127.0.0.1:8080", OPTION_X).expect("web address");
+    let (x, y) = text_from(&buf, &url, OPTION_X).expect("web address");
     assert!(x >= OPTION_X);
     assert_eq!(tui::cell_style(&buf, x, y).fg, Some(P.dim));
     assert!(!dump(&buf).contains("HTTP://"));
@@ -366,10 +375,10 @@ fn web_address_keeps_its_case_in_the_option_panel_and_the_footnote() {
     let buf = tui::render(&mut app, 100, 30);
     let foot = label_row(&buf) + 2;
     let line = span(&buf, foot, 0, 100);
-    assert!(line.contains("http://127.0.0.1:8080"), "{line:?}");
+    assert!(line.contains(&url), "{line:?}");
     app.settings_cursor = WEB_LAN;
     let buf = tui::render(&mut app, 100, 30);
-    assert!(span(&buf, label_row(&buf) + 2, 0, 100).contains("http://127.0.0.1:8080"));
+    assert!(span(&buf, label_row(&buf) + 2, 0, 100).contains(&url));
     app.settings_cursor = QUEUE_MODE;
     let buf = tui::render(&mut app, 100, 30);
     assert!(!dump(&buf).contains("http://"));

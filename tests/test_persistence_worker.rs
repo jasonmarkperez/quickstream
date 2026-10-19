@@ -129,7 +129,11 @@ fn test_settings_manager_save_goes_through_worker() {
     mgr.settings.volume_step = 10;
     assert!(mgr.save());
     assert!(wait_for(|| log.lock().unwrap().len() == 1));
-    mgr.cycle_setting(5, true, &[]); // force_transcode, saves again
+    mgr.cycle_setting(
+        quickstream::settings::setting::FORCE_TRANSCODE,
+        true,
+        &Default::default(),
+    ); // saves again
     assert!(
         start.elapsed() < Duration::from_millis(500),
         "settings save blocked for {:?}",

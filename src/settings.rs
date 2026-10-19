@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::paths;
@@ -283,20 +283,27 @@ pub fn step_in_display_order(index: usize, forward: bool) -> usize {
     SETTING_DISPLAY_ORDER[next]
 }
 
-/// The music folder (`~/Music` on macOS), looked up once per process: on Linux `directories`
-/// reads `user-dirs.dirs` for it, which must not happen on every key press.
-pub fn music_dir() -> Option<&'static Path> {
-    static MUSIC: OnceLock<Option<PathBuf>> = OnceLock::new();
-    MUSIC
-        .get_or_init(|| directories::UserDirs::new().and_then(|dirs| dirs.audio_dir().map(Path::to_path_buf)))
-        .as_deref()
+/// Look the music folder up (`~/Music` on macOS). On Linux `directories` reads
+/// `user-dirs.dirs` for it, so this touches the disk: the UI calls it on a worker at startup
+/// (`AppUI::set_music_dir_lookup`) and passes the answer in [`SettingsContext::music_dir`].
+pub fn lookup_music_dir() -> Option<PathBuf> {
+    directories::UserDirs::new().and_then(|dirs| dirs.audio_dir().map(Path::to_path_buf))
 }
 
-/// The user's home folder, looked up once per process.
-fn user_home() -> Option<&'static Path> {
-    static HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
-    HOME.get_or_init(|| directories::BaseDirs::new().map(|base| base.home_dir().to_path_buf()))
-        .as_deref()
+/// What the settings' values and choices depend on besides config.json. The caller (the UI)
+/// holds all of it in memory, so building values and choices never reads the disk.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SettingsContext<'a> {
+    /// The Music Homes; the startup home cycles through them (bookmarks.json is not read).
+    pub bookmarks: &'a [String],
+    /// The music folder, a startup home choice; `None` while it is still being looked up, or
+    /// when there is none.
+    pub music_dir: Option<&'a Path>,
+    /// The home folder: a startup home choice, and shown as `~` in paths.
+    pub home: Option<&'a Path>,
+    /// The port the web server is bound to while it runs, which is not `web_server_port` when
+    /// another program held that one; `None` while no server runs.
+    pub web_port: Option<u16>,
 }
 
 const PLAYER_BACKENDS: [&str; 2] = ["mpv", "ffplay"];
@@ -424,9 +431,6 @@ pub struct SettingsManager {
     /// writing on the calling thread.
     persist: Option<crate::persist::PersistHandle>,
     lan_ip: LanIp,
-    /// The port the web server is bound to while it runs (`set_bound_web_port`), which is not
-    /// `web_server_port` when another program held that one. `None` while no server runs.
-    bound_web_port: Option<u16>,
 }
 
 impl Default for SettingsManager {
@@ -456,7 +460,6 @@ impl SettingsManager {
             settings,
             persist: None,
             lan_ip: LanIp::new(default_lan_ip_resolver()),
-            bound_web_port: None,
         }
     }
 
@@ -471,10 +474,10 @@ impl SettingsManager {
         self.lan_ip = LanIp::new(Arc::new(resolver));
     }
 
-    /// Record the port the web server bound (`None` once it stops), for the web server's value
-    /// and address. The app calls this whenever it starts or stops the server.
-    pub fn set_bound_web_port(&mut self, port: Option<u16>) {
-        self.bound_web_port = port;
+    /// Start looking the LAN address up on a worker thread, unless it is cached and fresh, so
+    /// the pairing link is ready when it is shown. Never waits for the lookup.
+    pub fn prefetch_lan_address(&self) {
+        self.lan_ip.get();
     }
 
     pub fn load_from(path: &Path) -> Option<Settings> {
@@ -502,11 +505,10 @@ impl SettingsManager {
         }
     }
 
-    /// Move setting `index` to its next (or previous) choice, wrapping, and save. `bookmarks`
-    /// are the Music Homes the caller holds in memory (the startup home cycles through them);
-    /// bookmarks.json is not read here.
-    pub fn cycle_setting(&mut self, index: usize, forward: bool, bookmarks: &[String]) {
-        let options = self.options(index, bookmarks, music_dir());
+    /// Move setting `index` to its next (or previous) choice in `options(index, context)`,
+    /// wrapping, and save.
+    pub fn cycle_setting(&mut self, index: usize, forward: bool, context: &SettingsContext) {
+        let options = self.options(index, context);
         if let Some(choice) = options.choices.get(options.next(forward)) {
             self.set_value(index, choice.value.clone());
         }
@@ -554,10 +556,10 @@ impl SettingsManager {
     }
 
     /// Every choice setting `index` cycles through, in order, and which one it holds. The
-    /// startup home lists the launch directory, `audio_dir` (the music folder), the home folder,
-    /// `bookmarks`, then a custom path it holds, each once. `cycle_setting` moves along this
-    /// list, so the two never disagree.
-    pub fn options(&self, index: usize, bookmarks: &[String], audio_dir: Option<&Path>) -> SettingOptions {
+    /// startup home lists the launch directory, the context's music folder (left out while it is
+    /// unknown), home folder and bookmarks, then a custom path it holds, each once.
+    /// `cycle_setting` moves along this list, so the two never disagree.
+    pub fn options(&self, index: usize, context: &SettingsContext) -> SettingOptions {
         let bools = || vec![SettingValue::Bool(false), SettingValue::Bool(true)];
         let texts =
             |list: &[&str]| -> Vec<SettingValue> { list.iter().map(|v| SettingValue::Text(v.to_string())).collect() };
@@ -570,11 +572,12 @@ impl SettingsManager {
             FORCE_TRANSCODE | WEB_SERVER_ENABLED | GAPLESS_AUTOPILOT | ONLINE_ENRICHMENT | WEB_SERVER_LAN => bools(),
             HOME_DIR => {
                 let mut paths: Vec<Option<String>> = vec![None];
-                let listed = audio_dir
+                let listed = context
+                    .music_dir
                     .into_iter()
-                    .chain(user_home())
+                    .chain(context.home)
                     .map(|p| p.to_string_lossy().into_owned())
-                    .chain(bookmarks.iter().cloned())
+                    .chain(context.bookmarks.iter().cloned())
                     .chain(self.settings.home_dir.clone());
                 for path in listed {
                     if !paths.iter().any(|p| p.as_deref() == Some(path.as_str())) {
@@ -598,7 +601,7 @@ impl SettingsManager {
         let choices = values
             .into_iter()
             .map(|value| SettingChoice {
-                label: self.value_label(index, &value),
+                label: self.value_label(index, &value, context),
                 value,
             })
             .collect();
@@ -610,16 +613,16 @@ impl SettingsManager {
     }
 
     /// The compact value of setting `index` for the Settings list (`◂ VALUE ▸`, mockup 2e):
-    /// uppercase (`MPV`, `10 S`, `CONTINUOUS (LOOP)`, `ON  :8080` with the port the server bound,
-    /// `ON` while none runs), paths in their own case with `~` for home. The same wording labels
-    /// the choices in `options`.
-    pub fn short_value(&self, index: usize) -> String {
+    /// uppercase (`MPV`, `10 S`, `CONTINUOUS (LOOP)`, `ON  :8080` with the context's web port,
+    /// `ON` while no server runs), paths in their own case with `~` for the context's home. The
+    /// same wording labels the choices in `options`.
+    pub fn short_value(&self, index: usize, context: &SettingsContext) -> String {
         self.value(index)
-            .map(|value| self.value_label(index, &value))
+            .map(|value| self.value_label(index, &value, context))
             .unwrap_or_default()
     }
 
-    fn value_label(&self, index: usize, value: &SettingValue) -> String {
+    fn value_label(&self, index: usize, value: &SettingValue, context: &SettingsContext) -> String {
         let on_off = |on: bool| if on { "ON" } else { "OFF" }.to_string();
         match (index, value) {
             (METADATA_VIEW, SettingValue::Bool(tags)) => if *tags { "TAGS" } else { "FILES" }.to_string(),
@@ -630,7 +633,7 @@ impl SettingsManager {
                 other => other.to_uppercase(),
             },
             (FORCE_TRANSCODE, SettingValue::Bool(pcm)) => if *pcm { "PCM WAV" } else { "OFF" }.to_string(),
-            (WEB_SERVER_ENABLED, SettingValue::Bool(true)) => match self.bound_web_port {
+            (WEB_SERVER_ENABLED, SettingValue::Bool(true)) => match context.web_port {
                 Some(port) => format!("ON  :{}", port),
                 None => "ON".to_string(),
             },
@@ -643,20 +646,20 @@ impl SettingsManager {
             (_, SettingValue::Seconds(s)) => format!("{} S", s),
             (_, SettingValue::Percent(p)) => format!("{} %", p),
             (_, SettingValue::Path(None)) => "LAUNCH DIRECTORY".to_string(),
-            (_, SettingValue::Path(Some(path))) => paths::display_path(Path::new(path), user_home()),
+            (_, SettingValue::Path(Some(path))) => paths::display_path(Path::new(path), context.home),
         }
     }
 
-    /// The web remote's address while the web server setting is on and the server runs, in its
-    /// own case: `http://127.0.0.1:<port>` for this computer, or with network access the pairing
-    /// link (LAN address and session token), on the port the server bound. The LAN address comes
-    /// from the cache (looked up on a worker), so the link is `None` until it is known rather
-    /// than looked up while drawing.
-    pub fn web_url(&self) -> Option<String> {
+    /// The web remote's address while the web server setting is on and the server runs on
+    /// `web_port` (the port it bound; `None` while none runs), in its own case:
+    /// `http://127.0.0.1:<port>` for this computer, or with network access the pairing link (LAN
+    /// address and session token). The LAN address comes from the cache (looked up on a
+    /// worker), so the link is `None` until it is known rather than looked up while drawing.
+    pub fn web_url(&self, web_port: Option<u16>) -> Option<String> {
         if !self.settings.web_server_enabled {
             return None;
         }
-        let port = self.bound_web_port?;
+        let port = web_port?;
         if !self.settings.web_server_lan {
             return Some(format!("http://127.0.0.1:{}", port));
         }
@@ -669,7 +672,9 @@ impl SettingsManager {
         ))
     }
 
-    pub fn get_display_value(&self, index: usize) -> String {
+    /// The long wording of setting `index` (status messages): `Continuous (Loop Queue)`,
+    /// `Enabled (<web address>)`, a path with `~` for the context's home.
+    pub fn get_display_value(&self, index: usize, context: &SettingsContext) -> String {
         match index {
             METADATA_VIEW => if self.settings.metadata_view {
                 "Metadata (Tags)"
@@ -699,12 +704,12 @@ impl SettingsManager {
             }
             .to_string(),
             WEB_SERVER_ENABLED if !self.settings.web_server_enabled => "Disabled".to_string(),
-            WEB_SERVER_ENABLED => match self.web_url() {
+            WEB_SERVER_ENABLED => match self.web_url(context.web_port) {
                 Some(url) => format!("Enabled ({})", url),
                 None => "Enabled".to_string(),
             },
             HOME_DIR => match self.settings.home_dir {
-                Some(ref h) => paths::display_path(Path::new(h), user_home()),
+                Some(ref h) => paths::display_path(Path::new(h), context.home),
                 None => "Default (Launch Directory)".to_string(),
             },
             GAPLESS_AUTOPILOT => if self.settings.gapless_autopilot {
@@ -797,10 +802,12 @@ mod tests {
             .iter()
             .position(|d| d.key == "web_server_lan")
             .expect("setting row");
-        mgr.cycle_setting(idx, true, &[]);
+        mgr.cycle_setting(idx, true, &SettingsContext::default());
         assert!(mgr.settings.web_server_lan);
-        assert!(mgr.get_display_value(idx).contains("network"));
-        mgr.cycle_setting(idx, true, &[]);
+        assert!(mgr
+            .get_display_value(idx, &SettingsContext::default())
+            .contains("network"));
+        mgr.cycle_setting(idx, true, &SettingsContext::default());
         assert!(!mgr.settings.web_server_lan);
         let _ = fs::remove_dir_all(&temp_dir);
     }
@@ -813,38 +820,53 @@ mod tests {
         let mut mgr = SettingsManager::with_path(path);
 
         assert!(mgr.settings.metadata_view);
-        mgr.cycle_setting(METADATA_VIEW, true, &[]);
+        mgr.cycle_setting(METADATA_VIEW, true, &SettingsContext::default());
         assert!(!mgr.settings.metadata_view);
 
         assert_eq!(mgr.settings.player_backend, "mpv");
-        mgr.cycle_setting(PLAYER_BACKEND, true, &[]);
+        mgr.cycle_setting(PLAYER_BACKEND, true, &SettingsContext::default());
         assert_eq!(mgr.settings.player_backend, "ffplay");
 
         assert!(!mgr.settings.web_server_enabled);
-        mgr.cycle_setting(WEB_SERVER_ENABLED, true, &[]);
+        mgr.cycle_setting(WEB_SERVER_ENABLED, true, &SettingsContext::default());
         assert!(mgr.settings.web_server_enabled);
 
         assert_eq!(mgr.settings.home_dir, None);
-        assert_eq!(mgr.get_display_value(HOME_DIR), "Default (Launch Directory)");
-        mgr.cycle_setting(HOME_DIR, true, &[]);
-        mgr.cycle_setting(HOME_DIR, false, &[]);
+        assert_eq!(
+            mgr.get_display_value(HOME_DIR, &SettingsContext::default()),
+            "Default (Launch Directory)"
+        );
+        mgr.cycle_setting(HOME_DIR, true, &SettingsContext::default());
+        mgr.cycle_setting(HOME_DIR, false, &SettingsContext::default());
         assert_eq!(mgr.settings.home_dir, None);
 
         assert!(mgr.settings.gapless_autopilot);
-        assert_eq!(mgr.get_display_value(GAPLESS_AUTOPILOT), "Enabled (Seamless PCM)");
-        mgr.cycle_setting(GAPLESS_AUTOPILOT, true, &[]);
+        assert_eq!(
+            mgr.get_display_value(GAPLESS_AUTOPILOT, &SettingsContext::default()),
+            "Enabled (Seamless PCM)"
+        );
+        mgr.cycle_setting(GAPLESS_AUTOPILOT, true, &SettingsContext::default());
         assert!(!mgr.settings.gapless_autopilot);
-        assert_eq!(mgr.get_display_value(GAPLESS_AUTOPILOT), "Disabled (Track-by-track)");
+        assert_eq!(
+            mgr.get_display_value(GAPLESS_AUTOPILOT, &SettingsContext::default()),
+            "Disabled (Track-by-track)"
+        );
 
         assert_eq!(mgr.settings.default_mix_profile, "diverse");
-        mgr.cycle_setting(DEFAULT_MIX_PROFILE, true, &[]);
+        mgr.cycle_setting(DEFAULT_MIX_PROFILE, true, &SettingsContext::default());
         assert_eq!(mgr.settings.default_mix_profile, "bpm_flow");
-        assert_eq!(mgr.get_display_value(DEFAULT_MIX_PROFILE), "DJ BPM Flow (124 BPM)");
+        assert_eq!(
+            mgr.get_display_value(DEFAULT_MIX_PROFILE, &SettingsContext::default()),
+            "DJ BPM Flow (124 BPM)"
+        );
 
         assert!(!mgr.settings.online_enrichment);
-        mgr.cycle_setting(ONLINE_ENRICHMENT, true, &[]);
+        mgr.cycle_setting(ONLINE_ENRICHMENT, true, &SettingsContext::default());
         assert!(mgr.settings.online_enrichment);
-        assert_eq!(mgr.get_display_value(ONLINE_ENRICHMENT), "Enabled (Last.fm Cache)");
+        assert_eq!(
+            mgr.get_display_value(ONLINE_ENRICHMENT, &SettingsContext::default()),
+            "Enabled (Last.fm Cache)"
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

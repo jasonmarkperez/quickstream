@@ -1146,18 +1146,21 @@ fn test_settings_show_pairing_link_when_lan_access_enabled() {
     common::isolate();
     let mut mgr = quickstream::settings::SettingsManager::new();
     mgr.settings.web_server_enabled = true;
-    mgr.set_bound_web_port(Some(8080));
+    let running = quickstream::settings::SettingsContext {
+        web_port: Some(8080),
+        ..Default::default()
+    };
     mgr.settings.web_server_lan = false;
-    let local = mgr.get_display_value(quickstream::settings::setting::WEB_SERVER_ENABLED);
+    let local = mgr.get_display_value(quickstream::settings::setting::WEB_SERVER_ENABLED, &running);
     assert!(!local.contains("token"), "{}", local);
 
     mgr.settings.web_server_lan = true;
     // The LAN address is looked up on a worker; the link shows once it is known.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    let mut lan = mgr.get_display_value(quickstream::settings::setting::WEB_SERVER_ENABLED);
+    let mut lan = mgr.get_display_value(quickstream::settings::setting::WEB_SERVER_ENABLED, &running);
     while !lan.contains("http://") && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(5));
-        lan = mgr.get_display_value(quickstream::settings::setting::WEB_SERVER_ENABLED);
+        lan = mgr.get_display_value(quickstream::settings::setting::WEB_SERVER_ENABLED, &running);
     }
     let token = quickstream::web_access::web_token();
     assert!(lan.contains(&format!(":8080/?token={}", token)), "{}", lan);

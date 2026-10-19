@@ -3,9 +3,10 @@
 //! option panel for the selected setting beside it (its choices with ●/○, a description, the web
 //! address and the keys that change it).
 //!
-//! Only what is in memory is drawn: the settings, the Music Homes the app holds
-//! (`AppUI::bookmarks`, never bookmarks.json), the music folder looked up at startup, the port
-//! the web server bound and the cached LAN address (`SettingsManager::web_url`). The startup
+//! Only what is in memory is drawn: the settings and their `AppUI::settings_context` (the Music
+//! Homes the app holds, never bookmarks.json; the music folder once its startup worker has found
+//! it; the home folder; the port the running web server bound) and the cached LAN address
+//! (`SettingsManager::web_url`). The startup
 //! home editor stays inline: while it is open its row shows the typed text with a block cursor.
 
 use ratatui::prelude::*;
@@ -131,9 +132,15 @@ impl AppUI {
         } else {
             area
         };
-        // The address is looked up only while a web row is selected (from the cache).
-        let web_url = if setting::WEB.contains(&cursor) {
-            self.settings_mgr.web_url()
+        // The address is looked up only while a web row is selected (from the cache). With
+        // network access on, a web row starts the LAN address lookup (on a worker) even while the
+        // server is off, so the pairing link is ready once it is turned on.
+        let web_row = setting::WEB.contains(&cursor);
+        if web_row && self.settings_mgr.settings.web_server_lan {
+            self.settings_mgr.prefetch_lan_address();
+        }
+        let web_url = if web_row {
+            self.settings_mgr.web_url(self.web_port())
         } else {
             None
         };
@@ -223,10 +230,10 @@ impl AppUI {
                             format!("{}█", kit::visible_tail(input, value_cols.saturating_sub(1)))
                         }
                         (_, true) if value_cols >= 5 => {
-                            let value = self.settings_mgr.short_value(index);
+                            let value = self.settings_mgr.short_value(index, &self.settings_context());
                             format!("◂ {} ▸", kit::clip(&value, value_cols - 4))
                         }
-                        _ => self.settings_mgr.short_value(index),
+                        _ => self.settings_mgr.short_value(index, &self.settings_context()),
                     };
                     let cols = [
                         Col::fixed(kit::upper(SETTING_DEFINITIONS[index].label), label_cols, theme::mid()),
@@ -272,9 +279,7 @@ impl AppUI {
                     .map(|line| vec![Col::flex(line, theme::ink())]),
             );
         } else {
-            let options = self
-                .settings_mgr
-                .options(cursor, &self.bookmarks, settings::music_dir());
+            let options = self.settings_mgr.options(cursor, &self.settings_context());
             // Too many choices for the panel: the ones around the current choice.
             let len = options.choices.len();
             let shown = len.min(height);

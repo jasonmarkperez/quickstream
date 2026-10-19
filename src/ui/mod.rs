@@ -34,7 +34,22 @@ use crate::player::local::LocalPlayer;
 use crate::player::worker::AsyncPlayer;
 use crate::player::AudioPlayer;
 use crate::queue::PlaybackQueue;
-use crate::settings::{setting, SettingsManager, SETTING_DEFINITIONS, SETTING_DISPLAY_ORDER};
+use crate::settings::{setting, SettingsContext, SettingsManager, SETTING_DEFINITIONS, SETTING_DISPLAY_ORDER};
+
+/// The [`SettingsContext`] built from an `AppUI`'s fields one by one (not through `&self`), so
+/// `settings_mgr` can be borrowed mutably beside it: the Music Homes in memory, the music folder
+/// once its worker has found it, the home folder the library shows as `~`, and the port the
+/// running web server bound.
+macro_rules! settings_context {
+    ($app:expr) => {
+        SettingsContext {
+            bookmarks: &$app.bookmarks,
+            music_dir: $app.music_dir.get().and_then(|dir| dir.as_deref()),
+            home: $app.queue_tab.home.as_deref(),
+            web_port: $app.web_server.as_ref().map(|server| server.port),
+        }
+    };
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct CachedDir {
@@ -291,6 +306,12 @@ pub struct AppUI {
     now_playing: now_playing::NowPlayingCache,
     /// When the UI was created: the clock the Devices tab's scanning spinner turns by.
     ui_epoch: Instant,
+    /// The music folder (a startup home choice), set by a worker at startup
+    /// (`set_music_dir_lookup`); empty until it has answered.
+    music_dir: std::sync::Arc<std::sync::OnceLock<Option<PathBuf>>>,
+    /// The status message the web server row set while its pairing link was not known yet
+    /// (`show_setting_status`); `poll_settings_status` adds the link once the LAN address is in.
+    web_link_status: Option<String>,
 }
 
 impl Drop for AppUI {
@@ -328,9 +349,6 @@ impl AppUI {
         let cwd = std::path::absolute(&cwd).unwrap_or(cwd);
         let backend = settings_mgr.settings.player_backend.clone();
         let bookmarks = Self::load_bookmarks();
-        // Look the music folder up now, at startup, so cycling the startup home on the Settings
-        // tab never does (on Linux it reads user-dirs.dirs).
-        crate::settings::music_dir();
         // Discovery starts in run(): SSDP opens a socket on all interfaces, which tests that
         // only construct the app should not do (macOS firewall prompts).
         let device_manager = DeviceManager::new();
@@ -355,7 +373,10 @@ impl AppUI {
         } else {
             (None, None)
         };
-        settings_mgr.set_bound_web_port(web_server.as_ref().map(|s| s.port));
+        if settings_mgr.settings.web_server_lan {
+            // So the pairing link is ready by the time the Settings tab or a status shows it.
+            settings_mgr.prefetch_lan_address();
+        }
 
         let (metadata_tx, metadata_rx) = std::sync::mpsc::channel();
         let (queue_add_tx, queue_add_rx) = std::sync::mpsc::channel();
@@ -441,7 +462,11 @@ impl AppUI {
             queue_tab: queue_tab::QueueTabCache::new(),
             now_playing: now_playing::NowPlayingCache::default(),
             ui_epoch: Instant::now(),
+            music_dir: Default::default(),
+            web_link_status: None,
         };
+        // On Linux the music folder lookup reads user-dirs.dirs: never on the UI thread.
+        app.set_music_dir_lookup(crate::settings::lookup_music_dir);
         app.refresh_browser();
         app.start_playlist_load();
         app.update_web_state();
@@ -1674,6 +1699,7 @@ impl AppUI {
             self.poll_background_metadata();
             self.poll_pending_queue_adds();
             self.poll_playlists();
+            self.poll_settings_status();
 
             // Poll progressive background autopilot discovery
             self.poll_background_autopilot();
@@ -2093,8 +2119,7 @@ impl AppUI {
                         self.status_message = "Cleared startup home (defaulting to launch directory)".to_string();
                     } else {
                         let resolved = if raw.starts_with('~') {
-                            if let Some(base) = directories::BaseDirs::new() {
-                                let home = base.home_dir();
+                            if let Some(home) = self.queue_tab.home.as_deref() {
                                 if raw == "~" {
                                     home.to_string_lossy().to_string()
                                 } else if let Some(stripped) = raw.strip_prefix("~/") {
@@ -2266,7 +2291,7 @@ impl AppUI {
             (KeyCode::Char('v'), KeyModifiers::NONE) => {
                 if self.active_tab == 0 || self.active_tab == 1 {
                     self.settings_mgr
-                        .cycle_setting(setting::METADATA_VIEW, true, &self.bookmarks);
+                        .cycle_setting(setting::METADATA_VIEW, true, &settings_context!(self));
                     self.update_browser_entry_labels();
                     self.status_message = format!(
                         "Display mode: {}",
@@ -2752,7 +2777,7 @@ impl AppUI {
 
     pub fn cycle_and_apply_setting(&mut self, forward: bool) {
         self.settings_mgr
-            .cycle_setting(self.settings_cursor, forward, &self.bookmarks);
+            .cycle_setting(self.settings_cursor, forward, &settings_context!(self));
         if self.settings_cursor == setting::METADATA_VIEW {
             self.update_browser_entry_labels();
         } else if self.settings_cursor == setting::PLAYER_BACKEND {
@@ -2769,11 +2794,68 @@ impl AppUI {
         } else if self.settings_cursor == setting::HOME_DIR {
             self.update_web_state();
         }
+        self.show_setting_status(self.settings_cursor);
+    }
+
+    /// What setting `index`'s values and choices depend on besides config.json (see
+    /// [`SettingsContext`]), all from memory.
+    pub fn settings_context(&self) -> SettingsContext<'_> {
+        settings_context!(self)
+    }
+
+    /// The port the running web server bound, `None` while none runs.
+    pub fn web_port(&self) -> Option<u16> {
+        self.web_server.as_ref().map(|server| server.port)
+    }
+
+    /// Look the music folder up on a worker with `lookup` (`AppUI::new` uses
+    /// `settings::lookup_music_dir`; tests pass their own). Until it has answered, the startup
+    /// home's choices and cycling leave the music folder out, as if there were none.
+    pub fn set_music_dir_lookup(&mut self, lookup: impl FnOnce() -> Option<PathBuf> + Send + 'static) {
+        let cell = std::sync::Arc::new(std::sync::OnceLock::new());
+        self.music_dir = cell.clone();
+        self.workers.spawn("music-dir", move || {
+            let _ = cell.set(lookup());
+        });
+    }
+
+    /// Put setting `index` and its long value in the status line (`Now Playing Web Server:
+    /// Enabled (<address>)`). On the web server row with network access, while the LAN address
+    /// is still being looked up, the address is left out and `poll_settings_status` adds it once
+    /// it is known.
+    pub fn show_setting_status(&mut self, index: usize) {
+        let Some(def) = SETTING_DEFINITIONS.get(index) else {
+            return;
+        };
+        if setting::WEB.contains(&index) && self.settings_mgr.settings.web_server_lan {
+            self.settings_mgr.prefetch_lan_address();
+        }
         self.status_message = format!(
             "{}: {}",
-            SETTING_DEFINITIONS[self.settings_cursor].label,
-            self.settings_mgr.get_display_value(self.settings_cursor)
+            def.label,
+            self.settings_mgr.get_display_value(index, &self.settings_context())
         );
+        let link_pending = index == setting::WEB_SERVER_ENABLED
+            && self.settings_mgr.settings.web_server_enabled
+            && self.web_server.is_some()
+            && self.settings_mgr.web_url(self.web_port()).is_none();
+        self.web_link_status = link_pending.then(|| self.status_message.clone());
+    }
+
+    /// Once per tick: when the status still reads what `show_setting_status` put there without
+    /// the web address and the address is now known, show it with the address. Any other status
+    /// shown since, or the server stopping, drops the update.
+    pub fn poll_settings_status(&mut self) {
+        let Some(sent) = self.web_link_status.as_ref() else {
+            return;
+        };
+        if *sent != self.status_message || !self.settings_mgr.settings.web_server_enabled || self.web_server.is_none() {
+            self.web_link_status = None;
+            return;
+        }
+        if self.settings_mgr.web_url(self.web_port()).is_some() {
+            self.show_setting_status(setting::WEB_SERVER_ENABLED);
+        }
     }
 
     /// Play the queue's current track. Returns the playback error, if `player.play` failed (it
@@ -3137,7 +3219,6 @@ impl AppUI {
             Some(old) => {
                 let port = old.port;
                 old.stop();
-                self.settings_mgr.set_bound_web_port(None);
                 port
             }
             None => self.settings_mgr.settings.web_server_port,
@@ -3151,7 +3232,6 @@ impl AppUI {
                 }
                 self.web_server = Some(handle);
                 self.web_cmd_rx = Some(rx);
-                self.settings_mgr.set_bound_web_port(Some(actual_port));
                 Ok(actual_port)
             }
             Err(e) => {
@@ -3294,7 +3374,6 @@ impl AppUI {
             }
         } else if let Some(handle) = self.web_server.take() {
             handle.stop();
-            self.settings_mgr.set_bound_web_port(None);
             self.web_cmd_rx = None;
             self.status_message = "Stopped web server".to_string();
         }
