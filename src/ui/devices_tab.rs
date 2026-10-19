@@ -232,22 +232,42 @@ impl AppUI {
             }
             parts.join(SEP)
         };
-        // Under 24 rows the blank rows under the rule and under the column names go when the
-        // table would not fit with them (3h): the column names and their blank row, a row per
-        // output, and the scanning or nothing-found line after its blank row. The DEVICE panel
-        // follows, to stay level.
+        let detail_area =
+            detail.then(|| Rect::new(area.x + table_area.width + PANEL_GAP, area.y, DETAIL_COLS, area.height));
+        let is_active = match (selected_device, &active) {
+            (None, None) => true,
+            (Some(dev), Some(act)) => dev.udn == act.udn,
+            _ => false,
+        };
+        let detail_fields = detail_area.map(|detail_area| {
+            let value_cols = usize::from(kit::panel_text_width(detail_area).saturating_sub(KEY_COLS));
+            self.device_fields(selected_device, is_active, value_cols)
+        });
+        // Under 24 rows the blank rows under the rule and under the column names go when either
+        // panel would not fit with them (3h; side by side they decide together, to stay level):
+        // the table's column names and their blank row, a row per output, and the scanning or
+        // nothing-found line after its blank row; the DEVICE panel's fields and, for an output
+        // not in use, the ENTER line after its blank row.
         let message_rows = if table_message(scanning, devices.is_empty()).is_some() {
             2
         } else {
             0
         };
+        let switch_rows = if is_active { 0 } else { 2 };
         let spacer = kit::keeps_spacer(
             screen.short,
-            &[kit::PanelFit {
-                area: Some(table_area),
-                header_rows: kit::panel_header_rows(compact, true, false),
-                rows: 2 + devices.len() + 1 + message_rows,
-            }],
+            &[
+                kit::PanelFit {
+                    area: Some(table_area),
+                    header_rows: kit::panel_header_rows(compact, true, false),
+                    rows: 2 + devices.len() + 1 + message_rows,
+                },
+                kit::PanelFit {
+                    area: detail_area,
+                    header_rows: kit::panel_header_rows(compact, true, false),
+                    rows: detail_fields.as_ref().map_or(0, Vec::len) + switch_rows,
+                },
+            ],
         );
         let list = kit::panel_spaced(
             f,
@@ -263,14 +283,16 @@ impl AppUI {
         );
         self.render_device_table(f, list, &devices, active.as_ref(), scanning, spacer);
 
-        if detail {
-            let detail_area = Rect::new(area.x + table_area.width + PANEL_GAP, area.y, DETAIL_COLS, area.height);
-            let is_active = match (selected_device, &active) {
-                (None, None) => true,
-                (Some(dev), Some(act)) => dev.udn == act.udn,
-                _ => false,
-            };
-            self.render_device_detail(f, detail_area, selected_device, is_active, compact, spacer);
+        if let (Some(detail_area), Some(fields)) = (detail_area, detail_fields) {
+            self.render_device_detail(
+                f,
+                detail_area,
+                selected_device.is_some(),
+                &fields,
+                is_active,
+                compact,
+                spacer,
+            );
         }
     }
 
@@ -383,35 +405,15 @@ impl AppUI {
     /// The DEVICE panel (from 110 columns): the selected output's type in the footnote, then a
     /// row per field discovery found, its status, its volume when it is the active output (the
     /// player's, as on the strip), and for an output not in use the key that switches to it.
-    fn render_device_detail(
+    /// The DEVICE panel's fields for `device` (`None` for Local Audio), values cut to
+    /// `value_cols` where they would not fit otherwise.
+    fn device_fields(
         &self,
-        f: &mut Frame,
-        area: Rect,
         device: Option<&DLNADevice>,
         is_active: bool,
-        compact: bool,
-        spacer: bool,
-    ) {
-        let footnote = if device.is_some() {
-            "DLNA MEDIARENDERER"
-        } else {
-            "LOCAL PLAYBACK"
-        };
-        let list = kit::panel_spaced(
-            f,
-            area,
-            PanelSpec {
-                label: "Device",
-                right: None,
-                focused: true,
-                footnote: Some(Line::from(footnote)),
-                compact,
-            },
-            spacer,
-        );
-
-        let value_cols = usize::from(list.width.saturating_sub(KEY_COLS));
-        let mut fields: Vec<(&str, String)> = Vec::new();
+        value_cols: usize,
+    ) -> Vec<(&'static str, String)> {
+        let mut fields: Vec<(&'static str, String)> = Vec::new();
         match device {
             None => {
                 fields.push(("NAME", "LOCAL AUDIO".to_string()));
@@ -441,10 +443,43 @@ impl AppUI {
         if is_active {
             fields.push(("VOLUME", self.player.volume().to_string()));
         }
+        fields
+    }
+
+    /// The DEVICE panel: `fields` (from [`Self::device_fields`]) and, for an output not in use,
+    /// the ENTER line that switches to it.
+    #[allow(clippy::too_many_arguments)]
+    fn render_device_detail(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        renderer: bool,
+        fields: &[(&'static str, String)],
+        is_active: bool,
+        compact: bool,
+        spacer: bool,
+    ) {
+        let footnote = if renderer {
+            "DLNA MEDIARENDERER"
+        } else {
+            "LOCAL PLAYBACK"
+        };
+        let list = kit::panel_spaced(
+            f,
+            area,
+            PanelSpec {
+                label: "Device",
+                right: None,
+                focused: true,
+                footnote: Some(Line::from(footnote)),
+                compact,
+            },
+            spacer,
+        );
 
         let bold = theme::bold();
         let mut dy = 0;
-        for (key, value) in &fields {
+        for (key, value) in fields {
             if dy >= list.height {
                 return;
             }

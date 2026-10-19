@@ -639,3 +639,34 @@ fn ipv6_renderer_addresses_are_bracketed_and_keep_their_port() {
         }
     }
 }
+
+/// Under 24 rows the DEVICE panel takes part in the spacer decision with the table beside it
+/// (panels side by side decide together, 3h): when its fields would not all fit under the
+/// blank row, both panels give it up, so the active renderer's STATUS and VOLUME still show.
+#[test]
+fn short_devices_tab_drops_the_spacer_for_the_detail_panel() {
+    common::isolate();
+    let mut app = devices_app("detail_spacer", mockup_renderers());
+    let devices = app.device_manager.get_devices();
+    app.device_manager.set_active_device(Some(devices[0].clone()));
+    app.devices_cursor = 1;
+    // At 13 rows the panel has 8 rows without the blank one: up to STATUS; from 14 all 9.
+    for (w, h, volume) in [(120, 13, false), (140, 13, false), (120, 14, true), (120, 15, true)] {
+        let buf = tui::render(&mut app, w, h);
+        // The 40-column panel ends at the right gutter.
+        let rows: Vec<String> = (0..h).map(|y| span(&buf, y, w - 42, w)).collect();
+        let screen = tui::rows(&buf).join("\n");
+        assert!(rows.iter().any(|r| r == "STATUS      ACTIVE"), "{w}x{h}:\n{screen}");
+        if volume {
+            assert!(rows.iter().any(|r| r == "VOLUME      65"), "{w}x{h}:\n{screen}");
+        }
+    }
+    // With room for every field under it, the blank row stays.
+    let buf = tui::render(&mut app, 120, 23);
+    let rule = tui::find_row(&buf, "────").unwrap();
+    assert!(
+        tui::row(&buf, rule + 1).trim().is_empty(),
+        "{}",
+        tui::rows(&buf).join("\n")
+    );
+}
