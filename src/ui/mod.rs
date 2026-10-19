@@ -34,7 +34,7 @@ use crate::player::local::LocalPlayer;
 use crate::player::worker::AsyncPlayer;
 use crate::player::AudioPlayer;
 use crate::queue::PlaybackQueue;
-use crate::settings::{SettingsManager, SETTING_DEFINITIONS, SETTING_DISPLAY_ORDER};
+use crate::settings::{setting, SettingsManager, SETTING_DEFINITIONS, SETTING_DISPLAY_ORDER};
 
 #[derive(Clone, Debug, Default)]
 pub struct CachedDir {
@@ -2265,7 +2265,8 @@ impl AppUI {
             }
             (KeyCode::Char('v'), KeyModifiers::NONE) => {
                 if self.active_tab == 0 || self.active_tab == 1 {
-                    self.settings_mgr.cycle_setting(0, true, &self.bookmarks);
+                    self.settings_mgr
+                        .cycle_setting(setting::METADATA_VIEW, true, &self.bookmarks);
                     self.update_browser_entry_labels();
                     self.status_message = format!(
                         "Display mode: {}",
@@ -2282,7 +2283,7 @@ impl AppUI {
                     self.open_spotlight();
                 } else if self.active_tab == 0 || (self.active_tab == 1 && self.queue_focus) {
                     self.open_fuzzy_search();
-                } else if self.active_tab == 3 && self.settings_cursor == 7 {
+                } else if self.active_tab == 3 && self.settings_cursor == setting::HOME_DIR {
                     let curr = self
                         .settings_mgr
                         .settings
@@ -2709,12 +2710,14 @@ impl AppUI {
                     | (KeyCode::Down, KeyModifiers::SHIFT) => {
                         self.settings_cursor = SETTING_DISPLAY_ORDER[SETTING_DISPLAY_ORDER.len() - 1];
                     }
-                    (KeyCode::Char('e'), KeyModifiers::NONE) if self.settings_cursor == 7 => {
+                    (KeyCode::Char('e'), KeyModifiers::NONE) if self.settings_cursor == setting::HOME_DIR => {
                         let curr = self.settings_mgr.settings.home_dir.clone().unwrap_or_default();
                         self.editing_home_dir = Some(curr);
                         self.status_message = "Editing Startup Home Directory (Enter: Save, Esc: Cancel)".to_string();
                     }
-                    (KeyCode::Char('c'), KeyModifiers::NONE) | (KeyCode::Delete, _) if self.settings_cursor == 7 => {
+                    (KeyCode::Char('c'), KeyModifiers::NONE) | (KeyCode::Delete, _)
+                        if self.settings_cursor == setting::HOME_DIR =>
+                    {
                         self.settings_mgr.settings.home_dir = None;
                         self.settings_mgr.save();
                         self.status_message = "Cleared startup home (defaulting to launch directory)".to_string();
@@ -2727,7 +2730,7 @@ impl AppUI {
                         self.cycle_and_apply_setting(true);
                     }
                     (KeyCode::Enter, KeyModifiers::NONE) => {
-                        if self.settings_cursor == 7 {
+                        if self.settings_cursor == setting::HOME_DIR {
                             let curr = self.settings_mgr.settings.home_dir.clone().unwrap_or_default();
                             self.editing_home_dir = Some(curr);
                             self.status_message =
@@ -2750,9 +2753,9 @@ impl AppUI {
     pub fn cycle_and_apply_setting(&mut self, forward: bool) {
         self.settings_mgr
             .cycle_setting(self.settings_cursor, forward, &self.bookmarks);
-        if self.settings_cursor == 0 {
+        if self.settings_cursor == setting::METADATA_VIEW {
             self.update_browser_entry_labels();
-        } else if self.settings_cursor == 1 {
+        } else if self.settings_cursor == setting::PLAYER_BACKEND {
             let backend = self.settings_mgr.settings.player_backend.clone();
             if self.device_manager.get_active_device().is_none() {
                 let volume = self.player.volume();
@@ -2761,9 +2764,9 @@ impl AppUI {
                 let old = std::mem::replace(&mut self.player, new_player);
                 self.retire_player(old);
             }
-        } else if self.settings_cursor == 6 || SETTING_DEFINITIONS[self.settings_cursor].key == "web_server_lan" {
+        } else if setting::WEB.contains(&self.settings_cursor) {
             self.sync_web_server();
-        } else if self.settings_cursor == 7 {
+        } else if self.settings_cursor == setting::HOME_DIR {
             self.update_web_state();
         }
         self.status_message = format!(

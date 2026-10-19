@@ -469,7 +469,7 @@ impl AppUI {
             3 => {
                 // Enter on Startup Home Directory opens its editor and `c` clears it; on the
                 // rest Enter cycles.
-                let home = self.settings_cursor == 7;
+                let home = self.settings_cursor == crate::settings::setting::HOME_DIR;
                 let mut hints = vec![
                     KeyHint::new("J K", "SELECT", 6),
                     KeyHint::new("← →", "CHANGE", 8),

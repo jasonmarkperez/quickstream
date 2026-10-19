@@ -196,10 +196,74 @@ pub const SETTING_DEFINITIONS: &[SettingDefinition] = &[
     },
 ];
 
+/// Whether `a` and `b` are the same string, at compile time.
+const fn same_str(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The index of the setting whose key is `key` in `SETTING_DEFINITIONS`, worked out at compile
+/// time: a key that names no setting fails the build.
+const fn setting_index(key: &str) -> usize {
+    let mut i = 0;
+    while i < SETTING_DEFINITIONS.len() {
+        if same_str(SETTING_DEFINITIONS[i].key, key) {
+            return i;
+        }
+        i += 1;
+    }
+    panic!("no setting with that key")
+}
+
+/// Each setting's index in `SETTING_DEFINITIONS`, named after its key, so no code writes a
+/// setting's number.
+pub mod setting {
+    use super::setting_index;
+
+    pub const METADATA_VIEW: usize = setting_index("metadata_view");
+    pub const PLAYER_BACKEND: usize = setting_index("player_backend");
+    pub const SEEK_STEP_SECONDS: usize = setting_index("seek_step_seconds");
+    pub const VOLUME_STEP: usize = setting_index("volume_step");
+    pub const QUEUE_MODE: usize = setting_index("queue_mode");
+    pub const FORCE_TRANSCODE: usize = setting_index("force_transcode");
+    pub const WEB_SERVER_ENABLED: usize = setting_index("web_server_enabled");
+    pub const HOME_DIR: usize = setting_index("home_dir");
+    pub const GAPLESS_AUTOPILOT: usize = setting_index("gapless_autopilot");
+    pub const DEFAULT_MIX_PROFILE: usize = setting_index("default_mix_profile");
+    pub const ONLINE_ENRICHMENT: usize = setting_index("online_enrichment");
+    pub const WEB_SERVER_LAN: usize = setting_index("web_server_lan");
+
+    /// The settings whose rows show the web address (web server, web remote access).
+    pub const WEB: [usize; 2] = [WEB_SERVER_ENABLED, WEB_SERVER_LAN];
+}
+
 /// The order the Settings tab lists `SETTING_DEFINITIONS` in (mockup 2e): PLAYBACK (engine, seek,
 /// volume step, queue mode, gapless, transcoding), LIBRARY (file list display, startup home, mix
 /// algorithm, tag enrichment), WEB (web server, remote access). `j`/`k` move along it.
-pub const SETTING_DISPLAY_ORDER: [usize; 12] = [1, 2, 3, 4, 8, 5, 0, 7, 9, 10, 6, 11];
+pub const SETTING_DISPLAY_ORDER: [usize; 12] = [
+    setting::PLAYER_BACKEND,
+    setting::SEEK_STEP_SECONDS,
+    setting::VOLUME_STEP,
+    setting::QUEUE_MODE,
+    setting::GAPLESS_AUTOPILOT,
+    setting::FORCE_TRANSCODE,
+    setting::METADATA_VIEW,
+    setting::HOME_DIR,
+    setting::DEFAULT_MIX_PROFILE,
+    setting::ONLINE_ENRICHMENT,
+    setting::WEB_SERVER_ENABLED,
+    setting::WEB_SERVER_LAN,
+];
 
 const _: () = assert!(SETTING_DISPLAY_ORDER.len() == SETTING_DEFINITIONS.len());
 
@@ -371,6 +435,12 @@ impl Default for SettingsManager {
     }
 }
 
+// The named indexes, as match patterns.
+use setting::{
+    DEFAULT_MIX_PROFILE, FORCE_TRANSCODE, GAPLESS_AUTOPILOT, HOME_DIR, METADATA_VIEW, ONLINE_ENRICHMENT,
+    PLAYER_BACKEND, QUEUE_MODE, SEEK_STEP_SECONDS, VOLUME_STEP, WEB_SERVER_ENABLED, WEB_SERVER_LAN,
+};
+
 impl SettingsManager {
     pub fn new() -> Self {
         Self::default()
@@ -447,18 +517,18 @@ impl SettingsManager {
     pub fn value(&self, index: usize) -> Option<SettingValue> {
         let s = &self.settings;
         Some(match index {
-            0 => SettingValue::Bool(s.metadata_view),
-            1 => SettingValue::Text(s.player_backend.clone()),
-            2 => SettingValue::Seconds(s.seek_step_seconds),
-            3 => SettingValue::Percent(s.volume_step),
-            4 => SettingValue::Text(s.queue_mode.clone()),
-            5 => SettingValue::Bool(s.force_transcode),
-            6 => SettingValue::Bool(s.web_server_enabled),
-            7 => SettingValue::Path(s.home_dir.clone()),
-            8 => SettingValue::Bool(s.gapless_autopilot),
-            9 => SettingValue::Text(s.default_mix_profile.clone()),
-            10 => SettingValue::Bool(s.online_enrichment),
-            11 => SettingValue::Bool(s.web_server_lan),
+            METADATA_VIEW => SettingValue::Bool(s.metadata_view),
+            PLAYER_BACKEND => SettingValue::Text(s.player_backend.clone()),
+            SEEK_STEP_SECONDS => SettingValue::Seconds(s.seek_step_seconds),
+            VOLUME_STEP => SettingValue::Percent(s.volume_step),
+            QUEUE_MODE => SettingValue::Text(s.queue_mode.clone()),
+            FORCE_TRANSCODE => SettingValue::Bool(s.force_transcode),
+            WEB_SERVER_ENABLED => SettingValue::Bool(s.web_server_enabled),
+            HOME_DIR => SettingValue::Path(s.home_dir.clone()),
+            GAPLESS_AUTOPILOT => SettingValue::Bool(s.gapless_autopilot),
+            DEFAULT_MIX_PROFILE => SettingValue::Text(s.default_mix_profile.clone()),
+            ONLINE_ENRICHMENT => SettingValue::Bool(s.online_enrichment),
+            WEB_SERVER_LAN => SettingValue::Bool(s.web_server_lan),
             _ => return None,
         })
     }
@@ -467,18 +537,18 @@ impl SettingsManager {
     fn set_value(&mut self, index: usize, value: SettingValue) {
         let s = &mut self.settings;
         match (index, value) {
-            (0, SettingValue::Bool(v)) => s.metadata_view = v,
-            (1, SettingValue::Text(v)) => s.player_backend = v,
-            (2, SettingValue::Seconds(v)) => s.seek_step_seconds = v,
-            (3, SettingValue::Percent(v)) => s.volume_step = v,
-            (4, SettingValue::Text(v)) => s.queue_mode = v,
-            (5, SettingValue::Bool(v)) => s.force_transcode = v,
-            (6, SettingValue::Bool(v)) => s.web_server_enabled = v,
-            (7, SettingValue::Path(v)) => s.home_dir = v,
-            (8, SettingValue::Bool(v)) => s.gapless_autopilot = v,
-            (9, SettingValue::Text(v)) => s.default_mix_profile = v,
-            (10, SettingValue::Bool(v)) => s.online_enrichment = v,
-            (11, SettingValue::Bool(v)) => s.web_server_lan = v,
+            (METADATA_VIEW, SettingValue::Bool(v)) => s.metadata_view = v,
+            (PLAYER_BACKEND, SettingValue::Text(v)) => s.player_backend = v,
+            (SEEK_STEP_SECONDS, SettingValue::Seconds(v)) => s.seek_step_seconds = v,
+            (VOLUME_STEP, SettingValue::Percent(v)) => s.volume_step = v,
+            (QUEUE_MODE, SettingValue::Text(v)) => s.queue_mode = v,
+            (FORCE_TRANSCODE, SettingValue::Bool(v)) => s.force_transcode = v,
+            (WEB_SERVER_ENABLED, SettingValue::Bool(v)) => s.web_server_enabled = v,
+            (HOME_DIR, SettingValue::Path(v)) => s.home_dir = v,
+            (GAPLESS_AUTOPILOT, SettingValue::Bool(v)) => s.gapless_autopilot = v,
+            (DEFAULT_MIX_PROFILE, SettingValue::Text(v)) => s.default_mix_profile = v,
+            (ONLINE_ENRICHMENT, SettingValue::Bool(v)) => s.online_enrichment = v,
+            (WEB_SERVER_LAN, SettingValue::Bool(v)) => s.web_server_lan = v,
             _ => {}
         }
     }
@@ -492,13 +562,13 @@ impl SettingsManager {
         let texts =
             |list: &[&str]| -> Vec<SettingValue> { list.iter().map(|v| SettingValue::Text(v.to_string())).collect() };
         let values: Vec<SettingValue> = match index {
-            0 => vec![SettingValue::Bool(true), SettingValue::Bool(false)],
-            1 => texts(&PLAYER_BACKENDS),
-            2 => SEEK_STEPS.iter().map(|&v| SettingValue::Seconds(v)).collect(),
-            3 => VOLUME_STEPS.iter().map(|&v| SettingValue::Percent(v)).collect(),
-            4 => texts(&QUEUE_MODES),
-            5 | 6 | 8 | 10 | 11 => bools(),
-            7 => {
+            METADATA_VIEW => vec![SettingValue::Bool(true), SettingValue::Bool(false)],
+            PLAYER_BACKEND => texts(&PLAYER_BACKENDS),
+            SEEK_STEP_SECONDS => SEEK_STEPS.iter().map(|&v| SettingValue::Seconds(v)).collect(),
+            VOLUME_STEP => VOLUME_STEPS.iter().map(|&v| SettingValue::Percent(v)).collect(),
+            QUEUE_MODE => texts(&QUEUE_MODES),
+            FORCE_TRANSCODE | WEB_SERVER_ENABLED | GAPLESS_AUTOPILOT | ONLINE_ENRICHMENT | WEB_SERVER_LAN => bools(),
+            HOME_DIR => {
                 let mut paths: Vec<Option<String>> = vec![None];
                 let listed = audio_dir
                     .into_iter()
@@ -513,7 +583,7 @@ impl SettingsManager {
                 }
                 paths.into_iter().map(SettingValue::Path).collect()
             }
-            9 => texts(&MIX_PROFILES),
+            DEFAULT_MIX_PROFILE => texts(&MIX_PROFILES),
             _ => Vec::new(),
         };
         let current = self
@@ -522,7 +592,7 @@ impl SettingsManager {
         // A value outside the list cycles on from the default's choice, as it always has
         // (any engine other than mpv goes back to mpv).
         let fallback = match index {
-            1..=3 => 1,
+            PLAYER_BACKEND | SEEK_STEP_SECONDS | VOLUME_STEP => 1,
             _ => 0,
         };
         let choices = values
@@ -552,22 +622,22 @@ impl SettingsManager {
     fn value_label(&self, index: usize, value: &SettingValue) -> String {
         let on_off = |on: bool| if on { "ON" } else { "OFF" }.to_string();
         match (index, value) {
-            (0, SettingValue::Bool(tags)) => if *tags { "TAGS" } else { "FILES" }.to_string(),
-            (4, SettingValue::Text(mode)) => match mode.as_str() {
+            (METADATA_VIEW, SettingValue::Bool(tags)) => if *tags { "TAGS" } else { "FILES" }.to_string(),
+            (QUEUE_MODE, SettingValue::Text(mode)) => match mode.as_str() {
                 "loop" => "CONTINUOUS (LOOP)".to_string(),
                 "stop" => "STOP AT END".to_string(),
                 "repeat_one" => "REPEAT TRACK".to_string(),
                 other => other.to_uppercase(),
             },
-            (5, SettingValue::Bool(pcm)) => if *pcm { "PCM WAV" } else { "OFF" }.to_string(),
-            (6, SettingValue::Bool(true)) => match self.bound_web_port {
+            (FORCE_TRANSCODE, SettingValue::Bool(pcm)) => if *pcm { "PCM WAV" } else { "OFF" }.to_string(),
+            (WEB_SERVER_ENABLED, SettingValue::Bool(true)) => match self.bound_web_port {
                 Some(port) => format!("ON  :{}", port),
                 None => "ON".to_string(),
             },
-            (9, SettingValue::Text(key)) if MIX_PROFILES.contains(&key.as_str()) => {
+            (DEFAULT_MIX_PROFILE, SettingValue::Text(key)) if MIX_PROFILES.contains(&key.as_str()) => {
                 mix_profile_for(key).short_name().to_uppercase()
             }
-            (11, SettingValue::Bool(lan)) => if *lan { "NETWORK" } else { "THIS COMPUTER" }.to_string(),
+            (WEB_SERVER_LAN, SettingValue::Bool(lan)) => if *lan { "NETWORK" } else { "THIS COMPUTER" }.to_string(),
             (_, SettingValue::Bool(on)) => on_off(*on),
             (_, SettingValue::Text(text)) => text.to_uppercase(),
             (_, SettingValue::Seconds(s)) => format!("{} S", s),
@@ -601,49 +671,49 @@ impl SettingsManager {
 
     pub fn get_display_value(&self, index: usize) -> String {
         match index {
-            0 => if self.settings.metadata_view {
+            METADATA_VIEW => if self.settings.metadata_view {
                 "Metadata (Tags)"
             } else {
                 "Filename"
             }
             .to_string(),
-            1 => if self.settings.player_backend == "mpv" {
+            PLAYER_BACKEND => if self.settings.player_backend == "mpv" {
                 "MPV (IPC socket)"
             } else {
                 "FFplay (subprocess)"
             }
             .to_string(),
-            2 => format!("{} seconds", self.settings.seek_step_seconds),
-            3 => format!("{}%", self.settings.volume_step),
-            4 => match self.settings.queue_mode.as_str() {
+            SEEK_STEP_SECONDS => format!("{} seconds", self.settings.seek_step_seconds),
+            VOLUME_STEP => format!("{}%", self.settings.volume_step),
+            QUEUE_MODE => match self.settings.queue_mode.as_str() {
                 "loop" => "Continuous (Loop Queue)",
                 "stop" => "Stop at End",
                 "repeat_one" => "Repeat Current Track",
                 other => other,
             }
             .to_string(),
-            5 => if self.settings.force_transcode {
+            FORCE_TRANSCODE => if self.settings.force_transcode {
                 "Force 16-bit PCM WAV"
             } else {
                 "Direct Stream (Auto)"
             }
             .to_string(),
-            6 if !self.settings.web_server_enabled => "Disabled".to_string(),
-            6 => match self.web_url() {
+            WEB_SERVER_ENABLED if !self.settings.web_server_enabled => "Disabled".to_string(),
+            WEB_SERVER_ENABLED => match self.web_url() {
                 Some(url) => format!("Enabled ({})", url),
                 None => "Enabled".to_string(),
             },
-            7 => match self.settings.home_dir {
+            HOME_DIR => match self.settings.home_dir {
                 Some(ref h) => paths::display_path(Path::new(h), user_home()),
                 None => "Default (Launch Directory)".to_string(),
             },
-            8 => if self.settings.gapless_autopilot {
+            GAPLESS_AUTOPILOT => if self.settings.gapless_autopilot {
                 "Enabled (Seamless PCM)"
             } else {
                 "Disabled (Track-by-track)"
             }
             .to_string(),
-            9 => match self.settings.default_mix_profile.as_str() {
+            DEFAULT_MIX_PROFILE => match self.settings.default_mix_profile.as_str() {
                 "diverse" => "Diverse Library Shuffle",
                 "bpm_flow" => "DJ BPM Flow (124 BPM)",
                 "chill" => "Chill & Ambient (Downtempo)",
@@ -652,13 +722,13 @@ impl SettingsManager {
                 other => other,
             }
             .to_string(),
-            10 => if self.settings.online_enrichment {
+            ONLINE_ENRICHMENT => if self.settings.online_enrichment {
                 "Enabled (Last.fm Cache)"
             } else {
                 "Disabled (Local Analysis Only)"
             }
             .to_string(),
-            11 => if self.settings.web_server_lan {
+            WEB_SERVER_LAN => if self.settings.web_server_lan {
                 "Any device on your network"
             } else {
                 "This computer only"
@@ -743,40 +813,38 @@ mod tests {
         let mut mgr = SettingsManager::with_path(path);
 
         assert!(mgr.settings.metadata_view);
-        mgr.cycle_setting(0, true, &[]);
+        mgr.cycle_setting(METADATA_VIEW, true, &[]);
         assert!(!mgr.settings.metadata_view);
 
         assert_eq!(mgr.settings.player_backend, "mpv");
-        mgr.cycle_setting(1, true, &[]);
+        mgr.cycle_setting(PLAYER_BACKEND, true, &[]);
         assert_eq!(mgr.settings.player_backend, "ffplay");
 
         assert!(!mgr.settings.web_server_enabled);
-        mgr.cycle_setting(6, true, &[]);
+        mgr.cycle_setting(WEB_SERVER_ENABLED, true, &[]);
         assert!(mgr.settings.web_server_enabled);
 
         assert_eq!(mgr.settings.home_dir, None);
-        assert_eq!(mgr.get_display_value(7), "Default (Launch Directory)");
-        mgr.cycle_setting(7, true, &[]);
-        mgr.cycle_setting(7, false, &[]);
+        assert_eq!(mgr.get_display_value(HOME_DIR), "Default (Launch Directory)");
+        mgr.cycle_setting(HOME_DIR, true, &[]);
+        mgr.cycle_setting(HOME_DIR, false, &[]);
         assert_eq!(mgr.settings.home_dir, None);
 
         assert!(mgr.settings.gapless_autopilot);
-        assert_eq!(mgr.get_display_value(8), "Enabled (Seamless PCM)");
-        mgr.cycle_setting(8, true, &[]);
+        assert_eq!(mgr.get_display_value(GAPLESS_AUTOPILOT), "Enabled (Seamless PCM)");
+        mgr.cycle_setting(GAPLESS_AUTOPILOT, true, &[]);
         assert!(!mgr.settings.gapless_autopilot);
-        assert_eq!(mgr.get_display_value(8), "Disabled (Track-by-track)");
+        assert_eq!(mgr.get_display_value(GAPLESS_AUTOPILOT), "Disabled (Track-by-track)");
 
-        // Setting 9: default_mix_profile
         assert_eq!(mgr.settings.default_mix_profile, "diverse");
-        mgr.cycle_setting(9, true, &[]);
+        mgr.cycle_setting(DEFAULT_MIX_PROFILE, true, &[]);
         assert_eq!(mgr.settings.default_mix_profile, "bpm_flow");
-        assert_eq!(mgr.get_display_value(9), "DJ BPM Flow (124 BPM)");
+        assert_eq!(mgr.get_display_value(DEFAULT_MIX_PROFILE), "DJ BPM Flow (124 BPM)");
 
-        // Setting 10: online_enrichment
         assert!(!mgr.settings.online_enrichment);
-        mgr.cycle_setting(10, true, &[]);
+        mgr.cycle_setting(ONLINE_ENRICHMENT, true, &[]);
         assert!(mgr.settings.online_enrichment);
-        assert_eq!(mgr.get_display_value(10), "Enabled (Last.fm Cache)");
+        assert_eq!(mgr.get_display_value(ONLINE_ENRICHMENT), "Enabled (Last.fm Cache)");
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

@@ -14,7 +14,7 @@ use super::kit::{self, text_width, Col, PanelSpec, RowMark};
 use super::queue_tab::{display_path, SEP};
 use super::screen::{Screen, WidthTier};
 use super::{theme, AppUI};
-use crate::settings::{self, SettingGroup, SETTING_DEFINITIONS, SETTING_DISPLAY_ORDER};
+use crate::settings::{self, setting, SettingGroup, SETTING_DEFINITIONS, SETTING_DISPLAY_ORDER};
 
 /// Width of the option panel (from 110 columns) and the gap before it (2e: 72 + 4 + 40 at 120).
 const OPTION_COLS: u16 = 40;
@@ -29,12 +29,6 @@ const MIN_VALUE_COLS: u16 = 16;
 
 /// The option panel's ●/○ column.
 const MARK_COLS: u16 = 4;
-
-/// Setting index of the startup home directory, the one with the inline editor.
-const HOME_DIR: usize = 7;
-
-/// Setting indexes of the web server and web remote access, whose rows show the web address.
-const WEB_SETTINGS: [usize; 2] = [6, 11];
 
 /// The option panel while the startup home editor is open (what `Enter` accepts: a path, `~`
 /// for home, or nothing for the launch folder).
@@ -138,7 +132,7 @@ impl AppUI {
             area
         };
         // The address is looked up only while a web row is selected (from the cache).
-        let web_url = if WEB_SETTINGS.contains(&cursor) {
+        let web_url = if setting::WEB.contains(&cursor) {
             self.settings_mgr.web_url()
         } else {
             None
@@ -225,7 +219,7 @@ impl AppUI {
                 Entry::Setting(index) => {
                     let selected = index == cursor;
                     let value = match (&self.editing_home_dir, selected) {
-                        (Some(input), true) if index == HOME_DIR => {
+                        (Some(input), true) if index == setting::HOME_DIR => {
                             format!("{}█", kit::visible_tail(input, value_cols.saturating_sub(1)))
                         }
                         (_, true) if value_cols >= 5 => {
@@ -270,7 +264,7 @@ impl AppUI {
         let bold = theme::ink().add_modifier(Modifier::BOLD);
         let mut rows: Vec<Vec<Col>> = Vec::new();
 
-        let editing = cursor == HOME_DIR && self.editing_home_dir.is_some();
+        let editing = cursor == setting::HOME_DIR && self.editing_home_dir.is_some();
         if editing {
             rows.extend(
                 wrap_words(EDIT_HELP, width)

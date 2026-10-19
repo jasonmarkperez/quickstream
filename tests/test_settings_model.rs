@@ -62,6 +62,32 @@ fn display_order_lists_every_setting_once() {
 }
 
 #[test]
+fn named_setting_indexes_match_their_keys() {
+    common::isolate();
+    use quickstream::settings::setting;
+    let named = [
+        (setting::METADATA_VIEW, "metadata_view"),
+        (setting::PLAYER_BACKEND, "player_backend"),
+        (setting::SEEK_STEP_SECONDS, "seek_step_seconds"),
+        (setting::VOLUME_STEP, "volume_step"),
+        (setting::QUEUE_MODE, "queue_mode"),
+        (setting::FORCE_TRANSCODE, "force_transcode"),
+        (setting::WEB_SERVER_ENABLED, "web_server_enabled"),
+        (setting::HOME_DIR, "home_dir"),
+        (setting::GAPLESS_AUTOPILOT, "gapless_autopilot"),
+        (setting::DEFAULT_MIX_PROFILE, "default_mix_profile"),
+        (setting::ONLINE_ENRICHMENT, "online_enrichment"),
+        (setting::WEB_SERVER_LAN, "web_server_lan"),
+    ];
+    for (index, key) in named {
+        assert_eq!(SETTING_DEFINITIONS[index].key, key);
+        assert_eq!(index, index_of(key));
+    }
+    // Every setting has a name.
+    assert_eq!(named.len(), SETTING_DEFINITIONS.len());
+}
+
+#[test]
 fn display_order_groups_settings_as_mockup_2e() {
     common::isolate();
     let keys_of = |group: SettingGroup| -> Vec<&str> {
