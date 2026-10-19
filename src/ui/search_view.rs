@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
@@ -133,7 +133,7 @@ fn split(area: Rect, detail: bool) -> (Rect, Option<Rect>) {
 fn draw_query_row(f: &mut Frame, area: Rect, modal: &SearchModalState) {
     let width = area.width as usize;
     let counts = vec![
-        Span::styled(grouped(modal.filtered.len()), theme::ink().add_modifier(Modifier::BOLD)),
+        Span::styled(grouped(modal.filtered.len()), theme::bold()),
         Span::styled(format!(" / {} MATCHED", grouped(modal.all_tracks.len())), theme::dim()),
     ];
     let counts_width = kit::spans_width(&counts);
@@ -148,7 +148,7 @@ fn draw_query_row(f: &mut Frame, area: Rect, modal: &SearchModalState) {
     let cursor = Style::new().bg(theme::palette().ink);
     let line = Line::from(vec![
         Span::styled(label, theme::dim()),
-        Span::styled(query, theme::ink().add_modifier(Modifier::BOLD)),
+        Span::styled(query, theme::bold()),
         Span::styled(" ", cursor),
     ]);
     let buf = f.buffer_mut();
@@ -287,11 +287,7 @@ fn draw_detail(f: &mut Frame, area: Rect, track: Option<&AudioMetadata>, home: O
     for (label, value) in &fields {
         buf.set_stringn(content.x, y, label, width, theme::dim());
         if value_room > 0 {
-            let style = if *label == "TITLE" {
-                theme::ink().add_modifier(Modifier::BOLD)
-            } else {
-                theme::ink()
-            };
+            let style = if *label == "TITLE" { theme::bold() } else { theme::ink() };
             buf.set_stringn(
                 content.x + DETAIL_LABEL_COLS as u16,
                 y,

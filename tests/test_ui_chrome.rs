@@ -116,6 +116,9 @@ fn styles_use_the_palette_tokens() {
     assert_eq!(theme::rule(), Style::new().fg(p.rule));
     assert_eq!(theme::error(), Style::new().fg(p.error));
     assert_eq!(theme::label(true), Style::new().fg(p.ink).add_modifier(Modifier::BOLD));
+    // Bold INK, the one style for titles, names and numbers that stand out.
+    assert_eq!(theme::bold(), Style::new().fg(p.ink).add_modifier(Modifier::BOLD));
+    assert_eq!(theme::label(true), theme::bold());
     assert_eq!(theme::label(false), Style::new().fg(p.mid));
     assert_eq!(theme::keycap(), Style::new().fg(p.ink).bg(p.rule));
 

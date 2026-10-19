@@ -774,7 +774,7 @@ impl PlaylistsUi {
                 RowMark::Marker
             };
             let (name_style, count_style) = if mark == RowMark::Marker {
-                let bold = theme::ink().add_modifier(Modifier::BOLD);
+                let bold = theme::bold();
                 (bold, bold)
             } else {
                 (theme::ink(), theme::dim())
@@ -1176,10 +1176,6 @@ fn prompt_keys_row(inner: Rect) -> Option<u16> {
     (inner.height >= 3).then(|| (inner.y + PROMPT_ROWS - 1).min(inner.bottom() - 1))
 }
 
-fn bold_ink() -> Style {
-    theme::ink().add_modifier(Modifier::BOLD)
-}
-
 /// The name prompt (3b): `NAME` and the name as typed with a block cursor, the field's rule under
 /// it, then the keys. An error (3c) replaces the keys, in ERROR, and turns the rule ERROR too, so
 /// the prompt keeps its size; an error too long for its row takes the blank row above as well.
@@ -1208,7 +1204,7 @@ fn render_name_prompt(f: &mut Frame, purpose: &NamePurpose, input: &str, error: 
     let field_x = inner.x + label_cols;
     let field_cols = usize::from(inner.right() - field_x);
     let shown = visible_tail(input, field_cols.saturating_sub(1));
-    buf.set_stringn(field_x, inner.y, &shown, field_cols, bold_ink());
+    buf.set_stringn(field_x, inner.y, &shown, field_cols, theme::bold());
     let cursor_x = field_x + text_width(&shown) as u16;
     if cursor_x < inner.right() {
         buf.set_stringn(cursor_x, inner.y, "█", 1, theme::ink());
@@ -1261,7 +1257,7 @@ fn render_confirm_delete(f: &mut Frame, name: &str, count: usize) {
     let name_room = width.saturating_sub(text_width(&format!("Delete \"\" ({tracks})?")));
     let question = format!("Delete \"{}\" ({tracks})?", kit::clip(name, name_room));
     let buf = f.buffer_mut();
-    buf.set_stringn(inner.x, inner.y, kit::clip(&question, width), width, bold_ink());
+    buf.set_stringn(inner.x, inner.y, kit::clip(&question, width), width, theme::bold());
     if inner.height > 1 {
         buf.set_stringn(inner.x, inner.y + 1, kit::clip(DELETE_NOTE, width), width, theme::mid());
     }
@@ -1316,7 +1312,7 @@ fn render_add_picker(f: &mut Frame, store: &PlaylistStore, state: &mut ListState
     let room = width - usize::from(label_cols);
     let what = kit::clip(&kit::upper(pending.label()), room);
     let what_cols = text_width(&what);
-    buf.set_stringn(inner.x + label_cols, inner.y, &what, room, bold_ink());
+    buf.set_stringn(inner.x + label_cols, inner.y, &what, room, theme::bold());
     if let PendingAdd::Entries { entries, .. } = pending {
         if let [entry] = entries.as_slice() {
             let artist_room = room - what_cols;

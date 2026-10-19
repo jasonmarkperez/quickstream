@@ -405,10 +405,7 @@ pub fn volume_meter(vol: u8) -> Vec<Span<'static>> {
     if filled < VOLUME_CELLS {
         spans.push(Span::styled("▯".repeat(VOLUME_CELLS - filled), theme::dim()));
     }
-    spans.push(Span::styled(
-        format!(" {vol}"),
-        theme::ink().add_modifier(Modifier::BOLD),
-    ));
+    spans.push(Span::styled(format!(" {vol}"), theme::bold()));
     spans
 }
 

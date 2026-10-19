@@ -74,7 +74,7 @@ quickstream/
 │   │   ├── search_view.rs # Search modal (2h): query row + counts, SCANNING note, RANKED MATCHES (visible rows only), TRACK panel from 90 columns; headerless matches on short screens
 │   │   ├── mix_picker.rs # Mix picker (2i): rows from MixProfile::picker_profiles (title, description), ●/○, DIM 1–5; scrolls to the cursor on short screens
 │   │   ├── help.rs       # Help modal (2g): key sections as data, full 96×32 layout or compact (≤ 22 rows, title in the border), inside the gutters (80 columns wide at 80–83)
-│   │   ├── theme.rs      # Telemetry colour tokens: ColorDepth (COLORTERM), Palette, style constructors
+│   │   ├── theme.rs      # Telemetry colour tokens: ColorDepth (COLORTERM), Palette, style constructors (`bold()` is the one bold INK style)
 │   │   ├── kit.rs        # Key row, volume meter, progress bar, panel header (panel/PanelSpec), visible_window, list_row columns (underlined characters: Col::underline / underline_chars), width-aware fit / visible_tail, duration (MM:SS / H:MM:SS), big_digits (3-row numerals), spinner (clock-driven `⣾` frames), ClockCache, modal pieces: clear, dim_buffer, centered, modal_area (centred inside the 2-column gutters, MODAL_MARGIN), modal_frame/ModalSpec (subtitle after the chip), modal_title, modal_rule (`────── ▪`)
 │   │   ├── chrome.rs     # Screen chrome: ChromeLayout rows, header, tab row (tab_titles), strip, key row (tab_key_hints)
 │   │   └── screen.rs     # WidthTier (<80 / 80–89 / 90–109 / ≥110) and Screen (tier, short) per frame

@@ -457,7 +457,7 @@ impl AppUI {
                             index: "DIR".to_string(),
                             index_style: theme::dim(),
                             name,
-                            name_style: theme::ink().add_modifier(Modifier::BOLD),
+                            name_style: theme::bold(),
                             matched,
                             dimmed: false,
                             file: None,
@@ -610,7 +610,7 @@ impl AppUI {
         Line::from(vec![
             Span::styled(" / ", theme::keycap()),
             Span::raw("  "),
-            Span::styled(query, theme::ink().add_modifier(Modifier::BOLD)),
+            Span::styled(query, theme::bold()),
             Span::styled(" ", theme::cursor()),
             Span::raw(" ".repeat(pad)),
             Span::styled(count, count_style),
@@ -700,7 +700,7 @@ impl AppUI {
             } else {
                 RowMark::Marker
             };
-            let bold = theme::ink().add_modifier(Modifier::BOLD);
+            let bold = theme::bold();
             let (index_style, title_style, side) = if row.playing {
                 (bold, bold, bold)
             } else if mark == RowMark::Marker {

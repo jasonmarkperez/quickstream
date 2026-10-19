@@ -398,7 +398,7 @@ impl AppUI {
         let compact = screen.short || screen.tier <= WidthTier::Compact;
         let Some(track) = self.queue.current_track().cloned() else {
             let content = self.hero_panel(f, area, false, compact);
-            let bold = theme::ink().add_modifier(Modifier::BOLD);
+            let bold = theme::bold();
             line_at(f, content, 0, Line::styled("NO TRACK LOADED", bold));
             let hint = kit::clip(EMPTY_HINT, usize::from(content.width));
             line_at(f, content, 2, Line::styled(hint, theme::dim()));
@@ -455,7 +455,7 @@ impl AppUI {
         let (pos, dur) = self.playback_times();
         let elapsed = kit::duration(pos);
         let numerals = kit::big_digits(&elapsed);
-        let bold = theme::ink().add_modifier(Modifier::BOLD);
+        let bold = theme::bold();
         let title = kit::upper(track.display_title());
 
         let hero_width = if full {

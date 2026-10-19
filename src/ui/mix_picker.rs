@@ -5,7 +5,6 @@
 //! names it instead (`NOW: SEED RADIO`).
 
 use ratatui::layout::Rect;
-use ratatui::style::Modifier;
 use ratatui::text::Line;
 use ratatui::widgets::ListState;
 use ratatui::Frame;
@@ -97,7 +96,7 @@ pub(super) fn render(f: &mut Frame, cursor: usize, active: &MixProfile, list: &m
         }
         let is_active = active_row == Some(index);
         let (glyph, glyph_style, title_style) = if is_active {
-            ("●", bold_ink(), bold_ink())
+            ("●", theme::bold(), theme::bold())
         } else {
             ("○", theme::mid(), theme::ink())
         };
@@ -141,8 +140,4 @@ pub(super) fn render(f: &mut Frame, cursor: usize, active: &MixProfile, list: &m
         let line = kit::key_row(&hints, inner.width, None);
         f.buffer_mut().set_line(inner.x, bottom - 1, &line, inner.width);
     }
-}
-
-fn bold_ink() -> ratatui::style::Style {
-    theme::ink().add_modifier(Modifier::BOLD)
 }

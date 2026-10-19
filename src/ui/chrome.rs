@@ -218,7 +218,7 @@ impl AppUI {
     /// `QUICKSTREAM ▪ <version>` on the left, output, web server and clock on the right.
     pub(super) fn render_header(&mut self, f: &mut Frame, area: Rect) {
         let left = vec![
-            Span::styled("QUICKSTREAM", theme::ink().add_modifier(Modifier::BOLD)),
+            Span::styled("QUICKSTREAM", theme::bold()),
             Span::styled(format!(" ▪ {}", env!("CARGO_PKG_VERSION")), theme::dim()),
         ];
         let width = usize::from(area.width);
@@ -304,7 +304,7 @@ impl AppUI {
         let width = usize::from(area.width);
         let vol = self.player.volume();
         let vol_gap = if screen.tier >= WidthTier::Medium { PART_GAP } else { 2 };
-        let vol_number = Span::styled(vol.to_string(), theme::ink().add_modifier(Modifier::BOLD));
+        let vol_number = Span::styled(vol.to_string(), theme::bold());
 
         let Some(track) = self.queue.current_track() else {
             let left = vec![Span::styled("■ NO TRACK LOADED", theme::dim())];
@@ -372,10 +372,7 @@ impl AppUI {
 
         let room = width.saturating_sub(spans_width(&right) + if right.is_empty() { 0 } else { PART_GAP });
         let title = kit::clip(&title, room.saturating_sub(2));
-        let mut left = vec![Span::styled(
-            format!("{glyph} {title}"),
-            theme::ink().add_modifier(Modifier::BOLD),
-        )];
+        let mut left = vec![Span::styled(format!("{glyph} {title}"), theme::bold())];
         let artist_room = room.saturating_sub(spans_width(&left) + 3);
         if screen.tier >= WidthTier::Medium && !track.artist.is_empty() && artist_room >= 6 {
             let artist = kit::clip(&kit::upper(&track.artist), artist_room);
@@ -557,7 +554,7 @@ impl AppUI {
             } else {
                 vec![
                     Span::styled("VOL ", theme::dim()),
-                    Span::styled(vol.to_string(), theme::ink().add_modifier(Modifier::BOLD)),
+                    Span::styled(vol.to_string(), theme::bold()),
                 ]
             }
         });

@@ -114,10 +114,15 @@ pub fn error() -> Style {
     Style::new().fg(palette().error)
 }
 
+/// Bold INK: titles, names and numbers that stand out (a modal's title row, the selected track).
+pub fn bold() -> Style {
+    ink().add_modifier(Modifier::BOLD)
+}
+
 /// Panel label: INK bold when its panel has focus, MID otherwise.
 pub fn label(focused: bool) -> Style {
     if focused {
-        ink().add_modifier(Modifier::BOLD)
+        bold()
     } else {
         mid()
     }
