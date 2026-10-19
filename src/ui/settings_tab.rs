@@ -79,13 +79,17 @@ fn wrapped(lines: Vec<Line<'_>>, width: u16) -> (Paragraph<'_>, u16) {
     (paragraph, u16::try_from(rows).unwrap_or(u16::MAX))
 }
 
-/// The web address in DIM at the bottom of `list` (compact layouts, where neither the footnote
-/// nor an option panel has room for it): on one row, or on two when it is wider than the list
-/// and the list has rows to spare; its start is cut with `…` only when even that is too narrow.
-/// Returns the rows left for the list above it.
+/// The web address in DIM at the bottom of `list` (where neither the footnote nor the option
+/// panel has room for it): on one row, or on two when it is wider than the list, leaving the list
+/// at least one row (the cursor's); its start is cut with `…` only when the rows it gets are too
+/// few. Returns the rows left for the list above it.
 fn web_address_rows(f: &mut Frame, list: Rect, url: &str) -> Rect {
-    let max_rows: u16 = if list.height >= 8 { 2 } else { 1 };
-    if list.height <= max_rows || list.width == 0 {
+    if list.width == 0 {
+        return list;
+    }
+    let (_, needed) = wrapped(vec![Line::raw(url)], list.width);
+    let max_rows = needed.clamp(1, 2).min(list.height.saturating_sub(1));
+    if max_rows == 0 {
         return list;
     }
     let shown = kit::visible_tail(url, usize::from(list.width) * usize::from(max_rows));
@@ -104,11 +108,12 @@ fn web_address_rows(f: &mut Frame, list: Rect, url: &str) -> Rect {
 }
 
 impl AppUI {
-    /// Tab 4: SETTINGS and, from 110 columns, the option panel (2e). Under 110 columns the
-    /// position (`05 / 12`) joins the footnote, and on a web row the web address takes the
-    /// config file's place there (3h); at 80–89 columns, or under 24 rows, the footnote shrinks
-    /// to the position on the label row and the web address goes under the list
-    /// ([`web_address_rows`]), so it shows at every width.
+    /// Tab 4: SETTINGS and, from 110 columns, the option panel (2e), which shows the web
+    /// address on a web row. Under 110 columns the position (`05 / 12`) joins the footnote, and
+    /// on a web row the web address takes the config file's place there (3h); at 80–89 columns,
+    /// or under 24 rows, the footnote shrinks to the position on the label row and the web
+    /// address goes under the list ([`web_address_rows`]), as it does from 110 columns when the
+    /// option panel is too short to hold it whole, so it shows at every size.
     pub(super) fn render_settings_tab(&mut self, f: &mut Frame, area: Rect) {
         let screen = Screen::new(f.area());
         let compact = screen.tier < WidthTier::Medium || screen.short;
@@ -167,18 +172,17 @@ impl AppUI {
                 compact,
             },
         );
-        // Compact without the option panel the footnote is only the position, so the web address
-        // gets the list's last rows.
+        let address_in_panel = options_panel && {
+            let option_area = Rect::new(area.x + list_area.width + PANEL_GAP, area.y, OPTION_COLS, area.height);
+            self.render_setting_options(f, option_area, &position, web_url.as_deref(), compact)
+        };
+        // Compact without the option panel the footnote is only the position, and the option
+        // panel can be too short for the address: then the web address gets the list's last rows.
         let list = match &web_url {
-            Some(url) if compact && !options_panel => web_address_rows(f, list, url),
+            Some(url) if !address_in_panel && (options_panel || compact) => web_address_rows(f, list, url),
             _ => list,
         };
         self.render_settings_list(f, list);
-
-        if options_panel {
-            let option_area = Rect::new(area.x + list_area.width + PANEL_GAP, area.y, OPTION_COLS, area.height);
-            self.render_setting_options(f, option_area, &position, web_url.as_deref(), compact);
-        }
     }
 
     /// The grouped list: headings (DIM), each setting's label (MID) and value (INK); the
@@ -260,10 +264,22 @@ impl AppUI {
     /// footnote, every choice it cycles through (● the one it holds), its description, the web
     /// address on the web rows, and the keys that change it. While the startup home editor is
     /// open: what the field takes, instead of the choices.
-    fn render_setting_options(&self, f: &mut Frame, area: Rect, position: &str, web_url: Option<&str>, compact: bool) {
+    ///
+    /// The address is shown whole or not at all: when the panel is short it comes before the
+    /// description (which is cut at the panel's bottom) and the choices around the current one
+    /// give it their rows. Returns whether the address is shown; if not, the caller draws it
+    /// under the list.
+    fn render_setting_options(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        position: &str,
+        web_url: Option<&str>,
+        compact: bool,
+    ) -> bool {
         let cursor = self.settings_cursor;
         let Some(def) = SETTING_DEFINITIONS.get(cursor) else {
-            return;
+            return false;
         };
         let list = kit::panel(
             f,
@@ -278,6 +294,17 @@ impl AppUI {
         );
         let bold = theme::ink().add_modifier(Modifier::BOLD);
 
+        // The rows the address takes, kept free of choices; none if it can't fit whole.
+        let url_rows = web_url.map_or(0, |url| wrapped(vec![Line::raw(url)], list.width).1);
+        let web_url = web_url.filter(|_| url_rows <= list.height && list.width > 0);
+        let reserved = if web_url.is_some() { url_rows } else { 0 };
+        let choice_room = match list.height - reserved {
+            // A blank row between the choices and the address when there is room for both.
+            room if reserved > 0 && room >= 2 => room - 1,
+            room if reserved > 0 => room.min(1),
+            room => room,
+        };
+
         // The choices (each on one row), or while editing what the field takes.
         let editing = cursor == setting::HOME_DIR && self.editing_home_dir.is_some();
         let mut text = Vec::new();
@@ -288,7 +315,7 @@ impl AppUI {
             let options = self.settings_mgr.options(cursor, &self.settings_context());
             // Too many choices for the panel: the ones around the current choice.
             let len = options.choices.len();
-            let shown = len.min(usize::from(list.height));
+            let shown = len.min(usize::from(choice_room));
             let first = options.current.unwrap_or(0).saturating_sub(shown / 2).min(len - shown);
             for (i, choice) in options.choices.into_iter().enumerate().skip(first).take(shown) {
                 let (mark, style) = if options.current == Some(i) {
@@ -302,13 +329,26 @@ impl AppUI {
             }
         }
         // Then, after a blank row, the description and the web address on the web rows, wrapped.
-        text.push(Line::default());
-        text.push(Line::styled(def.description, theme::mid()));
+        // When that is taller than the rows left, the address goes first, so only the
+        // description is cut.
+        let rows_left = list.height - choice_rows;
+        let mut lines = text.clone();
+        lines.push(Line::default());
+        lines.push(Line::styled(def.description, theme::mid()));
         if let Some(url) = web_url {
-            text.push(Line::default());
-            text.push(Line::styled(url, theme::dim()));
+            lines.push(Line::default());
+            lines.push(Line::styled(url, theme::dim()));
         }
-        let (paragraph, text_rows) = wrapped(text, list.width);
+        let (mut paragraph, mut text_rows) = wrapped(lines, list.width);
+        if let Some(url) = web_url.filter(|_| text_rows > rows_left) {
+            if choice_rows > 0 && rows_left > url_rows {
+                text.push(Line::default());
+            }
+            text.push(Line::styled(url, theme::dim()));
+            text.push(Line::default());
+            text.push(Line::styled(def.description, theme::mid()));
+            (paragraph, text_rows) = wrapped(text, list.width);
+        }
         let text_area = Rect {
             y: list.y + choice_rows,
             height: list.height - choice_rows,
@@ -327,5 +367,6 @@ impl AppUI {
             let row = Rect::new(list.x, list.y + keys_dy, list.width, 1);
             f.render_widget(kit::key_row(&hints, list.width, None), row);
         }
+        web_url.is_some()
     }
 }

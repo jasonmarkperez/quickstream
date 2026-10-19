@@ -781,3 +781,119 @@ fn a_long_startup_home_keeps_its_last_folder() {
     let value = tui::row(&buf, row_of(&buf, "STARTUP"));
     assert!(value.contains("LAUNCH") && !value.contains("…H DIRECTORY"), "{value:?}");
 }
+
+/// The DIM text of row `y` between columns `from` and `to` (a link's cells; descriptions,
+/// choices and values are MID or INK).
+fn dim_text(buf: &Buffer, y: u16, from: u16, to: u16) -> String {
+    (from..to.min(buf.area.width))
+        .filter(|&x| tui::cell_style(buf, x, y).fg == Some(P.dim))
+        .map(|x| buf[(x, y)].symbol().to_string())
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// `link` as drawn between columns `from` and `to`: its first row (starting `http://`, or `…`
+/// when its start is cut) joined with the DIM rows under it that carry on the link.
+fn shown_link(buf: &Buffer, from: u16, to: u16, link: &str) -> Option<String> {
+    let part_of = |text: &str| !text.is_empty() && link.contains(text.trim_start_matches('…'));
+    (0..buf.area.height).find_map(|y| {
+        let first = dim_text(buf, y, from, to);
+        if !(first.starts_with("http://") || first.starts_with('…')) || !part_of(&first) {
+            return None;
+        }
+        let mut joined = first;
+        for next in y + 1..buf.area.height {
+            let more = format!("{joined}{}", dim_text(buf, next, from, to));
+            if more.len() == joined.len() || !part_of(&more) {
+                break;
+            }
+            joined = more;
+        }
+        Some(joined)
+    })
+}
+
+/// Network access on in the settings only (the server stays on loopback), with the LAN address
+/// `lan`; returns the pairing link.
+fn pairing_link(app: &mut AppUI, port: u16, lan: &'static str) -> String {
+    app.settings_mgr.settings.web_server_lan = true;
+    app.settings_mgr.set_lan_ip_resolver(move || lan.to_string());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while app.settings_mgr.web_url(Some(port)).is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let link = app.settings_mgr.web_url(Some(port)).expect("pairing link");
+    assert!(link.contains("?token="), "{link}");
+    link
+}
+
+/// Short terminals from 110 columns, where the option panel is drawn: the address is never
+/// left out, and never shown cut at its end (a pairing link missing part of its token). From 8
+/// rows tall the option panel has the two rows a pairing link takes.
+#[test]
+fn web_address_shows_whole_on_short_terminals_with_the_option_panel() {
+    common::isolate();
+    let mut app = settings_app("web_short_full");
+    let port = start_loopback_web(&mut app);
+    app.status_message.clear();
+    let loopback = format!("http://127.0.0.1:{port}");
+    let mut links = vec![loopback];
+    links.push(pairing_link(&mut app, port, "192.168.100.200"));
+    let token = quickstream::web_access::web_token();
+    for (n, link) in links.iter().enumerate() {
+        app.settings_mgr.settings.web_server_lan = n == 1;
+        for w in [110u16, 120, 140] {
+            for h in 8u16..=23 {
+                for cursor in [WEB_SERVER, WEB_LAN] {
+                    app.settings_cursor = cursor;
+                    let buf = tui::render(&mut app, w, h);
+                    let text = dump(&buf);
+                    // The list, or the option panel 40 columns from the right gutter.
+                    let panel_x = w - 2 - 40;
+                    let shown = shown_link(&buf, panel_x, w, link)
+                        .or_else(|| shown_link(&buf, 0, panel_x, link))
+                        .unwrap_or_else(|| panic!("{w}x{h}, row {cursor}: no {link}:\n{text}"));
+                    assert_eq!(&shown, link, "{w}x{h}, row {cursor}:\n{text}");
+                    assert!(shown.ends_with(&format!(":{port}")) || shown.ends_with(token));
+                }
+            }
+        }
+    }
+}
+
+fn text_width_of(text: &str) -> usize {
+    text.chars().count()
+}
+
+/// Under 110 columns on short terminals the address under the list takes the two rows it needs,
+/// so its host is not cut while two rows would hold it.
+#[test]
+fn compact_pairing_link_takes_two_rows_on_short_terminals() {
+    common::isolate();
+    let mut app = settings_app("web_short_compact");
+    let port = start_loopback_web(&mut app);
+    app.status_message.clear();
+    let link = pairing_link(&mut app, port, "192.168.100.200");
+    for w in [40u16, 50, 60, 73] {
+        for h in 9u16..=13 {
+            for cursor in [WEB_SERVER, WEB_LAN] {
+                app.settings_cursor = cursor;
+                let buf = tui::render(&mut app, w, h);
+                let text = dump(&buf);
+                let shown =
+                    shown_link(&buf, 0, w, &link).unwrap_or_else(|| panic!("{w}x{h}, row {cursor}: no link:\n{text}"));
+                // Two rows of the list's text width hold it whole.
+                if text_width_of(&link) <= 2 * usize::from(w - 4 - 2) {
+                    assert_eq!(shown, link, "{w}x{h}, row {cursor}:\n{text}");
+                }
+                // The cursor row stays on screen (its label may be cut at these widths).
+                let label = kit::upper(SETTING_DEFINITIONS[cursor].label);
+                let start: String = label.chars().take(6).collect();
+                let on_screen =
+                    (0..h).any(|y| is_cursor(&buf, LABEL_X, y) && span(&buf, y, LABEL_X, w).starts_with(&start));
+                assert!(on_screen, "{w}x{h}, row {cursor}:\n{text}");
+            }
+        }
+    }
+}
