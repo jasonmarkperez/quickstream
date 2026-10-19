@@ -174,3 +174,33 @@ fn test_autopilot_placeholders_leave_audio_properties_unknown() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// What lofty couldn't read stays 0 (unknown): no channel count is made up. A missing length is
+/// estimated from the bitrate and file size, an estimate from real data the queue needs.
+#[test]
+fn test_audio_properties_leave_unread_channels_unknown() {
+    common::isolate();
+    use lofty::properties::FileProperties;
+    use quickstream::metadata::audio_properties;
+    use std::time::Duration;
+
+    let unread = FileProperties::new(Duration::ZERO, None, Some(320), Some(44_100), None, None, None);
+    let props = audio_properties(&unread, 4_000_000);
+    assert_eq!(props.channels, 0, "no channel count is made up");
+    assert_eq!(props.bitrate_kbps, 320);
+    assert_eq!(props.sample_rate_hz, 44_100);
+    assert!((props.duration_seconds - 100.0).abs() < 1e-9, "{}", props.duration_seconds);
+
+    let read = FileProperties::new(Duration::from_secs(200), None, Some(900), Some(48_000), None, Some(1), None);
+    let props = audio_properties(&read, 4_000_000);
+    assert_eq!(props.channels, 1);
+    assert_eq!(props.duration_seconds, 200.0);
+
+    // Nothing to estimate from: unknown.
+    let nothing = FileProperties::new(Duration::ZERO, None, None, None, None, None, None);
+    let props = audio_properties(&nothing, 4_000_000);
+    assert_eq!(
+        (props.duration_seconds, props.bitrate_kbps, props.sample_rate_hz, props.channels),
+        (0.0, 0, 0, 0)
+    );
+}

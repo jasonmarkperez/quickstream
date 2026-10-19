@@ -3648,7 +3648,7 @@ impl AppUI {
                 state.format = String::new();
                 state.bitrate_kbps = 0;
                 state.sample_rate_hz = 0;
-                state.channels = 2;
+                state.channels = 0;
                 state.filepath = None;
                 state.has_cover = false;
                 state.bpm = None;
@@ -3960,7 +3960,14 @@ impl AppUI {
                 ]),
                 Line::from(vec![
                     Span::styled("Channels: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(format!("{}", track.channels), Style::default().fg(Color::White)),
+                    Span::styled(
+                        if track.channels > 0 {
+                            track.channels.to_string()
+                        } else {
+                            "<Unknown>".to_string()
+                        },
+                        Style::default().fg(Color::White),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled("Size:     ", Style::default().fg(Color::DarkGray)),

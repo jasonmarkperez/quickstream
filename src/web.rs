@@ -138,6 +138,7 @@ pub struct NowPlayingState {
     pub position_seconds: f64,
     pub bitrate_kbps: u32,
     pub sample_rate_hz: u32,
+    /// 0 when unknown (lofty couldn't read it, or tags not read yet).
     pub channels: u8,
     pub volume: u8,
     pub output_device: String,
@@ -195,7 +196,7 @@ impl Default for NowPlayingState {
             position_seconds: 0.0,
             bitrate_kbps: 0,
             sample_rate_hz: 0,
-            channels: 2,
+            channels: 0,
             volume: 100,
             output_device: "Local Audio".to_string(),
             filepath: None,
