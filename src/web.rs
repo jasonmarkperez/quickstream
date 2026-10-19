@@ -719,6 +719,30 @@ impl ContinuousStreamController {
         self.session.lock().unwrap().as_ref().is_some_and(|s| s.nonce == nonce)
     }
 
+    /// If the length of the track being decoded (`path`, at `index` in the queue) was unknown
+    /// when it started (placeholder metadata, tags not read yet), take it from `state`'s queue
+    /// once the UI has published it there. Called while streaming, so the length (and the seek
+    /// clamp that needs it) shows without waiting for the next track. Returns whether it was
+    /// learned now.
+    pub fn learn_duration(&self, state: &mut NowPlayingState, index: usize, path: &Path) -> bool {
+        let mut current = self.current_duration.lock().unwrap();
+        if *current > 0.0 {
+            return false;
+        }
+        let known = state
+            .queue
+            .get(index)
+            .filter(|t| Path::new(&t.filepath) == path)
+            .map(|t| t.duration_seconds)
+            .filter(|d| *d > 0.0);
+        let Some(duration) = known else {
+            return false;
+        };
+        *current = duration;
+        state.duration_seconds = duration;
+        true
+    }
+
     pub fn skip_to_index(&self, index: usize) {
         *self.target_index.lock().unwrap() = Some(index);
         self.skip_requested.store(true, Ordering::SeqCst);
@@ -2632,6 +2656,7 @@ pub fn serve_continuous_stream(
                         *controller.current_position.lock().unwrap() = pos;
                         if let Ok(mut s) = state.write() {
                             s.position_seconds = pos;
+                            controller.learn_duration(&mut s, track_index, &track_path);
                         }
                     }
                 }

@@ -372,3 +372,123 @@ fn test_upnp_continuous_play_uses_the_armed_session_path() {
     stop.store(true, Ordering::SeqCst);
     let _ = mock.join();
 }
+
+/// A track whose length wasn't known when the continuous stream started it (placeholder
+/// metadata, tags not read yet) gets its length once the queue in the web state knows it,
+/// without waiting for the next track.
+#[test]
+fn test_continuous_stream_learns_an_unknown_length_mid_track() {
+    common::isolate();
+    if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("ffmpeg not installed; skipping");
+        return;
+    }
+    let dir = temp_dir("learn_length");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    write_wav(&a, 20_000);
+    write_wav(&b, 100);
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    state.write().unwrap().queue = vec![
+        WebQueueItem {
+            duration_seconds: 0.0,
+            ..queue_item(0, &a)
+        },
+        WebQueueItem {
+            duration_seconds: 0.0,
+            ..queue_item(1, &b)
+        },
+    ];
+    let (handle, _rx) = start(state.clone());
+    let port = handle.port;
+    let controller = handle.stream_state().continuous.clone();
+    let path = handle.stream_state().arm_continuous_session();
+    let (status, mut reader) = open(port, &path);
+    assert_eq!(status, 200);
+    // Read slowly, so track A lasts a while.
+    let reading = Arc::new(AtomicBool::new(true));
+    let reading_thread = reading.clone();
+    let drain = std::thread::spawn(move || {
+        let mut buf = [0u8; 16384];
+        while reading_thread.load(Ordering::SeqCst) {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !controller.is_active.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(controller.is_active.load(Ordering::SeqCst), "stream never started");
+    // Track A has started (its title is published after its length was read as unknown).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.read().unwrap().title != "Track 0" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(state.read().unwrap().title, "Track 0", "track A never started");
+    assert_eq!(*controller.current_duration.lock().unwrap(), 0.0);
+
+    // A's tags arrive (update_web_state publishes the queue with its length).
+    state.write().unwrap().queue[0].duration_seconds = 20.0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut learned = false;
+    while Instant::now() < deadline {
+        let on_a = *controller.current_track_index.lock().unwrap() == 0;
+        let duration = *controller.current_duration.lock().unwrap();
+        assert!(on_a, "track A ended before its length was learned");
+        if duration == 20.0 {
+            learned = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(learned, "the length of the playing track was never learned");
+
+    reading.store(false, Ordering::SeqCst);
+    handle.stream_state().close_active_streams();
+    let _ = drain.join();
+    handle.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Seeking in the continuous stream is clamped to the track's length once it is known, and
+/// never goes below 0 while it isn't.
+#[test]
+fn test_upnp_continuous_seek_is_clamped_to_the_known_length() {
+    common::isolate();
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let device = DLNADevice {
+        udn: "uuid:clamp".to_string(),
+        friendly_name: "Clamp Renderer".to_string(),
+        model_name: "Test".to_string(),
+        manufacturer: "Test".to_string(),
+        host: "127.0.0.1".to_string(),
+        port,
+        location: format!("http://127.0.0.1:{}/desc.xml", port),
+        av_transport_control_url: format!("http://127.0.0.1:{}/ctrl/AVTransport", port),
+        rendering_control_url: format!("http://127.0.0.1:{}/ctrl/RenderingControl", port),
+    };
+    let ss = Arc::new(StreamServerState::new());
+    ss.continuous.is_active.store(true, Ordering::SeqCst);
+    let mut player = UPnPPlayer::new(device, 8080).with_stream_state(Some(ss.clone()));
+    let target = || *ss.continuous.target_seek.lock().unwrap();
+
+    // Unknown length: any target from 0 up.
+    player.seek_to(-5.0).unwrap();
+    assert_eq!(target(), Some(0.0));
+    player.seek_to(500.0).unwrap();
+    assert_eq!(target(), Some(500.0));
+
+    // Known length: clamped to it.
+    *ss.continuous.current_duration.lock().unwrap() = 120.0;
+    player.seek_to(500.0).unwrap();
+    assert_eq!(target(), Some(120.0));
+    player.seek_to(f64::NAN).unwrap();
+    assert_eq!(target(), Some(0.0));
+    assert_eq!(player.duration_seconds(), 120.0);
+    ss.continuous.is_active.store(false, Ordering::SeqCst);
+}

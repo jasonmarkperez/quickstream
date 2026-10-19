@@ -1243,7 +1243,11 @@ impl AudioPlayer for UPnPPlayer {
         let _cmd = self.begin_command();
         if let Some(ref ss) = self.stream_state {
             if ss.continuous.is_active.load(Ordering::SeqCst) {
-                ss.continuous.seek_to(position_seconds);
+                // Clamped to the track's length once the stream knows it; from 0 up until then.
+                let duration = *ss.continuous.current_duration.lock().unwrap();
+                let target = position_seconds.max(0.0);
+                let target = if duration > 0.0 { target.min(duration) } else { target };
+                ss.continuous.seek_to(target);
                 return Ok(());
             }
         }
