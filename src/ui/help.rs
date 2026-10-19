@@ -20,6 +20,15 @@ struct Section {
     keys: &'static [(&'static str, &'static str)],
 }
 
+/// The seek keys' description: drawn as `Seek -<step>s / +<step>s` with the settings' seek step
+/// ([`seek_desc`]).
+const SEEK_DESC: &str = "Seek -<step>s / +<step>s";
+
+/// `Seek -30s / +30s` for a 30 s seek step.
+fn seek_desc(step: f64) -> String {
+    format!("Seek -{step}s / +{step}s")
+}
+
 /// Shift notation (`⇧R`) for capital letters; descriptions at most [`DESC_MAX`] characters.
 const LEFT: [Section; 3] = [
     Section {
@@ -28,7 +37,7 @@ const LEFT: [Section; 3] = [
             ("SPC", "Play / Pause"),
             ("S", "Stop playback"),
             ("← →", "Previous / Next track"),
-            ("[ ]", "Seek -10s / +10s"),
+            ("[ ]", SEEK_DESC),
             ("+ −", "Volume Up / Down"),
         ],
     },
@@ -133,8 +142,8 @@ const _: () = assert!(COMPACT_HEIGHT <= 22, "the compact help must fit an 80x24 
 
 /// Draw the help modal centred on `screen`, inside its gutters ([`kit::modal_area`]), except on
 /// 80-83 column screens: there the gutters are what keeps every description whole, so the help
-/// takes [`WHOLE_MIN_WIDTH`] columns.
-pub(super) fn render(f: &mut Frame, screen: Rect) {
+/// takes [`WHOLE_MIN_WIDTH`] columns. `seek_step` is the settings' seek step in seconds.
+pub(super) fn render(f: &mut Frame, screen: Rect, seek_step: f64) {
     let room = screen.width.saturating_sub(2 * kit::MODAL_MARGIN);
     let full = screen.height >= FULL_HEIGHT && room >= FULL_MIN_WIDTH;
     let height = if full { FULL_HEIGHT } else { COMPACT_HEIGHT };
@@ -164,13 +173,13 @@ pub(super) fn render(f: &mut Frame, screen: Rect) {
     let left_width = inner.width.div_ceil(2);
     let left = Rect::new(inner.x, inner.y, left_width, list_height);
     let right = Rect::new(inner.x + left_width, inner.y, inner.width - left_width, list_height);
-    draw_column(f, left, &LEFT, full);
-    draw_column(f, right, &RIGHT, full);
+    draw_column(f, left, &LEFT, full, seek_step);
+    draw_column(f, right, &RIGHT, full, seek_step);
     draw_footer(f, Rect::new(inner.x, inner.bottom() - 1, inner.width, 1));
 }
 
 /// `sections` from the top of `area`, as many rows as fit.
-fn draw_column(f: &mut Frame, area: Rect, sections: &[Section], full: bool) {
+fn draw_column(f: &mut Frame, area: Rect, sections: &[Section], full: bool, seek_step: f64) {
     let buf = f.buffer_mut();
     let width = area.width as usize;
     let mut y = area.y;
@@ -192,7 +201,11 @@ fn draw_column(f: &mut Frame, area: Rect, sections: &[Section], full: bool) {
             if y >= area.bottom() {
                 return;
             }
-            draw_key(buf, area.x, y, width, key, desc);
+            if *desc == SEEK_DESC {
+                draw_key(buf, area.x, y, width, key, &seek_desc(seek_step));
+            } else {
+                draw_key(buf, area.x, y, width, key, desc);
+            }
             y += 1;
         }
     }

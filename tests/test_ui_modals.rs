@@ -512,7 +512,8 @@ fn help_dims_every_cell_outside_it() {
 // Help modal (2g)
 // ---------------------------------------------------------------------------------------------
 
-/// Every key the help lists, as its keycap reads, with today's description.
+/// Every key the help lists, as its keycap reads, with today's description (the seek step at
+/// its default, 10 s).
 const HELP_KEYS: [(&str, &str); 31] = [
     ("SPC", "Play / Pause"),
     ("S", "Stop playback"),
@@ -627,6 +628,24 @@ fn help_lists_every_key_with_its_description_at_120x40_and_80x24() {
     // with `…`.
     let buffer = tui::render(&mut app, 70, 24);
     assert_help_lists_every_key(&buffer, "70x24", false);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The seek keys' description names the seek step the settings use, not a fixed 10 s.
+#[test]
+fn help_names_the_seek_step_from_the_settings() {
+    common::isolate();
+    let (mut app, dir) = modal_app("help_seek_step");
+    app.show_help_modal = true;
+    for (step, text) in [(30.0, "Seek -30s / +30s"), (5.0, "Seek -5s / +5s"), (2.5, "Seek -2.5s / +2.5s")] {
+        app.settings_mgr.settings.seek_step_seconds = step;
+        for (w, h) in [(120, 40), (80, 24)] {
+            let buffer = tui::render(&mut app, w, h);
+            let rows = tui::rows(&buffer).join("\n");
+            assert!(rows.contains(text), "{w}x{h}: {text:?} missing\n{rows}");
+            assert!(!rows.contains("-10s"), "{w}x{h}: {rows}");
+        }
+    }
     let _ = fs::remove_dir_all(&dir);
 }
 

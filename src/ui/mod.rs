@@ -3799,7 +3799,7 @@ impl AppUI {
 
     fn render_help_modal(&self, f: &mut Frame) {
         let screen = f.area();
-        help::render(f, screen);
+        help::render(f, screen, self.settings_mgr.settings.seek_step_seconds);
     }
 
     fn render_mix_picker_modal(&mut self, f: &mut Frame) {
