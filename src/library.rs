@@ -24,11 +24,23 @@ pub enum AutopilotEvent {
 /// Clones share one map, so handing it to a worker costs a reference count instead of a copy of
 /// the whole library (issue #4). Lookups take a read lock only for the duration of the call.
 #[derive(Debug, Clone, Default)]
-pub struct MetadataCache(Arc<std::sync::RwLock<HashMap<PathBuf, AudioMetadata>>>);
+pub struct MetadataCache(Arc<CacheShared>);
+
+#[derive(Debug, Default)]
+struct CacheShared {
+    map: std::sync::RwLock<HashMap<PathBuf, AudioMetadata>>,
+    /// Bumped on every insert, so the UI can cache values computed from the map and recompute
+    /// them only when tags have arrived.
+    revision: AtomicU64,
+    /// For each folder that has had an insert, the [`revision`](Self::revision) after the last
+    /// insert of a file directly inside it: values computed from one folder's files (its total
+    /// length, its column widths) stay cached while tags arrive for other folders.
+    folders: std::sync::Mutex<HashMap<PathBuf, u64>>,
+}
 
 impl MetadataCache {
     fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<PathBuf, AudioMetadata>> {
-        self.0.read().unwrap_or_else(|e| e.into_inner())
+        self.0.map.read().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn get(&self, path: &Path) -> Option<AudioMetadata> {
@@ -39,12 +51,47 @@ impl MetadataCache {
         self.read().contains_key(path)
     }
 
+    /// Run `f` on the map under one read lock (for several lookups in a row, e.g. the rows of a
+    /// list being drawn).
+    pub fn read_with<R>(&self, f: impl FnOnce(&HashMap<PathBuf, AudioMetadata>) -> R) -> R {
+        f(&self.read())
+    }
+
     /// Insert or replace the entry for `meta.filepath`.
     pub fn insert(&self, meta: AudioMetadata) {
+        let folder = meta.filepath.parent().map(Path::to_path_buf);
         self.0
+            .map
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(meta.filepath.clone(), meta);
+        // After the map, so a reader that sees the new folder revision also sees the entry.
+        let revision = self.0.revision.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Some(folder) = folder {
+            self.0
+                .folders
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(folder, revision);
+        }
+    }
+
+    /// Changes whenever an entry is inserted or replaced (through any clone).
+    pub fn revision(&self) -> u64 {
+        self.0.revision.load(Ordering::Acquire)
+    }
+
+    /// Changes whenever an entry for a file directly inside `dir` is inserted or replaced
+    /// (through any clone); inserts elsewhere, subfolders included, leave it alone. `0` until
+    /// the first such insert.
+    pub fn folder_revision(&self, dir: &Path) -> u64 {
+        self.0
+            .folders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(dir)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn len(&self) -> usize {
@@ -63,7 +110,11 @@ impl MetadataCache {
 
 impl From<HashMap<PathBuf, AudioMetadata>> for MetadataCache {
     fn from(map: HashMap<PathBuf, AudioMetadata>) -> Self {
-        Self(Arc::new(std::sync::RwLock::new(map)))
+        Self(Arc::new(CacheShared {
+            map: std::sync::RwLock::new(map),
+            revision: AtomicU64::new(0),
+            folders: Default::default(),
+        }))
     }
 }
 

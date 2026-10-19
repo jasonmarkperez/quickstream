@@ -31,11 +31,9 @@ impl AudioMetadata {
         }
     }
 
+    /// The length as the TUI shows it everywhere ([`crate::ui::kit::duration`]).
     pub fn formatted_duration(&self) -> String {
-        let total = self.duration_seconds.round() as u64;
-        let mins = total / 60;
-        let secs = total % 60;
-        format!("{:02}:{:02}", mins, secs)
+        crate::ui::kit::duration(self.duration_seconds)
     }
 
     pub fn format_display_label(&self, metadata_mode: bool) -> String {

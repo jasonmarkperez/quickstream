@@ -13,6 +13,7 @@ use ratatui::widgets::*;
 mod chrome;
 pub mod kit;
 pub mod playlists;
+mod queue_tab;
 pub mod screen;
 pub mod search;
 pub mod tag_reads;
@@ -278,6 +279,8 @@ pub struct AppUI {
     pub playlists: playlists::PlaylistsUi,
     /// The header clock, read at most once a second.
     clock: kit::ClockCache,
+    /// Tab 2 values cached per queue / metadata revision (queued paths, total lengths).
+    queue_tab: queue_tab::QueueTabCache,
 }
 
 impl Drop for AppUI {
@@ -417,6 +420,7 @@ impl AppUI {
             persistence,
             playlists,
             clock: kit::ClockCache::new(),
+            queue_tab: queue_tab::QueueTabCache::new(),
         };
         app.refresh_browser();
         app.start_playlist_load();
@@ -1009,7 +1013,7 @@ impl AppUI {
     pub fn start_queue_metadata_fetch(&mut self) {
         let candidates: Vec<PathBuf> = self
             .queue
-            .tracks
+            .tracks()
             .iter()
             .filter(|t| t.duration_seconds <= 0.0 || t.artist.is_empty() || t.sample_rate_hz == 0)
             .map(|t| t.filepath.clone())
@@ -1109,11 +1113,8 @@ impl AppUI {
             self.metadata_cache.insert(meta.clone());
 
             // 1. Update matching tracks in queue
-            for track in &mut self.queue.tracks {
-                if track.filepath == path {
-                    *track = meta.clone();
-                    queue_updated = true;
-                }
+            if self.queue.update_metadata(&meta) {
+                queue_updated = true;
             }
 
             // 2. Update browser entries if active
@@ -1220,7 +1221,7 @@ impl AppUI {
         }
 
         if was_empty && !self.queue.is_empty() {
-            self.queue.current_index = 0;
+            self.queue.set_current_index(0);
             self.queue_cursor = 0;
 
             let _ = self.ensure_web_server_started();
@@ -1366,6 +1367,9 @@ impl AppUI {
         }
     }
 
+    /// Indices of the subfolders whose name matches the spotlight query (prefix matches
+    /// first). Only real subfolders (and, in Music Homes, the homes) take part: never the `..`
+    /// row, which the LIBRARY panel draws as `PARENT` / `FILE SYSTEM`, nor the Music Homes row.
     pub fn spotlight_matches(&self) -> Vec<usize> {
         let query = match &self.browser_spotlight {
             Some(q) if !q.is_empty() => q.to_lowercase(),
@@ -1375,10 +1379,11 @@ impl AppUI {
         let mut prefix_matches = Vec::new();
         let mut substring_matches = Vec::new();
 
-        for (idx, (name, path, is_dir)) in self.browser_entries.iter().enumerate() {
-            if !*is_dir || path.to_string_lossy() == "___MUSIC_HOMES___" {
+        for (idx, entry) in self.browser_entries.iter().enumerate() {
+            if !is_subfolder_entry(entry) {
                 continue;
             }
+            let name = &entry.0;
             let clean_name = name
                 .strip_prefix("📁 ")
                 .and_then(|s| s.strip_suffix('/'))
@@ -1626,8 +1631,8 @@ impl AppUI {
                     .load(std::sync::atomic::Ordering::SeqCst)
                 {
                     let cur_idx = *ws.stream_state().continuous.current_track_index.lock().unwrap();
-                    if cur_idx != self.queue.current_index && cur_idx < self.queue.len() {
-                        self.queue.current_index = cur_idx;
+                    if cur_idx != self.queue.current_index() && cur_idx < self.queue.len() {
+                        self.queue.set_current_index(cur_idx);
                         self.queue_cursor = cur_idx;
                     }
                 }
@@ -1898,7 +1903,7 @@ impl AppUI {
         let mode = if raw_mode == "repeat_one" { "loop" } else { &raw_mode };
         if let Some(track) = self.queue.next_track(mode) {
             let track_title = track.display_title().to_string();
-            self.queue_cursor = self.queue.current_index;
+            self.queue_cursor = self.queue.current_index();
 
             if !self.pending_track_skip && self.player.is_playing() {
                 let _ = self.player.stop();
@@ -1923,7 +1928,7 @@ impl AppUI {
 
         if let Some(track) = self.queue.prev_track() {
             let track_title = track.display_title().to_string();
-            self.queue_cursor = self.queue.current_index;
+            self.queue_cursor = self.queue.current_index();
 
             if !self.pending_track_skip && self.player.is_playing() {
                 let _ = self.player.stop();
@@ -2457,7 +2462,7 @@ impl AppUI {
                     (KeyCode::Enter, KeyModifiers::NONE) => {
                         if self.queue_focus {
                             self.supersede_playlist_queue();
-                            self.queue.current_index = self.queue_cursor;
+                            self.queue.set_current_index(self.queue_cursor);
                             self.play_current_track();
                         } else if self.browser_cursor < self.browser_entries.len() {
                             let (_, path, is_dir) = self.browser_entries[self.browser_cursor].clone();
@@ -2540,7 +2545,7 @@ impl AppUI {
                     }
                     (KeyCode::Char('r'), KeyModifiers::NONE) if self.queue_focus => {
                         if self.queue_cursor < self.queue.len() {
-                            let seed = self.queue.tracks[self.queue_cursor].filepath.clone();
+                            let seed = self.queue.tracks()[self.queue_cursor].filepath.clone();
                             self.start_seed_radio(seed);
                         } else if let Some(current) = self.queue.current_track() {
                             self.start_seed_radio(current.filepath.clone());
@@ -2762,7 +2767,7 @@ impl AppUI {
                 .is_active
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
-                ws.stream_state().continuous.skip_to_index(self.queue.current_index);
+                ws.stream_state().continuous.skip_to_index(self.queue.current_index());
                 self.update_web_state();
                 return None;
             }
@@ -2818,8 +2823,8 @@ impl AppUI {
                 .load(std::sync::atomic::Ordering::SeqCst)
                 && !self.queue.is_empty()
             {
-                let next_idx = (self.queue.current_index + 1) % self.queue.len();
-                self.queue.current_index = next_idx;
+                let next_idx = (self.queue.current_index() + 1) % self.queue.len();
+                self.queue.set_current_index(next_idx);
                 self.queue_cursor = next_idx;
                 ws.stream_state().continuous.skip_to_index(next_idx);
                 self.update_web_state();
@@ -2862,12 +2867,12 @@ impl AppUI {
                 .load(std::sync::atomic::Ordering::SeqCst)
                 && !self.queue.is_empty()
             {
-                let prev_idx = if self.queue.current_index > 0 {
-                    self.queue.current_index - 1
+                let prev_idx = if self.queue.current_index() > 0 {
+                    self.queue.current_index() - 1
                 } else {
                     self.queue.len().saturating_sub(1)
                 };
-                self.queue.current_index = prev_idx;
+                self.queue.set_current_index(prev_idx);
                 self.queue_cursor = prev_idx;
                 ws.stream_state().continuous.skip_to_index(prev_idx);
                 self.update_web_state();
@@ -2978,9 +2983,7 @@ impl AppUI {
             }
             AutopilotRunMode::Reshuffle => {
                 // Keep tracks 0..=current_index uninterrupted; truncate everything after current_index
-                if self.queue.current_index < self.queue.len() {
-                    self.queue.tracks.truncate(self.queue.current_index + 1);
-                }
+                self.queue.truncate_after(self.queue.current_index());
                 self.clamp_queue_cursor();
                 self.status_message = format!(
                     "🎲 Autopilot: Reshuffling mix from next track forward (from '{}')...",
@@ -3063,7 +3066,7 @@ impl AppUI {
         if self.active_tab == 1 {
             if self.queue_focus {
                 if self.queue_cursor < self.queue.len() {
-                    return Some(self.queue.tracks[self.queue_cursor].filepath.clone());
+                    return Some(self.queue.tracks()[self.queue_cursor].filepath.clone());
                 }
             } else if self.browser_cursor < self.browser_entries.len() {
                 let (_, p, is_dir) = &self.browser_entries[self.browser_cursor];
@@ -3121,7 +3124,7 @@ impl AppUI {
         match crate::web::WebServer::start_with_bind(bind, port, self.web_state.clone(), tx) {
             Ok(handle) => {
                 let actual_port = handle.port;
-                for track in &self.queue.tracks {
+                for track in self.queue.tracks() {
                     handle.register_stream_file(&track.filepath);
                 }
                 self.web_server = Some(handle);
@@ -3202,7 +3205,7 @@ impl AppUI {
         let _ = self.player.stop();
         if let Some(ref ws) = self.web_server {
             ws.close_active_streams();
-            for track in &self.queue.tracks {
+            for track in self.queue.tracks() {
                 ws.register_stream_file(&track.filepath);
             }
         }
@@ -3330,7 +3333,7 @@ impl AppUI {
                 crate::web::WebCommand::PlayIndex(idx) => {
                     if idx < self.queue.len() {
                         self.supersede_playlist_queue();
-                        self.queue.current_index = idx;
+                        self.queue.set_current_index(idx);
                         self.queue_cursor = idx;
                         self.play_current_track();
                         self.update_web_state();
@@ -3532,7 +3535,7 @@ impl AppUI {
                 .get_active_device()
                 .map(|d| d.friendly_name)
                 .unwrap_or_else(|| "Local Audio".to_string());
-            state.queue_index = self.queue.current_index;
+            state.queue_index = self.queue.current_index();
             state.queue_total = self.queue.len();
             state.queue_mode = self.settings_mgr.settings.queue_mode.clone();
             state.is_scanning = self.device_manager.is_scanning();
@@ -3545,7 +3548,7 @@ impl AppUI {
 
             state.queue = self
                 .queue
-                .tracks
+                .tracks()
                 .iter()
                 .enumerate()
                 .map(|(idx, track)| crate::web::WebQueueItem {
@@ -3555,7 +3558,7 @@ impl AppUI {
                     album: track.album.clone(),
                     duration_seconds: track.duration_seconds,
                     filepath: track.filepath.to_string_lossy().to_string(),
-                    is_current: idx == self.queue.current_index,
+                    is_current: idx == self.queue.current_index(),
                 })
                 .collect();
 
@@ -3611,14 +3614,14 @@ impl AppUI {
                 state.key = None;
             }
 
-            if self.queue.len() > 1 && self.queue.current_index + 1 < self.queue.len() {
+            if self.queue.len() > 1 && self.queue.current_index() + 1 < self.queue.len() {
                 state.next_track_title = self
                     .queue
-                    .tracks
-                    .get(self.queue.current_index + 1)
+                    .tracks()
+                    .get(self.queue.current_index() + 1)
                     .map(|t| t.display_title().to_string());
             } else if !self.queue.is_empty() && self.settings_mgr.settings.queue_mode == "loop" {
-                state.next_track_title = self.queue.tracks.first().map(|t| t.display_title().to_string());
+                state.next_track_title = self.queue.tracks().first().map(|t| t.display_title().to_string());
             } else {
                 state.next_track_title = None;
             }
@@ -3745,7 +3748,7 @@ impl AppUI {
         if !self.queue.is_empty() {
             row1.push(Span::raw("  "));
             row1.push(Span::styled(
-                format!("Track {} of {}", self.queue.current_index + 1, self.queue.len()),
+                format!("Track {} of {}", self.queue.current_index() + 1, self.queue.len()),
                 Style::default().fg(Color::Yellow),
             ));
         }
@@ -3845,8 +3848,8 @@ impl AppUI {
             } else {
                 self.player.duration_seconds().max(1.0)
             };
-            let pos_str = format_time(pos);
-            let dur_str = format_time(dur);
+            let pos_str = kit::duration(pos);
+            let dur_str = kit::duration(dur);
             let ratio = if dur > 0.0 { (pos / dur).clamp(0.0, 1.0) } else { 0.0 };
 
             let available_w = (hero_area.width as usize).saturating_sub(pos_str.len() + dur_str.len() + 6);
@@ -3867,7 +3870,7 @@ impl AppUI {
             // Row 6: Percentage & Time Remaining
             let percent = (ratio * 100.0).round() as usize;
             let remaining = (dur - pos).max(0.0);
-            let rem_str = format_time(remaining);
+            let rem_str = kit::duration(remaining);
             let info_line = Line::from(vec![
                 Span::styled(format!("{}% complete", percent), Style::default().fg(Color::White)),
                 Span::styled("   •   ", Style::default().fg(Color::DarkGray)),
@@ -3916,12 +3919,12 @@ impl AppUI {
                 )])];
                 f.render_widget(Paragraph::new(up_lines), up_inner);
             } else {
-                let current_idx = self.queue.current_index;
+                let current_idx = self.queue.current_index();
                 let next_idx = current_idx + 1;
                 let max_items = (up_inner.height as usize).saturating_sub(1).max(1);
                 let upcoming: Vec<_> = self
                     .queue
-                    .tracks
+                    .tracks()
                     .iter()
                     .enumerate()
                     .skip(next_idx)
@@ -3931,7 +3934,7 @@ impl AppUI {
                 if upcoming.is_empty() {
                     let loop_mode = self.settings_mgr.settings.queue_mode == "loop";
                     if loop_mode && self.queue.len() > 1 {
-                        let first = &self.queue.tracks[0];
+                        let first = &self.queue.tracks()[0];
                         let up_lines = vec![Line::from(vec![
                             Span::styled(
                                 "↺ End of queue reached. Loops to #1: ",
@@ -3970,7 +3973,7 @@ impl AppUI {
                             .into_iter()
                             .map(|(i, t)| {
                                 let dur_label = if t.duration_seconds > 0.0 {
-                                    format_time(t.duration_seconds)
+                                    kit::duration(t.duration_seconds)
                                 } else {
                                     "--:--".to_string()
                                 };
@@ -4002,7 +4005,7 @@ impl AppUI {
                             .into_iter()
                             .map(|(i, t)| {
                                 let dur_label = if t.duration_seconds > 0.0 {
-                                    format_time(t.duration_seconds)
+                                    kit::duration(t.duration_seconds)
                                 } else {
                                     "--:--".to_string()
                                 };
@@ -4031,187 +4034,6 @@ impl AppUI {
                 }
             }
         }
-    }
-
-    fn render_queue_tab(&mut self, f: &mut Frame, area: Rect) {
-        let split = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(area);
-
-        // Left Pane: File Browser (with optional inline Spotlight Search bar)
-        let spotlight_matches = self.spotlight_matches();
-        let (browser_area, spotlight_area) = if self.browser_spotlight.is_some() {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(1)])
-                .split(split[0]);
-            (chunks[1], Some(chunks[0]))
-        } else {
-            (split[0], None)
-        };
-
-        let inner_browser_h = browser_area.height.saturating_sub(2) as usize;
-        self.browser_page_height = inner_browser_h.max(1);
-
-        let inner_queue_h = split[1].height.saturating_sub(2) as usize;
-        self.queue_page_height = inner_queue_h.max(1);
-
-        if let Some(s_area) = spotlight_area {
-            let query = self.browser_spotlight.as_deref().unwrap_or("");
-            let match_text = if query.is_empty() {
-                let subfolder_count = self
-                    .browser_entries
-                    .iter()
-                    .filter(|(_, p, is_dir)| *is_dir && p.to_string_lossy() != "___MUSIC_HOMES___")
-                    .count();
-                format!("Type to jump ({} subfolders)", subfolder_count)
-            } else if spotlight_matches.is_empty() {
-                "No matching subfolders".to_string()
-            } else {
-                let current_match_pos = spotlight_matches
-                    .iter()
-                    .position(|&i| i == self.browser_cursor)
-                    .map(|p| p + 1)
-                    .unwrap_or(1);
-                format!(
-                    "{} of {} matching subfolders",
-                    current_match_pos,
-                    spotlight_matches.len()
-                )
-            };
-
-            let spotlight_block = Block::default()
-                .borders(Borders::ALL)
-                .title(" 🔍 SPOTLIGHT SUBFOLDER JUMP (Esc exit, Enter open) ")
-                .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
-
-            let status_style = if spotlight_matches.is_empty() && !query.is_empty() {
-                Style::default().fg(Color::Red)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-
-            let spotlight_text = Line::from(vec![
-                Span::styled(" > ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(query, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                Span::styled("█", Style::default().fg(Color::Yellow)),
-                Span::raw("   "),
-                Span::styled(format!("[{}]", match_text), status_style),
-            ]);
-            let spotlight_widget = Paragraph::new(spotlight_text).block(spotlight_block);
-            f.render_widget(spotlight_widget, s_area);
-        }
-
-        let mode_tag = if self.settings_mgr.settings.metadata_view {
-            "[TAGS]"
-        } else {
-            "[FILES]"
-        };
-        let count_tag = if self.browser_entries.is_empty() {
-            String::new()
-        } else {
-            format!(" ({}/{})", self.browser_cursor + 1, self.browser_entries.len())
-        };
-        let loading_tag = if self.browser_loading { " [LOADING...]" } else { "" };
-        let browser_title = if self.in_bookmarks_view {
-            format!(" BROWSER [★ Music Homes]{}{} {} ", count_tag, loading_tag, mode_tag)
-        } else {
-            format!(" BROWSER [File System]{}{} {} ", count_tag, loading_tag, mode_tag)
-        };
-        let browser_block = Block::default()
-            .borders(Borders::ALL)
-            .title(browser_title.as_str())
-            .border_style(if !self.queue_focus {
-                if self.browser_spotlight.is_some() {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                }
-            } else {
-                Style::default().fg(Color::DarkGray)
-            });
-
-        let match_set: std::collections::HashSet<usize> = if self.browser_spotlight.is_some() {
-            spotlight_matches.iter().copied().collect()
-        } else {
-            std::collections::HashSet::new()
-        };
-
-        let mut browser_items: Vec<ListItem> = self
-            .browser_entries
-            .iter()
-            .enumerate()
-            .map(|(idx, (name, _, is_dir))| {
-                let is_selected = idx == self.browser_cursor && !self.queue_focus;
-                let is_spotlight_match = match_set.contains(&idx);
-
-                let style = if is_selected {
-                    theme::cursor()
-                } else if is_spotlight_match {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                } else if *is_dir {
-                    Style::default().fg(Color::Cyan)
-                } else {
-                    Style::default().fg(Color::Green)
-                };
-                ListItem::new(name.clone()).style(style)
-            })
-            .collect();
-
-        if self.browser_loading {
-            let header_count = if self.browser_dir.parent().is_some() { 2 } else { 1 };
-            let content_count = self.browser_entries.len().saturating_sub(header_count);
-            let loading_text = if content_count > 0 {
-                format!("  ⏳ Reading directory contents... ({} items loaded)", content_count)
-            } else {
-                "  ⏳ Reading directory contents...".to_string()
-            };
-            browser_items.push(
-                ListItem::new(loading_text).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC)),
-            );
-        }
-
-        self.browser_state.select(Some(self.browser_cursor));
-        let browser_list = List::new(browser_items).block(browser_block);
-        f.render_stateful_widget(browser_list, browser_area, &mut self.browser_state);
-
-        // Right Pane: Queue
-        let queue_title = if self.queue.is_empty() {
-            " QUEUE (0 tracks) ".to_string()
-        } else {
-            format!(" QUEUE ({}/{} tracks) ", self.queue_cursor + 1, self.queue.len())
-        };
-        let queue_block = Block::default()
-            .borders(Borders::ALL)
-            .title(queue_title.as_str())
-            .border_style(if self.queue_focus {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            });
-
-        let metadata_view = self.settings_mgr.settings.metadata_view;
-        let queue_items: Vec<ListItem> = self
-            .queue
-            .tracks
-            .iter()
-            .enumerate()
-            .map(|(idx, track)| {
-                let prefix = if idx == self.queue.current_index { "▶ " } else { "  " };
-                let text = format!("{}{}. {}", prefix, idx + 1, track.format_queue_label(metadata_view));
-                let style = if idx == self.queue_cursor && self.queue_focus {
-                    theme::cursor()
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                ListItem::new(text).style(style)
-            })
-            .collect();
-
-        self.queue_state.select(Some(self.queue_cursor));
-        let queue_list = List::new(queue_items).block(queue_block);
-        f.render_stateful_widget(queue_list, split[1], &mut self.queue_state);
     }
 
     fn render_devices_tab(&mut self, f: &mut Frame, area: Rect) {
@@ -4789,11 +4611,10 @@ fn modal_rect_with_height(r: Rect, height: u16) -> Rect {
 /// Status line while the browser spotlight is open.
 const SPOTLIGHT_HINT: &str = "Spotlight: type to jump to subfolder (Esc to exit, Enter to open)";
 
-fn format_time(seconds: f64) -> String {
-    let total = seconds.round().max(0.0) as u64;
-    let mins = total / 60;
-    let secs = total % 60;
-    format!("{:02}:{:02}", mins, secs)
+/// Whether a browser entry is a folder the spotlight can jump to: a subfolder (or a bookmarked
+/// Music Home), labelled `📁 name/`. The `..` row and the `★ Music Homes` row are not.
+pub(crate) fn is_subfolder_entry((label, _, is_dir): &(String, PathBuf, bool)) -> bool {
+    *is_dir && label.starts_with("📁 ")
 }
 
 #[cfg(test)]

@@ -867,7 +867,7 @@ fn test_browser_add_track_to_queue_does_not_start_playback() {
     // 1. Both songs in queue
     assert_eq!(app.queue.len(), 2);
     // 2. Current index remained 0
-    assert_eq!(app.queue.current_index, 0);
+    assert_eq!(app.queue.current_index(), 0);
     // 3. Playback still NOT started
     assert!(!app.player.is_playing());
     assert!(app.status_message.contains("Added to queue: "));
@@ -1003,7 +1003,7 @@ fn test_queue_track_skip_debouncing_and_flushing() {
     }
 
     assert_eq!(app.queue.len(), 5);
-    assert_eq!(app.queue.current_index, 0);
+    assert_eq!(app.queue.current_index(), 0);
 
     // Initial state: no pending skip
     assert!(!app.pending_track_skip);
@@ -1018,7 +1018,7 @@ fn test_queue_track_skip_debouncing_and_flushing() {
     }
 
     // Cursor should have advanced 3 times: 0 -> 1 -> 2 -> 3
-    assert_eq!(app.queue.current_index, 3);
+    assert_eq!(app.queue.current_index(), 3);
     assert_eq!(app.queue_cursor, 3);
     assert!(app.pending_track_skip);
     assert!(app.last_track_skip_time.is_some());
@@ -1036,7 +1036,7 @@ fn test_queue_track_skip_debouncing_and_flushing() {
     // Now it should have flushed!
     assert!(!app.pending_track_skip);
     assert!(app.last_track_skip_time.is_none());
-    assert_eq!(app.queue.current_index, 3);
+    assert_eq!(app.queue.current_index(), 3);
 
     // Test Prev skip debounce
     for _ in 0..2 {
@@ -1045,7 +1045,7 @@ fn test_queue_track_skip_debouncing_and_flushing() {
             crossterm::event::KeyModifiers::NONE,
         ));
     }
-    assert_eq!(app.queue.current_index, 1);
+    assert_eq!(app.queue.current_index(), 1);
     assert!(app.pending_track_skip);
 
     // Test that pressing Space immediately flushes pending skip without waiting
@@ -1054,7 +1054,7 @@ fn test_queue_track_skip_debouncing_and_flushing() {
         crossterm::event::KeyModifiers::NONE,
     ));
     assert!(!app.pending_track_skip);
-    assert_eq!(app.queue.current_index, 1);
+    assert_eq!(app.queue.current_index(), 1);
 
     // Test that pressing 's' cancels pending skip
     let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
@@ -1254,12 +1254,17 @@ fn test_queue_rendering_without_file_type_and_file_list_display_swap() {
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
 
-    // 1. In metadata_view = true, Queue displays "Test Artist - Test Track (01:00)" without [WAV]
+    // 1. In metadata_view = true, the queue row shows the title and artist in their own
+    //    columns (UPPERCASE) and the length, without a [WAV] badge.
     app.active_tab = 1;
     terminal.draw(|f| app.render(f)).unwrap();
     let view1 = terminal.backend().to_string();
-    assert!(view1.contains("Test Artist - Test Track"));
-    assert!(!view1.contains("[WAV] Test Artist"));
+    let queue_row = view1
+        .lines()
+        .find(|line| line.contains("TEST TRACK") && line.contains("01:00"))
+        .unwrap_or_else(|| panic!("no queue row with title and length:\n{view1}"));
+    assert!(queue_row.contains("TEST ARTIST"), "{queue_row:?}");
+    assert!(!view1.contains("[WAV]"));
 
     // 2. Toggle via 'v' hotkey -> metadata_view = false (Filename mode)
     let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
@@ -1268,11 +1273,17 @@ fn test_queue_rendering_without_file_type_and_file_list_display_swap() {
     ));
     assert!(!app.settings_mgr.settings.metadata_view);
 
-    // In Filename mode, Queue displays "01_test_song.wav (01:00)" without [WAV]
+    // In Filename mode, the queue row shows the file name as it is on disk and the length,
+    // without [WAV].
     terminal.draw(|f| app.render(f)).unwrap();
     let view2 = terminal.backend().to_string();
-    assert!(view2.contains("01_test_song.wav"));
-    assert!(!view2.contains("[WAV] 01_test_song.wav (01:00)"));
+    assert!(
+        view2
+            .lines()
+            .any(|line| line.contains("01_test_song.wav") && line.contains("01:00")),
+        "{view2}"
+    );
+    assert!(!view2.contains("[WAV]"));
 
     // Browser entries also show clean filename
     let browser_entry = app

@@ -13,7 +13,7 @@ use quickstream::metadata::AudioMetadata;
 use quickstream::player::AudioPlayer;
 use quickstream::playlist::{Playlist, PlaylistEntry};
 use quickstream::settings::SettingsManager;
-use quickstream::ui::playlists::{missing_row_text, mount_hint, ExistsChecker};
+use quickstream::ui::playlists::{mount_hint, ExistsChecker};
 use quickstream::ui::AppUI;
 
 const PLAYLIST: &str = "Road Trip";
@@ -91,6 +91,15 @@ fn render(app: &mut AppUI, width: u16, height: u16) -> String {
     terminal.backend().to_string()
 }
 
+/// The first line of `view` containing `text`, without the quotes the test backend puts
+/// around each line.
+fn row_with<'a>(view: &'a str, text: &str) -> &'a str {
+    view.lines()
+        .find(|line| line.contains(text))
+        .map(|line| line.trim_matches('"'))
+        .unwrap_or_else(|| panic!("{text:?} not drawn:\n{view}"))
+}
+
 #[test]
 fn test_mount_hint_is_the_first_two_folders() {
     common::isolate();
@@ -136,13 +145,6 @@ fn test_all_missing_without_a_mount_hint_leaves_out_the_question() {
 }
 
 #[test]
-fn test_missing_row_text_marks_the_entry() {
-    common::isolate();
-    let ghost = entry(Path::new("/music/gone.flac"), "Ghost", "Gone");
-    assert_eq!(missing_row_text(1, &ghost), "2. ✗ missing: Ghost - Gone  ----");
-}
-
-#[test]
 fn test_missing_entries_render_as_missing_and_playlist_is_untouched() {
     common::isolate();
     let dir = temp_dir("missing_rows");
@@ -161,10 +163,24 @@ fn test_missing_entries_render_as_missing_and_playlist_is_untouched() {
     assert!(app.playlists.is_missing(&ghost));
     assert!(!app.playlists.is_missing(&present));
 
+    // The missing entry keeps its number and title, and reads MISSING FILE with no length in
+    // place of its artist and length; the entry that exists is not marked.
     let view = render(&mut app, 120, 30);
-    assert!(view.contains("✗ missing: Ghost - Gone  ----"), "{}", view);
-    assert!(view.contains("Alpha - One"), "{}", view);
-    assert!(!view.contains("✗ missing: Alpha"), "{}", view);
+    let ghost_row = row_with(&view, "GONE");
+    assert!(ghost_row.contains("02   GONE"), "{}", view);
+    assert!(
+        ghost_row.contains("MISSING FILE") && ghost_row.trim_end().ends_with("--:--"),
+        "{}",
+        view
+    );
+    assert!(!ghost_row.contains("GHOST"), "{}", view);
+    let present_row = row_with(&view, "ONE");
+    assert!(
+        present_row.contains("01   ONE") && present_row.contains("ALPHA"),
+        "{}",
+        view
+    );
+    assert!(!present_row.contains("MISSING FILE"), "{}", view);
 
     // A missing file never changes the playlist or its file.
     app.persistence.flush();
@@ -207,8 +223,8 @@ fn test_hung_existence_check_does_not_block_ui() {
 
     // Rows not checked yet render normally.
     let view = render(&mut app, 120, 30);
-    assert!(view.contains("Ghost - Gone"), "{}", view);
-    assert!(!view.contains("✗ missing"), "{}", view);
+    assert!(row_with(&view, "GONE").contains("GHOST"), "{}", view);
+    assert!(!view.contains("MISSING FILE"), "{}", view);
 
     // Polling again neither blocks nor checks the same paths a second time.
     let start = Instant::now();
@@ -230,7 +246,7 @@ fn test_hung_existence_check_does_not_block_ui() {
     app.poll_playlists();
     assert_eq!(app.playlists.checks_in_flight(), 0);
     let view = render(&mut app, 120, 30);
-    assert!(view.contains("✗ missing: Ghost - Gone"), "{}", view);
+    assert!(row_with(&view, "GONE").contains("MISSING FILE"), "{}", view);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -319,7 +335,7 @@ fn press(app: &mut AppUI, code: crossterm::event::KeyCode) {
 }
 
 fn queue_paths(app: &AppUI) -> Vec<PathBuf> {
-    app.queue.tracks.iter().map(|t| t.filepath.clone()).collect()
+    app.queue.tracks().iter().map(|t| t.filepath.clone()).collect()
 }
 
 fn old_track(dir: &Path) -> AudioMetadata {
@@ -379,14 +395,14 @@ fn test_enter_replaces_queue_stops_autopilot_and_plays_next_existing_track() {
 
     assert_eq!(app.status_message, "Queued 2 tracks from Road Trip, 1 missing");
     assert_eq!(queue_paths(&app), vec![first.clone(), third.clone()]);
-    assert_eq!(app.queue.tracks[0].title, "Cached One", "cached metadata is used");
-    assert_eq!(app.queue.current_index, 1);
+    assert_eq!(app.queue.tracks()[0].title, "Cached One", "cached metadata is used");
+    assert_eq!(app.queue.current_index(), 1);
     assert_eq!(app.queue_cursor, 1);
 
     // The uncached entry is a placeholder with an #EXTINF artist and duration but no audio
     // properties: its real tags (album, bitrate, sample rate) are still fetched in the background.
-    assert_eq!(app.queue.tracks[1].artist, "Gamma");
-    assert!(app.queue.tracks[1].duration_seconds > 0.0);
+    assert_eq!(app.queue.tracks()[1].artist, "Gamma");
+    assert!(app.queue.tracks()[1].duration_seconds > 0.0);
     assert!(
         app.queue_metadata_attempted.contains(&third),
         "placeholder with artist and duration was not sent for a tag fetch"
@@ -451,7 +467,7 @@ fn test_a_appends_playlist_from_either_pane_without_touching_playback() {
         queue_paths(&app),
         vec![dir.join("old.mp3"), first.clone(), second.clone()]
     );
-    assert_eq!(app.queue.current_index, 0);
+    assert_eq!(app.queue.current_index(), 0);
 
     // Tracks pane.
     app.playlists.tracks_focus = true;
@@ -461,7 +477,7 @@ fn test_a_appends_playlist_from_either_pane_without_touching_playback() {
         "a in the tracks pane did not append; status: {}",
         app.status_message
     );
-    assert_eq!(app.queue.current_index, 0);
+    assert_eq!(app.queue.current_index(), 0);
     assert!(
         calls.lock().unwrap().is_empty(),
         "append must not stop or start playback"
@@ -848,7 +864,7 @@ fn test_enter_plays_the_selected_track_before_the_rest_are_checked() {
     );
     assert_eq!(play_calls(&calls), vec![format!("play {}", paths[1].display())]);
     assert_eq!(queue_paths(&app), vec![paths[1].clone()], "the old queue was replaced");
-    assert_eq!(app.queue.current_index, 0);
+    assert_eq!(app.queue.current_index(), 0);
     assert!(app.playlists.queue_check_pending(), "the rest are still being checked");
     assert_eq!(app.status_message, "Playing from Road Trip; checking the rest…");
 
@@ -860,7 +876,7 @@ fn test_enter_plays_the_selected_track_before_the_rest_are_checked() {
     );
     assert_eq!(app.status_message, "Queued 4 tracks from Road Trip");
     assert_eq!(queue_paths(&app), paths);
-    assert_eq!(app.queue.current_index, 1, "the playing track keeps its place");
+    assert_eq!(app.queue.current_index(), 1, "the playing track keeps its place");
     assert_eq!(app.queue_cursor, 1);
     assert_eq!(
         play_calls(&calls).len(),
@@ -907,7 +923,7 @@ fn test_enter_on_a_missing_track_starts_the_next_existing_one_first() {
     assert!(poll_until(&mut app, |app| app.status_message.starts_with("Queued")));
     assert_eq!(app.status_message, "Queued 3 tracks from Road Trip, 1 missing");
     assert_eq!(queue_paths(&app), vec![first.clone(), third.clone(), fourth.clone()]);
-    assert_eq!(app.queue.current_index, 1);
+    assert_eq!(app.queue.current_index(), 1);
     assert_eq!(play_calls(&calls).len(), 1);
     assert!(app.playlists.is_missing(&ghost));
     let _ = std::fs::remove_dir_all(&dir);
@@ -942,7 +958,7 @@ fn test_enter_after_the_last_existing_track_wraps_to_the_first() {
     drop(gate_tx);
     assert!(poll_until(&mut app, |app| app.status_message.starts_with("Queued")));
     assert_eq!(queue_paths(&app), vec![first.clone(), second.clone()]);
-    assert_eq!(app.queue.current_index, 0);
+    assert_eq!(app.queue.current_index(), 0);
     assert_eq!(play_calls(&calls).len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -979,7 +995,7 @@ fn test_tracks_queued_while_the_rest_are_checked_stay_after_the_playlist() {
         queue_paths(&app),
         vec![first.clone(), second.clone(), third.clone(), dir.join("old.mp3")]
     );
-    assert_eq!(app.queue.current_index, 1);
+    assert_eq!(app.queue.current_index(), 1);
     assert_eq!(app.queue_cursor, 3, "the cursor stays on the row it was on");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1038,7 +1054,7 @@ fn test_enter_on_a_link_to_an_audio_file_starts_on_its_target() {
     app.queue_selected_playlist(Some(1));
     assert!(poll_until(&mut app, |app| app.status_message.starts_with("Queued")));
     assert_eq!(queue_paths(&app), vec![first.clone(), target.clone(), third.clone()]);
-    assert_eq!(app.queue.current_index, 1);
+    assert_eq!(app.queue.current_index(), 1);
     assert_eq!(play_calls(&calls), vec![format!("play {}", target.display())]);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1119,7 +1135,8 @@ fn test_started_track_ending_before_the_rest_is_checked_goes_on_to_the_next_trac
         );
         assert_eq!(queue_paths(&app), paths, "{}", mode);
         assert_eq!(
-            app.queue.current_index, 1,
+            app.queue.current_index(),
+            1,
             "{}: playback went on to the next track",
             mode
         );
@@ -1154,12 +1171,12 @@ fn test_next_while_the_rest_is_checked_plays_the_next_track_once_known() {
     press(&mut app, crossterm::event::KeyCode::Right);
     assert_eq!(app.status_message, "Next track plays once Road Trip is checked…");
     assert!(app.player.is_playing(), "the started track keeps playing");
-    assert_eq!(app.queue.current_index, 0);
+    assert_eq!(app.queue.current_index(), 0);
 
     drop(gate_tx);
     assert!(poll_until(&mut app, |app| !app.playlists.queue_check_pending()));
     assert_eq!(queue_paths(&app), paths);
-    assert_eq!(app.queue.current_index, 1);
+    assert_eq!(app.queue.current_index(), 1);
     assert_eq!(play_calls(&calls).last(), Some(&format!("play {}", paths[1].display())));
     assert_eq!(play_calls(&calls).len(), 2);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1189,7 +1206,7 @@ fn test_previous_while_the_rest_is_checked_plays_the_previous_track_once_known()
     drop(gate_tx);
     assert!(poll_until(&mut app, |app| !app.playlists.queue_check_pending()));
     assert_eq!(queue_paths(&app), paths);
-    assert_eq!(app.queue.current_index, 0);
+    assert_eq!(app.queue.current_index(), 0);
     assert_eq!(play_calls(&calls).last(), Some(&format!("play {}", paths[0].display())));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1250,7 +1267,7 @@ fn test_enter_on_the_second_copy_of_a_file_queues_every_entry_once() {
     assert!(poll_until(&mut app, |app| app.status_message.starts_with("Queued")));
     assert_eq!(app.status_message, "Queued 4 tracks from Road Trip");
     assert_eq!(queue_paths(&app), vec![x.clone(), y.clone(), x.clone(), z.clone()]);
-    assert_eq!(app.queue.current_index, 2, "the second copy is the one playing");
+    assert_eq!(app.queue.current_index(), 2, "the second copy is the one playing");
     assert_eq!(play_calls(&calls).len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1287,13 +1304,13 @@ fn test_rest_goes_around_the_playing_copy_when_another_copy_is_queued_ahead_of_i
         ..Default::default()
     });
     assert!(app.queue.reorder_track(1, 0));
-    assert_eq!(app.queue.current_index, 1);
+    assert_eq!(app.queue.current_index(), 1);
 
     drop(gate_tx);
     assert!(poll_until(&mut app, |app| app.status_message.starts_with("Queued")));
-    let titles: Vec<String> = app.queue.tracks.iter().map(|t| t.title.clone()).collect();
+    let titles: Vec<String> = app.queue.tracks().iter().map(|t| t.title.clone()).collect();
     assert_eq!(titles, vec!["Ex", "Why", "Ex again", "Ex", "Zed"]);
-    assert_eq!(app.queue.current_index, 3);
-    assert_eq!(app.queue.tracks[4].filepath, z);
+    assert_eq!(app.queue.current_index(), 3);
+    assert_eq!(app.queue.tracks()[4].filepath, z);
     let _ = std::fs::remove_dir_all(&dir);
 }

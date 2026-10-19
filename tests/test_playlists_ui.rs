@@ -27,6 +27,24 @@ fn fresh_dirs(tag: &str) -> PathBuf {
     temp_dir
 }
 
+/// The first row of `buffer` containing `text`.
+fn row_with(buffer: &ratatui::buffer::Buffer, text: &str) -> u16 {
+    common::tui::find_row(buffer, text)
+        .unwrap_or_else(|| panic!("{text:?} not drawn:\n{}", common::tui::rows(buffer).join("\n")))
+}
+
+/// The first row whose PLAYLISTS pane part (columns 2–45 at 120 columns) contains `text`.
+fn pane_row(buffer: &ratatui::buffer::Buffer, text: &str) -> u16 {
+    (0..buffer.area.height)
+        .find(|&y| common::tui::cells(buffer, y)[2..46].concat().contains(text))
+        .unwrap_or_else(|| panic!("{text:?} not in the pane:\n{}", common::tui::rows(buffer).join("\n")))
+}
+
+/// Whether the PLAYLISTS pane's part of row `y` (columns 2–45 at 120 columns) ends with `text`.
+fn pane_ends_with(buffer: &ratatui::buffer::Buffer, y: u16, text: &str) -> bool {
+    common::tui::cells(buffer, y)[2..46].concat().trim_end().ends_with(text)
+}
+
 fn entry(dir: &Path, file: &str, artist: &str, title: &str, secs: i64) -> PlaylistEntry {
     PlaylistEntry {
         path: dir.join(file),
@@ -169,23 +187,47 @@ fn test_playlists_tab_renders_rows_titles_and_empty_playlist() {
     wait_loaded(&mut app);
     press(&mut app, KeyCode::Char('5'));
 
-    // Sorted case-insensitively: "chill" comes first and is selected.
-    let view = render(&mut app, 120, 30);
-    assert!(view.contains("chill  (0 tracks)"), "{}", view);
-    assert!(view.contains("Road Trip  (2 tracks)"), "{}", view);
+    // Sorted case-insensitively: "chill" comes first and is selected. Each row is the name
+    // (UPPERCASE) and its track count against the panel's right edge.
+    let buffer = common::tui::render(&mut app, 120, 30);
+    let view = common::tui::rows(&buffer).join("\n");
+    let chill = pane_row(&buffer, "CHILL");
+    let road_trip = pane_row(&buffer, "ROAD TRIP");
+    assert!(chill < road_trip, "{}", view);
+    assert!(pane_ends_with(&buffer, chill, "0"), "{}", view);
+    assert!(pane_ends_with(&buffer, road_trip, "2"), "{}", view);
     assert!(
         view.contains("Empty. Press L on a track in tab 2 to add it."),
         "{}",
         view
     );
+    assert!(view.contains("CHILL") && view.contains("0 TRACKS"), "{}", view);
 
-    // Down selects Road Trip; the unknown duration is left out of the total.
+    // Down selects Road Trip; the unknown duration is left out of the total and of its row.
     press(&mut app, KeyCode::Down);
     assert_eq!(app.playlists.selected_name().as_deref(), Some("Road Trip"));
-    let view = render(&mut app, 120, 30);
-    assert!(view.contains("ROAD TRIP (2 tracks, 4:44)"), "{}", view);
-    assert!(view.contains("1. Radiohead - Airbag  4:44"), "{}", view);
-    assert!(view.contains("2. Paranoid Android  -:--"), "{}", view);
+    let buffer = common::tui::render(&mut app, 120, 30);
+    let view = common::tui::rows(&buffer).join("\n");
+    let label = common::tui::row(&buffer, row_with(&buffer, "2 TRACKS"));
+    assert!(
+        label.contains("ROAD TRIP") && label.contains("2 TRACKS  ·  04:44"),
+        "{}",
+        view
+    );
+    let airbag = common::tui::row(&buffer, row_with(&buffer, "AIRBAG"));
+    assert!(airbag.contains("01   AIRBAG"), "{}", view);
+    assert!(
+        airbag.contains("RADIOHEAD") && airbag.trim_end().ends_with("04:44"),
+        "{}",
+        view
+    );
+    let paranoid = common::tui::row(&buffer, row_with(&buffer, "PARANOID ANDROID"));
+    assert!(paranoid.contains("02   PARANOID ANDROID"), "{}", view);
+    assert!(
+        paranoid.trim_end().ends_with("PARANOID ANDROID"),
+        "no length shown: {}",
+        view
+    );
 
     // A small terminal must not panic.
     render(&mut app, 40, 12);

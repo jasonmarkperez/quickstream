@@ -10,9 +10,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use super::kit::{self, visible_tail};
-use super::theme;
-use super::AppUI;
+use super::kit::{self, text_width, visible_tail, Col, PanelSpec, RowMark};
+use super::screen::{Screen, WidthTier};
+use super::{queue_tab, theme, AppUI};
 use crate::paths;
 use crate::playlist::{Playlist, PlaylistEntry};
 use crate::playlist_store::{LoadResult, PlaylistStore, WriteFailure};
@@ -162,11 +162,6 @@ pub fn mount_hint(path: &std::path::Path) -> Option<String> {
     (folders == 2).then(|| hint.display().to_string())
 }
 
-/// Row text for a playlist entry whose file was not found: `<n>. ✗ missing: <label>  ----`.
-pub fn missing_row_text(index: usize, entry: &crate::playlist::PlaylistEntry) -> String {
-    format!("{}. ✗ missing: {}  ----", index + 1, entry.display_label())
-}
-
 /// Tracks waiting for the user to choose a playlist.
 #[derive(Debug, Clone)]
 pub enum PendingAdd {
@@ -226,6 +221,13 @@ pub struct PlaylistsUi {
     /// Rows each pane showed at the last render: how far PageUp / PageDown move.
     pub list_page_height: usize,
     pub tracks_page_height: usize,
+    /// Known total length and column layout of the playlist under the cursor, keyed on the
+    /// store revision, the cursor and the missing-file checks, so a long playlist is not walked
+    /// every frame and its columns don't change while it scrolls.
+    tracks_summary: Option<((u64, usize, u64), TracksSummary)>,
+    /// Width of the PLAYLISTS panel's track count column, from every playlist, per store
+    /// revision.
+    list_count_cols: Option<(u64, usize)>,
     /// The playlist last created from the name prompt, and the one selected before it: if the
     /// writer then reports the create failed, the cursor goes back there instead of staying on
     /// the row the new playlist had sorted into.
@@ -258,6 +260,8 @@ impl PlaylistsUi {
             tracks_state: ListState::default(),
             list_page_height: 10,
             tracks_page_height: 10,
+            tracks_summary: None,
+            list_count_cols: None,
             created_from: None,
             folder_add_creates: HashMap::new(),
         }
@@ -369,19 +373,6 @@ fn wrap_step(cursor: usize, len: usize, down: bool) -> usize {
     }
 }
 
-/// `m:ss`, or `h:mm:ss` from one hour; `-:--` when the length is unknown (negative).
-pub fn format_duration(secs: i64) -> String {
-    if secs < 0 {
-        return "-:--".to_string();
-    }
-    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    if h > 0 {
-        format!("{}:{:02}:{:02}", h, m, s)
-    } else {
-        format!("{}:{:02}", m, s)
-    }
-}
-
 /// "1 track" / "24 tracks".
 pub fn track_count_label(count: usize) -> String {
     if count == 1 {
@@ -389,16 +380,6 @@ pub fn track_count_label(count: usize) -> String {
     } else {
         format!("{} tracks", count)
     }
-}
-
-/// Tracks-pane row for the entry at `index`: `<n>. <artist> - <title>  <m:ss>`.
-pub fn track_row_label(index: usize, entry: &PlaylistEntry) -> String {
-    format!(
-        "{}. {}  {}",
-        index + 1,
-        entry.display_label(),
-        format_duration(entry.duration_secs)
-    )
 }
 
 impl AppUI {
@@ -586,120 +567,23 @@ impl AppUI {
         }
     }
 
+    /// Tab 5: the PLAYLISTS and tracks panels (2f). From 90 columns they are 4 columns apart and
+    /// the tracks panel's footnote is the playlist's file; at 80–89 the artist column and the
+    /// footnote drop and the panels are 2 apart; under 80 only the focused pane shows, and `h` /
+    /// `l` switch it. The page sizes of PageUp / PageDown are the rows each list shows.
     pub(super) fn render_playlists_tab(&mut self, f: &mut Frame, area: Rect) {
         self.playlists.clamp_cursors();
-        let split = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-            .split(area);
-        let focused = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-        let unfocused = Style::default().fg(Color::DarkGray);
-        let selected = super::theme::cursor();
-        let hint = Style::default().fg(Color::DarkGray);
-        let empty_tracks = Block::default()
-            .borders(Borders::ALL)
-            .title(" TRACKS ")
-            .border_style(unfocused);
-
+        let screen = Screen::new(f.area());
+        let compact = screen.tier < WidthTier::Medium || screen.short;
+        let (list_area, tracks_area) =
+            queue_tab::split_panes(area, screen.tier, self.playlists.tracks_focus, PLAYLISTS_SHARE);
+        let home = self.queue_tab.home.as_deref();
         let ui = &mut self.playlists;
-        // Rows inside each pane's borders: one page for PageUp / PageDown.
-        ui.list_page_height = usize::from(split[0].height.saturating_sub(2)).max(1);
-        ui.tracks_page_height = usize::from(split[1].height.saturating_sub(2)).max(1);
-        if !ui.store.is_loaded() {
-            let text = if ui.load_failed {
-                "Couldn't load playlists. Restart Quickstream to try again."
-            } else {
-                "Loading playlists…"
-            };
-            let loading = Paragraph::new(text)
-                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC))
-                .wrap(Wrap { trim: true })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" PLAYLISTS ")
-                        .border_style(focused),
-                );
-            f.render_widget(loading, split[0]);
-            f.render_widget(empty_tracks, split[1]);
-            return;
-        }
-
-        // Left pane: playlists with their track counts.
-        let list_block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" PLAYLISTS ({}) ", ui.store.playlists().len()))
-            .border_style(if ui.tracks_focus { unfocused } else { focused });
-        if ui.store.playlists().is_empty() {
-            let empty = Paragraph::new("No playlists yet. Press c to create one, or L on any track.")
-                .style(hint)
-                .wrap(Wrap { trim: true })
-                .block(list_block);
-            f.render_widget(empty, split[0]);
-            f.render_widget(empty_tracks, split[1]);
-            return;
-        }
-        let rows: Vec<ListItem> = ui
-            .store
-            .playlists()
-            .iter()
-            .enumerate()
-            .map(|(idx, playlist)| {
-                let text = format!("{}  ({})", playlist.name, track_count_label(playlist.entries.len()));
-                let style = if idx != ui.list_cursor {
-                    Style::default().fg(Color::White)
-                } else if ui.tracks_focus {
-                    // The open playlist stays marked while its tracks have focus.
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                } else {
-                    selected
-                };
-                ListItem::new(text).style(style)
-            })
-            .collect();
-        ui.list_state.select(Some(ui.list_cursor));
-        f.render_stateful_widget(List::new(rows).block(list_block), split[0], &mut ui.list_state);
-
-        // Right pane: the selected playlist's tracks.
-        let playlist = &ui.store.playlists()[ui.list_cursor];
-        let title = format!(
-            " {} ({}, {}) ",
-            playlist.name.to_uppercase(),
-            track_count_label(playlist.entries.len()),
-            format_duration(playlist.total_duration_secs())
-        );
-        let tracks_block = Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .border_style(if ui.tracks_focus { focused } else { unfocused });
-        if playlist.entries.is_empty() {
-            let empty = Paragraph::new("Empty. Press L on a track in tab 2 to add it.")
-                .style(hint)
-                .wrap(Wrap { trim: true })
-                .block(tracks_block);
-            f.render_widget(empty, split[1]);
-            return;
-        }
-        let rows: Vec<ListItem> = playlist
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(idx, entry)| {
-                let style = if idx == ui.track_cursor && ui.tracks_focus {
-                    selected
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                let text = if ui.is_missing(&entry.path) {
-                    missing_row_text(idx, entry)
-                } else {
-                    track_row_label(idx, entry)
-                };
-                ListItem::new(text).style(style)
-            })
-            .collect();
-        ui.tracks_state.select(Some(ui.track_cursor));
-        f.render_stateful_widget(List::new(rows).block(tracks_block), split[1], &mut ui.tracks_state);
+        let list_rows = list_area.map(|a| ui.render_list_panel(f, a, compact));
+        let track_rows = tracks_area.map(|a| ui.render_tracks_panel(f, a, screen.tier, compact, home));
+        // A hidden pane pages by the rows the shown one has: the same panel, a pane-switch away.
+        ui.list_page_height = list_rows.or(track_rows).unwrap_or(1).max(1) as usize;
+        ui.tracks_page_height = track_rows.or(list_rows).unwrap_or(1).max(1) as usize;
     }
 
     pub(super) fn render_playlist_modal(&self, f: &mut Frame) {
@@ -711,6 +595,322 @@ impl AppUI {
             Some(PlaylistModal::AddPicker { pending, cursor }) => self.render_add_picker(f, pending, *cursor),
             None => {}
         }
+    }
+}
+
+/// The PLAYLISTS panel's share of the width the gap between the panels leaves: 46 of 112
+/// columns at 120 (2f).
+const PLAYLISTS_SHARE: (u16, u16) = (23, 56);
+
+/// Width of the PLAYLISTS panel's marker column (`▸`).
+const MARKER_COLS: u16 = 2;
+
+/// Shown in the artist column of an entry whose file was not found (2f).
+const MISSING_FILE: &str = "MISSING FILE";
+
+/// Shown in the length column of an entry whose file was not found.
+const MISSING_LENGTH: &str = "--:--";
+
+/// One tracks-panel row, mapped from a playlist entry at draw time.
+struct TrackRow {
+    title: String,
+    artist: String,
+    duration: String,
+    missing: bool,
+}
+
+/// `text` (a message, kept as written) wrapped in `area`.
+fn panel_message(f: &mut Frame, area: Rect, text: &str, style: Style) {
+    f.render_widget(Paragraph::new(text).style(style).wrap(Wrap { trim: true }), area);
+}
+
+/// `"<n> TRACKS"` (`"1 TRACK"`) and, when any length is known, the total of the known ones.
+fn tracks_note(count: usize, known_total: Option<i64>) -> String {
+    let tracks = kit::upper(&track_count_label(count));
+    match known_total {
+        Some(total) => format!("{tracks}{}{}", queue_tab::SEP, kit::duration(total as f64)),
+        None => tracks,
+    }
+}
+
+/// The playlist under the cursor: the total of its known lengths and what its columns need,
+/// from all its entries (not only the rows on screen).
+#[derive(Debug, Clone, Copy, Default)]
+struct TracksSummary {
+    /// `None` when no length is known.
+    known_total: Option<i64>,
+    /// Width of the length column (`--:--` for a missing file counts too).
+    duration_cols: usize,
+    /// Any entry has an artist or is missing: the artist column (or `MISSING FILE`) shows.
+    any_side: bool,
+}
+
+impl PlaylistsUi {
+    /// The known total length and column layout of the playlist under the cursor, recomputed
+    /// only when the playlists, the cursor or the missing-file checks change.
+    fn selected_summary(&mut self) -> TracksSummary {
+        let key = (self.store.revision(), self.list_cursor, self.exists_version);
+        if let Some((cached, summary)) = self.tracks_summary {
+            if cached == key {
+                return summary;
+            }
+        }
+        let summary = self
+            .selected_playlist()
+            .map(|playlist| {
+                let (mut longest, mut any_length, mut any_missing, mut any_side) = (0, false, false, false);
+                for entry in &playlist.entries {
+                    if self.is_missing(&entry.path) {
+                        any_missing = true;
+                        any_side = true;
+                    } else {
+                        any_side |= !entry.artist.is_empty();
+                        if entry.duration_secs >= 0 {
+                            any_length = true;
+                            longest = longest.max(entry.duration_secs);
+                        }
+                    }
+                }
+                let length_cols = if any_length {
+                    text_width(&kit::duration(longest as f64))
+                } else {
+                    0
+                };
+                let missing_cols = if any_missing { text_width(MISSING_LENGTH) } else { 0 };
+                TracksSummary {
+                    known_total: playlist
+                        .entries
+                        .iter()
+                        .any(|e| e.duration_secs >= 0)
+                        .then(|| playlist.total_duration_secs()),
+                    duration_cols: length_cols.max(missing_cols),
+                    any_side,
+                }
+            })
+            .unwrap_or_default();
+        self.tracks_summary = Some((key, summary));
+        summary
+    }
+
+    /// Width of the PLAYLISTS panel's track count column: the widest count of any playlist.
+    fn count_cols(&mut self) -> usize {
+        let revision = self.store.revision();
+        if let Some((cached, cols)) = self.list_count_cols {
+            if cached == revision {
+                return cols;
+            }
+        }
+        let cols = self
+            .store
+            .playlists()
+            .iter()
+            .map(|p| p.entries.len().to_string().len())
+            .max()
+            .unwrap_or(0);
+        self.list_count_cols = Some((revision, cols));
+        cols
+    }
+
+    /// The PLAYLISTS panel: one row per playlist (name, track count), or the loading, failed or
+    /// empty message. Returns the rows its list shows.
+    fn render_list_panel(&mut self, f: &mut Frame, area: Rect, compact: bool) -> u16 {
+        let count = self.store.is_loaded().then(|| self.store.playlists().len().to_string());
+        let focused = !self.tracks_focus;
+        let list = kit::panel(
+            f,
+            area,
+            PanelSpec {
+                label: "Playlists",
+                right: count.as_deref(),
+                focused,
+                // An empty footnote row keeps the rows level with the tracks panel's.
+                footnote: (!compact).then(Line::default),
+                compact: false,
+            },
+        );
+        if !self.store.is_loaded() {
+            if self.load_failed {
+                let text = format!("{LOAD_FAILED}. Restart Quickstream to try again.");
+                panel_message(f, list, &text, theme::error());
+            } else {
+                panel_message(f, list, "Loading playlists…", theme::mid());
+            }
+            return list.height;
+        }
+        let len = self.store.playlists().len();
+        if len == 0 {
+            panel_message(
+                f,
+                list,
+                "No playlists yet. Press c to create one, or L on any track.",
+                theme::mid(),
+            );
+            return list.height;
+        }
+
+        self.list_state.select(Some(self.list_cursor));
+        let window = kit::visible_window(&mut self.list_state, len, usize::from(list.height));
+        // From every playlist, so the column doesn't change while the list scrolls.
+        let count_cols = self.count_cols();
+        let playlists = &self.store.playlists()[window.clone()];
+        for (row_y, (idx, playlist)) in window.zip(playlists).enumerate() {
+            let mark = if idx != self.list_cursor {
+                RowMark::Plain
+            } else if focused {
+                RowMark::Cursor
+            } else {
+                // The open playlist keeps `▸` (bold, as in 2f) while its tracks have focus.
+                RowMark::Marker
+            };
+            let (name_style, count_style) = if mark == RowMark::Marker {
+                let bold = theme::ink().add_modifier(Modifier::BOLD);
+                (bold, bold)
+            } else {
+                (theme::ink(), theme::dim())
+            };
+            let count = queue_tab::right_aligned(&playlist.entries.len().to_string(), count_cols);
+            let cols = [
+                Col::fixed("", MARKER_COLS, name_style),
+                Col::flex(kit::upper(&playlist.name), name_style),
+                Col::fixed(count, count_cols as u16, count_style),
+            ];
+            let y = list.y + row_y as u16;
+            kit::list_row(f, Rect::new(list.x, y, list.width, 1), &cols, mark);
+        }
+        list.height
+    }
+
+    /// The tracks panel: the selected playlist's name, track count and known total length, its
+    /// file as the footnote, and one row per entry (`01  TITLE  ARTIST  04:02`; a missing file
+    /// reads `MISSING FILE` and `--:--`). Returns the rows its list shows.
+    fn render_tracks_panel(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        tier: WidthTier,
+        compact: bool,
+        home: Option<&Path>,
+    ) -> u16 {
+        let focused = self.tracks_focus;
+        let summary = self.selected_summary();
+        let Some(playlist) = self.store.is_loaded().then(|| self.selected_playlist()).flatten() else {
+            let list = kit::panel(
+                f,
+                area,
+                PanelSpec {
+                    label: "Tracks",
+                    right: None,
+                    focused,
+                    footnote: (!compact).then(Line::default),
+                    compact: false,
+                },
+            );
+            return list.height;
+        };
+        let note = tracks_note(playlist.entries.len(), summary.known_total);
+        let footnote = (!compact).then(|| {
+            // Where the file is: under its old name while a rename is unsettled.
+            let file = self
+                .store
+                .file_path_of(&playlist.name)
+                .map(|path| queue_tab::display_path(&path, home))
+                .unwrap_or_default();
+            let room = usize::from(area.width.saturating_sub(2));
+            Line::from(visible_tail(&file, room))
+        });
+        let list = kit::panel(
+            f,
+            area,
+            PanelSpec {
+                label: &playlist.name,
+                right: Some(&note),
+                focused,
+                footnote,
+                compact: false,
+            },
+        );
+        let len = playlist.entries.len();
+        if len == 0 {
+            panel_message(f, list, "Empty. Press L on a track in tab 2 to add it.", theme::mid());
+            return list.height;
+        }
+
+        self.tracks_state.select(Some(self.track_cursor));
+        let window = kit::visible_window(&mut self.tracks_state, len, usize::from(list.height));
+        let playlist = &self.store.playlists()[self.list_cursor];
+        let rows: Vec<(usize, TrackRow)> = window
+            .map(|idx| {
+                let entry = &playlist.entries[idx];
+                let missing = self.is_missing(&entry.path);
+                let duration = if missing {
+                    MISSING_LENGTH.to_string()
+                } else if entry.duration_secs >= 0 {
+                    kit::duration(entry.duration_secs as f64)
+                } else {
+                    // Unknown length: left out, never faked.
+                    String::new()
+                };
+                let row = TrackRow {
+                    title: kit::upper(&entry.title),
+                    artist: if missing {
+                        String::new()
+                    } else {
+                        kit::upper(&entry.artist)
+                    },
+                    duration,
+                    missing,
+                };
+                (idx, row)
+            })
+            .collect();
+
+        let digits = len.to_string().len().max(2);
+        let index_cols = digits as u16 + 3;
+        // Columns decided from the whole playlist, so they don't change while scrolling.
+        let duration_cols = summary.duration_cols;
+        let show_artist = tier >= WidthTier::Medium && summary.any_side;
+        // Title and artist share what is left 5:4 (30 and 24 columns in 2f).
+        let free = usize::from(list.width).saturating_sub(usize::from(index_cols) + duration_cols);
+        let title_cols = (free * 5 / 9) as u16;
+
+        for (row_y, (idx, row)) in rows.iter().enumerate() {
+            let mark = if focused && *idx == self.track_cursor {
+                RowMark::Cursor
+            } else {
+                // The unfocused tracks pane marks nothing: there is no marker column, and its
+                // cursor is back on the first row whenever another playlist is selected.
+                RowMark::Plain
+            };
+            let (title_style, side) = if row.missing {
+                (theme::dim(), theme::dim())
+            } else {
+                (theme::ink(), theme::mid())
+            };
+            let mut cols = vec![Col::fixed(format!("{:02}", idx + 1), index_cols, theme::dim())];
+            if show_artist {
+                cols.push(Col::fixed(row.title.as_str(), title_cols, title_style));
+                cols.push(if row.missing {
+                    Col::flex(MISSING_FILE, theme::error())
+                } else {
+                    Col::flex(row.artist.as_str(), side)
+                });
+            } else {
+                cols.push(Col::flex(row.title.as_str(), title_style));
+                if row.missing {
+                    cols.push(Col::auto(MISSING_FILE, theme::error()));
+                }
+            }
+            if duration_cols > 0 {
+                cols.push(Col::fixed(
+                    queue_tab::right_aligned(&row.duration, duration_cols),
+                    duration_cols as u16,
+                    side,
+                ));
+            }
+            let y = list.y + row_y as u16;
+            kit::list_row(f, Rect::new(list.x, y, list.width, 1), &cols, mark);
+        }
+        list.height
     }
 }
 
@@ -1140,7 +1340,7 @@ impl super::AppUI {
     /// What `L` would add, or the status message explaining why nothing can be added.
     fn pending_add_for_selection(&self) -> Result<PendingAdd, String> {
         if self.active_tab == 1 && self.queue_focus {
-            return match self.queue.tracks.get(self.queue_cursor) {
+            return match self.queue.tracks().get(self.queue_cursor) {
                 Some(track) => Ok(pending_track(PlaylistEntry::from_metadata(track))),
                 None => Err("Queue is empty".to_string()),
             };
@@ -1703,7 +1903,7 @@ impl AppUI {
         // Stop any autopilot scan and continuous stream, then the queue is this one track.
         self.reset_playback_session();
         self.enqueue_tracks(plan.tracks);
-        self.queue.current_index = 0;
+        self.queue.set_current_index(0);
         self.queue_cursor = 0;
         let playback_error = self.play_current_track();
         self.status_message = match &playback_error {
@@ -1725,9 +1925,9 @@ impl AppUI {
     /// the first queued track with that path, or `None` once it has left the queue.
     fn started_queue_position(&self, started: &StartedPlay) -> Option<usize> {
         if self.queue.current_track().is_some_and(|t| t.filepath == started.path) {
-            return Some(self.queue.current_index);
+            return Some(self.queue.current_index());
         }
-        self.queue.tracks.iter().position(|t| t.filepath == started.path)
+        self.queue.tracks().iter().position(|t| t.filepath == started.path)
     }
 
     /// Whether the track `Enter` started is the current track and the rest of its playlist is
@@ -1850,7 +2050,7 @@ impl AppUI {
             (Some(_), Some(start), None) => {
                 self.reset_playback_session();
                 self.enqueue_tracks(tracks);
-                self.queue.current_index = start;
+                self.queue.set_current_index(start);
                 self.queue_cursor = start;
                 self.play_current_track()
             }
@@ -1879,7 +2079,7 @@ impl AppUI {
                     PlaylistSkip::Ended | PlaylistSkip::Next => self.play_next_track(),
                     PlaylistSkip::Previous => self.play_prev_track(),
                 }
-                self.queue_cursor = self.queue.current_index;
+                self.queue_cursor = self.queue.current_index();
                 (!self.status_message.is_empty()).then(|| self.status_message.clone())
             }
             None => playback_error,
@@ -2132,7 +2332,7 @@ impl AppUI {
     /// queue row for that file (the now-playing track), else the metadata cache, else the file
     /// name. Never reads the file.
     fn playlist_entry_for_web_add(&self, path: &Path) -> PlaylistEntry {
-        match self.queue.tracks.iter().find(|track| track.filepath == path) {
+        match self.queue.tracks().iter().find(|track| track.filepath == path) {
             Some(track) => PlaylistEntry::from_metadata(track),
             None => self.playlist_entry_for_path(path),
         }

@@ -60,7 +60,7 @@ fn test_web_add_file_does_not_read_metadata_on_ui_thread() {
 
     assert!(elapsed < UI_BUDGET, "UI thread blocked for {:?}", elapsed);
     assert_eq!(app.queue.len(), 1);
-    assert_eq!(app.queue.tracks[0].filepath, slow);
+    assert_eq!(app.queue.tracks()[0].filepath, slow);
 }
 
 #[test]
@@ -84,5 +84,5 @@ fn test_web_add_folder_does_not_block_ui_thread() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(app.queue.len(), 1);
-    assert_eq!(app.queue.tracks[0].filepath, slow);
+    assert_eq!(app.queue.tracks()[0].filepath, slow);
 }

@@ -544,7 +544,7 @@ fn test_folder_add_tags_reach_the_index_and_refresh_queue_rows() {
     for _ in 0..200 {
         app.poll_playlists();
         app.poll_background_metadata();
-        if app.queue.tracks[0].duration_seconds > 1.5
+        if app.queue.tracks()[0].duration_seconds > 1.5
             && app
                 .playlists
                 .store
@@ -880,7 +880,7 @@ fn test_add_key_uses_queue_row_and_now_playing_track() {
 
     // Any other tab: the now-playing track, and only while something is playing.
     app.active_tab = 0;
-    app.queue.current_index = 1;
+    app.queue.set_current_index(1);
     press(&mut app, KeyCode::Char('L'));
     assert!(app.playlists.modal.is_none());
     assert_eq!(app.status_message, "Nothing is playing");
