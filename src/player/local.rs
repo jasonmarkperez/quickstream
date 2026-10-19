@@ -20,6 +20,10 @@ struct SharedState {
     is_paused: AtomicBool,
     is_playing: AtomicBool,
     is_finished: AtomicBool,
+    /// The current load asked mpv to start past 0:00. mpv ends such a load with reason "error"
+    /// when the start lies at or past the file's real end (a tag length can be an estimate
+    /// longer than the file), so that end counts as the track finishing (issue #48).
+    started_past_zero: AtomicBool,
 }
 
 /// File name of the mpv IPC socket inside the player's private directory.
@@ -327,7 +331,8 @@ impl LocalPlayer {
                                                 shared.is_finished.store(true, Ordering::SeqCst);
                                                 shared.is_playing.store(false, Ordering::SeqCst);
                                             } else if reason == "error" {
-                                                shared.is_finished.store(false, Ordering::SeqCst);
+                                                let past_end = shared.started_past_zero.load(Ordering::SeqCst);
+                                                shared.is_finished.store(past_end, Ordering::SeqCst);
                                                 shared.is_playing.store(false, Ordering::SeqCst);
                                             }
                                         }
@@ -522,6 +527,9 @@ impl LocalPlayer {
         self.shared_state.is_finished.store(false, Ordering::SeqCst);
         self.shared_state.is_playing.store(true, Ordering::SeqCst);
         self.shared_state.is_paused.store(false, Ordering::SeqCst);
+        self.shared_state
+            .started_past_zero
+            .store(start_seconds > 0.0, Ordering::SeqCst);
 
         if self.backend == "mpv" {
             let mpv_res = (|| -> anyhow::Result<()> {

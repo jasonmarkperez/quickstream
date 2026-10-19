@@ -296,3 +296,39 @@ fn test_mpv_play_at_loads_file_with_start_position() {
     drop(player);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Waits up to 5 s for `player` to report that its track finished.
+fn wait_for_finished(player: &mut LocalPlayer) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if player.is_track_finished() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[test]
+fn test_mpv_play_at_past_the_end_finishes_the_track() {
+    common::isolate();
+    if !has("mpv") {
+        eprintln!("SKIPPED: mpv not installed");
+        return;
+    }
+    let Some(track) = silent_track() else {
+        eprintln!("SKIPPED: ffmpeg not installed");
+        return;
+    };
+
+    // A tag length can be an estimate longer than the file, so a hand-off can ask for a start
+    // past the real end. mpv then ends the load with reason "error"; the track must still count
+    // as finished so the queue moves on instead of sitting stopped (issue #48).
+    let mut player = LocalPlayer::new("mpv");
+    player.play_at(&track, 95.0).expect("play_at");
+    assert!(
+        wait_for_finished(&mut player),
+        "play_at past the end never reported the track finished"
+    );
+    assert!(!player.is_playing(), "nothing plays after a start past the end");
+}

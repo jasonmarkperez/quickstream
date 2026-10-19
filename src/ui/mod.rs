@@ -35,7 +35,7 @@ use crate::metadata::is_supported_audio_file;
 use crate::paths;
 use crate::player::local::LocalPlayer;
 use crate::player::worker::AsyncPlayer;
-use crate::player::AudioPlayer;
+use crate::player::{resume_position, AudioPlayer, Resume};
 use crate::queue::PlaybackQueue;
 use crate::settings::{setting, SettingsContext, SettingsManager, SETTING_DEFINITIONS, SETTING_DISPLAY_ORDER};
 
@@ -3223,10 +3223,30 @@ impl AppUI {
         }
     }
 
+    /// Length of the track the current output plays, for [`resume_position`]: the player's when
+    /// it knows it, else the track's own (0 when neither is known). Read before the old player
+    /// stops; the new one's `play_at` returns before it has loaded the file.
+    fn resume_duration(&self) -> f64 {
+        let reported = self.player.duration_seconds();
+        if reported.is_finite() && reported > 0.0 {
+            return reported;
+        }
+        self.queue.current_track().map(|t| t.duration_seconds).unwrap_or(0.0)
+    }
+
+    /// An output switch found the track over (issue #48): move on as at its natural end, so
+    /// stop-at-end and repeat-one behave as usual. A paused track's successor loads paused.
+    fn finish_track_after_switch(&mut self, was_paused: bool) {
+        self.handle_track_finished();
+        if was_paused && self.player.is_playing() {
+            let _ = self.player.pause();
+        }
+    }
+
     pub fn switch_to_local_player(&mut self) {
         let was_playing = self.player.is_playing();
         let was_paused = self.player.is_paused();
-        let pos = self.player.position_seconds();
+        let resume = resume_position(self.player.position_seconds(), self.resume_duration());
         let vol = self.player.volume();
         let current_track = self.queue.current_track().cloned();
 
@@ -3241,19 +3261,28 @@ impl AppUI {
         let mut new_player = spawn_local_player(&backend, vol);
         let _ = new_player.set_volume(vol);
 
+        let mut track_over = false;
         if let Some(track) = current_track {
             if was_playing || was_paused {
-                if let Ok(mut s) = self.web_state.write() {
-                    s.filepath = Some(track.filepath.clone());
-                }
-                if new_player.play_at(&track.filepath, pos).is_ok() && was_paused {
-                    let _ = new_player.pause();
+                match resume {
+                    Resume::At(pos) => {
+                        if let Ok(mut s) = self.web_state.write() {
+                            s.filepath = Some(track.filepath.clone());
+                        }
+                        if new_player.play_at(&track.filepath, pos).is_ok() && was_paused {
+                            let _ = new_player.pause();
+                        }
+                    }
+                    Resume::NextTrack => track_over = true,
                 }
             }
         }
 
         let old = std::mem::replace(&mut self.player, new_player);
         self.retire_player(old);
+        if track_over {
+            self.finish_track_after_switch(was_paused);
+        }
         self.status_message = "Active output: Local Audio".to_string();
         self.sync_web_server();
         self.update_web_state();
@@ -3276,7 +3305,7 @@ impl AppUI {
             .unwrap_or(self.settings_mgr.settings.web_server_port);
         let was_playing = self.player.is_playing();
         let was_paused = self.player.is_paused();
-        let pos = self.player.position_seconds();
+        let resume = resume_position(self.player.position_seconds(), self.resume_duration());
         let current_track = self.queue.current_track().cloned();
 
         self.player.detach_stream_state();
@@ -3302,22 +3331,31 @@ impl AppUI {
         ));
 
         let status = format!("Active output: {}", dev.friendly_name);
+        let mut track_over = false;
         if let Some(track) = current_track {
             if was_playing || was_paused {
-                if let Some(ref ws) = self.web_server {
-                    ws.register_stream_file(&track.filepath);
-                }
-                if let Ok(mut s) = self.web_state.write() {
-                    s.filepath = Some(track.filepath.clone());
-                }
-                if upnp_player.play_at(&track.filepath, pos).is_ok() && was_paused {
-                    let _ = upnp_player.pause();
+                match resume {
+                    Resume::At(pos) => {
+                        if let Some(ref ws) = self.web_server {
+                            ws.register_stream_file(&track.filepath);
+                        }
+                        if let Ok(mut s) = self.web_state.write() {
+                            s.filepath = Some(track.filepath.clone());
+                        }
+                        if upnp_player.play_at(&track.filepath, pos).is_ok() && was_paused {
+                            let _ = upnp_player.pause();
+                        }
+                    }
+                    Resume::NextTrack => track_over = true,
                 }
             }
         }
 
         let old = std::mem::replace(&mut self.player, upnp_player);
         self.retire_player(old);
+        if track_over {
+            self.finish_track_after_switch(was_paused);
+        }
         self.status_message = status;
         self.update_web_state();
     }

@@ -45,3 +45,29 @@ pub trait AudioPlayer: Send + Sync {
         None
     }
 }
+
+/// How close to its end, in seconds, a track counts as over when playback moves to another
+/// output (issue #48).
+pub const RESUME_END_MARGIN_SECONDS: f64 = 1.0;
+
+/// Where the new output picks up a track when playback moves to it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Resume {
+    /// Start the track at this many seconds.
+    At(f64),
+    /// The track is over: move on as at its natural end.
+    NextTrack,
+}
+
+/// Where to resume a track `duration` seconds long that was at `position` when the output
+/// changed. A start at or past a file's real end leaves mpv stopped without ever reporting the
+/// end, so inside the last [`RESUME_END_MARGIN_SECONDS`] (or past the end) the track is over.
+/// With an unknown length (0, as the continuous stream can report) the position is kept.
+pub fn resume_position(position: f64, duration: f64) -> Resume {
+    let position = if position.is_finite() { position.max(0.0) } else { 0.0 };
+    if duration.is_finite() && duration > 0.0 && position > 0.0 && position >= duration - RESUME_END_MARGIN_SECONDS {
+        Resume::NextTrack
+    } else {
+        Resume::At(position)
+    }
+}
