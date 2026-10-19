@@ -332,7 +332,8 @@ impl AppUI {
 
     /// The NOW PLAYING footnote: `TRACK 04/12 · QUEUE LOOP · ▶ PLAYING`. Compact (at the right
     /// end of the label row, in `room` columns): `04/12 · LOOP · ▶ PLAYING · ⚡ PROFILE`, giving
-    /// up the mode, then the position, then the profile until it fits; the state always stays.
+    /// up the mode, then the position, then the profile until it fits; the state always stays,
+    /// as its glyph alone (`▶`) when even the word doesn't fit.
     fn hero_footnote(&self, has_track: bool, compact: bool, room: usize) -> String {
         let len = self.queue.len();
         let digits = len.to_string().len().max(2);
@@ -357,7 +358,12 @@ impl AppUI {
                 return joined;
             }
         }
-        state
+        if text_width(&state) <= room {
+            return state;
+        }
+        // Too narrow for the word: the glyph alone, which the label row keeps even when it has
+        // to shorten the label.
+        self.player_state_glyph().to_string()
     }
 
     /// The NOW PLAYING panel header; returns the area left for its content.

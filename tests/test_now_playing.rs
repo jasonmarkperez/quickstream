@@ -1062,3 +1062,27 @@ fn test_now_playing_up_next_format_treats_high_bitrate_m4a_as_lossless() {
     assert!(aac.contains("M4A 256"), "{aac:?}");
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Too narrow for `▶ PLAYING` beside the label, the compact footnote still shows the state, as
+/// its glyph alone.
+#[test]
+fn test_now_playing_compact_footnote_keeps_the_state_when_very_narrow() {
+    common::isolate();
+    let (mut app, dir) = np_app("narrow_state");
+    for (w, wanted, word) in [(24, "▶", "PLAYING"), (26, "▶", "PLAYING")] {
+        let buffer = common::tui::render(&mut app, w, 24);
+        let rows = common::tui::rows(&buffer);
+        let label = rows
+            .iter()
+            .find(|r| r.contains("NOW PLA"))
+            .unwrap_or_else(|| panic!("{w}: no label row:\n{}", rows.join("\n")));
+        let note = label.trim_start().trim_start_matches("NOW PLAYING");
+        assert!(note.contains(wanted), "{w}: {label:?}");
+        assert!(!note.contains(word), "{w}: {label:?}");
+    }
+    app.pending_track_skip = true;
+    let rows = common::tui::rows(&common::tui::render(&mut app, 24, 24));
+    let label = rows.iter().find(|r| r.contains("NOW PLA")).expect("label row");
+    assert!(label.contains('»'), "{label:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
