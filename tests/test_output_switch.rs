@@ -236,3 +236,33 @@ fn test_switch_to_local_in_the_last_second_plays_the_next_track() {
     assert_eq!(app.status_message, "Active output: Local Audio");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_switch_after_an_unhandled_track_end_plays_the_next_track() {
+    common::isolate();
+    // The old output reported the track finished (and no longer playing) after the event loop's
+    // last check: retiring it must not lose that end.
+    let mut ended = FakePlayer::playing_at(180.0, 180.0);
+    ended.playing = false;
+    ended.finished = true;
+    let (mut app, dir) = app("ended", "loop", &[("First", 180.0), ("Second", 200.0)], ended);
+    app.switch_to_upnp_player(unresponsive_renderer());
+    assert_eq!(app.queue.current_index(), 1, "the queue moves on to the next track");
+    assert!(app.player.is_playing());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_switch_while_stopped_near_the_end_starts_nothing() {
+    common::isolate();
+    let mut stopped = FakePlayer::playing_at(179.6, 180.0);
+    stopped.playing = false;
+    let (mut app, dir) = app("stopped", "loop", &[("First", 180.0), ("Second", 200.0)], stopped);
+    app.switch_to_upnp_player(unresponsive_renderer());
+    assert_eq!(app.queue.current_index(), 0);
+    assert!(
+        !app.player.is_playing(),
+        "a stopped player stays stopped on the new output"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

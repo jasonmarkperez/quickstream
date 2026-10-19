@@ -11,6 +11,8 @@ pub struct FakePlayer {
     pub paused: bool,
     pub position: f64,
     pub duration: f64,
+    /// What `is_track_finished` reports until `reset_finished`.
+    pub finished: bool,
     pub volume: u8,
     /// What `backend_name` reports.
     pub backend: Option<&'static str>,
@@ -23,6 +25,7 @@ impl Default for FakePlayer {
             paused: false,
             position: 0.0,
             duration: 0.0,
+            finished: false,
             volume: 50,
             backend: None,
         }
@@ -97,6 +100,12 @@ impl AudioPlayer for FakePlayer {
     }
     fn duration_seconds(&self) -> f64 {
         self.duration
+    }
+    fn is_track_finished(&mut self) -> bool {
+        self.finished
+    }
+    fn reset_finished(&mut self) {
+        self.finished = false;
     }
     fn backend_name(&self) -> Option<&'static str> {
         self.backend

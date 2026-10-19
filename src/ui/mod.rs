@@ -3234,6 +3234,20 @@ impl AppUI {
         self.queue.current_track().map(|t| t.duration_seconds).unwrap_or(0.0)
     }
 
+    /// Where the new output picks up the current track, read from the old player before it
+    /// stops, and whether the old player had already reported the track finished. Such a report
+    /// the event loop has not handled yet would be lost with the retired player and leave the
+    /// queue stuck, so the track is over then too, though the player no longer reads as playing.
+    fn resume_on_new_output(&mut self) -> (Resume, bool) {
+        if self.player.is_track_finished() {
+            return (Resume::NextTrack, true);
+        }
+        (
+            resume_position(self.player.position_seconds(), self.resume_duration()),
+            false,
+        )
+    }
+
     /// An output switch found the track over (issue #48): move on as at its natural end, so
     /// stop-at-end and repeat-one behave as usual. A paused track's successor loads paused.
     fn finish_track_after_switch(&mut self, was_paused: bool) {
@@ -3246,7 +3260,7 @@ impl AppUI {
     pub fn switch_to_local_player(&mut self) {
         let was_playing = self.player.is_playing();
         let was_paused = self.player.is_paused();
-        let resume = resume_position(self.player.position_seconds(), self.resume_duration());
+        let (resume, finished) = self.resume_on_new_output();
         let vol = self.player.volume();
         let current_track = self.queue.current_track().cloned();
 
@@ -3263,7 +3277,7 @@ impl AppUI {
 
         let mut track_over = false;
         if let Some(track) = current_track {
-            if was_playing || was_paused {
+            if was_playing || was_paused || finished {
                 match resume {
                     Resume::At(pos) => {
                         if let Ok(mut s) = self.web_state.write() {
@@ -3305,7 +3319,7 @@ impl AppUI {
             .unwrap_or(self.settings_mgr.settings.web_server_port);
         let was_playing = self.player.is_playing();
         let was_paused = self.player.is_paused();
-        let resume = resume_position(self.player.position_seconds(), self.resume_duration());
+        let (resume, finished) = self.resume_on_new_output();
         let current_track = self.queue.current_track().cloned();
 
         self.player.detach_stream_state();
@@ -3333,7 +3347,7 @@ impl AppUI {
         let status = format!("Active output: {}", dev.friendly_name);
         let mut track_over = false;
         if let Some(track) = current_track {
-            if was_playing || was_paused {
+            if was_playing || was_paused || finished {
                 match resume {
                     Resume::At(pos) => {
                         if let Some(ref ws) = self.web_server {
