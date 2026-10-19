@@ -1,5 +1,6 @@
 //! Small drawing pieces shared by the Telemetry screens: key row, volume meter, progress bar,
-//! panel headers, list rows in columns, display-width-aware text fitting and a cached clock.
+//! big numerals, panel headers, list rows in columns, display-width-aware text fitting and a
+//! cached clock.
 //!
 //! Everything here is pure (no I/O) and cheap enough to call on every frame.
 
@@ -24,7 +25,7 @@ const VOLUME_CELLS: usize = 11;
 
 /// Columns at the right of a panel kept clear of text: the rule's ` ▪` sits there, and the cursor
 /// bar reaches one column into it.
-const PANEL_RIGHT_PAD: u16 = 2;
+pub(super) const PANEL_RIGHT_PAD: u16 = 2;
 
 /// Columns between a panel label and its right note.
 const LABEL_GAP: usize = 2;
@@ -247,6 +248,51 @@ pub fn progress_bar(inner_width: usize, ratio: f64) -> Vec<Span<'static>> {
     }
     spans.push(Span::styled("▏", theme::ink()));
     spans
+}
+
+/// Rows of the big numerals `0`–`9` (3 columns each, heavy box drawing; style sheet 2a).
+const BIG_DIGITS: [[&str; 3]; 10] = [
+    ["┏━┓", "┃ ┃", "┗━┛"],
+    ["  ╻", "  ┃", "  ╹"],
+    ["╺━┓", "┏━┛", "┗━╸"],
+    ["╺━┓", " ━┫", "╺━┛"],
+    ["╻ ╻", "┗━┫", "  ╹"],
+    ["┏━╸", "┗━┓", "╺━┛"],
+    ["┏━╸", "┣━┓", "┗━┛"],
+    ["╺━┓", "  ┃", "  ╹"],
+    ["┏━┓", "┣━┫", "┗━┛"],
+    ["┏━┓", "┗━┫", "╺━┛"],
+];
+
+/// The big-numeral glyph of `c`: a digit (3 columns) or `:` (1 column, the dot on the middle row).
+fn big_glyph(c: char) -> Option<[&'static str; 3]> {
+    match c {
+        ':' => Some([" ", ":", " "]),
+        _ => c.to_digit(10).map(|d| BIG_DIGITS[d as usize]),
+    }
+}
+
+/// `text` (a time such as `02:41` or `1:15:00`) in the 3-row big numerals of Now Playing, top row
+/// first, glyphs one column apart. Characters other than digits and `:` are left out.
+pub fn big_digits(text: &str) -> [String; 3] {
+    let mut rows: [String; 3] = Default::default();
+    for (n, glyph) in text.chars().filter_map(big_glyph).enumerate() {
+        for (row, part) in rows.iter_mut().zip(glyph) {
+            if n > 0 {
+                row.push(' ');
+            }
+            row.push_str(part);
+        }
+    }
+    rows
+}
+
+/// Columns each row of [`big_digits`]`(text)` takes.
+pub fn big_digits_width(text: &str) -> usize {
+    let (count, cols) = text.chars().filter_map(big_glyph).fold((0, 0), |(count, cols), glyph| {
+        (count + 1, cols + glyph[0].chars().count())
+    });
+    (cols + count).saturating_sub(1)
 }
 
 /// What [`panel`] draws above a panel's content.

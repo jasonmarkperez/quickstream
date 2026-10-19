@@ -404,7 +404,8 @@ impl LibraryManager {
             }
         }
 
-        // Helper to process an audio file path quickly without blocking network I/O
+        // Helper to process an audio file path quickly without blocking network I/O. A file not in
+        // the cache gets a placeholder whose audio properties stay unknown (0) until its tags are read.
         let process_file = |path: &Path, tracks: &mut Vec<AudioMetadata>| {
             let file_len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             if let Some(cached) = cache.get(path) {
@@ -424,8 +425,6 @@ impl LibraryManager {
                 album,
                 format_name: ext,
                 file_size: file_len,
-                sample_rate_hz: 44100,
-                channels: 2,
                 ..Default::default()
             });
         };
@@ -639,8 +638,6 @@ impl LibraryManager {
                     genre: feat.genre,
                     format_name: path.extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase(),
                     file_size: file_len,
-                    sample_rate_hz: 44100,
-                    channels: 2,
                     ..Default::default()
                 };
             }
@@ -663,8 +660,6 @@ impl LibraryManager {
                 album,
                 format_name: ext,
                 file_size: file_len,
-                sample_rate_hz: 44100,
-                channels: 2,
                 ..Default::default()
             }
         };

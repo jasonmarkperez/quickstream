@@ -170,7 +170,7 @@ fn spread<'a>(mut left: Vec<Span<'a>>, right: Vec<Span<'a>>, width: usize) -> Li
 
 impl AppUI {
     /// The output the header names: `LOCAL/MPV`, or `DLNA/<RENDERER>`.
-    fn output_label(&self) -> String {
+    pub(super) fn output_label(&self) -> String {
         match self.device_manager.get_active_device() {
             Some(device) => format!("DLNA/{}", kit::upper(&device.friendly_name)),
             None => format!("LOCAL/{}", kit::upper(&self.local_backend())),
@@ -259,6 +259,45 @@ impl AppUI {
         f.render_widget(Line::from(rule), area);
     }
 
+    /// The player state as the strip and Now Playing show it: `»` while a debounced skip is
+    /// pending (the queue moved, the player not yet), else `▶` playing, `‖` paused, `■` stopped.
+    pub(super) fn player_state_glyph(&self) -> &'static str {
+        if self.pending_track_skip {
+            "»"
+        } else if self.player.is_playing() {
+            "▶"
+        } else if self.player.is_paused() {
+            "‖"
+        } else {
+            "■"
+        }
+    }
+
+    /// Elapsed time and length of the current track, as the strip and Now Playing show them. The
+    /// position is a pending seek's target, else the player's. The length is the player's when
+    /// it knows it (the tag length may be an estimate) and is playing or paused, else the
+    /// track's own; `None` when neither is known. A stopped player keeps the last track's
+    /// length, which may not be the current track's (it was removed from the queue, or the
+    /// queue cleared and refilled). During a pending skip the player still holds the old track,
+    /// so the target shows from 00:00 with only its own length, never the old track's.
+    pub(super) fn playback_times(&self) -> (f64, Option<f64>) {
+        let own = self
+            .queue
+            .current_track()
+            .map(|t| t.duration_seconds)
+            .filter(|d| *d > 0.0);
+        if self.pending_track_skip {
+            return (0.0, own);
+        }
+        let pos = self
+            .pending_seek_target
+            .unwrap_or_else(|| self.player.position_seconds())
+            .max(0.0);
+        let loaded = self.player.is_playing() || self.player.is_paused();
+        let player = Some(self.player.duration_seconds()).filter(|d| loaded && *d > 0.0);
+        (pos, player.or(own))
+    }
+
     /// The mini player strip (tabs 2–5): state and title (and artist from 90 columns) on the
     /// left; elapsed time, progress bar, duration and volume on the right.
     pub(super) fn render_strip(&self, f: &mut Frame, area: Rect, screen: &Screen) {
@@ -276,28 +315,10 @@ impl AppUI {
 
         // A debounced skip has moved the queue but not the player yet: show the target track
         // from its start, marked as queued.
-        let glyph = if self.pending_track_skip {
-            "»"
-        } else if self.player.is_playing() {
-            "▶"
-        } else if self.player.is_paused() {
-            "‖"
-        } else {
-            "■"
-        };
-        let (pos, mut dur) = if self.pending_track_skip {
-            (0.0, track.duration_seconds)
-        } else {
-            let pos = self
-                .pending_seek_target
-                .unwrap_or_else(|| self.player.position_seconds());
-            (pos, self.player.duration_seconds())
-        };
-        if dur <= 0.0 {
-            dur = track.duration_seconds;
-        }
-        let ratio = if dur > 0.0 { pos / dur } else { 0.0 };
-        let (pos, dur) = (kit::duration(pos), kit::duration(dur));
+        let glyph = self.player_state_glyph();
+        let (pos, dur) = self.playback_times();
+        let ratio = dur.map_or(0.0, |d| pos / d);
+        let (pos, dur) = (kit::duration(pos), kit::duration(dur.unwrap_or(0.0)));
 
         let title = kit::upper(track.display_title());
         let title_min = 2 + Span::raw(title.as_str()).width().min(12);

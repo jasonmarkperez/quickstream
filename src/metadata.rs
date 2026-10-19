@@ -190,6 +190,34 @@ pub fn parse_path_heuristics(path: &Path) -> (String, String, String) {
     (title, artist, album)
 }
 
+/// The audio properties of a file as [`extract_metadata`] stores them; 0 means unknown.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioProperties {
+    pub duration_seconds: f64,
+    pub bitrate_kbps: u32,
+    pub sample_rate_hz: u32,
+    pub channels: u8,
+}
+
+/// The audio properties lofty read from a `file_size`-byte file. Each one lofty couldn't read
+/// stays 0 (unknown), never guessed: the UI leaves it out. The one exception is a missing
+/// length, estimated from the bitrate and the file size when both are known: an estimate from
+/// the file's own data (exact for constant bitrate), which the queue, seeking and totals need.
+/// The player's own length replaces it on screen once known (`AppUI::playback_times`).
+pub fn audio_properties(properties: &lofty::properties::FileProperties, file_size: u64) -> AudioProperties {
+    let bitrate_kbps = properties.audio_bitrate().unwrap_or(0);
+    let mut duration_seconds = properties.duration().as_secs_f64();
+    if duration_seconds <= 0.0 && bitrate_kbps > 0 && file_size > 0 {
+        duration_seconds = (file_size as f64 * 8.0) / (f64::from(bitrate_kbps) * 1000.0);
+    }
+    AudioProperties {
+        duration_seconds,
+        bitrate_kbps,
+        sample_rate_hz: properties.sample_rate().unwrap_or(0),
+        channels: properties.channels().unwrap_or(0),
+    }
+}
+
 pub fn extract_metadata(path: &Path) -> anyhow::Result<AudioMetadata> {
     let filename = path
         .file_name()
@@ -209,17 +237,12 @@ pub fn extract_metadata(path: &Path) -> anyhow::Result<AudioMetadata> {
     // Probe and parse with lofty, skipping cover art to avoid multi-megabyte image reads
     let parse_opts = ParseOptions::new().read_cover_art(false);
     let tagged_file = Probe::open(path)?.options(parse_opts).guess_file_type()?.read()?;
-    let properties = tagged_file.properties();
-
-    let mut duration_seconds = properties.duration().as_secs_f64();
-    let bitrate_kbps = properties.audio_bitrate().unwrap_or(0);
-    let sample_rate_hz = properties.sample_rate().unwrap_or(0);
-    let channels = properties.channels().unwrap_or(2);
-
-    // If duration couldn't be determined from headers, estimate from bitrate and file size
-    if duration_seconds <= 0.0 && bitrate_kbps > 0 && file_size > 0 {
-        duration_seconds = (file_size as f64 * 8.0) / (bitrate_kbps as f64 * 1000.0);
-    }
+    let AudioProperties {
+        duration_seconds,
+        bitrate_kbps,
+        sample_rate_hz,
+        channels,
+    } = audio_properties(tagged_file.properties(), file_size);
 
     let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag());
 
@@ -264,6 +287,8 @@ pub fn extract_metadata(path: &Path) -> anyhow::Result<AudioMetadata> {
 }
 
 /// Create fast fallback metadata directly from filepath and file size without reading tags.
+/// The audio properties (length, bitrate, sample rate, channels) stay 0, meaning unknown: they
+/// are shown and stored only once the tags are read, never guessed.
 pub fn fallback_metadata(path: &Path) -> AudioMetadata {
     let filename = path
         .file_name()
@@ -279,11 +304,6 @@ pub fn fallback_metadata(path: &Path) -> AudioMetadata {
         .unwrap_or("UNKNOWN")
         .to_uppercase();
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let duration_seconds = if file_size > 0 {
-        (file_size as f64 * 8.0) / (320.0 * 1000.0)
-    } else {
-        0.0
-    };
 
     AudioMetadata {
         filepath: path.to_path_buf(),
@@ -293,11 +313,8 @@ pub fn fallback_metadata(path: &Path) -> AudioMetadata {
         album: String::new(),
         genre: String::new(),
         format_name: ext,
-        duration_seconds,
         file_size,
-        bitrate_kbps: 320,
-        sample_rate_hz: 44100,
-        channels: 2,
+        ..Default::default()
     }
 }
 

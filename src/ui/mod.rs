@@ -11,7 +11,9 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 mod chrome;
+pub mod features;
 pub mod kit;
+mod now_playing;
 pub mod playlists;
 mod queue_tab;
 pub mod screen;
@@ -270,6 +272,8 @@ pub struct AppUI {
     pub analysis_db: crate::analysis::AnalysisDatabase,
     /// Background BPM/key/energy analysis of discovered tracks (stops and joins on drop).
     pub analysis_worker: crate::analysis::worker::AnalysisWorker,
+    /// Reads the current track's analysis features off the UI thread.
+    track_features: features::TrackFeaturesWorker,
     pub active_mix_profile: crate::analysis::MixProfile,
     pub show_mix_picker_modal: bool,
     pub mix_picker_cursor: usize,
@@ -281,6 +285,8 @@ pub struct AppUI {
     clock: kit::ClockCache,
     /// Tab 2 values cached per queue / metadata revision (queued paths, total lengths).
     queue_tab: queue_tab::QueueTabCache,
+    /// Tab 1 values cached per queue revision (Up Next count, total length, columns).
+    now_playing: now_playing::NowPlayingCache,
 }
 
 impl Drop for AppUI {
@@ -351,6 +357,9 @@ impl AppUI {
         let analysis_db = crate::analysis::AnalysisDatabase::open_default()
             .unwrap_or_else(|_| crate::analysis::AnalysisDatabase::open_in_memory().unwrap());
         let active_mix_profile = settings_mgr.settings.mix_profile();
+        let mut workers = WorkerRegistry::new();
+        let track_features =
+            features::TrackFeaturesWorker::spawn(&mut workers, features::database_source(analysis_db.clone()));
 
         let mut app = Self {
             active_tab: 1,
@@ -388,7 +397,7 @@ impl AppUI {
             queue_metadata_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             queue_metadata_attempted: std::collections::HashSet::new(),
             tag_reads,
-            workers: WorkerRegistry::new(),
+            workers,
             browser_state: ListState::default(),
             queue_state: ListState::default(),
             devices_state: ListState::default(),
@@ -413,6 +422,7 @@ impl AppUI {
             autopilot_run_mode: AutopilotRunMode::Fresh,
             autopilot_added_count: 0,
             analysis_worker: crate::analysis::worker::AnalysisWorker::spawn(analysis_db.clone(), 1),
+            track_features,
             analysis_db,
             active_mix_profile,
             show_mix_picker_modal: false,
@@ -421,6 +431,7 @@ impl AppUI {
             playlists,
             clock: kit::ClockCache::new(),
             queue_tab: queue_tab::QueueTabCache::new(),
+            now_playing: now_playing::NowPlayingCache::default(),
         };
         app.refresh_browser();
         app.start_playlist_load();
@@ -1557,6 +1568,7 @@ impl AppUI {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.playlists.stop_checks();
+        self.track_features.stop();
         // Dropping the inbox wakes queue metadata workers blocked waiting for work.
         self.queue_metadata_tx = None;
         if let Some(mut modal) = self.search_modal.take() {
@@ -1640,6 +1652,8 @@ impl AppUI {
 
             // Process remote web commands
             self.handle_web_commands();
+
+            self.poll_track_features();
 
             // Synchronize web server live state
             self.update_web_state();
@@ -3520,6 +3534,42 @@ impl AppUI {
         roots
     }
 
+    /// Whether the UPnP continuous stream is playing the queue: it then plays on to the end of
+    /// the queue whatever the queue mode, and `play_next_track` wraps.
+    pub fn continuous_stream_active(&self) -> bool {
+        self.web_server.as_ref().is_some_and(|ws| {
+            ws.stream_state()
+                .continuous
+                .is_active
+                .load(std::sync::atomic::Ordering::SeqCst)
+        })
+    }
+
+    /// Point the features worker at the current track and take what it has found. Never blocks.
+    /// The event loop calls it once per tick, before `update_web_state`.
+    pub fn poll_track_features(&mut self) {
+        let track = self.queue.current_track().map(|t| t.filepath.as_path());
+        self.track_features.follow(track);
+        self.track_features.poll();
+    }
+
+    /// How many times the features worker has been polled (tests check once per tick).
+    #[doc(hidden)]
+    pub fn track_feature_polls(&self) -> u64 {
+        self.track_features.polls()
+    }
+
+    /// The current track's analysis features, once the worker has found them.
+    pub fn track_features(&self) -> Option<&crate::analysis::TrackFeatures> {
+        self.track_features.features()
+    }
+
+    /// Read track features from `source` instead of the analysis database (test seam). The old
+    /// worker is stopped and a new one started.
+    pub fn set_track_feature_source(&mut self, source: features::FeatureSource) {
+        self.track_features = features::TrackFeaturesWorker::spawn(&mut self.workers, source);
+    }
+
     pub fn update_web_state(&mut self) {
         if self.web_server.is_none() {
             return;
@@ -3592,13 +3642,11 @@ impl AppUI {
                 state.channels = track.channels;
                 state.filepath = Some(track.filepath.clone());
                 state.has_cover = true;
-                if let Some(feat) = self.analysis_db.get_features(&track.filepath) {
-                    state.bpm = feat.bpm;
-                    state.key = feat.display_key();
-                } else {
-                    state.bpm = None;
-                    state.key = None;
-                }
+                // What this tick's poll of the features worker found for this track: no
+                // database read on the UI thread, and never the previous track's features.
+                let feat = self.track_features.features_for(&track.filepath);
+                state.bpm = feat.and_then(|f| f.bpm);
+                state.key = feat.and_then(|f| f.display_key());
             } else {
                 state.title = "No Track Loaded".to_string();
                 state.artist = String::new();
@@ -3607,7 +3655,7 @@ impl AppUI {
                 state.format = String::new();
                 state.bitrate_kbps = 0;
                 state.sample_rate_hz = 0;
-                state.channels = 2;
+                state.channels = 0;
                 state.filepath = None;
                 state.has_cover = false;
                 state.bpm = None;
@@ -3670,369 +3718,6 @@ impl AppUI {
             self.render_mix_picker_modal(f);
         } else if self.show_help_modal {
             self.render_help_modal(f);
-        }
-    }
-
-    fn render_now_playing_tab(&mut self, f: &mut Frame, area: Rect) {
-        if area.width < 10 || area.height < 4 {
-            return;
-        }
-
-        let outer_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(Span::styled(
-                " [1] NOW PLAYING ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ));
-
-        let inner = outer_block.inner(area);
-        f.render_widget(outer_block, area);
-
-        // If terminal has plenty of vertical space, split into Hero Track and Up Next Queue
-        let show_up_next = inner.height >= 14;
-        let (hero_area, up_next_area) = if show_up_next {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(8), Constraint::Min(4)])
-                .split(inner);
-            (chunks[0], Some(chunks[1]))
-        } else {
-            (inner, None)
-        };
-
-        // --- 1. Hero Track Presentation ---
-        let mut hero_lines = Vec::new();
-
-        // Row 1: State Pill, Active Output, Volume, Mode Pill
-        let mut row1 = Vec::new();
-        // A debounced skip has moved the queue but not the player yet: the hero shows the target
-        // track from its start, marked as queued (the strip does the same on the other tabs).
-        if self.pending_track_skip {
-            row1.push(Span::styled(" » QUEUED ", theme::cursor()));
-        } else if self.player.is_playing() {
-            row1.push(Span::styled(" ▶ PLAYING ", theme::cursor()));
-        } else if self.player.is_paused() {
-            row1.push(Span::styled(" ⏸ PAUSED ", theme::cursor()));
-        } else {
-            row1.push(Span::styled(" ⏹ STOPPED ", theme::cursor()));
-        }
-
-        let active_dev_name = self
-            .device_manager
-            .get_active_device()
-            .map(|d| d.friendly_name)
-            .unwrap_or_else(|| format!("Local Audio ({})", self.local_backend()));
-        row1.push(Span::raw("  "));
-        row1.push(Span::styled(
-            format!("[Output: {}]", active_dev_name),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ));
-        row1.push(Span::raw("  "));
-        row1.push(Span::styled(
-            format!("Vol: {}%", self.player.volume()),
-            Style::default().fg(Color::White),
-        ));
-        row1.push(Span::raw("  "));
-        let mode_label = match self.settings_mgr.settings.queue_mode.as_str() {
-            "loop" => "Continuous (Loop)",
-            "stop" => "Stop at End",
-            "repeat_one" => "Repeat Track",
-            m => m,
-        };
-        row1.push(Span::styled(
-            format!("Mode: {}", mode_label),
-            Style::default().fg(Color::DarkGray),
-        ));
-
-        if !self.queue.is_empty() {
-            row1.push(Span::raw("  "));
-            row1.push(Span::styled(
-                format!("Track {} of {}", self.queue.current_index() + 1, self.queue.len()),
-                Style::default().fg(Color::Yellow),
-            ));
-        }
-
-        hero_lines.push(Line::from(row1));
-
-        if let Some(track) = self.queue.current_track() {
-            // Row 2: Prominent Hero Title
-            let title_line = Line::from(vec![
-                Span::styled("♫  ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    track.display_title(),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                ),
-            ]);
-            hero_lines.push(title_line);
-
-            // Row 3: Artist & Album
-            let mut artist_album_spans = Vec::new();
-            if !track.artist.is_empty() {
-                artist_album_spans.push(Span::styled(
-                    &track.artist,
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ));
-            } else {
-                artist_album_spans.push(Span::styled("Unknown Artist", Style::default().fg(Color::DarkGray)));
-            }
-            if !track.album.is_empty() {
-                artist_album_spans.push(Span::styled("  —  ", Style::default().fg(Color::DarkGray)));
-                artist_album_spans.push(Span::styled(&track.album, Style::default().fg(Color::White)));
-            }
-            hero_lines.push(Line::from(artist_album_spans));
-
-            // Row 4: Format Quality Badges
-            let mut badge_spans = Vec::new();
-            if self.autopilot_dir.is_some() {
-                badge_spans.push(Span::styled(
-                    format!("[⚡ AUTOPILOT · {}]", kit::upper(self.active_mix_profile.short_name())),
-                    theme::cursor(),
-                ));
-                badge_spans.push(Span::raw(" "));
-            }
-            if !track.format_name.is_empty() {
-                badge_spans.push(Span::styled(
-                    format!("[{}]", track.format_name.to_uppercase()),
-                    theme::cursor(),
-                ));
-                badge_spans.push(Span::raw(" "));
-            }
-            if track.sample_rate_hz > 0 {
-                let khz = track.sample_rate_hz as f64 / 1000.0;
-                badge_spans.push(Span::styled(format!("[{:.1} kHz]", khz), theme::keycap()));
-                badge_spans.push(Span::raw(" "));
-            }
-            if track.bitrate_kbps > 0 {
-                badge_spans.push(Span::styled(format!("[{} kbps]", track.bitrate_kbps), theme::keycap()));
-                badge_spans.push(Span::raw(" "));
-            }
-            if track.channels > 0 {
-                let chan_label = if track.channels == 1 {
-                    "Mono"
-                } else if track.channels == 2 {
-                    "Stereo"
-                } else {
-                    "Multi"
-                };
-                badge_spans.push(Span::styled(format!("[{}]", chan_label), theme::keycap()));
-                badge_spans.push(Span::raw(" "));
-            }
-            if !track.genre.is_empty() {
-                badge_spans.push(Span::styled(
-                    format!("[{}]", track.genre),
-                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-                ));
-                badge_spans.push(Span::raw(" "));
-            }
-            if track.file_size > 0 {
-                let mb = track.file_size as f64 / 1_048_576.0;
-                badge_spans.push(Span::styled(
-                    format!("[{:.1} MB]", mb),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            hero_lines.push(Line::from(badge_spans));
-
-            // Row 5: Full-Width Scrubbable Timeline Progress Bar
-            let pos = if self.pending_track_skip {
-                0.0
-            } else {
-                self.pending_seek_target
-                    .unwrap_or_else(|| self.player.position_seconds())
-            };
-            // During a pending skip the player still holds the old track, so its duration is
-            // not the target's: use only the target's own (00:00 while unknown), as the strip does.
-            let dur = if track.duration_seconds > 0.0 || self.pending_track_skip {
-                track.duration_seconds.max(0.0)
-            } else {
-                self.player.duration_seconds().max(1.0)
-            };
-            let pos_str = kit::duration(pos);
-            let dur_str = kit::duration(dur);
-            let ratio = if dur > 0.0 { (pos / dur).clamp(0.0, 1.0) } else { 0.0 };
-
-            let available_w = (hero_area.width as usize).saturating_sub(pos_str.len() + dur_str.len() + 6);
-            let filled = (ratio * available_w as f64).round() as usize;
-            let empty = available_w.saturating_sub(filled);
-
-            let bar_str = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
-
-            let prog_line = Line::from(vec![
-                Span::styled(pos_str, Style::default().fg(Color::White)),
-                Span::raw("  "),
-                Span::styled(bar_str, Style::default().fg(Color::Cyan)),
-                Span::raw("  "),
-                Span::styled(dur_str, Style::default().fg(Color::DarkGray)),
-            ]);
-            hero_lines.push(prog_line);
-
-            // Row 6: Percentage & Time Remaining
-            let percent = (ratio * 100.0).round() as usize;
-            let remaining = (dur - pos).max(0.0);
-            let rem_str = kit::duration(remaining);
-            let info_line = Line::from(vec![
-                Span::styled(format!("{}% complete", percent), Style::default().fg(Color::White)),
-                Span::styled("   •   ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("-{} remaining", rem_str), Style::default().fg(Color::DarkGray)),
-                Span::styled("   •   ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    track.filepath.display().to_string(),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]);
-            hero_lines.push(info_line);
-        } else {
-            let empty_title = Line::from(vec![
-                Span::styled("♫  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "No Track Loaded",
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
-                ),
-            ]);
-            hero_lines.push(empty_title);
-            hero_lines.push(Line::from(vec![Span::styled(
-                "Press Space to play active queue, or navigate to [2] Queue & Library to browse your collection.",
-                Style::default().fg(Color::DarkGray),
-            )]));
-        }
-
-        f.render_widget(Paragraph::new(hero_lines), hero_area);
-
-        // --- 2. Up Next in Queue Section ---
-        if let Some(up_area) = up_next_area {
-            let up_block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(Span::styled(
-                    " UP NEXT IN QUEUE ",
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                ));
-
-            let up_inner = up_block.inner(up_area);
-            f.render_widget(up_block, up_area);
-
-            if self.queue.is_empty() {
-                let up_lines = vec![Line::from(vec![Span::styled(
-                    "Queue is empty. Select files or press 'a' in the library to enqueue tracks.",
-                    Style::default().fg(Color::DarkGray),
-                )])];
-                f.render_widget(Paragraph::new(up_lines), up_inner);
-            } else {
-                let current_idx = self.queue.current_index();
-                let next_idx = current_idx + 1;
-                let max_items = (up_inner.height as usize).saturating_sub(1).max(1);
-                let upcoming: Vec<_> = self
-                    .queue
-                    .tracks()
-                    .iter()
-                    .enumerate()
-                    .skip(next_idx)
-                    .take(max_items)
-                    .collect();
-
-                if upcoming.is_empty() {
-                    let loop_mode = self.settings_mgr.settings.queue_mode == "loop";
-                    if loop_mode && self.queue.len() > 1 {
-                        let first = &self.queue.tracks()[0];
-                        let up_lines = vec![Line::from(vec![
-                            Span::styled(
-                                "↺ End of queue reached. Loops to #1: ",
-                                Style::default().fg(Color::Cyan),
-                            ),
-                            Span::styled(first.display_title(), Style::default().fg(Color::Yellow)),
-                            Span::styled(format!("  —  {}", first.artist), Style::default().fg(Color::White)),
-                        ])];
-                        f.render_widget(Paragraph::new(up_lines), up_inner);
-                    } else {
-                        let up_lines = vec![Line::from(vec![Span::styled(
-                            "End of playback queue. (Playback will stop after this track)",
-                            Style::default().fg(Color::DarkGray),
-                        )])];
-                        f.render_widget(Paragraph::new(up_lines), up_inner);
-                    }
-                } else {
-                    let metadata_view = self.settings_mgr.settings.metadata_view;
-                    let (header, widths, rows) = if metadata_view {
-                        let header = Row::new(vec![
-                            Cell::from("#"),
-                            Cell::from("TITLE"),
-                            Cell::from("ARTIST"),
-                            Cell::from("TIME"),
-                        ])
-                        .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
-
-                        let widths = vec![
-                            Constraint::Length(5),
-                            Constraint::Fill(3),
-                            Constraint::Fill(2),
-                            Constraint::Length(7),
-                        ];
-
-                        let rows: Vec<Row> = upcoming
-                            .into_iter()
-                            .map(|(i, t)| {
-                                let dur_label = if t.duration_seconds > 0.0 {
-                                    kit::duration(t.duration_seconds)
-                                } else {
-                                    "--:--".to_string()
-                                };
-                                let artist_text = if !t.artist.is_empty() {
-                                    t.artist.as_str()
-                                } else {
-                                    "Unknown Artist"
-                                };
-                                Row::new(vec![
-                                    Cell::from(Span::styled(
-                                        format!("#{:02}", i + 1),
-                                        Style::default().fg(Color::Cyan),
-                                    )),
-                                    Cell::from(Span::styled(t.display_title(), Style::default().fg(Color::White))),
-                                    Cell::from(Span::styled(artist_text, Style::default().fg(Color::DarkGray))),
-                                    Cell::from(Span::styled(dur_label, Style::default().fg(Color::DarkGray))),
-                                ])
-                            })
-                            .collect();
-
-                        (header, widths, rows)
-                    } else {
-                        let header = Row::new(vec![Cell::from("#"), Cell::from("FILE"), Cell::from("TIME")])
-                            .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
-
-                        let widths = vec![Constraint::Length(5), Constraint::Fill(1), Constraint::Length(7)];
-
-                        let rows: Vec<Row> = upcoming
-                            .into_iter()
-                            .map(|(i, t)| {
-                                let dur_label = if t.duration_seconds > 0.0 {
-                                    kit::duration(t.duration_seconds)
-                                } else {
-                                    "--:--".to_string()
-                                };
-                                let fname = if !t.filename.is_empty() {
-                                    t.filename.as_str()
-                                } else {
-                                    t.filepath.file_name().and_then(|f| f.to_str()).unwrap_or("")
-                                };
-                                Row::new(vec![
-                                    Cell::from(Span::styled(
-                                        format!("#{:02}", i + 1),
-                                        Style::default().fg(Color::Cyan),
-                                    )),
-                                    Cell::from(Span::styled(fname, Style::default().fg(Color::White))),
-                                    Cell::from(Span::styled(dur_label, Style::default().fg(Color::DarkGray))),
-                                ])
-                            })
-                            .collect();
-
-                        (header, widths, rows)
-                    };
-
-                    let table = Table::new(rows, widths).header(header).column_spacing(2);
-
-                    f.render_widget(table, up_inner);
-                }
-            }
         }
     }
 
@@ -4282,7 +3967,14 @@ impl AppUI {
                 ]),
                 Line::from(vec![
                     Span::styled("Channels: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(format!("{}", track.channels), Style::default().fg(Color::White)),
+                    Span::styled(
+                        if track.channels > 0 {
+                            track.channels.to_string()
+                        } else {
+                            "<Unknown>".to_string()
+                        },
+                        Style::default().fg(Color::White),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled("Size:     ", Style::default().fg(Color::DarkGray)),

@@ -685,8 +685,9 @@ fn tall_layout_rows_at_120x40_and_120x29() {
     let rows = tui::rows(&buffer);
     assert_eq!(key_row_index(&buffer), 38);
     assert!(!rows.contains(&rule_row), "no rule on Now Playing");
+    // The tab's own empty state says NO TRACK LOADED too; the strip's starts with its glyph.
     assert!(
-        !rows.iter().any(|r| r.contains("NO TRACK LOADED")),
+        !rows.iter().any(|r| r.contains("■ NO TRACK LOADED")),
         "no strip on Now Playing"
     );
     let _ = fs::remove_dir_all(&dir);
