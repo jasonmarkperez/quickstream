@@ -14,7 +14,7 @@ use ratatui::Frame;
 use super::kit::{self, Col, KeyHint, ModalSpec, PanelSpec, RowMark};
 use super::now_playing::{channels_label, khz};
 use super::queue_tab::display_path;
-use super::search::{row_match_indices, SearchModalState};
+use super::search::SearchModalState;
 use super::theme;
 use crate::metadata::AudioMetadata;
 
@@ -205,16 +205,14 @@ fn draw_match_rows(f: &mut Frame, content: Rect, modal: &mut SearchModalState) {
     }
 
     // The length column fits the longest length in the whole list, so it doesn't change width
-    // while scrolling.
-    let long = modal.filtered.iter().any(|(_, t)| t.duration_seconds.round() >= 3600.0);
-    let length_cols: u16 = if long { 7 } else { 5 };
+    // while scrolling (worked out once per list, as each row's underlined characters are).
+    let length_cols: u16 = if modal.long_lengths() { 7 } else { 5 };
     let window = kit::visible_window(&mut modal.list_state, modal.filtered.len(), content.height as usize);
-    let query = modal.query.trim();
     for (row, index) in window.enumerate() {
+        let (title_marks, artist_marks) = modal.row_marks(index);
         let track = &modal.filtered[index].1;
         let title = kit::upper(track.display_title());
         let artist = kit::upper(&track.artist);
-        let (title_marks, artist_marks) = row_match_indices(query, &title, &artist);
         let length = if track.duration_seconds > 0.0 {
             format!(
                 "{:>width$}",

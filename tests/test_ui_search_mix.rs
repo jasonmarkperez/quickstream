@@ -391,6 +391,94 @@ fn search_underlines_the_matched_characters() {
     }
 }
 
+/// A word is underlined in the title or artist only when that is where the ranking matched it:
+/// a word ranked on the album (or the file name, or a folder) underlines nothing, even when it
+/// also fuzzy-matches a few scattered letters of the title.
+#[test]
+fn search_underlines_a_word_only_in_the_field_it_ranked_on() {
+    common::isolate();
+    let (mut app, dir) = test_app("search_underline_field");
+    let tracks = vec![
+        track(
+            &dir,
+            "Mira Lenz/Low Tide Atlas/01 - Stoic Mild Breeze.flac",
+            "Stoic Mild Breeze",
+            "Mira Lenz",
+            "Low Tide Atlas",
+            200.0,
+            "flac",
+            44_100,
+            900,
+            2,
+            1,
+        ),
+        track(
+            &dir,
+            "Ada/Tide Pools.mp3",
+            "Tide Pools",
+            "Ada",
+            "",
+            200.0,
+            "mp3",
+            44_100,
+            320,
+            2,
+            1,
+        ),
+    ];
+    let mut modal = SearchModalState::new(dir.clone(), tracks);
+    modal.update_query("tide".to_string());
+    assert_eq!(modal.filtered.len(), 2, "both match: the album and the title");
+    app.search_modal = Some(modal);
+    let buffer = tui::render(&mut app, 120, 40);
+    // `tide` ranked on the album: the scattered T I D E of the title stay plain.
+    let (x, y) = tui::find_text(&buffer, "STOIC MILD BREEZE").unwrap();
+    assert!(
+        (0..17).all(|dx| !underlined(&buffer, x + dx, y)),
+        "title not marked: {:?}",
+        tui::row(&buffer, y)
+    );
+    // `tide` ranked on the title: marked there.
+    let (x, y) = tui::find_text(&buffer, "TIDE POOLS").unwrap();
+    assert!((0..4).all(|dx| underlined(&buffer, x + dx, y)));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The length column's width and each row's underlined characters are worked out once per
+/// ranked list: redrawing it, or moving the cursor within it, does no scan or match work.
+#[test]
+fn search_redraws_without_rescanning_or_rematching() {
+    common::isolate();
+    let (mut app, dir) = test_app("search_redraw_work");
+    open_search(&mut app, &dir, "halc");
+    tui::render(&mut app, 120, 40);
+    let work = app.search_modal.as_ref().unwrap().view_work();
+    for _ in 0..3 {
+        tui::render(&mut app, 120, 40);
+        tui::render(&mut app, 80, 24);
+    }
+    assert_eq!(
+        app.search_modal.as_ref().unwrap().view_work(),
+        work,
+        "redraws do no work"
+    );
+    app.search_modal.as_mut().unwrap().move_selection_down();
+    tui::render(&mut app, 120, 40);
+    assert_eq!(
+        app.search_modal.as_ref().unwrap().view_work(),
+        work,
+        "moving the cursor over rows already drawn does no work"
+    );
+    // A new query is a new list: its rows are worked out once more.
+    app.search_modal.as_mut().unwrap().update_query("halcy".to_string());
+    tui::render(&mut app, 120, 40);
+    let after = app.search_modal.as_ref().unwrap().view_work();
+    assert!(after > work, "{after} > {work}");
+    tui::render(&mut app, 120, 40);
+    assert_eq!(app.search_modal.as_ref().unwrap().view_work(), after);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn search_draws_only_the_rows_that_fit_and_scrolls_to_the_selection() {
     common::isolate();
