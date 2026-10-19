@@ -363,6 +363,26 @@ fn a_replaced_queue_with_the_same_change_count_refreshes_in_queue_and_the_total(
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A track over an hour long reads `1:15:00` in its queue row, in the queue total and in the
+/// mini player strip alike.
+#[test]
+fn an_hour_long_track_reads_the_same_in_the_rows_the_total_and_the_strip() {
+    common::isolate();
+    let (mut app, dir) = lists_app("hour", &[0, 1, 2]);
+    let mut long = queue_track(&dir, 0);
+    long.duration_seconds = 4500.0;
+    app.queue.add_track(long);
+    let buf = tui::render(&mut app, 120, 40);
+    let shown = screen(&buf);
+    let (_, qy) = queue(&buf, "TIDEWATER").unwrap_or_else(|| panic!("{shown}"));
+    assert!(span_text(&buf, qy, QUEUE_X, 120).contains("1:15:00"), "{shown}");
+    assert!(shown.contains("1 TRACK  ·  1:15:00"), "{shown}");
+    let strip = tui::find_row(&buf, "VOL").unwrap_or_else(|| panic!("{shown}"));
+    assert!(tui::row(&buf, strip).contains("1:15:00"), "{shown}");
+    assert!(!shown.contains("75:00") && !shown.contains("01:15:00"), "{shown}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Cursor and focus
 // ---------------------------------------------------------------------------------------------

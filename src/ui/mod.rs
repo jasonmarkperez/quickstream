@@ -3844,8 +3844,8 @@ impl AppUI {
             } else {
                 self.player.duration_seconds().max(1.0)
             };
-            let pos_str = format_time(pos);
-            let dur_str = format_time(dur);
+            let pos_str = kit::duration(pos);
+            let dur_str = kit::duration(dur);
             let ratio = if dur > 0.0 { (pos / dur).clamp(0.0, 1.0) } else { 0.0 };
 
             let available_w = (hero_area.width as usize).saturating_sub(pos_str.len() + dur_str.len() + 6);
@@ -3866,7 +3866,7 @@ impl AppUI {
             // Row 6: Percentage & Time Remaining
             let percent = (ratio * 100.0).round() as usize;
             let remaining = (dur - pos).max(0.0);
-            let rem_str = format_time(remaining);
+            let rem_str = kit::duration(remaining);
             let info_line = Line::from(vec![
                 Span::styled(format!("{}% complete", percent), Style::default().fg(Color::White)),
                 Span::styled("   •   ", Style::default().fg(Color::DarkGray)),
@@ -3969,7 +3969,7 @@ impl AppUI {
                             .into_iter()
                             .map(|(i, t)| {
                                 let dur_label = if t.duration_seconds > 0.0 {
-                                    format_time(t.duration_seconds)
+                                    kit::duration(t.duration_seconds)
                                 } else {
                                     "--:--".to_string()
                                 };
@@ -4001,7 +4001,7 @@ impl AppUI {
                             .into_iter()
                             .map(|(i, t)| {
                                 let dur_label = if t.duration_seconds > 0.0 {
-                                    format_time(t.duration_seconds)
+                                    kit::duration(t.duration_seconds)
                                 } else {
                                     "--:--".to_string()
                                 };
@@ -4606,13 +4606,6 @@ fn modal_rect_with_height(r: Rect, height: u16) -> Rect {
 
 /// Status line while the browser spotlight is open.
 const SPOTLIGHT_HINT: &str = "Spotlight: type to jump to subfolder (Esc to exit, Enter to open)";
-
-fn format_time(seconds: f64) -> String {
-    let total = seconds.round().max(0.0) as u64;
-    let mins = total / 60;
-    let secs = total % 60;
-    format!("{:02}:{:02}", mins, secs)
-}
 
 #[cfg(test)]
 mod terminal_tests {

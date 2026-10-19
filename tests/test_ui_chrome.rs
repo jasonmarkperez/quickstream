@@ -340,6 +340,22 @@ fn progress_bar_splits_ink_and_rule() {
 // kit: text
 // ---------------------------------------------------------------------------------------------
 
+/// One duration format for every list row, total and the strip: `MM:SS` under an hour,
+/// `H:MM:SS` from one (PR #68 review: rows read `01:15:00` while the strip read `75:00`).
+#[test]
+fn duration_is_mm_ss_under_an_hour_and_h_mm_ss_from_one() {
+    common::isolate();
+    assert_eq!(kit::duration(0.0), "00:00");
+    assert_eq!(kit::duration(-3.0), "00:00");
+    assert_eq!(kit::duration(242.0), "04:02");
+    assert_eq!(kit::duration(241.6), "04:02");
+    assert_eq!(kit::duration(3599.0), "59:59");
+    assert_eq!(kit::duration(3599.6), "1:00:00");
+    assert_eq!(kit::duration(3600.0), "1:00:00");
+    assert_eq!(kit::duration(4500.0), "1:15:00");
+    assert_eq!(kit::duration(36_005.0), "10:00:05");
+}
+
 #[test]
 fn upper_uses_full_unicode_case_mapping() {
     common::isolate();

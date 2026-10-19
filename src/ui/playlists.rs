@@ -623,7 +623,7 @@ fn panel_message(f: &mut Frame, area: Rect, text: &str, style: Style) {
 fn tracks_note(count: usize, known_total: Option<i64>) -> String {
     let tracks = kit::upper(&track_count_label(count));
     match known_total {
-        Some(total) => format!("{tracks}{}{}", queue_tab::SEP, queue_tab::clock(total as f64)),
+        Some(total) => format!("{tracks}{}{}", queue_tab::SEP, kit::duration(total as f64)),
         None => tracks,
     }
 }
@@ -783,7 +783,7 @@ impl PlaylistsUi {
                 let duration = if missing {
                     MISSING_LENGTH.to_string()
                 } else if entry.duration_secs >= 0 {
-                    queue_tab::clock(entry.duration_secs as f64)
+                    kit::duration(entry.duration_secs as f64)
                 } else {
                     // Unknown length: left out, never faked.
                     String::new()

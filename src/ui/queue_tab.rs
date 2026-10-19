@@ -99,17 +99,6 @@ struct QueueRow {
     duration: String,
 }
 
-/// `m:ss`-style length for list rows and totals: `MM:SS`, or `HH:MM:SS` from an hour.
-pub(super) fn clock(seconds: f64) -> String {
-    let total = seconds.round().max(0.0) as u64;
-    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
-    if h > 0 {
-        format!("{h:02}:{m:02}:{s:02}")
-    } else {
-        format!("{m:02}:{s:02}")
-    }
-}
-
 /// `text` right-aligned in `width` columns.
 pub(super) fn right_aligned(text: &str, width: usize) -> String {
     format!("{}{}", " ".repeat(width.saturating_sub(text_width(text))), text)
@@ -389,7 +378,7 @@ impl AppUI {
                         let duration = meta
                             .map(|m| m.duration_seconds)
                             .filter(|&s| s > 0.0)
-                            .map(clock)
+                            .map(kit::duration)
                             .unwrap_or_default();
                         let is_playing = playing.as_deref() == Some(path.as_path());
                         LibraryRow {
@@ -473,7 +462,7 @@ impl AppUI {
         let mut suffix = format!("{SEP}{position}");
         if let Some(total) = self.folder_total() {
             suffix.push_str(SEP);
-            suffix.push_str(&clock(total));
+            suffix.push_str(&kit::duration(total));
         }
         let place = if self.in_bookmarks_view {
             "MUSIC HOMES".to_string()
@@ -536,7 +525,7 @@ impl AppUI {
                 format!("{len} TRACKS")
             };
             match self.queue_total() {
-                Some(total) => format!("{tracks}{SEP}{}", clock(total)),
+                Some(total) => format!("{tracks}{SEP}{}", kit::duration(total)),
                 None => tracks,
             }
         };
@@ -580,7 +569,7 @@ impl AppUI {
                     (name, String::new())
                 };
                 let duration = if track.duration_seconds > 0.0 {
-                    clock(track.duration_seconds)
+                    kit::duration(track.duration_seconds)
                 } else {
                     String::new()
                 };

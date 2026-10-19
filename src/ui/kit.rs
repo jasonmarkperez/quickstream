@@ -566,6 +566,19 @@ fn column_widths(cols: &[Col], width: usize) -> Vec<usize> {
     widths
 }
 
+/// A length or a position as the TUI shows it everywhere (list rows, totals, the strip, Now
+/// Playing): `MM:SS` under an hour (`04:02`), `H:MM:SS` from an hour (`1:15:00`). Rounded to
+/// the second; negative values read `00:00`.
+pub fn duration(seconds: f64) -> String {
+    let total = seconds.round().max(0.0) as u64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
 /// Uppercase with full Unicode case mapping (`ß` becomes `SS`, so the result can be longer).
 pub fn upper(text: &str) -> String {
     text.to_uppercase()

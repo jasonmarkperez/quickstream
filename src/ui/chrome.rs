@@ -9,7 +9,7 @@ use ratatui::prelude::*;
 use super::kit::{self, spans_width, text_width, KeyHint};
 use super::playlists::PlaylistModal;
 use super::screen::{Screen, WidthTier};
-use super::{format_time, theme, AppUI};
+use super::{theme, AppUI};
 
 /// Columns left blank at each side of the screen.
 const GUTTER: u16 = 2;
@@ -297,7 +297,7 @@ impl AppUI {
             dur = track.duration_seconds;
         }
         let ratio = if dur > 0.0 { pos / dur } else { 0.0 };
-        let (pos, dur) = (format_time(pos), format_time(dur));
+        let (pos, dur) = (kit::duration(pos), kit::duration(dur));
 
         let title = kit::upper(track.display_title());
         let title_min = 2 + Span::raw(title.as_str()).width().min(12);
@@ -311,7 +311,9 @@ impl AppUI {
         ];
         // Bar width from the mockups: 42 at 120 columns, 26 at 80. It shrinks to leave the title
         // some room, and gives way to `pos / dur` when it would be too short to read.
-        let fixed = spans_width(&right) + 6 + 2 + 6 + spans_width(&volume);
+        // `pos ` and ` dur` (wider from an hour, `1:15:00`) and the bar's two edge cells.
+        let times = text_width(&pos) + 1 + 2 + 1 + text_width(&dur);
+        let fixed = spans_width(&right) + times + spans_width(&volume);
         let inner = (width * 2 / 5)
             .saturating_sub(4)
             .min(width.saturating_sub(title_min + PART_GAP + fixed));

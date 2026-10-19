@@ -49,6 +49,11 @@ fn test_extract_metadata_real_audio() {
     assert_eq!(meta.sample_rate_hz, 44100);
     assert!((meta.duration_seconds - 2.0).abs() < 0.1);
     assert_eq!(meta.formatted_duration(), "00:02");
+    let long = quickstream::metadata::AudioMetadata {
+        duration_seconds: 4500.0,
+        ..Default::default()
+    };
+    assert_eq!(long.formatted_duration(), "1:15:00", "the TUI's one duration format");
 
     // Display labels
     let label_tags = meta.format_display_label(true);
