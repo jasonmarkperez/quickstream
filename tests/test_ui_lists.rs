@@ -151,15 +151,15 @@ fn panels_and_columns_at_120_cols() {
 
     // Folder rows: `DIR`, then the name in UPPERCASE with `/`, no child count.
     let (dx, dy) = lib(&buf, "LOW TIDE ATLAS/").unwrap_or_else(|| panic!("{shown}"));
-    assert_eq!(dx, LIB_X + 6);
-    assert_eq!(span_text(&buf, dy, LIB_X, LIB_X + 6), "DIR   ");
+    assert_eq!(dx, LIB_X + 8, "after the marker and index columns");
+    assert_eq!(span_text(&buf, dy, LIB_X, LIB_X + 8), "  DIR   ");
     assert_eq!(
         span_text(&buf, dy, dx + 15, LIB_X + TEXT_W).trim(),
         "",
         "no child count"
     );
     assert!(!tui::cell_style(&buf, dx, dy).add_modifier.contains(Modifier::REVERSED));
-    assert_eq!(tui::cell_style(&buf, LIB_X, dy).fg, Some(P.dim), "DIR is DIM");
+    assert_eq!(tui::cell_style(&buf, LIB_X + 2, dy).fg, Some(P.dim), "DIR is DIM");
     assert!(
         tui::cell_style(&buf, dx, dy).add_modifier.contains(Modifier::BOLD),
         "folder names are bold"
@@ -167,16 +167,16 @@ fn panels_and_columns_at_120_cols() {
 
     // Music Homes and parent rows.
     let (_, hy) = lib(&buf, "MUSIC HOMES").unwrap_or_else(|| panic!("{shown}"));
-    assert_eq!(span_text(&buf, hy, LIB_X, LIB_X + 1), "★");
+    assert_eq!(span_text(&buf, hy, LIB_X + 2, LIB_X + 3), "★");
     let (_, py) = lib(&buf, "PARENT").unwrap_or_else(|| panic!("{shown}"));
-    assert_eq!(span_text(&buf, py, LIB_X, LIB_X + 2), "..");
+    assert_eq!(span_text(&buf, py, LIB_X + 2, LIB_X + 4), "..");
 
     // File rows: number, TITLE, ARTIST, format and duration against the right edge.
     // Tags mode sorts by artist and title: GLASS HARBOUR, TIDEWATER, then HALCYON DRIFT.
     let (tx, ty) = lib(&buf, "TIDEWATER").unwrap_or_else(|| panic!("{shown}"));
-    assert_eq!(tx, LIB_X + 6, "{shown}");
-    assert_eq!(span_text(&buf, ty, LIB_X, LIB_X + 2), "02");
-    assert_eq!(tui::cell_style(&buf, LIB_X, ty).fg, Some(P.dim), "number is DIM");
+    assert_eq!(tx, LIB_X + 8, "{shown}");
+    assert_eq!(span_text(&buf, ty, LIB_X + 2, LIB_X + 4), "02");
+    assert_eq!(tui::cell_style(&buf, LIB_X + 2, ty).fg, Some(P.dim), "number is DIM");
     assert_eq!(tui::cell_style(&buf, tx, ty).fg, Some(P.ink), "title is INK");
     let ax = (tx + 9..QUEUE_X - 2)
         .find(|&x| span_text(&buf, ty, x, x + 9) == "MIRA LENZ")
@@ -189,12 +189,12 @@ fn panels_and_columns_at_120_cols() {
     );
     assert_eq!(tui::cell_style(&buf, LIB_X + TEXT_W - 1, ty).fg, Some(P.mid));
 
-    // Queue rows: marker, number, TITLE, ARTIST, duration against the right edge.
+    // Queue rows: marker, playing glyph, number, TITLE, ARTIST, duration against the right edge.
     let (qx, qy) = queue(&buf, "HALCYON DRIFT").unwrap_or_else(|| panic!("{shown}"));
-    assert_eq!(qx, QUEUE_X + 6);
-    assert_eq!(span_text(&buf, qy, QUEUE_X, QUEUE_X + 6), "  01  ");
+    assert_eq!(qx, QUEUE_X + 8);
+    assert_eq!(span_text(&buf, qy, QUEUE_X, QUEUE_X + 8), "    01  ");
     assert_eq!(
-        tui::cell_style(&buf, QUEUE_X + 2, qy).fg,
+        tui::cell_style(&buf, QUEUE_X + 4, qy).fg,
         Some(P.dim),
         "queue number is DIM"
     );
@@ -291,20 +291,24 @@ fn playing_track_gets_the_square_in_the_library_and_the_arrow_in_the_queue() {
     let buf = tui::render(&mut app, 120, 40);
 
     let (_, gy) = lib(&buf, "GLASS HARBOUR").unwrap();
-    assert_eq!(span_text(&buf, gy, LIB_X, LIB_X + 2), "▪ ", "{}", screen(&buf));
-    assert_eq!(tui::cell_style(&buf, LIB_X, gy).fg, Some(P.ink));
+    assert_eq!(span_text(&buf, gy, LIB_X + 2, LIB_X + 4), "▪ ", "{}", screen(&buf));
+    assert_eq!(tui::cell_style(&buf, LIB_X + 2, gy).fg, Some(P.ink));
     let (_, ty) = lib(&buf, "TIDEWATER").unwrap();
-    assert_eq!(span_text(&buf, ty, LIB_X, LIB_X + 2), "02", "files keep their numbers");
+    assert_eq!(
+        span_text(&buf, ty, LIB_X + 2, LIB_X + 4),
+        "02",
+        "files keep their numbers"
+    );
 
     let (_, qy) = queue(&buf, "GLASS HARBOUR").unwrap();
-    assert_eq!(span_text(&buf, qy, QUEUE_X, QUEUE_X + 4), "▶ 02");
-    for x in [QUEUE_X + 2, QUEUE_X + 6] {
+    assert_eq!(span_text(&buf, qy, QUEUE_X + 2, QUEUE_X + 6), "▶ 02");
+    for x in [QUEUE_X + 2, QUEUE_X + 4, QUEUE_X + 8] {
         let style = tui::cell_style(&buf, x, qy);
         assert_eq!(style.fg, Some(P.ink), "playing row is INK");
         assert!(style.add_modifier.contains(Modifier::BOLD), "playing row is bold");
     }
     let (_, oy) = queue(&buf, "TIDEWATER").unwrap();
-    assert!(!tui::cell_style(&buf, QUEUE_X + 6, oy)
+    assert!(!tui::cell_style(&buf, QUEUE_X + 8, oy)
         .add_modifier
         .contains(Modifier::BOLD));
     let _ = fs::remove_dir_all(&dir);
@@ -427,6 +431,50 @@ fn cursor_bar_in_the_focused_pane_and_marker_in_the_other() {
     let (_, y) = lib(&buf, "SEA GLASS EP/").unwrap();
     assert_eq!(span_text(&buf, y, LIB_X, LIB_X + 1), "▸");
     assert_ne!(tui::cell_style(&buf, LIB_X + 6, y).bg, Some(P.ink));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The unfocused pane's `▸` has a column of its own, so it never hides the playing track's `▶`
+/// (queue) or `▪` (library), even though the queue cursor usually sits on the current track
+/// (PR #68 review).
+#[test]
+fn the_unfocused_marker_never_hides_the_playing_glyph() {
+    common::isolate();
+    let (mut app, dir) = lists_app("markerplaying", &[0, 1, 2]);
+    app.queue.add_track(queue_track(&dir, 0));
+    app.queue.add_track(queue_track(&dir, 1));
+    app.queue.set_current_index(1);
+    app.queue_cursor = 1;
+    let playing = app
+        .browser_entries
+        .iter()
+        .position(|(_, p, _)| p.ends_with(FILES[1].0))
+        .unwrap();
+    app.browser_cursor = playing;
+
+    // Library focused: the queue's cursor row is the playing one and shows both.
+    let buf = tui::render(&mut app, 120, 40);
+    let shown = screen(&buf);
+    let (_, qy) = queue(&buf, "GLASS HARBOUR").unwrap_or_else(|| panic!("{shown}"));
+    assert_eq!(span_text(&buf, qy, QUEUE_X, QUEUE_X + 6), "▸ ▶ 02", "{shown}");
+    assert_eq!(tui::cell_style(&buf, QUEUE_X, qy).fg, Some(P.mid));
+    let play = tui::cell_style(&buf, QUEUE_X + 2, qy);
+    assert_eq!(play.fg, Some(P.ink));
+    assert!(play.add_modifier.contains(Modifier::BOLD));
+
+    // Queue focused: the library's cursor row is the playing file and shows both.
+    app.handle_tab_key(KeyCode::Char('l'));
+    let buf = tui::render(&mut app, 120, 40);
+    let shown = screen(&buf);
+    let (_, ly) = lib(&buf, "GLASS HARBOUR").unwrap_or_else(|| panic!("{shown}"));
+    assert_eq!(span_text(&buf, ly, LIB_X, LIB_X + 3), "▸ ▪", "{shown}");
+    assert_eq!(tui::cell_style(&buf, LIB_X, ly).fg, Some(P.mid));
+    assert_eq!(tui::cell_style(&buf, LIB_X + 2, ly).fg, Some(P.ink));
+
+    // Every row keeps the same columns whichever pane has focus.
+    let (tx, _) = lib(&buf, "TIDEWATER").unwrap();
+    let (gx, _) = lib(&buf, "GLASS HARBOUR").unwrap();
+    assert_eq!(tx, gx, "{shown}");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -687,7 +735,7 @@ fn loading_row_counts_the_items_read_so_far() {
     let buf = tui::render(&mut app, 120, 40);
     let shown = screen(&buf);
     let (x, y) = lib(&buf, "READING DIRECTORY  ·  6 ITEMS").unwrap_or_else(|| panic!("{shown}"));
-    assert_eq!(span_text(&buf, y, LIB_X, LIB_X + 3), "···");
+    assert_eq!(span_text(&buf, y, LIB_X + 2, LIB_X + 5), "···");
     assert_eq!(tui::cell_style(&buf, x, y).fg, Some(P.dim));
     app.browser_loading = false;
     let _ = fs::remove_dir_all(&dir);

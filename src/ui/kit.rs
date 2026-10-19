@@ -468,8 +468,9 @@ pub enum RowMark {
     /// Selected in the focused pane: the cursor bar ([`theme::cursor`]), one column wider than
     /// the row's area on each side.
     Cursor,
-    /// Selected in an unfocused pane: `▸` replaces the first column's text (the row's marker
-    /// column), in that column's style.
+    /// Selected in an unfocused pane: `▸` is drawn in the first column, in that column's style.
+    /// Callers keep that column for it (a marker column with no text of its own, the same on
+    /// every row), so it never hides what the row shows, such as a playing glyph.
     Marker,
 }
 

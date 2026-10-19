@@ -30,8 +30,12 @@ const COMPACT_GAP: u16 = 2;
 const INDEX_COLS: u16 = 6;
 const COMPACT_INDEX_COLS: u16 = 5;
 
-/// Width of the queue's marker column (`▶`, `▸`).
+/// Width of the marker column both panels start every row with: the unfocused pane's `▸`, in a
+/// column of its own so it never hides the playing track's `▶` / `▪`.
 const MARKER_COLS: u16 = 2;
+
+/// Width of the queue's playing column (`▶`).
+const PLAYING_COLS: u16 = 2;
 
 /// Shown in the format column of a library file that is in the queue (resolution 6).
 const IN_QUEUE: &str = "IN QUEUE";
@@ -426,16 +430,15 @@ impl AppUI {
             } else {
                 RowMark::Cursor
             };
-            let index_style = if mark == RowMark::Marker {
-                theme::mid()
-            } else {
-                row.index_style
-            };
             let mut name = Col::flex(row.name.as_str(), row.name_style);
             if let Some(range) = &row.matched {
                 name = name.underline(range.clone());
             }
-            let mut cols = vec![Col::fixed(row.index.as_str(), index_cols, index_style), name];
+            let mut cols = vec![
+                Col::fixed("", MARKER_COLS, theme::mid()),
+                Col::fixed(row.index.as_str(), index_cols, row.index_style),
+                name,
+            ];
             if let Some(file) = &row.file {
                 // Everything on the right of a file row is MID, unless the spotlight dims it.
                 let side = if row.dimmed { theme::dim() } else { theme::mid() };
@@ -590,7 +593,8 @@ impl AppUI {
         let duration_cols = rows.iter().map(|(_, r)| text_width(&r.duration)).max().unwrap_or(0);
         let show_artist = tags && tier >= WidthTier::Medium && rows.iter().any(|(_, r)| !r.artist.is_empty());
         // Title and artist share what is left about 3:2 (26 and 17 columns in 2c).
-        let free = usize::from(list.width).saturating_sub(usize::from(MARKER_COLS + index_cols) + duration_cols);
+        let free = usize::from(list.width)
+            .saturating_sub(usize::from(MARKER_COLS + PLAYING_COLS + index_cols) + duration_cols);
         let title_cols = ((free * 3 + 2) / 5) as u16;
 
         for (row_y, (idx, row)) in rows.iter().enumerate() {
@@ -603,16 +607,17 @@ impl AppUI {
                 RowMark::Marker
             };
             let bold = theme::ink().add_modifier(Modifier::BOLD);
-            let (marker_style, index_style, title_style, side) = if row.playing {
-                (bold, bold, bold, bold)
+            let (index_style, title_style, side) = if row.playing {
+                (bold, bold, bold)
             } else if mark == RowMark::Marker {
-                (theme::mid(), theme::mid(), theme::ink(), theme::mid())
+                (theme::mid(), theme::ink(), theme::mid())
             } else {
-                (theme::ink(), theme::dim(), theme::ink(), theme::mid())
+                (theme::dim(), theme::ink(), theme::mid())
             };
-            let marker = if row.playing { "▶" } else { "" };
+            let playing = if row.playing { "▶" } else { "" };
             let mut cols = vec![
-                Col::fixed(marker, MARKER_COLS, marker_style),
+                Col::fixed("", MARKER_COLS, theme::mid()),
+                Col::fixed(playing, PLAYING_COLS, bold),
                 Col::fixed(format!("{:02}", idx + 1), index_cols, index_style),
             ];
             if show_artist {
