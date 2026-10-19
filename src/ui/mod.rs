@@ -11,6 +11,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 mod chrome;
+mod devices_tab;
 pub mod features;
 pub mod kit;
 mod now_playing;
@@ -287,6 +288,8 @@ pub struct AppUI {
     queue_tab: queue_tab::QueueTabCache,
     /// Tab 1 values cached per queue revision (Up Next count, total length, columns).
     now_playing: now_playing::NowPlayingCache,
+    /// When the UI was created: the clock the Devices tab's scanning spinner turns by.
+    ui_epoch: Instant,
 }
 
 impl Drop for AppUI {
@@ -435,6 +438,7 @@ impl AppUI {
             clock: kit::ClockCache::new(),
             queue_tab: queue_tab::QueueTabCache::new(),
             now_playing: now_playing::NowPlayingCache::default(),
+            ui_epoch: Instant::now(),
         };
         app.refresh_browser();
         app.start_playlist_load();
@@ -3717,70 +3721,6 @@ impl AppUI {
         } else if self.show_help_modal {
             self.render_help_modal(f);
         }
-    }
-
-    fn render_devices_tab(&mut self, f: &mut Frame, area: Rect) {
-        let is_scanning = self.device_manager.is_scanning();
-        let title = if is_scanning {
-            " AUDIO OUTPUT DEVICES (Scanning...) "
-        } else {
-            " AUDIO OUTPUT DEVICES "
-        };
-        let block = Block::default().borders(Borders::ALL).title(title);
-
-        let active_dev = self.device_manager.get_active_device();
-        let devices = self.device_manager.get_devices();
-
-        let mut items = Vec::new();
-
-        // [0] Local Audio
-        let is_local_active = active_dev.is_none();
-        let local_bullet = if is_local_active { "●" } else { "○" };
-        let local_status = if is_local_active { " (Active)" } else { "" };
-        let local_text = format!("{} Local Audio (mpv/ffplay){}", local_bullet, local_status);
-        let local_style = if self.devices_cursor == 0 {
-            theme::cursor()
-        } else if is_local_active {
-            Style::default().fg(Color::Green)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        items.push(ListItem::new(local_text).style(local_style));
-
-        // [1..] Discovered Network Renderers
-        for (idx, dev) in devices.iter().enumerate() {
-            let cursor_idx = idx + 1;
-            let is_active = active_dev.as_ref().map(|d| d.udn == dev.udn).unwrap_or(false);
-            let bullet = if is_active { "●" } else { "○" };
-            let status = if is_active { " (Active)" } else { "" };
-            let text = format!(
-                "{} {} [{}:{}]{}",
-                bullet,
-                dev.display_label(),
-                dev.host,
-                dev.port,
-                status
-            );
-            let style = if self.devices_cursor == cursor_idx {
-                theme::cursor()
-            } else if is_active {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            items.push(ListItem::new(text).style(style));
-        }
-
-        if devices.is_empty() && is_scanning {
-            items.push(
-                ListItem::new("  (Searching for DLNA / UPnP MediaRenderers...)")
-                    .style(Style::default().fg(Color::DarkGray)),
-            );
-        }
-
-        self.devices_state.select(Some(self.devices_cursor));
-        let list = List::new(items).block(block);
-        f.render_stateful_widget(list, area, &mut self.devices_state);
     }
 
     fn render_settings_tab(&mut self, f: &mut Frame, area: Rect) {

@@ -613,6 +613,18 @@ fn column_widths(cols: &[Col], width: usize) -> Vec<usize> {
     widths
 }
 
+/// Frames of [`spinner`], one every [`SPINNER_FRAME`].
+const SPINNER_FRAMES: [char; 8] = ['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
+const SPINNER_FRAME: Duration = Duration::from_millis(100);
+
+/// The frame of the busy spinner (`SCANNING ⣾`) `elapsed` after some fixed instant: it turns
+/// with the clock, so it needs no thread or per-frame counter and turns at the same speed
+/// however often the screen is drawn.
+pub fn spinner(elapsed: Duration) -> char {
+    let frame = elapsed.as_millis() / SPINNER_FRAME.as_millis();
+    SPINNER_FRAMES[(frame % SPINNER_FRAMES.len() as u128) as usize]
+}
+
 /// A length or a position as the TUI shows it everywhere (list rows, totals, the strip, Now
 /// Playing): `MM:SS` under an hour (`04:02`), `H:MM:SS` from an hour (`1:15:00`). Rounded to
 /// the second; negative values read `00:00`.
