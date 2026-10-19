@@ -54,6 +54,59 @@ pub struct RemovedTrack {
     pub was_current: bool,
 }
 
+/// What happens once the tracks [`PlaybackQueue::upcoming`] lists have played.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueEnd {
+    /// Playback stops (stop mode).
+    Stops,
+    /// The current track plays again, and again (repeat-one mode); nothing else is next.
+    RepeatOne,
+    /// The queue loops: after the listed tracks (which already wrap past the end to the first
+    /// track) the current one plays again. With a single track it simply repeats.
+    Loops,
+    /// The UPnP continuous stream reshuffles the queue and starts over, so what follows the
+    /// listed tracks isn't known yet.
+    Reshuffles,
+}
+
+/// The indices of the tracks that play after the current one, in play order, from
+/// [`PlaybackQueue::upcoming`]; [`Upcoming::end`] says what happens after them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Upcoming {
+    /// Next position to yield, counted from 0 and taken modulo `queue_len`.
+    next: usize,
+    queue_len: usize,
+    left: usize,
+    end: QueueEnd,
+}
+
+impl Upcoming {
+    /// What happens once the listed tracks have played.
+    pub fn end(&self) -> QueueEnd {
+        self.end
+    }
+}
+
+impl Iterator for Upcoming {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        if self.left == 0 {
+            return None;
+        }
+        let index = self.next % self.queue_len;
+        self.next += 1;
+        self.left -= 1;
+        Some(index)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl ExactSizeIterator for Upcoming {}
+
 impl PlaybackQueue {
     pub fn new() -> Self {
         Self::default()
@@ -216,6 +269,41 @@ impl PlaybackQueue {
         } else {
             // "stop" mode
             None
+        }
+    }
+
+    /// The tracks that play after the current one, as [`Self::next_track`] in `mode` will play
+    /// them (`wrap: false`), or as the UPnP continuous stream does (`wrap: true`): it plays on to
+    /// the end of the queue whatever the mode, then reshuffles and starts over. Stop mode lists
+    /// the tracks to the end of the queue; loop mode every other track, past the end to the
+    /// first; repeat-one none, since the current track repeats.
+    pub fn upcoming(&self, mode: &str, wrap: bool) -> Upcoming {
+        let len = self.tracks.len();
+        let next = self.current_index + 1;
+        let to_end = len.saturating_sub(next);
+        let (left, end) = if len <= 1 {
+            let end = if mode == "repeat_one" && !wrap {
+                QueueEnd::RepeatOne
+            } else if mode == "loop" || wrap {
+                QueueEnd::Loops
+            } else {
+                QueueEnd::Stops
+            };
+            (0, end)
+        } else if wrap {
+            (to_end, QueueEnd::Reshuffles)
+        } else {
+            match mode {
+                "repeat_one" => (0, QueueEnd::RepeatOne),
+                "loop" => (len - 1, QueueEnd::Loops),
+                _ => (to_end, QueueEnd::Stops),
+            }
+        };
+        Upcoming {
+            next,
+            queue_len: len,
+            left,
+            end,
         }
     }
 

@@ -498,6 +498,7 @@ fn test_now_playing_layout_at_80x24() {
 fn test_now_playing_up_next_total_only_when_every_length_is_known() {
     common::isolate();
     let (mut app, dir) = np_app("up_next_total");
+    app.settings_mgr.settings.queue_mode = "stop".to_string();
     app.queue.track_mut(3).unwrap().duration_seconds = 0.0;
     let screen = common::tui::render_text(&mut app, 120, 40);
     let up = screen
@@ -511,10 +512,7 @@ fn test_now_playing_up_next_total_only_when_every_length_is_known() {
     app.queue.set_current_index(3);
     let screen = common::tui::render_text(&mut app, 120, 40);
     assert!(screen.contains("0 REMAINING"), "{screen}");
-    assert!(
-        screen.contains("LOOPS TO 01"),
-        "loop mode names the first track:\n{screen}"
-    );
+    assert!(screen.contains("PLAYBACK STOPS AFTER THIS TRACK"), "{screen}");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -522,6 +520,7 @@ fn test_now_playing_up_next_total_only_when_every_length_is_known() {
 fn test_now_playing_up_next_summary_is_cached_on_the_queue_revision() {
     common::isolate();
     let (mut app, dir) = np_app("up_next_cache");
+    app.settings_mgr.settings.queue_mode = "stop".to_string();
     for _ in 0..5 {
         common::tui::render(&mut app, 120, 40);
     }
@@ -530,6 +529,13 @@ fn test_now_playing_up_next_summary_is_cached_on_the_queue_revision() {
     let screen = common::tui::render_text(&mut app, 120, 40);
     assert_eq!(app.up_next_summary_builds(), 2);
     assert!(screen.contains("2 REMAINING  ·  09:49"), "{screen}");
+    // A new queue mode or the continuous stream starting changes what plays next.
+    app.settings_mgr.settings.queue_mode = "loop".to_string();
+    let screen = common::tui::render_text(&mut app, 120, 40);
+    assert_eq!(app.up_next_summary_builds(), 3);
+    assert!(screen.contains("3 REMAINING  ·  15:41"), "{screen}");
+    common::tui::render(&mut app, 120, 40);
+    assert_eq!(app.up_next_summary_builds(), 3);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -583,6 +589,8 @@ fn test_now_playing_footnote_follows_the_player_state() {
 fn test_now_playing_shows_a_pending_skip_as_queued_from_its_start() {
     common::isolate();
     let (mut app, dir) = np_app("skip");
+    // Stop mode, so UP NEXT doesn't list Halcyon Drift after the loop.
+    app.settings_mgr.settings.queue_mode = "stop".to_string();
     let buffer = common::tui::render(&mut app, 120, 40);
     let screen = common::tui::rows(&buffer).join("\n");
     assert!(screen.contains("▶ PLAYING"), "{screen}");
@@ -771,37 +779,137 @@ fn test_now_playing_total_after_the_numerals_is_regular_dim() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The UP NEXT rows from its label row down (trimmed), up to the end of the screen.
+fn up_next_lines(app: &mut AppUI, w: u16, h: u16) -> Vec<String> {
+    let buffer = common::tui::render(app, w, h);
+    let rows = common::tui::rows(&buffer);
+    let y = common::tui::find_row(&buffer, "UP NEXT")
+        .unwrap_or_else(|| panic!("no UP NEXT:\n{}", rows.join("\n")));
+    rows[y as usize..].iter().map(|r| r.trim().to_string()).collect()
+}
+
+/// Where the first UP NEXT line containing `text` is, if any.
+fn line_with(lines: &[String], text: &str) -> Option<usize> {
+    lines.iter().position(|l| l.contains(text))
+}
+
 /// What UP NEXT says on the last track in each queue mode.
 #[test]
 fn test_now_playing_end_of_queue_follows_the_queue_mode() {
     common::isolate();
     let (mut app, dir) = np_app("end_of_queue");
     app.queue.set_current_index(3);
-    let up_next = |app: &mut AppUI| {
-        let screen = common::tui::render_text(app, 120, 40);
-        screen
-            .lines()
-            .find(|r| r.contains("END OF QUEUE"))
-            .unwrap_or_else(|| panic!("no END OF QUEUE:\n{screen}"))
-            .to_string()
-    };
 
+    // Loop: the queue starts over, and the first track is next.
     app.settings_mgr.settings.queue_mode = "loop".to_string();
-    assert!(up_next(&mut app).contains("LOOPS TO 01  HALCYON DRIFT"));
+    let lines = up_next_lines(&mut app, 120, 40);
+    let wrap = line_with(&lines, "END OF QUEUE  ·  LOOPS TO 01").unwrap_or_else(|| panic!("{lines:#?}"));
+    let first = line_with(&lines, "HALCYON DRIFT").unwrap_or_else(|| panic!("{lines:#?}"));
+    assert!(first > wrap, "{lines:#?}");
     app.settings_mgr.settings.queue_mode = "stop".to_string();
-    assert!(up_next(&mut app).contains("PLAYBACK STOPS AFTER THIS TRACK"));
+    let lines = up_next_lines(&mut app, 120, 40);
+    assert!(line_with(&lines, "END OF QUEUE  ·  PLAYBACK STOPS AFTER THIS TRACK").is_some(), "{lines:#?}");
     // Repeat-one replays the track when it ends.
     app.settings_mgr.settings.queue_mode = "repeat_one".to_string();
-    let line = up_next(&mut app);
-    assert!(line.contains("REPEATS THIS TRACK"), "{line:?}");
-    assert!(!line.contains("STOPS"), "{line:?}");
+    let lines = up_next_lines(&mut app, 120, 40);
+    assert!(line_with(&lines, "REPEAT ONE  ·  THIS TRACK REPEATS").is_some(), "{lines:#?}");
+    assert!(line_with(&lines, "STOPS").is_none(), "{lines:#?}");
 
     // So does loop with a single track.
     app.queue.clear();
     app.queue.add_track(track(&dir, "Halcyon Drift", "Mira Lenz", 352.0));
     app.settings_mgr.settings.queue_mode = "loop".to_string();
-    let line = up_next(&mut app);
-    assert!(line.contains("REPEATS THIS TRACK"), "{line:?}");
+    let lines = up_next_lines(&mut app, 120, 40);
+    assert!(line_with(&lines, "END OF QUEUE  ·  REPEATS THIS TRACK").is_some(), "{lines:#?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Repeat-one with tracks after the current one: those don't play next, the current track does.
+#[test]
+fn test_now_playing_up_next_in_repeat_one_lists_no_later_tracks() {
+    common::isolate();
+    let (mut app, dir) = np_app("up_next_repeat_one");
+    app.settings_mgr.settings.queue_mode = "repeat_one".to_string();
+    for (w, h) in [(120, 40), (80, 24)] {
+        let lines = up_next_lines(&mut app, w, h);
+        assert!(line_with(&lines, "REPEAT ONE  ·  THIS TRACK REPEATS").is_some(), "{w}x{h}: {lines:#?}");
+        for later in ["GLASS HARBOUR", "NORTHBOUND", "SALT LINES"] {
+            assert!(line_with(&lines, later).is_none(), "{w}x{h}: {later}: {lines:#?}");
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Loop mode: the list runs past the end of the queue to the first track, marked where it wraps.
+#[test]
+fn test_now_playing_up_next_in_loop_wraps_around() {
+    common::isolate();
+    let (mut app, dir) = np_app("up_next_loop");
+    app.settings_mgr.settings.queue_mode = "loop".to_string();
+    app.queue.set_current_index(2);
+    let lines = up_next_lines(&mut app, 120, 40);
+    assert!(lines[0].contains("3 REMAINING"), "{lines:#?}");
+    let salt = line_with(&lines, "SALT LINES").unwrap_or_else(|| panic!("{lines:#?}"));
+    let wrap = line_with(&lines, "END OF QUEUE  ·  LOOPS TO 01").unwrap_or_else(|| panic!("{lines:#?}"));
+    let halcyon = line_with(&lines, "HALCYON DRIFT").unwrap_or_else(|| panic!("{lines:#?}"));
+    let glass = line_with(&lines, "GLASS HARBOUR").unwrap_or_else(|| panic!("{lines:#?}"));
+    assert!(salt < wrap && wrap < halcyon && halcyon < glass, "{lines:#?}");
+    assert!(lines[halcyon].starts_with("01"), "{lines:#?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Stop mode: the tracks to the end of the queue, then where playback stops.
+#[test]
+fn test_now_playing_up_next_in_stop_mode_ends_where_playback_stops() {
+    common::isolate();
+    let (mut app, dir) = np_app("up_next_stop");
+    app.settings_mgr.settings.queue_mode = "stop".to_string();
+    app.queue.set_current_index(2);
+    let lines = up_next_lines(&mut app, 120, 40);
+    assert!(lines[0].contains("1 REMAINING"), "{lines:#?}");
+    let salt = line_with(&lines, "SALT LINES").unwrap_or_else(|| panic!("{lines:#?}"));
+    let stops = line_with(&lines, "END OF QUEUE  ·  PLAYBACK STOPS").unwrap_or_else(|| panic!("{lines:#?}"));
+    assert!(salt < stops, "{lines:#?}");
+    assert!(line_with(&lines, "HALCYON DRIFT").is_none(), "{lines:#?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// With the UPnP continuous stream the queue plays on to its end whatever the mode, then the
+/// stream reshuffles it and starts over: UP NEXT never says playback stops.
+#[test]
+fn test_now_playing_up_next_follows_the_continuous_stream() {
+    common::isolate();
+    let (mut app, dir) = np_app("up_next_continuous");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let state = Arc::new(std::sync::RwLock::new(quickstream::web::NowPlayingState::default()));
+    let handle = quickstream::web::WebServer::start(0, state, tx).expect("web server");
+    handle
+        .stream_state()
+        .continuous
+        .is_active
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    app.web_server = Some(handle);
+
+    for mode in ["stop", "repeat_one", "loop"] {
+        app.settings_mgr.settings.queue_mode = mode.to_string();
+        app.queue.set_current_index(2);
+        let lines = up_next_lines(&mut app, 120, 40);
+        assert!(line_with(&lines, "SALT LINES").is_some(), "{mode}: {lines:#?}");
+        assert!(line_with(&lines, "HALCYON DRIFT").is_none(), "{mode}: {lines:#?}");
+        assert!(line_with(&lines, "RESHUFFLES").is_some(), "{mode}: {lines:#?}");
+        assert!(line_with(&lines, "STOPS").is_none(), "{mode}: {lines:#?}");
+        assert!(line_with(&lines, "THIS TRACK REPEATS").is_none(), "{mode}: {lines:#?}");
+
+        app.queue.set_current_index(3);
+        let lines = up_next_lines(&mut app, 120, 40);
+        assert!(
+            line_with(&lines, "END OF QUEUE  ·  RESHUFFLES AND STARTS OVER").is_some(),
+            "{mode}: {lines:#?}"
+        );
+    }
+    if let Some(handle) = app.web_server.take() {
+        handle.stop();
+    }
     let _ = fs::remove_dir_all(&dir);
 }
 

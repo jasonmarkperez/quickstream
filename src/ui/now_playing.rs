@@ -24,6 +24,7 @@ use super::screen::{Screen, WidthTier};
 use super::{theme, AppUI};
 use crate::analysis::TrackFeatures;
 use crate::metadata::AudioMetadata;
+use crate::queue::{QueueEnd, Upcoming};
 
 /// Width of the SIGNAL panel (from 110 columns) and the gap between it and NOW PLAYING (2b).
 const SIGNAL_COLS: u16 = 34;
@@ -63,18 +64,25 @@ const EMPTY_HINT: &str =
 /// Formats whose bitrate says more than their sample rate in the Up Next format column.
 const LOSSY_FORMATS: [&str; 6] = ["mp3", "aac", "m4a", "ogg", "opus", "wma"];
 
+/// What the Up Next summary was built for: the queue revision, the queue mode and whether the
+/// UPnP continuous stream was playing.
+type UpNextKey = (u64, String, bool);
+
 /// Values for tab 1 that would otherwise need a pass over the queue every frame.
 #[derive(Debug, Default)]
 pub(super) struct NowPlayingCache {
-    /// The Up Next summary and the queue revision it was built for.
-    up_next: Option<(u64, UpNextSummary)>,
+    /// The Up Next summary and what it was built for.
+    up_next: Option<(UpNextKey, UpNextSummary)>,
     /// How many times the summary has been built (tests check it is not rebuilt every frame).
     builds: u64,
 }
 
-/// The tracks after the current one: how many, their total length and what the columns need.
+/// The tracks that play after the current one: which, their total length and what the columns
+/// need.
 #[derive(Debug, Clone, Copy)]
 struct UpNextSummary {
+    /// The tracks in play order ([`crate::queue::PlaybackQueue::upcoming`]).
+    upcoming: Upcoming,
     remaining: usize,
     /// `None` when nothing remains or any length is unknown.
     total: Option<f64>,
@@ -266,26 +274,30 @@ impl AppUI {
         self.now_playing.builds
     }
 
-    /// The tracks after the current one, summed up once per queue revision (which also changes
-    /// with the current index).
+    /// The tracks that play after the current one, summed up once per queue revision (which also
+    /// changes with the current index), queue mode and continuous-stream state.
     fn up_next_summary(&mut self) -> UpNextSummary {
-        let revision = self.queue.revision();
-        if let Some((cached, summary)) = self.now_playing.up_next {
-            if cached == revision {
-                return summary;
+        let (revision, wrap) = (self.queue.revision(), self.continuous_stream_active());
+        let mode = &self.settings_mgr.settings.queue_mode;
+        if let Some(((r, m, w), summary)) = &self.now_playing.up_next {
+            if (*r, m, *w) == (revision, mode, wrap) {
+                return *summary;
             }
         }
+        let key: UpNextKey = (revision, mode.clone(), wrap);
+        let upcoming = self.queue.upcoming(mode, wrap);
         let tracks = self.queue.tracks();
-        let next = &tracks[(self.queue.current_index() + 1).min(tracks.len())..];
+        let next: Vec<&AudioMetadata> = upcoming.map(|i| &tracks[i]).collect();
         let known = !next.is_empty() && next.iter().all(|t| t.duration_seconds > 0.0);
         let summary = UpNextSummary {
+            upcoming,
             remaining: next.len(),
             total: known.then(|| next.iter().map(|t| t.duration_seconds).sum()),
             any_artist: next.iter().any(|t| !t.artist.is_empty()),
             duration_cols: duration_cols(next.iter().map(|t| t.duration_seconds).fold(0.0, f64::max)),
             format_cols: next.iter().map(|t| text_width(&format_badge(t))).max().unwrap_or(0),
         };
-        self.now_playing.up_next = Some((revision, summary));
+        self.now_playing.up_next = Some((key, summary));
         self.now_playing.builds += 1;
         summary
     }
@@ -574,24 +586,20 @@ impl AppUI {
         );
         let tracks = self.queue.tracks();
         let digits = tracks.len().to_string().len().max(2);
+        let end = summary.upcoming.end();
+        let width = usize::from(list.width);
+        let note_row = |f: &mut Frame, dy: usize, text: &str| {
+            line_at(f, list, dy as u16, Line::styled(kit::clip(text, width), theme::dim()));
+        };
         if summary.remaining == 0 {
-            // What plays when this track ends (`PlaybackQueue::next_track`): repeat-one, and loop
-            // over a single track, replay it.
-            let mode = self.settings_mgr.settings.queue_mode.as_str();
-            let text = if mode == "loop" && tracks.len() > 1 {
-                let first = kit::upper(tracks[0].display_title());
-                format!("END OF QUEUE{SEP}LOOPS TO {:0digits$}  {first}", 1)
-            } else if mode == "repeat_one" || mode == "loop" {
-                format!("END OF QUEUE{SEP}REPEATS THIS TRACK")
-            } else {
-                format!("END OF QUEUE{SEP}PLAYBACK STOPS AFTER THIS TRACK")
+            // What plays when this track ends (`PlaybackQueue::upcoming`).
+            let text = match end {
+                QueueEnd::Stops => format!("END OF QUEUE{SEP}PLAYBACK STOPS AFTER THIS TRACK"),
+                QueueEnd::RepeatOne => format!("REPEAT ONE{SEP}THIS TRACK REPEATS"),
+                QueueEnd::Loops => format!("END OF QUEUE{SEP}REPEATS THIS TRACK"),
+                QueueEnd::Reshuffles => format!("END OF QUEUE{SEP}RESHUFFLES AND STARTS OVER"),
             };
-            line_at(
-                f,
-                list,
-                0,
-                Line::styled(kit::clip(&text, usize::from(list.width)), theme::dim()),
-            );
+            note_row(f, 0, &text);
             return;
         }
 
@@ -608,8 +616,17 @@ impl AppUI {
         let free = usize::from(list.width).saturating_sub(usize::from(index_cols) + format_cols + duration_cols);
         let title_cols = ((free * 3 + 2) / 5) as u16;
 
-        let first = self.queue.current_index() + 1;
-        for (dy, idx) in (first..tracks.len()).take(usize::from(list.height)).enumerate() {
+        let rows = usize::from(list.height);
+        let mut dy = 0;
+        for idx in summary.upcoming {
+            // Loop mode runs past the end of the queue to its first track.
+            if idx == 0 && dy < rows {
+                note_row(f, dy, &format!("END OF QUEUE{SEP}LOOPS TO {:0digits$}", 1));
+                dy += 1;
+            }
+            if dy >= rows {
+                return;
+            }
             let track = &tracks[idx];
             let title = if tags {
                 kit::upper(track.display_title())
@@ -640,6 +657,16 @@ impl AppUI {
             }
             let row = Rect::new(list.x, list.y + dy as u16, list.width, 1);
             kit::list_row(f, row, &cols, RowMark::Plain);
+            dy += 1;
+        }
+        // Every track is listed: what happens after the last one, when that isn't a loop.
+        let after = match end {
+            QueueEnd::Stops => Some(format!("END OF QUEUE{SEP}PLAYBACK STOPS")),
+            QueueEnd::Reshuffles => Some(format!("END OF QUEUE{SEP}RESHUFFLES AND STARTS OVER")),
+            QueueEnd::RepeatOne | QueueEnd::Loops => None,
+        };
+        if let Some(text) = after.filter(|_| dy < rows) {
+            note_row(f, dy, &text);
         }
     }
 }

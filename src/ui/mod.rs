@@ -3534,6 +3534,17 @@ impl AppUI {
         roots
     }
 
+    /// Whether the UPnP continuous stream is playing the queue: it then plays on to the end of
+    /// the queue whatever the queue mode, and `play_next_track` wraps.
+    pub fn continuous_stream_active(&self) -> bool {
+        self.web_server.as_ref().is_some_and(|ws| {
+            ws.stream_state()
+                .continuous
+                .is_active
+                .load(std::sync::atomic::Ordering::SeqCst)
+        })
+    }
+
     /// Point the features worker at the current track and take what it has found. Never blocks.
     pub fn poll_track_features(&mut self) {
         let track = self.queue.current_track().map(|t| t.filepath.as_path());
