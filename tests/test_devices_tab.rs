@@ -584,3 +584,58 @@ fn device_addresses_show_whole_at_every_width() {
         }
     }
 }
+
+#[test]
+fn detail_panel_leaves_out_a_model_that_repeats_the_name() {
+    common::isolate();
+    // Sonos names a speaker after its room and may report the same as its model.
+    let devices = vec![renderer("Kitchen", "192.168.1.61", 1400, "Sonos", "Kitchen", "uuid:k")];
+    let mut app = devices_app("model_name", devices);
+    app.devices_cursor = 1;
+    let buf = tui::render(&mut app, 120, 40);
+    let keys: Vec<String> = (0..40).map(|y| span(&buf, y, DETAIL_X, DETAIL_VALUE_X)).collect();
+    assert!(keys.iter().any(|k| k == "MAKER"), "{keys:?}");
+    assert!(
+        !keys.iter().any(|k| k == "MODEL"),
+        "MODEL repeats the name:\n{}",
+        tui::rows(&buf).join("\n")
+    );
+}
+
+#[test]
+fn ipv6_renderer_addresses_are_bracketed_and_keep_their_port() {
+    common::isolate();
+    let devices = vec![
+        renderer("Short Six", "fd00::12", 1400, "", "", "uuid:s"),
+        // `[fe80::1c2b:3a4d:5e6f:7081]:1400` is 32 characters, wider than the column.
+        renderer("Long Six", "fe80::1c2b:3a4d:5e6f:7081", 1400, "", "", "uuid:l"),
+    ];
+    let mut app = devices_app("ipv6", devices);
+    app.devices_cursor = 0;
+    for active in [None, Some(0), Some(1)] {
+        if let Some(i) = active {
+            let devices = app.device_manager.get_devices();
+            app.device_manager.set_active_device(Some(devices[i].clone()));
+        }
+        for (w, h) in [(120, 40), (100, 30), (85, 30), (80, 24), (70, 24)] {
+            let buf = tui::render(&mut app, w, h);
+            let rows = tui::rows(&buf);
+            let row = |name: &str| -> String {
+                rows.iter()
+                    .find(|r| r.contains(name) && r.contains(":1400"))
+                    .unwrap_or_else(|| panic!("{w}x{h}, active {active:?}: no {name} row:\n{}", rows.join("\n")))
+                    .clone()
+            };
+            assert!(
+                row("SHORT SIX").contains("[fd00::12]:1400"),
+                "{w}x{h}, active {active:?}:\n{}",
+                rows.join("\n")
+            );
+            let long = row("LONG SIX");
+            assert!(
+                long.contains("[fe80:") && long.contains("]:1400"),
+                "{w}x{h}, active {active:?}: {long}"
+            );
+        }
+    }
+}

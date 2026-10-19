@@ -28,7 +28,8 @@ const MIN_TABLE_COLS: u16 = 40;
 /// rest (30 columns at 120). The address column shows 21 characters, the longest IPv4
 /// `host:port` (`255.255.255.255:65535`), and a row without `ACTIVE` lets its address run on into
 /// that column too (28 columns in all, as in 2d). The type takes 2 columns less than 2d's 10 to
-/// make that room, which still fits the longest type (`FFPLAY`).
+/// make that room, which still fits the longest type (`FFPLAY`). An IPv6 address too wide for
+/// its cell is cut in the middle of the host, so the port always shows ([`host_port`]).
 const MARK_COLS: u16 = 4;
 const TYPE_COLS: u16 = 8;
 const ADDRESS_COLS: u16 = 22;
@@ -86,6 +87,21 @@ impl TableColumns {
         cols
     }
 
+    /// Columns the address text of a row gets (0 when the column is dropped): an empty `ACTIVE`
+    /// cell gives its columns to the address, and a cell with a column after it keeps one
+    /// column for the gap.
+    fn address_width(self, active: bool) -> usize {
+        if !self.address {
+            0
+        } else if !self.active {
+            usize::from(ADDRESS_COLS)
+        } else if active {
+            usize::from(ADDRESS_COLS - 1)
+        } else {
+            usize::from(ADDRESS_COLS + ACTIVE_COLS)
+        }
+    }
+
     /// The row's columns: marker, name, and the optional ones that fit. An empty `ACTIVE` cell
     /// gives its columns to the address.
     fn cols<'a>(self, mark: (&'a str, Style), name: (&'a str, Style), rest: [(&'a str, Style); 3]) -> Vec<Col<'a>> {
@@ -110,17 +126,35 @@ impl TableColumns {
     }
 }
 
-/// `MAKER MODEL` of a renderer, or `None` when discovery found neither; a model that only
-/// repeats the name is left out, as [`DLNADevice::display_label`] does.
+/// A renderer's model, `None` when discovery found none or it only repeats the name (as
+/// [`DLNADevice::display_label`] leaves it out).
+fn model(device: &DLNADevice) -> Option<&str> {
+    let model = device.model_name.as_str();
+    (!model.is_empty() && model != device.friendly_name).then_some(model)
+}
+
+/// `MAKER MODEL` of a renderer, or `None` when discovery found neither (the model by [`model`]).
 fn maker_model(device: &DLNADevice) -> Option<String> {
     let mut parts = Vec::new();
     if !device.manufacturer.is_empty() {
         parts.push(device.manufacturer.as_str());
     }
-    if !device.model_name.is_empty() && device.model_name != device.friendly_name {
-        parts.push(device.model_name.as_str());
-    }
+    parts.extend(model(device));
     (!parts.is_empty()).then(|| kit::upper(&parts.join(" ")))
+}
+
+/// `host:port` in at most `width` columns, an IPv6 host in brackets (`[fe80::1]:1400`, so the
+/// port can't be read as part of it). Too wide, the host is cut in the middle (both ends tell
+/// addresses apart) and the port is kept.
+fn host_port(host: &str, port: u16, width: usize) -> String {
+    let (open, close) = if host.contains(':') { ("[", "]") } else { ("", "") };
+    let tail = format!("{close}:{port}");
+    let whole = format!("{open}{host}{tail}");
+    if text_width(&whole) <= width {
+        return whole;
+    }
+    let room = width.saturating_sub(open.len() + tail.len());
+    format!("{open}{}{tail}", middle_cut(host, room))
 }
 
 /// `text` in at most `width` columns, cut in the middle with `…` so both ends stay (a UDN's
@@ -267,12 +301,15 @@ impl AppUI {
                     address: "THIS MACHINE".to_string(),
                     active: active.is_none(),
                 },
-                Some(dev) => OutputRow {
-                    name: kit::upper(&dev.friendly_name),
-                    kind: "DLNA".to_string(),
-                    address: format!("{}:{}", dev.host, dev.port),
-                    active: active.is_some_and(|a| a.udn == dev.udn),
-                },
+                Some(dev) => {
+                    let is_active = active.is_some_and(|a| a.udn == dev.udn);
+                    OutputRow {
+                        name: kit::upper(&dev.friendly_name),
+                        kind: "DLNA".to_string(),
+                        address: host_port(&dev.host, dev.port, columns.address_width(is_active)),
+                        active: is_active,
+                    }
+                }
             };
             let bold = theme::ink().add_modifier(Modifier::BOLD);
             let (mark, name_style) = if row.active {
@@ -353,8 +390,8 @@ impl AppUI {
                 if !dev.manufacturer.is_empty() {
                     fields.push(("MAKER", kit::upper(&dev.manufacturer)));
                 }
-                if !dev.model_name.is_empty() {
-                    fields.push(("MODEL", kit::upper(&dev.model_name)));
+                if let Some(model) = model(dev) {
+                    fields.push(("MODEL", kit::upper(model)));
                 }
                 fields.push(("HOST", dev.host.clone()));
                 fields.push(("PORT", dev.port.to_string()));
