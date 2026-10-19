@@ -114,10 +114,15 @@ pub fn error() -> Style {
     Style::new().fg(palette().error)
 }
 
+/// Bold INK: titles, names and numbers that stand out (a modal's title row, the selected track).
+pub fn bold() -> Style {
+    ink().add_modifier(Modifier::BOLD)
+}
+
 /// Panel label: INK bold when its panel has focus, MID otherwise.
 pub fn label(focused: bool) -> Style {
     if focused {
-        ink().add_modifier(Modifier::BOLD)
+        bold()
     } else {
         mid()
     }
@@ -128,6 +133,17 @@ pub fn label(focused: bool) -> Style {
 pub fn cursor() -> Style {
     let p = palette();
     Style::new().fg(p.ground).bg(p.ink).add_modifier(Modifier::BOLD)
+}
+
+/// A modal's title chip (` KEYS `): reverse video like [`cursor`], or GROUND on ERROR for an error
+/// or the delete confirmation.
+pub fn chip(error: bool) -> Style {
+    if error {
+        let p = palette();
+        Style::new().fg(p.ground).bg(p.error).add_modifier(Modifier::BOLD)
+    } else {
+        cursor()
+    }
 }
 
 /// A key name in a key hint (` SPC `).

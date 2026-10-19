@@ -444,3 +444,23 @@ fn list_row_underlines_the_marked_characters_and_never_the_ellipsis() {
     assert!((12..14).all(|x| underlined(x, 1)), "`nd` of the range is underlined");
     assert!(!underlined(14, 1), "the ellipsis is not");
 }
+
+#[test]
+fn list_row_underlines_scattered_characters() {
+    common::isolate();
+    let buf = draw(30, 1, |f| {
+        kit::list_row(
+            f,
+            Rect::new(0, 0, 30, 1),
+            &[
+                Col::fixed("HALF-LIGHT CHORUS", 20, Style::new()).underline_chars([0, 1, 2, 11]),
+                Col::flex("ADA", Style::new()).underline(0..1).underline(2..3),
+            ],
+            RowMark::Plain,
+        );
+    });
+    let underlined = |x: u16| tui::cell_style(&buf, x, 0).add_modifier.contains(Modifier::UNDERLINED);
+    let marked: Vec<u16> = (0..30).filter(|&x| underlined(x)).collect();
+    // H A L and the C of CHORUS; the first and last A of ADA (at column 20).
+    assert_eq!(marked, vec![0, 1, 2, 11, 20, 22]);
+}

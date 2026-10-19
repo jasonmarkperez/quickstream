@@ -10,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use super::kit::{self, text_width, visible_tail, Col, PanelSpec, RowMark};
+use super::kit::{self, text_width, visible_tail, Col, KeyHint, ModalSpec, PanelSpec, RowMark};
 use super::screen::{Screen, WidthTier};
 use super::{queue_tab, theme, AppUI};
 use crate::paths;
@@ -218,6 +218,8 @@ pub struct PlaylistsUi {
     load_failed: bool,
     list_state: ListState,
     tracks_state: ListState,
+    /// The add picker's scroll position, reset each time it opens.
+    add_picker_state: ListState,
     /// Rows each pane showed at the last render: how far PageUp / PageDown move.
     pub list_page_height: usize,
     pub tracks_page_height: usize,
@@ -258,6 +260,7 @@ impl PlaylistsUi {
             load_failed: false,
             list_state: ListState::default(),
             tracks_state: ListState::default(),
+            add_picker_state: ListState::default(),
             list_page_height: 10,
             tracks_page_height: 10,
             tracks_summary: None,
@@ -586,13 +589,21 @@ impl AppUI {
         ui.tracks_page_height = track_rows.or(list_rows).unwrap_or(1).max(1) as usize;
     }
 
-    pub(super) fn render_playlist_modal(&self, f: &mut Frame) {
-        match &self.playlists.modal {
+    pub(super) fn render_playlist_modal(&mut self, f: &mut Frame) {
+        let PlaylistsUi {
+            modal,
+            store,
+            add_picker_state,
+            ..
+        } = &mut self.playlists;
+        match modal {
             Some(PlaylistModal::NamePrompt { purpose, input, error }) => {
                 render_name_prompt(f, purpose, input, error.as_deref())
             }
             Some(PlaylistModal::ConfirmDelete { name, count }) => render_confirm_delete(f, name, *count),
-            Some(PlaylistModal::AddPicker { pending, cursor }) => self.render_add_picker(f, pending, *cursor),
+            Some(PlaylistModal::AddPicker { pending, cursor }) => {
+                render_add_picker(f, store, add_picker_state, pending, *cursor)
+            }
             None => {}
         }
     }
@@ -763,7 +774,7 @@ impl PlaylistsUi {
                 RowMark::Marker
             };
             let (name_style, count_style) = if mark == RowMark::Marker {
-                let bold = theme::ink().add_modifier(Modifier::BOLD);
+                let bold = theme::bold();
                 (bold, bold)
             } else {
                 (theme::ink(), theme::dim())
@@ -1119,85 +1130,254 @@ fn renamed_message(old: &str, new: &str) -> String {
     }
 }
 
-/// A centred box `height` rows tall and at most 64 columns wide for the playlist prompts.
-fn playlist_prompt_rect(r: Rect, height: u16) -> Rect {
-    let width = 64.min(r.width.saturating_sub(4));
-    let height = height.min(r.height);
-    let x = r.x + r.width.saturating_sub(width) / 2;
-    let y = r.y + r.height.saturating_sub(height) / 2;
-    Rect::new(x, y, width, height)
+/// Width of the name prompt and the delete confirmation (3b, 3d).
+const PROMPT_WIDTH: u16 = 64;
+
+/// Width of the add picker (3e).
+const PICKER_WIDTH: u16 = 52;
+
+/// Rows a full modal frame takes: the borders, a padding row at the top and bottom, the title
+/// row and the blank row under it. A compact frame (title in the border) takes the borders only.
+const FRAME_ROWS: u16 = 6;
+const COMPACT_FRAME_ROWS: u16 = 2;
+
+/// The name prompt's and the delete confirmation's content: two rows, a blank row, then the
+/// keys (or the prompt's error).
+const PROMPT_ROWS: u16 = 4;
+
+/// Columns of the name prompt's `NAME` label (3b) and the add picker's `ADDING` label (3e).
+const NAME_LABEL_COLS: u16 = 7;
+const ADDING_LABEL_COLS: u16 = 8;
+
+/// The add picker's rows around its list: `ADDING`, its rule and a blank row above, a blank row
+/// and the keys below. Compact: no blank rows.
+const PICKER_ROWS: u16 = 5;
+const COMPACT_PICKER_ROWS: u16 = 3;
+
+/// The fewest list rows the add picker keeps a full frame for; with less room it goes compact.
+const PICKER_MIN_LIST_ROWS: u16 = 3;
+
+/// What the delete confirmation says happens (3d): only the playlist's own file goes.
+const DELETE_NOTE: &str = "The .m3u8 file is removed. Audio files are not touched.";
+
+/// The name prompt's keys, in its footer and the screen's key row alike.
+pub(super) fn name_prompt_hints() -> Vec<KeyHint> {
+    vec![KeyHint::new("ENTER", "SAVE", 1), KeyHint::new("ESC", "CANCEL", 1)]
 }
 
+/// The delete confirmation's keys: only `y` deletes; any other key keeps the playlist. Both
+/// have the same priority, so the screen's key row never drops either (a status is cut
+/// instead); the modal's own footer leaves out `ANY KEY CANCEL` when it is too narrow.
+pub(super) fn confirm_delete_hints() -> Vec<KeyHint> {
+    vec![KeyHint::new("Y", "DELETE", 1), KeyHint::new("ANY KEY", "CANCEL", 1)]
+}
+
+/// The add picker's keys.
+pub(super) fn add_picker_hints() -> Vec<KeyHint> {
+    vec![
+        KeyHint::new("ENTER", "ADD", 3),
+        KeyHint::new("J K", "SELECT", 2),
+        KeyHint::new("ESC", "CANCEL", 3),
+    ]
+}
+
+/// The name prompt and the delete confirmation: centred, [`PROMPT_WIDTH`] wide, compact when the
+/// screen is too short for the full frame.
+fn prompt_frame(f: &mut Frame, spec: ModalSpec) -> Rect {
+    let screen = f.area();
+    let full = screen.height >= FRAME_ROWS + PROMPT_ROWS;
+    let frame_rows = if full { FRAME_ROWS } else { COMPACT_FRAME_ROWS };
+    let area = kit::modal_area(screen, PROMPT_WIDTH, frame_rows + PROMPT_ROWS);
+    kit::modal_frame(f, area, ModalSpec { compact: !full, ..spec })
+}
+
+/// The row of a prompt's keys (or its error): the fourth content row, or the last row when the
+/// modal was cut shorter. `None` when there is no row for it under the first two.
+fn prompt_keys_row(inner: Rect) -> Option<u16> {
+    (inner.height >= 3).then(|| (inner.y + PROMPT_ROWS - 1).min(inner.bottom() - 1))
+}
+
+/// The name prompt (3b): `NAME` and the name as typed with a block cursor, the field's rule under
+/// it, then the keys. An error (3c) replaces the keys, in ERROR, and turns the rule ERROR too, so
+/// the prompt keeps its size; an error too long for its row takes the blank row above as well.
 fn render_name_prompt(f: &mut Frame, purpose: &NamePurpose, input: &str, error: Option<&str>) {
-    let area = playlist_prompt_rect(f.area(), 5);
-    kit::clear(f.buffer_mut(), area);
-
-    let title = match purpose {
-        NamePurpose::Create | NamePurpose::CreateAndAdd(_) => " NEW PLAYLIST ".to_string(),
-        NamePurpose::Rename { old } => format!(" RENAME \"{}\" ", old),
+    let (title, subtitle) = match purpose {
+        NamePurpose::Create | NamePurpose::CreateAndAdd(_) => ("NEW PLAYLIST", None),
+        // The playlist as the PLAYLISTS panel lists it.
+        NamePurpose::Rename { old } => ("RENAME", Some(kit::upper(old))),
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
+    let inner = prompt_frame(
+        f,
+        ModalSpec {
             title,
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(theme::base());
-
-    // The error replaces the key hint so the prompt keeps its height.
-    let message = match error {
-        Some(err) => Line::from(Span::styled(err.to_string(), Style::default().fg(Color::Red))),
-        None => Line::from(Span::styled(
-            "[Enter] Save   [Esc] Cancel",
-            Style::default().fg(Color::DarkGray),
-        )),
-    };
+            subtitle: subtitle.as_deref(),
+            ..Default::default()
+        },
+    );
+    if inner.is_empty() {
+        return;
+    }
+    let buf = f.buffer_mut();
+    let label_cols = NAME_LABEL_COLS.min(inner.width);
+    buf.set_stringn(inner.x, inner.y, "NAME", usize::from(label_cols), theme::dim());
     // Scroll long names horizontally: the field shows the end of the name, where typing
     // happens, and the cursor block (issue #52).
-    let label = "Name: ";
-    let field_width = (area.width as usize)
-        .saturating_sub(2) // borders
-        .saturating_sub(label.len())
-        .saturating_sub(1); // cursor
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(label, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                format!("{}█", visible_tail(input, field_width)),
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(""),
-        message,
-    ];
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    let field_x = inner.x + label_cols;
+    let field_cols = usize::from(inner.right() - field_x);
+    let shown = visible_tail(input, field_cols.saturating_sub(1));
+    buf.set_stringn(field_x, inner.y, &shown, field_cols, theme::bold());
+    let cursor_x = field_x + text_width(&shown) as u16;
+    if cursor_x < inner.right() {
+        buf.set_stringn(cursor_x, inner.y, "█", 1, theme::ink());
+    }
+    let rule_style = if error.is_some() { theme::error() } else { theme::ink() };
+    if inner.height > 1 {
+        buf.set_stringn(field_x, inner.y + 1, "─".repeat(field_cols), field_cols, rule_style);
+    }
+
+    let Some(keys_y) = prompt_keys_row(inner) else {
+        return;
+    };
+    match error {
+        Some(err) if text_width(err) > usize::from(inner.width) && keys_y >= inner.y + 3 => {
+            // Two rows: the blank one above the keys' row and that row; an error that needs
+            // more ends its second row with `…`.
+            let width = usize::from(inner.width);
+            for (i, line) in kit::wrap_clipped(err, width, 2).iter().enumerate() {
+                buf.set_stringn(inner.x, keys_y - 1 + i as u16, line, width, theme::error());
+            }
+        }
+        Some(err) => {
+            let width = usize::from(inner.width);
+            buf.set_stringn(inner.x, keys_y, kit::clip(err, width), width, theme::error());
+        }
+        None => {
+            let hints = name_prompt_hints();
+            buf.set_line(inner.x, keys_y, &kit::key_row(&hints, inner.width, None), inner.width);
+        }
+    }
 }
 
+/// The delete confirmation (3d), the one modal in ERROR: border, title chip and `Y` keycap.
+/// `Delete "<name>" (<n> tracks)?` (the name cut with `…` to keep the count), what is removed,
+/// then the keys.
 fn render_confirm_delete(f: &mut Frame, name: &str, count: usize) {
-    let area = playlist_prompt_rect(f.area(), 5);
-    kit::clear(f.buffer_mut(), area);
+    let inner = prompt_frame(
+        f,
+        ModalSpec {
+            title: "DELETE PLAYLIST",
+            error: true,
+            ..Default::default()
+        },
+    );
+    if inner.is_empty() {
+        return;
+    }
+    let width = usize::from(inner.width);
+    let tracks = track_count_label(count);
+    let name_room = width.saturating_sub(text_width(&format!("Delete \"\" ({tracks})?")));
+    let question = format!("Delete \"{}\" ({tracks})?", kit::clip(name, name_room));
+    let buf = f.buffer_mut();
+    buf.set_stringn(inner.x, inner.y, kit::clip(&question, width), width, theme::bold());
+    if inner.height > 1 {
+        buf.set_stringn(inner.x, inner.y + 1, kit::clip(DELETE_NOTE, width), width, theme::mid());
+    }
+    let Some(keys_y) = prompt_keys_row(inner) else {
+        return;
+    };
+    // Too narrow for both (under about 42 columns), `ANY KEY CANCEL` goes; the screen's key
+    // row, which never drops it, still shows it.
+    let mut hints = confirm_delete_hints();
+    if kit::top_priority_width(&hints) > usize::from(inner.width) {
+        hints.truncate(1);
+    }
+    let mut line = kit::key_row(&hints, inner.width, None);
+    // The `Y` keycap is ERROR, like the chip.
+    if let Some(keycap) = line.spans.first_mut() {
+        keycap.style = theme::chip(true);
+    }
+    buf.set_line(inner.x, keys_y, &line, inner.width);
+}
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            " DELETE PLAYLIST ",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(Color::Red))
-        .style(theme::base());
-    let lines = vec![
-        Line::from(Span::styled(
-            format!("Delete \"{}\" ({})? y/n", name, track_count_label(count)),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "[y] Delete   any other key: Cancel",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-    f.render_widget(Paragraph::new(lines).block(block), area);
+/// The add picker (3e): `ADDING` and what is added (the track title and its artist, or
+/// `<folder> (folder)`), one row per playlist with its track count, `last_playlist` preselected
+/// by the caller, then `+ NEW PLAYLIST…`. The rows scroll ([`kit::visible_window`] over `state`)
+/// so the cursor row always shows however many playlists there are.
+fn render_add_picker(f: &mut Frame, store: &PlaylistStore, state: &mut ListState, pending: &PendingAdd, cursor: usize) {
+    let screen = f.area();
+    let playlists = store.playlists();
+    let rows = playlists.len() as u16 + 1;
+    let max_height = screen.height.saturating_sub(2);
+    let full = max_height >= FRAME_ROWS + PICKER_ROWS + rows.min(PICKER_MIN_LIST_ROWS);
+    let around = if full {
+        FRAME_ROWS + PICKER_ROWS
+    } else {
+        COMPACT_FRAME_ROWS + COMPACT_PICKER_ROWS
+    };
+    let area = kit::modal_area(screen, PICKER_WIDTH, (around + rows).min(max_height));
+    let inner = kit::modal_frame(
+        f,
+        area,
+        ModalSpec {
+            title: "ADD TO PLAYLIST",
+            compact: !full,
+            ..Default::default()
+        },
+    );
+    if inner.is_empty() {
+        return;
+    }
+
+    // `ADDING  AFTERIMAGE  ·  MIRA LENZ`: the title is kept before the artist.
+    let width = usize::from(inner.width);
+    let buf = f.buffer_mut();
+    let label_cols = ADDING_LABEL_COLS.min(inner.width);
+    buf.set_stringn(inner.x, inner.y, "ADDING", usize::from(label_cols), theme::dim());
+    let room = width - usize::from(label_cols);
+    let what = kit::clip(&kit::upper(pending.label()), room);
+    let what_cols = text_width(&what);
+    buf.set_stringn(inner.x + label_cols, inner.y, &what, room, theme::bold());
+    if let PendingAdd::Entries { entries, .. } = pending {
+        if let [entry] = entries.as_slice() {
+            let artist_room = room - what_cols;
+            if !entry.artist.is_empty() && artist_room > 5 {
+                let artist = kit::clip(&format!("  ·  {}", kit::upper(&entry.artist)), artist_room);
+                let x = inner.x + label_cols + what_cols as u16;
+                buf.set_stringn(x, inner.y, artist, artist_room, theme::mid());
+            }
+        }
+    }
+    if inner.height > 1 {
+        kit::modal_rule(buf, inner.x, inner.y + 1, inner.width);
+    }
+
+    let gap = u16::from(full);
+    let list_top = inner.y + 2 + gap;
+    let list_bottom = inner.bottom().saturating_sub(1 + gap);
+    let height = usize::from(list_bottom.saturating_sub(list_top));
+    state.select(Some(cursor));
+    let window = kit::visible_window(state, usize::from(rows), height);
+    for (row_y, index) in window.enumerate() {
+        let y = list_top + row_y as u16;
+        let cols = match playlists.get(index) {
+            Some(playlist) => vec![
+                Col::flex(kit::upper(&playlist.name), theme::ink()),
+                Col::auto(playlist.entries.len().to_string(), theme::dim()),
+            ],
+            None => vec![Col::flex(kit::upper(NEW_PLAYLIST_ROW), theme::mid())],
+        };
+        let mark = if index == cursor {
+            RowMark::Cursor
+        } else {
+            RowMark::Plain
+        };
+        kit::list_row(f, Rect::new(inner.x, y, inner.width, 1), &cols, mark);
+    }
+
+    if inner.height > 2 {
+        let line = kit::key_row(&add_picker_hints(), inner.width, None);
+        f.buffer_mut().set_line(inner.x, inner.bottom() - 1, &line, inner.width);
+    }
 }
 
 /// The audio files directly inside `dir` (not recursive), sorted by name case-insensitively.
@@ -1334,6 +1514,7 @@ impl super::AppUI {
             .as_deref()
             .and_then(|name| self.playlists.store.index_of(name))
             .unwrap_or(0);
+        self.playlists.add_picker_state = ListState::default();
         self.playlists.modal = Some(PlaylistModal::AddPicker { pending, cursor });
     }
 
@@ -1569,62 +1750,6 @@ impl super::AppUI {
                 capitalize_first(&problem)
             };
         }
-    }
-
-    /// The add picker: what is being added, one row per playlist, then "+ New playlist…".
-    fn render_add_picker(&self, f: &mut Frame, pending: &PendingAdd, cursor: usize) {
-        let area = super::centered_rect(60, 60, f.area());
-        kit::clear(f.buffer_mut(), area);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                " ADD TO PLAYLIST ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ))
-            .title_bottom(Span::styled(
-                " [Enter] Add   [j/k] Move   [Esc] Cancel ",
-                Style::default().fg(Color::DarkGray),
-            ))
-            .border_style(Style::default().fg(Color::Cyan))
-            .style(theme::base());
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(2), Constraint::Min(1)])
-            .split(inner);
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled("Adding: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                pending.label().to_string(),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            ),
-        ]));
-        f.render_widget(header, chunks[0]);
-
-        let mut items: Vec<ListItem> = self
-            .playlists
-            .store
-            .playlists()
-            .iter()
-            .map(|p| ListItem::new(format!("{}  ({})", p.name, track_count_label(p.entries.len()))))
-            .collect();
-        items.push(ListItem::new(Span::styled(
-            NEW_PLAYLIST_ROW,
-            Style::default().fg(Color::Green),
-        )));
-        let list = List::new(items)
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("▶ ");
-        let mut state = ListState::default();
-        state.select(Some(cursor));
-        f.render_stateful_widget(list, chunks[1], &mut state);
     }
 }
 

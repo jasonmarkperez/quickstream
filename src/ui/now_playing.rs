@@ -99,7 +99,7 @@ struct UpNextSummary {
 }
 
 /// A sample rate in kHz: `96`, `44.1`.
-fn khz(hz: u32) -> String {
+pub(super) fn khz(hz: u32) -> String {
     if hz.is_multiple_of(1000) {
         (hz / 1000).to_string()
     } else {
@@ -107,7 +107,7 @@ fn khz(hz: u32) -> String {
     }
 }
 
-fn channels_label(channels: u8) -> String {
+pub(super) fn channels_label(channels: u8) -> String {
     match channels {
         1 => "MONO".to_string(),
         2 => "STEREO".to_string(),
@@ -398,7 +398,7 @@ impl AppUI {
         let compact = screen.short || screen.tier <= WidthTier::Compact;
         let Some(track) = self.queue.current_track().cloned() else {
             let content = self.hero_panel(f, area, false, compact);
-            let bold = theme::ink().add_modifier(Modifier::BOLD);
+            let bold = theme::bold();
             line_at(f, content, 0, Line::styled("NO TRACK LOADED", bold));
             let hint = kit::clip(EMPTY_HINT, usize::from(content.width));
             line_at(f, content, 2, Line::styled(hint, theme::dim()));
@@ -455,7 +455,7 @@ impl AppUI {
         let (pos, dur) = self.playback_times();
         let elapsed = kit::duration(pos);
         let numerals = kit::big_digits(&elapsed);
-        let bold = theme::ink().add_modifier(Modifier::BOLD);
+        let bold = theme::bold();
         let title = kit::upper(track.display_title());
 
         let hero_width = if full {

@@ -38,6 +38,16 @@ impl MoodType {
         }
     }
 
+    /// What the mood plays, for the mix picker (its BPM range is added from [`Self::bpm_range`]).
+    pub fn description(&self) -> &'static str {
+        match self {
+            MoodType::Chill => "Downtempo, acoustic, lofi & low energy vibes",
+            MoodType::Workout => "Dance, electronic, rock & upbeat vibes",
+            MoodType::Focus => "Instrumental, synthwave, minimalist & piano",
+            MoodType::Groove => "Soul, funk, disco, house & groove vibes",
+        }
+    }
+
     pub fn bpm_range(&self) -> (f64, f64) {
         match self {
             MoodType::Chill => (60.0, 98.0),
@@ -222,6 +232,65 @@ impl MixProfile {
                 let name = path.file_stem().unwrap_or_default().to_string_lossy();
                 format!("Seed Radio ({})", name)
             }
+        }
+    }
+
+    /// The profiles the mix picker (`M`) lists, in its order: keys `1`–`5`.
+    pub fn picker_profiles() -> [MixProfile; 5] {
+        [
+            MixProfile::DiverseShuffle,
+            MixProfile::BpmFlow {
+                target_bpm: 120.0,
+                tolerance: 0.15,
+            },
+            MixProfile::MoodVibe(MoodType::Chill),
+            MixProfile::MoodVibe(MoodType::Workout),
+            MixProfile::MoodVibe(MoodType::Groove),
+        ]
+    }
+
+    /// This profile's own row in the mix picker, or `None` for a profile the picker doesn't list
+    /// (Seed Radio, Focus). Only this row is marked as the profile in use.
+    pub fn picker_row(&self) -> Option<usize> {
+        match self {
+            MixProfile::DiverseShuffle => Some(0),
+            MixProfile::BpmFlow { .. } => Some(1),
+            MixProfile::MoodVibe(MoodType::Chill) => Some(2),
+            MixProfile::MoodVibe(MoodType::Workout) => Some(3),
+            MixProfile::MoodVibe(MoodType::Groove) => Some(4),
+            MixProfile::MoodVibe(MoodType::Focus) | MixProfile::SeedRadio(_) => None,
+        }
+    }
+
+    /// The row the mix picker's cursor starts on: [`Self::picker_row`], or for a profile the
+    /// picker doesn't list, the closest one (Seed Radio: Diverse Shuffle; Focus: Late Night
+    /// Groove).
+    pub fn picker_index(&self) -> usize {
+        self.picker_row().unwrap_or(match self {
+            MixProfile::MoodVibe(MoodType::Focus) => 4,
+            _ => 0,
+        })
+    }
+
+    /// The name as the mix picker lists it: [`Self::name`], without the `Mood:` prefix.
+    pub fn title(&self) -> String {
+        match self {
+            MixProfile::MoodVibe(mood) => mood.name().to_string(),
+            _ => self.name(),
+        }
+    }
+
+    /// One line on what the profile does, for the mix picker. A mood's ends with its BPM range,
+    /// from [`MoodType::bpm_range`].
+    pub fn description(&self) -> String {
+        match self {
+            MixProfile::DiverseShuffle => "Fair random sampling across all artists (prevents cluster bias)".to_string(),
+            MixProfile::BpmFlow { .. } => "Cohesive tempo gradient with harmonic Camelot wheel transitions".to_string(),
+            MixProfile::MoodVibe(mood) => {
+                let (lo, hi) = mood.bpm_range();
+                format!("{} ({lo:.0}-{hi:.0} BPM)", mood.description())
+            }
+            MixProfile::SeedRadio(_) => "Radio station seeded by a chosen track".to_string(),
         }
     }
 

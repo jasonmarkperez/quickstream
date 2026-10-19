@@ -292,7 +292,7 @@ impl AppUI {
                 compact,
             },
         );
-        let bold = theme::ink().add_modifier(Modifier::BOLD);
+        let bold = theme::bold();
 
         // The rows the address takes, kept free of choices; none if it can't fit whole.
         let url_rows = web_url.map_or(0, |url| wrapped(vec![Line::raw(url)], list.width).1);

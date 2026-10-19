@@ -923,9 +923,11 @@ fn test_add_picker_renders_header_rows_and_new_playlist_row() {
     terminal.draw(|f| app.render(f)).unwrap();
     let view = terminal.backend().to_string();
     assert!(view.contains("ADD TO PLAYLIST"), "{}", view);
-    assert!(view.contains("Adding: Airbag"), "{}", view);
-    assert!(view.contains("Road Trip  (0 tracks)"), "{}", view);
-    assert!(view.contains("+ New playlist…"), "{}", view);
+    assert!(view.contains("ADDING  AIRBAG  ·  RADIOHEAD"), "{}", view);
+    // The playlist as tab 5 lists it, its track count against the right edge.
+    let row = view.lines().find(|l| l.contains("ROAD TRIP")).expect("playlist row");
+    assert!(row.split('│').nth(1).unwrap().trim_end().ends_with(" 0"), "{}", view);
+    assert!(view.contains("+ NEW PLAYLIST…"), "{}", view);
     let _ = fs::remove_dir_all(&dir);
 }
 

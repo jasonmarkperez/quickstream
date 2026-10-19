@@ -116,6 +116,9 @@ fn styles_use_the_palette_tokens() {
     assert_eq!(theme::rule(), Style::new().fg(p.rule));
     assert_eq!(theme::error(), Style::new().fg(p.error));
     assert_eq!(theme::label(true), Style::new().fg(p.ink).add_modifier(Modifier::BOLD));
+    // Bold INK, the one style for titles, names and numbers that stand out.
+    assert_eq!(theme::bold(), Style::new().fg(p.ink).add_modifier(Modifier::BOLD));
+    assert_eq!(theme::label(true), theme::bold());
     assert_eq!(theme::label(false), Style::new().fg(p.mid));
     assert_eq!(theme::keycap(), Style::new().fg(p.ink).bg(p.rule));
 
@@ -1138,10 +1141,10 @@ fn modals_sit_on_ground_not_the_terminal_default() {
                     continue;
                 }
                 let bg = buffer[(x, y)].bg;
-                // GROUND, keycaps (RULE), cursor rows (INK) and the add picker's highlight (Cyan,
-                // restyled later), never the terminal default or black.
+                // GROUND, keycaps (RULE), cursor rows (INK) and the delete confirmation's ERROR
+                // chip and `Y` keycap, never the terminal default or black.
                 assert!(
-                    [p.ground, p.rule, p.ink, Color::Cyan].contains(&bg),
+                    [p.ground, p.rule, p.ink, p.error].contains(&bg),
                     "{modal:?}: cell ({x}, {y}) has background {bg:?}\n{screen}"
                 );
             }
@@ -1154,14 +1157,14 @@ fn modals_sit_on_ground_not_the_terminal_default() {
 /// The keys each modal's handler acts on, as the key row shows them.
 fn modal_keys(modal: Modal) -> &'static [&'static str] {
     match modal {
-        Modal::Help => &[" ESC  CLOSE"],
-        Modal::MixPicker => &[" J K  SELECT", " ENTER  START", " 1-5  PROFILE", " ESC  CLOSE"],
+        Modal::Help => &[" ? ESC  CLOSE"],
+        Modal::MixPicker => &[" J K  SELECT", " ENTER  START MIX", " 1-5  PROFILE", " ESC  CANCEL"],
         Modal::Search => &[
             " ↑↓  SELECT",
             " ENTER  ADD & CLOSE",
-            " TAB  ADD",
+            " TAB  ADD TO QUEUE",
             " ⇧TAB  ADD ALL",
-            " ESC  CLOSE",
+            " ESC  CANCEL",
         ],
         Modal::NamePrompt => &[" ENTER  SAVE", " ESC  CANCEL"],
         Modal::ConfirmDelete => &[" Y  DELETE", " ANY KEY  CANCEL"],
@@ -1206,6 +1209,114 @@ fn key_row_shows_the_open_modals_keys_instead_of_the_tabs() {
     let buffer = tui::render(&mut app, 120, 40);
     let row = tui::row(&buffer, key_row_index(&buffer));
     assert!(row.contains(" /  SPOTLIGHT"), "{row:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The delete confirmation's footer drops `ANY KEY CANCEL` when the modal is too narrow for it,
+/// so on a narrow screen the key row must keep both keys: a status message is cut instead of
+/// `ANY KEY CANCEL`, which would then show nowhere.
+#[test]
+fn narrow_delete_confirmation_keeps_any_key_cancel_beside_a_status() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("delete_keys_narrow");
+    app.active_tab = 4;
+    open_modal(&mut app, Modal::ConfirmDelete);
+    for status in [
+        "Nothing is playing",
+        "Couldn't rename \"Old\" to \"New\": permission denied",
+    ] {
+        app.status_message = status.to_string();
+        for width in [40, 44, 50] {
+            let buffer = tui::render(&mut app, width, 24);
+            let rows = tui::rows(&buffer).join("\n");
+            let y = (0..24)
+                .rev()
+                .find(|&y| tui::row(&buffer, y).contains(" Y  DELETE"))
+                .unwrap_or_else(|| panic!("{width}: no key row\n{rows}"));
+            let row = tui::row(&buffer, y);
+            assert!(
+                row.contains(" ANY KEY  CANCEL"),
+                "{width} cols, status {status:?}: ANY KEY CANCEL dropped from the key row: {row:?}\n{rows}"
+            );
+            // The modal's footer shows it whole or not at all, never cut.
+            let footer_y = (0..y)
+                .find(|&y| tui::row(&buffer, y).contains(" Y  DELETE"))
+                .unwrap_or_else(|| panic!("{width}: no modal footer\n{rows}"));
+            let footer = tui::row(&buffer, footer_y);
+            assert!(
+                !footer.contains(" ANY") || footer.contains(" ANY KEY  CANCEL"),
+                "{width} cols: footer cuts ANY KEY CANCEL: {footer:?}\n{rows}"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The keys in row `y` between columns `left` and `right` as (keycap, label) pairs: each run
+/// of keycap cells (RULE background) and the text after it, up to the next keycap.
+fn key_pairs(buffer: &ratatui::buffer::Buffer, y: u16, left: u16, right: u16) -> Vec<(String, String)> {
+    let rule = theme::palette().rule;
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut in_keycap = false;
+    for x in left..right {
+        let cell = &buffer[(x, y)];
+        let is_keycap = cell.bg == rule;
+        if is_keycap && !in_keycap {
+            pairs.push((String::new(), String::new()));
+        }
+        in_keycap = is_keycap;
+        if let Some((key, label)) = pairs.last_mut() {
+            if is_keycap {
+                key.push_str(cell.symbol());
+            } else {
+                label.push_str(cell.symbol());
+            }
+        }
+    }
+    pairs
+        .into_iter()
+        .map(|(k, l)| {
+            // A label ends where a wide gap starts (the status or the meter may follow).
+            let label = l.trim().split("   ").next().unwrap_or("").trim().to_string();
+            (k.trim().to_string(), label)
+        })
+        .collect()
+}
+
+/// A modal's footer and the key row name its keys in the same words: every key the footer
+/// shows is in the key row with the footer's label (the key row may add keys the footer leaves
+/// out, such as `↑↓ SELECT` in search).
+#[test]
+fn modal_footers_and_the_key_row_name_keys_alike() {
+    common::isolate();
+    let (mut app, dir) = chrome_app("modal_footer_agree");
+    app.active_tab = 1;
+    for modal in MODALS {
+        open_modal(&mut app, modal);
+        app.status_message.clear();
+        let buffer = tui::render(&mut app, 120, 40);
+        let rows = tui::rows(&buffer).join("\n");
+        // The modal's frame: its bottom border, and the footer the last row inside with keycaps.
+        let (left, top) = tui::find_text(&buffer, "┌").unwrap_or_else(|| panic!("{modal:?}\n{rows}"));
+        let bottom = (top + 1..40).find(|&y| buffer[(left, y)].symbol() == "└").unwrap();
+        let right = (left + 1..120).find(|&x| buffer[(x, top)].symbol() == "┐").unwrap();
+        let footer_y = (top + 1..bottom)
+            .rev()
+            .find(|&y| !key_pairs(&buffer, y, left + 1, right).is_empty())
+            .unwrap_or_else(|| panic!("{modal:?}: no footer\n{rows}"));
+        let footer = key_pairs(&buffer, footer_y, left + 1, right);
+        let key_row_y = (bottom + 1..40)
+            .find(|&y| !key_pairs(&buffer, y, 0, 120).is_empty())
+            .unwrap_or_else(|| panic!("{modal:?}: no key row under the modal\n{rows}"));
+        let key_row = key_pairs(&buffer, key_row_y, 0, 120);
+        for pair in &footer {
+            assert!(
+                key_row.contains(pair),
+                "{modal:?}: footer {pair:?} not in the key row {key_row:?}\n{rows}"
+            );
+        }
+        close_modals(&mut app);
+    }
     let _ = fs::remove_dir_all(&dir);
 }
 

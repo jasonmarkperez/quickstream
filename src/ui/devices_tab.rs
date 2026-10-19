@@ -311,7 +311,7 @@ impl AppUI {
                     }
                 }
             };
-            let bold = theme::ink().add_modifier(Modifier::BOLD);
+            let bold = theme::bold();
             let (mark, name_style) = if row.active {
                 (("●", bold), bold)
             } else {
@@ -410,7 +410,7 @@ impl AppUI {
             fields.push(("VOLUME", self.player.volume().to_string()));
         }
 
-        let bold = theme::ink().add_modifier(Modifier::BOLD);
+        let bold = theme::bold();
         let mut dy = 0;
         for (key, value) in &fields {
             if dy >= list.height {

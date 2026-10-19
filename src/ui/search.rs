@@ -46,10 +46,23 @@ pub struct SearchModalState {
     pub scan_receiver: Option<Receiver<Vec<AudioMetadata>>>,
     pub stop_flag: Option<Arc<AtomicBool>>,
     pub scan_start: Option<std::time::Instant>,
-    pub spinner_frame: usize,
     last_filter_at: Option<std::time::Instant>,
     filter_pending: bool,
+    /// The ranked list's query words (UPPERCASE, as the rows draw their text).
+    ranked_tokens: Vec<String>,
+    /// Per `filtered` row, the query words the ranking matched in the title and in the artist
+    /// (bit `i` for word `i`; words past the 64th are never marked).
+    row_fields: Vec<(u64, u64)>,
+    /// Whether a `filtered` track is an hour or longer: the length column is then 7 wide.
+    long_lengths: bool,
+    /// Per `filtered` row, its underlined characters once a frame has drawn it.
+    row_marks: Vec<Option<RowMarks>>,
+    /// Scans and match work done for drawing the list ([`Self::view_work`]).
+    view_work: u64,
 }
+
+/// The characters a ranked row underlines: char indices into its UPPERCASE title and artist.
+pub type RowMarks = (Vec<usize>, Vec<usize>);
 
 impl SearchModalState {
     pub fn new(root_dir: PathBuf, tracks: Vec<AudioMetadata>) -> Self {
@@ -80,9 +93,13 @@ impl SearchModalState {
             scan_receiver,
             stop_flag,
             scan_start,
-            spinner_frame: 0,
             last_filter_at: None,
             filter_pending: false,
+            ranked_tokens: Vec::new(),
+            row_fields: Vec::new(),
+            long_lengths: false,
+            row_marks: Vec::new(),
+            view_work: 0,
         };
 
         if !tracks.is_empty() {
@@ -201,12 +218,6 @@ impl SearchModalState {
                 }
             }
         }
-        self.spinner_frame = (self.spinner_frame + 1) % 10;
-    }
-
-    pub fn spinner_char(&self) -> &'static str {
-        const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        SPINNERS[self.spinner_frame % SPINNERS.len()]
     }
 
     pub fn close(&mut self) {
@@ -250,6 +261,7 @@ impl SearchModalState {
         self.last_filter_at = Some(std::time::Instant::now());
         self.filter_pending = false;
         let trimmed = self.query.trim();
+        self.ranked_tokens = trimmed.split_whitespace().map(str::to_uppercase).collect();
         if trimmed.is_empty() {
             // Return all tracks sorted by artist / title / filename
             let mut indices: Vec<usize> = (0..self.all_tracks.len()).collect();
@@ -260,6 +272,7 @@ impl SearchModalState {
                 .take(2000)
                 .map(|idx| (0i64, self.all_tracks[idx].clone()))
                 .collect();
+            self.row_fields = vec![(0, 0); self.filtered.len()];
         } else {
             let matcher = SkimMatcherV2::default();
             let prepared_tokens: Vec<(String, String, bool)> = trimmed
@@ -272,8 +285,11 @@ impl SearchModalState {
             for item in &self.search_items {
                 let mut total_score = 0i64;
                 let mut matches_all = true;
+                // The words this item ranked on in its title and in its artist.
+                let mut in_title = 0u64;
+                let mut in_artist = 0u64;
 
-                for (token, lower_token, has_slash) in &prepared_tokens {
+                for (word, (token, lower_token, has_slash)) in prepared_tokens.iter().enumerate() {
                     let score_title = score_field(&matcher, &item.title, &item.lower_title, token, lower_token);
                     let score_artist = score_field(&matcher, &item.artist, &item.lower_artist, token, lower_token);
                     let score_album = score_field(&matcher, &item.album, &item.lower_album, token, lower_token);
@@ -293,10 +309,12 @@ impl SearchModalState {
                         None
                     };
 
+                    let title_score = score_title.map(|s| s + 30); // boost title match
+                    let artist_score = score_artist.map(|s| s + 20); // boost artist match
                     let best_token_score = [
-                        score_title.map(|s| s + 30),  // boost title match
-                        score_artist.map(|s| s + 20), // boost artist match
-                        score_album.map(|s| s + 10),  // boost album match
+                        title_score,
+                        artist_score,
+                        score_album.map(|s| s + 10), // boost album match
                         score_filename,
                         score_comp,
                         score_rel,
@@ -307,6 +325,14 @@ impl SearchModalState {
 
                     if let Some(s) = best_token_score {
                         total_score += s;
+                        // Marked where it ranked (the title on a tie with the artist); a word
+                        // that ranked on the album, file name or a folder marks nothing.
+                        let bit = 1u64.checked_shl(word as u32).unwrap_or(0);
+                        if title_score == Some(s) {
+                            in_title |= bit;
+                        } else if artist_score == Some(s) {
+                            in_artist |= bit;
+                        }
                     } else {
                         matches_all = false;
                         break;
@@ -314,7 +340,7 @@ impl SearchModalState {
                 }
 
                 if matches_all {
-                    scored.push((total_score, item.track_idx));
+                    scored.push((total_score, item.track_idx, in_title, in_artist));
                 }
             }
 
@@ -324,12 +350,18 @@ impl SearchModalState {
                     .then_with(|| self.search_items[a.1].sort_key.cmp(&self.search_items[b.1].sort_key))
             });
 
+            scored.truncate(1000);
+            self.row_fields = scored.iter().map(|&(_, _, t, a)| (t, a)).collect();
             self.filtered = scored
                 .into_iter()
-                .take(1000)
-                .map(|(score, idx)| (score, self.all_tracks[idx].clone()))
+                .map(|(score, idx, _, _)| (score, self.all_tracks[idx].clone()))
                 .collect();
         }
+
+        // What the rows need that depends on the whole list, worked out once per list.
+        self.long_lengths = self.filtered.iter().any(|(_, t)| t.duration_seconds.round() >= 3600.0);
+        self.row_marks = vec![None; self.filtered.len()];
+        self.view_work += 1;
 
         if self.filtered.is_empty() {
             self.selected_index = 0;
@@ -412,6 +444,62 @@ impl SearchModalState {
 
     pub fn selected_track(&self) -> Option<&AudioMetadata> {
         self.filtered.get(self.selected_index).map(|(_, t)| t)
+    }
+
+    /// Whether the ranked list has a track an hour or longer (its length column is 7 wide, not
+    /// 5). Worked out once per list, not per frame.
+    pub fn long_lengths(&self) -> bool {
+        self.long_lengths
+    }
+
+    /// The characters to underline in ranked row `index`: char indices into its title and artist
+    /// as the row draws them (UPPERCASE). Each query word is marked only in the field the
+    /// ranking matched it in (the title or the artist, with the ranking's boosts); a word ranked
+    /// on the album, file name or a folder marks nothing. Worked out the first time the row is
+    /// drawn and kept until the list changes.
+    pub fn row_marks(&mut self, index: usize) -> RowMarks {
+        if self.row_marks.len() != self.filtered.len() {
+            self.row_marks = vec![None; self.filtered.len()];
+        }
+        if let Some(Some(marks)) = self.row_marks.get(index) {
+            return marks.clone();
+        }
+        let Some((_, track)) = self.filtered.get(index) else {
+            return RowMarks::default();
+        };
+        let (in_title, in_artist) = self.row_fields.get(index).copied().unwrap_or((0, 0));
+        let marks = if in_title == 0 && in_artist == 0 {
+            RowMarks::default()
+        } else {
+            self.view_work += 1;
+            let title = super::kit::upper(track.display_title());
+            let artist = super::kit::upper(&track.artist);
+            let matcher = SkimMatcherV2::default();
+            let mut marks = RowMarks::default();
+            for (word, token) in self.ranked_tokens.iter().enumerate().take(64) {
+                let bit = 1u64 << word;
+                let (text, out) = if in_title & bit != 0 {
+                    (&title, &mut marks.0)
+                } else if in_artist & bit != 0 {
+                    (&artist, &mut marks.1)
+                } else {
+                    continue;
+                };
+                if let Some((_, indices)) = matcher.fuzzy_indices(text, token) {
+                    out.extend(indices);
+                }
+            }
+            marks
+        };
+        self.row_marks[index] = Some(marks.clone());
+        marks
+    }
+
+    /// How many list scans and row match computations drawing the list has needed (test seam:
+    /// a redraw of an unchanged list needs none).
+    #[doc(hidden)]
+    pub fn view_work(&self) -> u64 {
+        self.view_work
     }
 
     pub fn all_filtered_tracks(&self) -> Vec<AudioMetadata> {

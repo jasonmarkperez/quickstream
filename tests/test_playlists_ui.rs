@@ -379,7 +379,7 @@ fn test_playlist_modal_takes_keys_before_global_hotkeys() {
         count: 24,
     });
     let view = render(&mut app, 120, 30);
-    assert!(view.contains("Delete \"Road Trip\" (24 tracks)? y/n"), "{}", view);
+    assert!(view.contains("Delete \"Road Trip\" (24 tracks)?"), "{}", view);
     let quit = app
         .handle_input_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
         .unwrap();
@@ -397,7 +397,7 @@ fn test_help_modal_lists_tab_5_navigation() {
     assert!(app.show_help_modal);
 
     let view = render(&mut app, 100, 40);
-    assert!(view.contains("1 - 5"), "{}", view);
+    assert!(view.contains("1–5"), "{}", view);
     assert!(view.contains("PLAYLISTS (TAB 5)"), "{}", view);
     assert!(view.contains("Focus panes (tabs 2 & 5)"), "{}", view);
     assert!(view.contains("Open/Play / Queue playlist"), "{}", view);
@@ -420,8 +420,8 @@ fn test_help_modal_fits_tab_5_keys_at_80x24() {
     let view = render(&mut app, 80, 24);
     for text in [
         "PLAYLISTS (TAB 5)",
-        "R / D",
-        "Enter/a",
+        "C ⇧R ⇧D",
+        "↵ A",
         "New / Rename / Delete",
         "Open/Play / Queue playlist",
         "Focus panes (tabs 2 & 5)",
@@ -613,7 +613,7 @@ fn test_help_modal_descriptions_line_up() {
 #[test]
 fn test_mix_picker_first_option_row_is_not_overdrawn() {
     common::isolate();
-    // Issue #59: a leftover footer drew "Press [?], [Esc], or [q] to close" over the `[1]` row.
+    // Issue #59: a leftover footer drew "Press [?], [Esc], or [q] to close" over the first row.
     let temp_dir = fresh_dirs("mix_picker");
     let mut app = new_app(&temp_dir);
     app.handle_input_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT))
@@ -623,15 +623,15 @@ fn test_mix_picker_first_option_row_is_not_overdrawn() {
     for (width, height) in [(80, 24), (120, 40)] {
         let view = render(&mut app, width, height);
         assert!(!view.contains("to close"), "{view}");
-        // Skip the tab bar, whose first label also starts with `[1]`.
-        let row = view
-            .lines()
-            .skip(1)
-            .find(|l| l.contains("[1]"))
-            .unwrap_or_else(|| panic!("no [1] row at {width}x{height}:\n{view}"));
+        let lines: Vec<&str> = view.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("DIVERSE ARTISTS SHUFFLE"))
+            .unwrap_or_else(|| panic!("no first row at {width}x{height}:\n{view}"));
+        let (row, description) = (lines[at], lines[at + 1]);
         assert!(
-            row.contains("[1] Diverse Artists Shuffle") && row.contains("— Fair random sampling"),
-            "[1] row overdrawn at {width}x{height}: {row:?}"
+            row.contains("1  ●  DIVERSE ARTISTS SHUFFLE") && description.contains("Fair random sampling"),
+            "first row overdrawn at {width}x{height}: {row:?} / {description:?}"
         );
     }
 

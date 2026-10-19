@@ -12,8 +12,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use quickstream::discovery::DLNADevice;
+use quickstream::metadata::AudioMetadata;
 use quickstream::player::upnp::UPnPPlayer;
 use quickstream::player::AudioPlayer;
+use quickstream::settings::SettingsManager;
+use quickstream::ui::AppUI;
 use quickstream::web::{
     ContinuousAdmission, ContinuousStreamController, NowPlayingState, StreamServerState, WebCommand, WebQueueItem,
     WebServer, WebServerHandle,
@@ -373,9 +376,27 @@ fn test_upnp_continuous_play_uses_the_armed_session_path() {
     let _ = mock.join();
 }
 
+fn track_meta(path: &Path, title: &str, seconds: f64) -> AudioMetadata {
+    AudioMetadata {
+        filepath: path.to_path_buf(),
+        filename: path.file_name().unwrap().to_string_lossy().to_string(),
+        title: title.to_string(),
+        artist: "Artist".to_string(),
+        album: "Album".to_string(),
+        genre: String::new(),
+        format_name: "wav".to_string(),
+        duration_seconds: seconds,
+        file_size: 0,
+        bitrate_kbps: 0,
+        sample_rate_hz: 0,
+        channels: 0,
+    }
+}
+
 /// A track whose length wasn't known when the continuous stream started it (placeholder
-/// metadata, tags not read yet) gets its length once the queue in the web state knows it,
-/// without waiting for the next track.
+/// metadata, tags not read yet) gets its length as soon as the UI publishes the queue with it
+/// (`AppUI::update_web_state`), without waiting for the next track, and whatever the stream's
+/// socket is doing: here the renderer has stopped reading, so the stream's writer is blocked.
 #[test]
 fn test_continuous_stream_learns_an_unknown_length_mid_track() {
     common::isolate();
@@ -386,74 +407,72 @@ fn test_continuous_stream_learns_an_unknown_length_mid_track() {
     let dir = temp_dir("learn_length");
     let a = dir.join("a.wav");
     let b = dir.join("b.wav");
+    let c = dir.join("c.wav");
     // Track A is longer than the socket buffers can hold (Linux lets the server write several MB
-    // ahead of the reader), so however large they are, the server is still writing A, at the
-    // pace the reader reads, while the test waits for its length.
+    // ahead of the reader), so the server is still on A, blocked writing it, while the test runs.
     write_wav(&a, 120_000);
     write_wav(&b, 100);
-    let state = Arc::new(RwLock::new(NowPlayingState::default()));
-    state.write().unwrap().queue = vec![
-        WebQueueItem {
-            duration_seconds: 0.0,
-            ..queue_item(0, &a)
-        },
-        WebQueueItem {
-            duration_seconds: 0.0,
-            ..queue_item(1, &b)
-        },
-    ];
-    let (handle, _rx) = start(state.clone());
+    write_wav(&c, 100);
+    let settings = SettingsManager::with_path(dir.join("config.json"));
+    let mut app = AppUI::new(Some(dir.clone()), settings);
+    app.queue
+        .add_tracks(vec![track_meta(&a, "Track 0", 0.0), track_meta(&b, "Track 1", 0.0)]);
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, app.web_state.clone(), tx).expect("start web server");
     let port = handle.port;
     let controller = handle.stream_state().continuous.clone();
     let path = handle.stream_state().arm_continuous_session();
-    let (status, mut reader) = open(port, &path);
+    app.web_server = Some(handle);
+    app.update_web_state();
+    let state = app.web_state.clone();
+
+    // The renderer reads the response head, then nothing more.
+    let (status, reader) = open(port, &path);
     assert_eq!(status, 200);
-    // Read at about real time (4 KB every 20 ms is 200 KB/s; CD audio is 176.4 KB/s), so the
-    // 21 MB of track A last well over a minute once the socket buffers are full.
-    let reading = Arc::new(AtomicBool::new(true));
-    let reading_thread = reading.clone();
-    let drain = std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        while reading_thread.load(Ordering::SeqCst) {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => std::thread::sleep(Duration::from_millis(20)),
-            }
-        }
-    });
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !controller.is_active.load(Ordering::SeqCst) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(controller.is_active.load(Ordering::SeqCst), "stream never started");
-    // Track A has started (its title is published after its length was read as unknown).
     let deadline = Instant::now() + Duration::from_secs(5);
     while state.read().unwrap().title != "Track 0" && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(2));
     }
+    assert!(controller.is_active.load(Ordering::SeqCst), "stream never started");
     assert_eq!(state.read().unwrap().title, "Track 0", "track A never started");
     assert_eq!(*controller.current_duration.lock().unwrap(), 0.0);
 
-    // A's tags arrive (update_web_state publishes the queue with its length).
-    state.write().unwrap().queue[0].duration_seconds = 120.0;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut learned = false;
-    while Instant::now() < deadline {
-        let on_a = *controller.current_track_index.lock().unwrap() == 0;
-        let duration = *controller.current_duration.lock().unwrap();
-        assert!(on_a, "track A ended before its length was learned");
-        if duration == 120.0 {
-            learned = true;
+    // Wait until the writer is stuck: while writes go through it moves the position every
+    // 250 ms, so a position that holds for a second means the socket is full.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let before = *controller.current_position.lock().unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        if *controller.current_position.lock().unwrap() == before {
             break;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        assert!(Instant::now() < deadline, "the stream never filled the socket");
     }
-    assert!(learned, "the length of the playing track was never learned");
+    assert_eq!(*controller.current_track_index.lock().unwrap(), 0, "still on track A");
 
-    reading.store(false, Ordering::SeqCst);
-    handle.stream_state().close_active_streams();
-    let _ = drain.join();
-    handle.stop();
+    // Another track with a known length at A's place in the queue: not the track being
+    // streamed, so its length is not taken.
+    app.queue.insert_tracks(0, vec![track_meta(&c, "Track C", 50.0)]);
+    app.update_web_state();
+    assert_eq!(
+        *controller.current_duration.lock().unwrap(),
+        0.0,
+        "C's length is not A's"
+    );
+    app.queue.remove_track(0);
+
+    // A's tags arrive: publishing the queue gives the stream its length at once.
+    app.queue.update_metadata(&track_meta(&a, "Track 0", 120.0));
+    app.update_web_state();
+    assert_eq!(*controller.current_duration.lock().unwrap(), 120.0, "length learned");
+    assert_eq!(state.read().unwrap().duration_seconds, 120.0, "and published");
+    assert_eq!(*controller.current_track_index.lock().unwrap(), 0, "still on track A");
+
+    if let Some(handle) = app.web_server.take() {
+        handle.stream_state().close_active_streams();
+        drop(reader);
+        handle.stop();
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
