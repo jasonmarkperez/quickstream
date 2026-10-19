@@ -26,9 +26,9 @@ fn temp_dir(name: &str) -> PathBuf {
     std::fs::canonicalize(&dir).unwrap()
 }
 
-/// A short silent 16-bit 44.1 kHz stereo WAV.
+/// A silent 16-bit 44.1 kHz stereo WAV.
 fn write_wav(path: &Path, millis: u32) {
-    let data_len = 44100 * 4 * millis / 1000;
+    let data_len = u32::try_from(44100 * 4 * u64::from(millis) / 1000).expect("WAV under 4 GB");
     let mut hdr = Vec::with_capacity(44 + data_len as usize);
     hdr.extend_from_slice(b"RIFF");
     hdr.extend_from_slice(&(36 + data_len).to_le_bytes());
@@ -386,7 +386,10 @@ fn test_continuous_stream_learns_an_unknown_length_mid_track() {
     let dir = temp_dir("learn_length");
     let a = dir.join("a.wav");
     let b = dir.join("b.wav");
-    write_wav(&a, 20_000);
+    // Track A is longer than the socket buffers can hold (Linux lets the server write several MB
+    // ahead of the reader), so however large they are, the server is still writing A, at the
+    // pace the reader reads, while the test waits for its length.
+    write_wav(&a, 120_000);
     write_wav(&b, 100);
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
     state.write().unwrap().queue = vec![
@@ -405,15 +408,16 @@ fn test_continuous_stream_learns_an_unknown_length_mid_track() {
     let path = handle.stream_state().arm_continuous_session();
     let (status, mut reader) = open(port, &path);
     assert_eq!(status, 200);
-    // Read slowly, so track A lasts a while.
+    // Read at about real time (4 KB every 20 ms is 200 KB/s; CD audio is 176.4 KB/s), so the
+    // 21 MB of track A last well over a minute once the socket buffers are full.
     let reading = Arc::new(AtomicBool::new(true));
     let reading_thread = reading.clone();
     let drain = std::thread::spawn(move || {
-        let mut buf = [0u8; 16384];
+        let mut buf = [0u8; 4096];
         while reading_thread.load(Ordering::SeqCst) {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
-                Ok(_) => std::thread::sleep(Duration::from_millis(5)),
+                Ok(_) => std::thread::sleep(Duration::from_millis(20)),
             }
         }
     });
@@ -431,14 +435,14 @@ fn test_continuous_stream_learns_an_unknown_length_mid_track() {
     assert_eq!(*controller.current_duration.lock().unwrap(), 0.0);
 
     // A's tags arrive (update_web_state publishes the queue with its length).
-    state.write().unwrap().queue[0].duration_seconds = 20.0;
+    state.write().unwrap().queue[0].duration_seconds = 120.0;
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut learned = false;
     while Instant::now() < deadline {
         let on_a = *controller.current_track_index.lock().unwrap() == 0;
         let duration = *controller.current_duration.lock().unwrap();
         assert!(on_a, "track A ended before its length was learned");
-        if duration == 20.0 {
+        if duration == 120.0 {
             learned = true;
             break;
         }

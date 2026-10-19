@@ -971,9 +971,12 @@ pub fn parse_device_description(xml_data: &str, location_url: &str) -> Option<DL
     })
 }
 
-/// Discover DLNA MediaRenderers on the local network via SSDP UDP multicast (239.255.255.250:1900).
+/// The SSDP multicast group and port discovery searches (also named on the Devices tab).
+pub const SSDP_MULTICAST_ADDR: &str = "239.255.255.250:1900";
+
+/// Discover DLNA MediaRenderers on the local network via SSDP UDP multicast ([`SSDP_MULTICAST_ADDR`]).
 pub fn discover_devices(timeout: Duration) -> Vec<DLNADevice> {
-    let multicast_addr = "239.255.255.250:1900";
+    let multicast_addr = SSDP_MULTICAST_ADDR;
     let search_targets = [
         "urn:schemas-upnp-org:device:MediaRenderer:1",
         "urn:schemas-upnp-org:service:AVTransport:1",

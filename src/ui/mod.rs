@@ -11,6 +11,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 mod chrome;
+mod devices_tab;
 pub mod features;
 pub mod kit;
 mod now_playing;
@@ -18,6 +19,7 @@ pub mod playlists;
 mod queue_tab;
 pub mod screen;
 pub mod search;
+mod settings_tab;
 pub mod tag_reads;
 pub mod theme;
 pub mod workers;
@@ -32,7 +34,22 @@ use crate::player::local::LocalPlayer;
 use crate::player::worker::AsyncPlayer;
 use crate::player::AudioPlayer;
 use crate::queue::PlaybackQueue;
-use crate::settings::{SettingsManager, SETTING_DEFINITIONS};
+use crate::settings::{setting, SettingsContext, SettingsManager, SETTING_DEFINITIONS, SETTING_DISPLAY_ORDER};
+
+/// The [`SettingsContext`] built from an `AppUI`'s fields one by one (not through `&self`), so
+/// `settings_mgr` can be borrowed mutably beside it: the Music Homes in memory, the music folder
+/// once its worker has found it, the home folder the library shows as `~`, and the port the
+/// running web server bound.
+macro_rules! settings_context {
+    ($app:expr) => {
+        SettingsContext {
+            bookmarks: &$app.bookmarks,
+            music_dir: $app.music_dir.get().and_then(|dir| dir.as_deref()),
+            home: $app.queue_tab.home.as_deref(),
+            web_port: $app.web_server.as_ref().map(|server| server.port),
+        }
+    };
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct CachedDir {
@@ -287,6 +304,14 @@ pub struct AppUI {
     queue_tab: queue_tab::QueueTabCache,
     /// Tab 1 values cached per queue revision (Up Next count, total length, columns).
     now_playing: now_playing::NowPlayingCache,
+    /// When the UI was created: the clock the Devices tab's scanning spinner turns by.
+    ui_epoch: Instant,
+    /// The music folder (a startup home choice), set by a worker at startup
+    /// (`set_music_dir_lookup`); empty until it has answered.
+    music_dir: std::sync::Arc<std::sync::OnceLock<Option<PathBuf>>>,
+    /// The status message the web server row set while its pairing link was not known yet
+    /// (`show_setting_status`); `poll_settings_status` adds the link once the LAN address is in.
+    web_link_status: Option<String>,
 }
 
 impl Drop for AppUI {
@@ -348,6 +373,10 @@ impl AppUI {
         } else {
             (None, None)
         };
+        if settings_mgr.settings.web_server_lan {
+            // So the pairing link is ready by the time the Settings tab or a status shows it.
+            settings_mgr.prefetch_lan_address();
+        }
 
         let (metadata_tx, metadata_rx) = std::sync::mpsc::channel();
         let (queue_add_tx, queue_add_rx) = std::sync::mpsc::channel();
@@ -378,7 +407,7 @@ impl AppUI {
             pending_parent_restore: None,
             queue_cursor: 0,
             devices_cursor: 0,
-            settings_cursor: 0,
+            settings_cursor: SETTING_DISPLAY_ORDER[0],
             bookmarks,
             in_bookmarks_view: false,
             show_help_modal: false,
@@ -432,7 +461,12 @@ impl AppUI {
             clock: kit::ClockCache::new(),
             queue_tab: queue_tab::QueueTabCache::new(),
             now_playing: now_playing::NowPlayingCache::default(),
+            ui_epoch: Instant::now(),
+            music_dir: Default::default(),
+            web_link_status: None,
         };
+        // On Linux the music folder lookup reads user-dirs.dirs: never on the UI thread.
+        app.set_music_dir_lookup(crate::settings::lookup_music_dir);
         app.refresh_browser();
         app.start_playlist_load();
         app.update_web_state();
@@ -1665,6 +1699,7 @@ impl AppUI {
             self.poll_background_metadata();
             self.poll_pending_queue_adds();
             self.poll_playlists();
+            self.poll_settings_status();
 
             // Poll progressive background autopilot discovery
             self.poll_background_autopilot();
@@ -2084,8 +2119,7 @@ impl AppUI {
                         self.status_message = "Cleared startup home (defaulting to launch directory)".to_string();
                     } else {
                         let resolved = if raw.starts_with('~') {
-                            if let Some(base) = directories::BaseDirs::new() {
-                                let home = base.home_dir();
+                            if let Some(home) = self.queue_tab.home.as_deref() {
                                 if raw == "~" {
                                     home.to_string_lossy().to_string()
                                 } else if let Some(stripped) = raw.strip_prefix("~/") {
@@ -2256,7 +2290,8 @@ impl AppUI {
             }
             (KeyCode::Char('v'), KeyModifiers::NONE) => {
                 if self.active_tab == 0 || self.active_tab == 1 {
-                    self.settings_mgr.cycle_setting(0, true);
+                    self.settings_mgr
+                        .cycle_setting(setting::METADATA_VIEW, true, &settings_context!(self));
                     self.update_browser_entry_labels();
                     self.status_message = format!(
                         "Display mode: {}",
@@ -2273,7 +2308,7 @@ impl AppUI {
                     self.open_spotlight();
                 } else if self.active_tab == 0 || (self.active_tab == 1 && self.queue_focus) {
                     self.open_fuzzy_search();
-                } else if self.active_tab == 3 && self.settings_cursor == 7 {
+                } else if self.active_tab == 3 && self.settings_cursor == setting::HOME_DIR {
                     let curr = self
                         .settings_mgr
                         .settings
@@ -2678,40 +2713,36 @@ impl AppUI {
             3 => {
                 // Settings Tab
                 match (code, modifiers) {
+                    // The cursor holds a setting index and moves in the order the tab lists
+                    // the settings (grouped), wrapping at either end.
                     (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
-                        if self.settings_cursor > 0 {
-                            self.settings_cursor -= 1;
-                        } else {
-                            self.settings_cursor = SETTING_DEFINITIONS.len() - 1;
-                        }
+                        self.settings_cursor = crate::settings::step_in_display_order(self.settings_cursor, false);
                     }
                     (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
-                        if self.settings_cursor + 1 < SETTING_DEFINITIONS.len() {
-                            self.settings_cursor += 1;
-                        } else {
-                            self.settings_cursor = 0;
-                        }
+                        self.settings_cursor = crate::settings::step_in_display_order(self.settings_cursor, true);
                     }
                     (KeyCode::PageUp, _)
                     | (KeyCode::Home, _)
                     | (KeyCode::Char('g'), KeyModifiers::NONE)
                     | (KeyCode::Char('K'), _)
                     | (KeyCode::Up, KeyModifiers::SHIFT) => {
-                        self.settings_cursor = 0;
+                        self.settings_cursor = SETTING_DISPLAY_ORDER[0];
                     }
                     (KeyCode::PageDown, _)
                     | (KeyCode::End, _)
                     | (KeyCode::Char('G'), _)
                     | (KeyCode::Char('J'), _)
                     | (KeyCode::Down, KeyModifiers::SHIFT) => {
-                        self.settings_cursor = SETTING_DEFINITIONS.len() - 1;
+                        self.settings_cursor = SETTING_DISPLAY_ORDER[SETTING_DISPLAY_ORDER.len() - 1];
                     }
-                    (KeyCode::Char('e'), KeyModifiers::NONE) if self.settings_cursor == 7 => {
+                    (KeyCode::Char('e'), KeyModifiers::NONE) if self.settings_cursor == setting::HOME_DIR => {
                         let curr = self.settings_mgr.settings.home_dir.clone().unwrap_or_default();
                         self.editing_home_dir = Some(curr);
                         self.status_message = "Editing Startup Home Directory (Enter: Save, Esc: Cancel)".to_string();
                     }
-                    (KeyCode::Char('c'), KeyModifiers::NONE) | (KeyCode::Delete, _) if self.settings_cursor == 7 => {
+                    (KeyCode::Char('c'), KeyModifiers::NONE) | (KeyCode::Delete, _)
+                        if self.settings_cursor == setting::HOME_DIR =>
+                    {
                         self.settings_mgr.settings.home_dir = None;
                         self.settings_mgr.save();
                         self.status_message = "Cleared startup home (defaulting to launch directory)".to_string();
@@ -2724,7 +2755,7 @@ impl AppUI {
                         self.cycle_and_apply_setting(true);
                     }
                     (KeyCode::Enter, KeyModifiers::NONE) => {
-                        if self.settings_cursor == 7 {
+                        if self.settings_cursor == setting::HOME_DIR {
                             let curr = self.settings_mgr.settings.home_dir.clone().unwrap_or_default();
                             self.editing_home_dir = Some(curr);
                             self.status_message =
@@ -2745,10 +2776,11 @@ impl AppUI {
     }
 
     pub fn cycle_and_apply_setting(&mut self, forward: bool) {
-        self.settings_mgr.cycle_setting(self.settings_cursor, forward);
-        if self.settings_cursor == 0 {
+        self.settings_mgr
+            .cycle_setting(self.settings_cursor, forward, &settings_context!(self));
+        if self.settings_cursor == setting::METADATA_VIEW {
             self.update_browser_entry_labels();
-        } else if self.settings_cursor == 1 {
+        } else if self.settings_cursor == setting::PLAYER_BACKEND {
             let backend = self.settings_mgr.settings.player_backend.clone();
             if self.device_manager.get_active_device().is_none() {
                 let volume = self.player.volume();
@@ -2757,16 +2789,73 @@ impl AppUI {
                 let old = std::mem::replace(&mut self.player, new_player);
                 self.retire_player(old);
             }
-        } else if self.settings_cursor == 6 || SETTING_DEFINITIONS[self.settings_cursor].key == "web_server_lan" {
+        } else if setting::WEB.contains(&self.settings_cursor) {
             self.sync_web_server();
-        } else if self.settings_cursor == 7 {
+        } else if self.settings_cursor == setting::HOME_DIR {
             self.update_web_state();
+        }
+        self.show_setting_status(self.settings_cursor);
+    }
+
+    /// What setting `index`'s values and choices depend on besides config.json (see
+    /// [`SettingsContext`]), all from memory.
+    pub fn settings_context(&self) -> SettingsContext<'_> {
+        settings_context!(self)
+    }
+
+    /// The port the running web server bound, `None` while none runs.
+    pub fn web_port(&self) -> Option<u16> {
+        self.web_server.as_ref().map(|server| server.port)
+    }
+
+    /// Look the music folder up on a worker with `lookup` (`AppUI::new` uses
+    /// `settings::lookup_music_dir`; tests pass their own). Until it has answered, the startup
+    /// home's choices and cycling leave the music folder out, as if there were none.
+    pub fn set_music_dir_lookup(&mut self, lookup: impl FnOnce() -> Option<PathBuf> + Send + 'static) {
+        let cell = std::sync::Arc::new(std::sync::OnceLock::new());
+        self.music_dir = cell.clone();
+        self.workers.spawn("music-dir", move || {
+            let _ = cell.set(lookup());
+        });
+    }
+
+    /// Put setting `index` and its long value in the status line (`Now Playing Web Server:
+    /// Enabled (<address>)`). On the web server row with network access, while the LAN address
+    /// is still being looked up, the address is left out and `poll_settings_status` adds it once
+    /// it is known.
+    pub fn show_setting_status(&mut self, index: usize) {
+        let Some(def) = SETTING_DEFINITIONS.get(index) else {
+            return;
+        };
+        if setting::WEB.contains(&index) && self.settings_mgr.settings.web_server_lan {
+            self.settings_mgr.prefetch_lan_address();
         }
         self.status_message = format!(
             "{}: {}",
-            SETTING_DEFINITIONS[self.settings_cursor].label,
-            self.settings_mgr.get_display_value(self.settings_cursor)
+            def.label,
+            self.settings_mgr.get_display_value(index, &self.settings_context())
         );
+        let link_pending = index == setting::WEB_SERVER_ENABLED
+            && self.settings_mgr.settings.web_server_enabled
+            && self.web_server.is_some()
+            && self.settings_mgr.web_url(self.web_port()).is_none();
+        self.web_link_status = link_pending.then(|| self.status_message.clone());
+    }
+
+    /// Once per tick: when the status still reads what `show_setting_status` put there without
+    /// the web address and the address is now known, show it with the address. Any other status
+    /// shown since, or the server stopping, drops the update.
+    pub fn poll_settings_status(&mut self) {
+        let Some(sent) = self.web_link_status.as_ref() else {
+            return;
+        };
+        if *sent != self.status_message || !self.settings_mgr.settings.web_server_enabled || self.web_server.is_none() {
+            self.web_link_status = None;
+            return;
+        }
+        if self.settings_mgr.web_url(self.web_port()).is_some() {
+            self.show_setting_status(setting::WEB_SERVER_ENABLED);
+        }
     }
 
     /// Play the queue's current track. Returns the playback error, if `player.play` failed (it
@@ -3719,116 +3808,6 @@ impl AppUI {
         } else if self.show_help_modal {
             self.render_help_modal(f);
         }
-    }
-
-    fn render_devices_tab(&mut self, f: &mut Frame, area: Rect) {
-        let is_scanning = self.device_manager.is_scanning();
-        let title = if is_scanning {
-            " AUDIO OUTPUT DEVICES (Scanning...) "
-        } else {
-            " AUDIO OUTPUT DEVICES "
-        };
-        let block = Block::default().borders(Borders::ALL).title(title);
-
-        let active_dev = self.device_manager.get_active_device();
-        let devices = self.device_manager.get_devices();
-
-        let mut items = Vec::new();
-
-        // [0] Local Audio
-        let is_local_active = active_dev.is_none();
-        let local_bullet = if is_local_active { "●" } else { "○" };
-        let local_status = if is_local_active { " (Active)" } else { "" };
-        let local_text = format!("{} Local Audio (mpv/ffplay){}", local_bullet, local_status);
-        let local_style = if self.devices_cursor == 0 {
-            theme::cursor()
-        } else if is_local_active {
-            Style::default().fg(Color::Green)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        items.push(ListItem::new(local_text).style(local_style));
-
-        // [1..] Discovered Network Renderers
-        for (idx, dev) in devices.iter().enumerate() {
-            let cursor_idx = idx + 1;
-            let is_active = active_dev.as_ref().map(|d| d.udn == dev.udn).unwrap_or(false);
-            let bullet = if is_active { "●" } else { "○" };
-            let status = if is_active { " (Active)" } else { "" };
-            let text = format!(
-                "{} {} [{}:{}]{}",
-                bullet,
-                dev.display_label(),
-                dev.host,
-                dev.port,
-                status
-            );
-            let style = if self.devices_cursor == cursor_idx {
-                theme::cursor()
-            } else if is_active {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            items.push(ListItem::new(text).style(style));
-        }
-
-        if devices.is_empty() && is_scanning {
-            items.push(
-                ListItem::new("  (Searching for DLNA / UPnP MediaRenderers...)")
-                    .style(Style::default().fg(Color::DarkGray)),
-            );
-        }
-
-        self.devices_state.select(Some(self.devices_cursor));
-        let list = List::new(items).block(block);
-        f.render_stateful_widget(list, area, &mut self.devices_state);
-    }
-
-    fn render_settings_tab(&mut self, f: &mut Frame, area: Rect) {
-        let mut block = Block::default().borders(Borders::ALL).title(" APPLICATION SETTINGS ");
-
-        if self.editing_home_dir.is_some() {
-            block = block.title_bottom(Span::styled(
-                " [Enter] Save Path   [Esc] Cancel Editing   [Backspace] Delete ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ));
-        } else if self.settings_cursor == 7 {
-            block = block.title_bottom(Span::styled(
-                " [Enter / e] Edit Path   [c] Clear   [←/→] Cycle Presets   [↑/↓] Navigate ",
-                Style::default().fg(Color::DarkGray),
-            ));
-        } else {
-            block = block.title_bottom(Span::styled(
-                " [Enter / Space / ←/→] Change   [↑/↓] Navigate ",
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-
-        let items: Vec<ListItem> = SETTING_DEFINITIONS
-            .iter()
-            .enumerate()
-            .map(|(idx, defn)| {
-                if idx == 7 && self.editing_home_dir.is_some() {
-                    let edit_val = self.editing_home_dir.as_deref().unwrap_or("");
-                    let text = format!("{:<28} : [ {}█ ]", defn.label, edit_val);
-                    ListItem::new(text).style(theme::cursor())
-                } else {
-                    let val_str = self.settings_mgr.get_display_value(idx);
-                    let text = format!("{:<28} : {}", defn.label, val_str);
-                    let style = if idx == self.settings_cursor {
-                        theme::cursor()
-                    } else {
-                        Style::default().fg(Color::White)
-                    };
-                    ListItem::new(text).style(style)
-                }
-            })
-            .collect();
-
-        self.settings_state.select(Some(self.settings_cursor));
-        let list = List::new(items).block(block);
-        f.render_stateful_widget(list, area, &mut self.settings_state);
     }
 
     fn render_search_modal(modal: &mut SearchModalState, f: &mut Frame) {
