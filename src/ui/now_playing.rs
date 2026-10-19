@@ -437,7 +437,11 @@ impl AppUI {
             3
         };
         let base_core = header_rows + hero_body + 2 + u16::from(!tech.is_empty());
-        let wanted = (summary.remaining.max(1)).min(usize::from(MIN_UP_NEXT_ROWS)) as u16;
+        // UP NEXT's rows: up to MIN_UP_NEXT_ROWS tracks (or the end-of-queue note when none),
+        // plus loop mode's `LOOPS TO 01` row when the list wraps among them.
+        let listed = summary.remaining.min(usize::from(MIN_UP_NEXT_ROWS));
+        let wraps = summary.upcoming.take(listed).any(|idx| idx == 0);
+        let wanted = (listed.max(1) + usize::from(wraps)) as u16;
         let up_next_rows = 1 + PLAIN_HEADER_ROWS + wanted;
         let show_up_next = !screen.short && base_core + up_next_rows <= height;
         let show_info = base_core + 1 + if show_up_next { up_next_rows } else { 0 } <= height;

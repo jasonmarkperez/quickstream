@@ -1164,3 +1164,42 @@ fn test_now_playing_stopped_player_never_shows_the_old_tracks_length() {
     assert!(strip.contains("04:18") && !strip.contains("05:52"), "{strip:?}");
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// In loop mode the `LOOPS TO 01` note takes a row of its own: whenever UP NEXT shows, it still
+/// lists every upcoming track up to three, the wrapped ones included.
+#[test]
+fn test_now_playing_loop_note_never_crowds_out_an_upcoming_track() {
+    common::isolate();
+    let (mut app, dir) = np_app("loop_note_rows");
+    app.settings_mgr.settings.queue_mode = "loop".to_string();
+    // Current Northbound: Salt Lines, then the wrap to Halcyon Drift and Glass Harbour.
+    // Current Salt Lines (last): the wrap, then Halcyon Drift, Glass Harbour, Northbound.
+    for (current, wanted) in [
+        (2, vec!["SALT LINES", "HALCYON DRIFT", "GLASS HARBOUR"]),
+        (3, vec!["HALCYON DRIFT", "GLASS HARBOUR", "NORTHBOUND"]),
+    ] {
+        app.queue.set_current_index(current);
+        for w in [80u16, 100, 120] {
+            for h in 14..=40u16 {
+                let screen = common::tui::render_text(&mut app, w, h);
+                if !screen.contains("UP NEXT") {
+                    continue;
+                }
+                for title in &wanted {
+                    assert!(screen.contains(title), "{current} {w}x{h}: {title}\n{screen}");
+                }
+            }
+        }
+    }
+    // Two tracks, the last current: the one upcoming track is listed under the note.
+    app.queue.remove(3);
+    app.queue.remove(2);
+    app.queue.set_current_index(1);
+    for (w, h) in [(120u16, 25u16), (120, 26), (120, 27), (100, 24), (100, 25)] {
+        let screen = common::tui::render_text(&mut app, w, h);
+        if screen.contains("LOOPS TO 01") {
+            assert!(screen.contains("HALCYON DRIFT"), "{w}x{h}\n{screen}");
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
