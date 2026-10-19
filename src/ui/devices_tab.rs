@@ -25,10 +25,13 @@ const PANEL_GAP: u16 = 4;
 const MIN_TABLE_COLS: u16 = 40;
 
 /// Table columns (2d): the `●` / `○` marker, then type, address and `ACTIVE`; the name takes the
-/// rest (30 columns at 120).
+/// rest (30 columns at 120). The address column shows 21 characters, the longest IPv4
+/// `host:port` (`255.255.255.255:65535`), and a row without `ACTIVE` lets its address run on into
+/// that column too (28 columns in all, as in 2d). The type takes 2 columns less than 2d's 10 to
+/// make that room, which still fits the longest type (`FFPLAY`).
 const MARK_COLS: u16 = 4;
-const TYPE_COLS: u16 = 10;
-const ADDRESS_COLS: u16 = 20;
+const TYPE_COLS: u16 = 8;
+const ADDRESS_COLS: u16 = 22;
 const ACTIVE_COLS: u16 = 6;
 
 /// The name column keeps at least this many columns: narrower, the `ACTIVE`, type and address
@@ -83,17 +86,24 @@ impl TableColumns {
         cols
     }
 
-    /// The row's columns: marker, name, and the optional ones that fit.
+    /// The row's columns: marker, name, and the optional ones that fit. An empty `ACTIVE` cell
+    /// gives its columns to the address.
     fn cols<'a>(self, mark: (&'a str, Style), name: (&'a str, Style), rest: [(&'a str, Style); 3]) -> Vec<Col<'a>> {
         let [kind, address, active] = rest;
         let mut cols = vec![Col::fixed(mark.0, MARK_COLS, mark.1), Col::flex(name.0, name.1)];
         if self.kind {
             cols.push(Col::fixed(kind.0, TYPE_COLS, kind.1));
         }
+        let merge = self.address && self.active && active.0.is_empty();
         if self.address {
-            cols.push(Col::fixed(address.0, ADDRESS_COLS, address.1));
+            let width = if merge {
+                ADDRESS_COLS + ACTIVE_COLS
+            } else {
+                ADDRESS_COLS
+            };
+            cols.push(Col::fixed(address.0, width, address.1));
         }
-        if self.active {
+        if self.active && !merge {
             cols.push(Col::fixed(active.0, ACTIVE_COLS, active.1));
         }
         cols

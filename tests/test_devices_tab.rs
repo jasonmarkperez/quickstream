@@ -23,11 +23,12 @@ const P: Palette = Palette::TRUECOLOR;
 
 /// At 120 columns (2d): the table's text starts at the gutter, the name, type and address
 /// columns follow a 4-column marker column, and the detail panel starts 4 columns after the
-/// 72-column OUTPUT DEVICES panel.
+/// 72-column OUTPUT DEVICES panel. The type column is 8 wide (2d: 10), so the address has room
+/// for any IPv4 `host:port` before `ACTIVE`.
 const MARK_X: u16 = 2;
 const NAME_X: u16 = 6;
 const TYPE_X: u16 = 36;
-const ADDRESS_X: u16 = 46;
+const ADDRESS_X: u16 = 44;
 const DETAIL_X: u16 = 78;
 const DETAIL_VALUE_X: u16 = 90;
 
@@ -167,7 +168,7 @@ fn devices_table_lists_local_audio_and_renderers_in_columns() {
     assert_eq!(span(&buf, local, TYPE_X, ADDRESS_X), "MPV");
     assert_eq!(
         span(&buf, local, ADDRESS_X, DETAIL_X - 4),
-        format!("{:<20}ACTIVE", "THIS MACHINE")
+        format!("{:<22}ACTIVE", "THIS MACHINE")
     );
     let active_x = x_of(&buf, "ACTIVE");
     assert!(bold(&buf, MARK_X, local) && bold(&buf, NAME_X, local) && bold(&buf, active_x, local));
@@ -198,7 +199,7 @@ fn devices_table_lists_local_audio_and_renderers_in_columns() {
     assert_eq!(span(&buf, living, MARK_X, NAME_X), "●");
     assert_eq!(
         span(&buf, living, ADDRESS_X, DETAIL_X - 4),
-        "192.168.1.60:1400   ACTIVE"
+        "192.168.1.60:1400     ACTIVE"
     );
     assert_eq!(span(&buf, local, MARK_X, NAME_X), "○");
     assert_eq!(span(&buf, local, ADDRESS_X, DETAIL_X - 4), "THIS MACHINE");
@@ -531,6 +532,55 @@ fn narrow_devices_tab_does_not_panic_and_keeps_the_cursor_row_visible() {
                 is_cursor(&buf, x, y),
                 "{w}x{h} cursor {cursor}: {name} not under the cursor bar"
             );
+        }
+    }
+}
+
+#[test]
+fn device_addresses_show_whole_at_every_width() {
+    common::isolate();
+    // A 3-digit-octet host with a 5-digit port (20 characters, a real Primare), and the longest
+    // IPv4 `host:port` there is (21).
+    let devices = vec![
+        renderer(
+            "Primare I15 Prisma",
+            "192.168.50.222",
+            38400,
+            "Primare",
+            "I15",
+            "uuid:p",
+        ),
+        renderer("Longest", "255.255.255.255", 65535, "", "", "uuid:l"),
+    ];
+    let mut app = devices_app("address", devices);
+    app.devices_cursor = 0;
+    for active in [None, Some(1)] {
+        if let Some(i) = active {
+            let devices = app.device_manager.get_devices();
+            app.device_manager.set_active_device(Some(devices[i].clone()));
+        }
+        for (w, h) in [(120, 40), (100, 30), (85, 30), (80, 24), (70, 24), (80, 20)] {
+            let buf = tui::render(&mut app, w, h);
+            let rows = tui::rows(&buf);
+            // (The header names an active renderer too, so the table row is the one with both.)
+            for (name, address) in [
+                ("PRIMARE I15 PRISMA", "192.168.50.222:38400"),
+                ("LONGEST", "255.255.255.255:65535"),
+            ] {
+                assert!(
+                    rows.iter()
+                        .any(|r| r.contains(name) && r.contains(address) && !r.contains('…')),
+                    "{w}x{h}, active {active:?}: {address} not whole:\n{}",
+                    rows.join("\n")
+                );
+            }
+            if active.is_some() {
+                assert!(
+                    rows.iter().any(|r| r.contains("255.255.255.255:65535 ACTIVE")),
+                    "{w}x{h}:\n{}",
+                    rows.join("\n")
+                );
+            }
         }
     }
 }
