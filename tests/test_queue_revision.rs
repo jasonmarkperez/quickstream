@@ -181,3 +181,29 @@ fn calls_that_change_nothing_do_not_bump_revision() {
         assert!(q.next_track("loop").is_none());
     });
 }
+
+/// Revisions come from one process-wide counter, so two queues (a replacement, a clone that then
+/// changes) never share a revision while their tracks differ (PR #68 review).
+#[test]
+fn different_queues_never_share_a_revision() {
+    common::isolate();
+    let mut a = PlaybackQueue::new();
+    let mut b = PlaybackQueue::new();
+    assert_ne!(a.revision(), b.revision(), "two new queues");
+    a.add_track(track(1));
+    b.add_track(track(2));
+    assert_ne!(a.revision(), b.revision(), "same number of changes, different tracks");
+
+    let mut c = a.clone();
+    assert_ne!(c.revision(), a.revision(), "a clone gets its own revision");
+    c.add_track(track(3));
+    a.add_track(track(4));
+    assert_ne!(
+        c.revision(),
+        a.revision(),
+        "a clone and its original after one change each"
+    );
+
+    let d = PlaybackQueue::default();
+    assert_ne!(d.revision(), PlaybackQueue::default().revision(), "default queues");
+}

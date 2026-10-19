@@ -1,16 +1,48 @@
 //! Playback queue state and circular track traversal.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::metadata::AudioMetadata;
+
+/// Source of every [`PlaybackQueue::revision`] value, shared by all queues in the process, so a
+/// new queue, a clone or a replacement never repeats a revision another queue state had.
+static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+
+fn next_revision() -> u64 {
+    NEXT_REVISION.fetch_add(1, Ordering::Relaxed)
+}
 
 /// The tracks to play and which one is current.
 ///
 /// The fields are private so every change goes through a method that bumps [`Self::revision`];
 /// caches built from the queue (the IN QUEUE path set, totals) rebuild when it moves.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
 pub struct PlaybackQueue {
     tracks: Vec<AudioMetadata>,
     current_index: usize,
     revision: u64,
+}
+
+impl Default for PlaybackQueue {
+    fn default() -> Self {
+        Self {
+            tracks: Vec::new(),
+            current_index: 0,
+            revision: next_revision(),
+        }
+    }
+}
+
+/// A clone gets a revision of its own: its tracks start out equal to the original's, but either
+/// may change next, and a cache keyed on the revision must not mistake one for the other.
+impl Clone for PlaybackQueue {
+    fn clone(&self) -> Self {
+        Self {
+            tracks: self.tracks.clone(),
+            current_index: self.current_index,
+            revision: next_revision(),
+        }
+    }
 }
 
 /// A track taken out of the queue by [`PlaybackQueue::remove`].
@@ -28,13 +60,14 @@ impl PlaybackQueue {
     }
 
     /// A number that changes whenever the tracks, their order, their metadata or the current
-    /// index change. Reads and calls that change nothing leave it as it is.
+    /// index change. Reads and calls that change nothing leave it as it is. Every value comes from
+    /// one process-wide counter, so no two queues (new, cloned or replaced) ever share one.
     pub fn revision(&self) -> u64 {
         self.revision
     }
 
     fn bump(&mut self) {
-        self.revision = self.revision.wrapping_add(1);
+        self.revision = next_revision();
     }
 
     pub fn is_empty(&self) -> bool {

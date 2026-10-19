@@ -333,6 +333,36 @@ fn in_queue_set_is_rebuilt_only_when_the_queue_changes() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Replacing the queue with a new one that has had as many changes must not reuse the cached
+/// IN QUEUE set or total (PR #68 review: the revision used to be per queue).
+#[test]
+fn a_replaced_queue_with_the_same_change_count_refreshes_in_queue_and_the_total() {
+    common::isolate();
+    let (mut app, dir) = lists_app("replaced", &[0, 1, 2]);
+    app.queue.add_track(queue_track(&dir, 0));
+    app.queue.add_track(queue_track(&dir, 1));
+    let buf = tui::render(&mut app, 120, 40);
+    assert!(screen(&buf).contains("2 TRACKS  ·  08:20"), "{}", screen(&buf));
+
+    app.queue = quickstream::queue::PlaybackQueue::new();
+    app.queue.add_track(queue_track(&dir, 2));
+    app.queue.add_track(queue_track(&dir, 2));
+    let buf = tui::render(&mut app, 120, 40);
+    let shown = screen(&buf);
+    assert!(shown.contains("2 TRACKS  ·  11:44"), "{shown}");
+    let (_, ty) = lib(&buf, "TIDEWATER").unwrap();
+    assert!(
+        span_text(&buf, ty, LIB_X, LIB_X + TEXT_W).contains("FLAC  04:02"),
+        "no longer queued: {shown}"
+    );
+    let (_, hy) = lib(&buf, "HALCYON DRIFT").unwrap();
+    assert!(
+        span_text(&buf, hy, LIB_X, LIB_X + TEXT_W).contains("IN QUEUE  05:52"),
+        "{shown}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Cursor and focus
 // ---------------------------------------------------------------------------------------------

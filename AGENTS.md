@@ -90,7 +90,7 @@ quickstream/
 │   ├── playlist.rs       # Pure M3U8 playlist model: parse/write, name validation, safe file paths, queue plan
 │   ├── playlist_store.rs # In-memory PlaylistStore (sorted), write-through to disk via PersistHandle
 │   ├── persist.rs        # Background atomic writer: ordered save / create / delete / rename (PersistHandle), failures reported back
-│   ├── queue.rs          # PlaybackQueue (private fields, revision() bumped by every mutation), FastRng (SplitMix64 deterministic PRNG), shuffle & loop
+│   ├── queue.rs          # PlaybackQueue (private fields, revision() bumped by every mutation, drawn from one process-wide counter so new/cloned queues never repeat one), FastRng (SplitMix64 deterministic PRNG), shuffle & loop
 │   ├── web.rs            # Embedded HTTP byte-range server, continuous WAV streaming, REST API (incl. playlists), Web UI
 │   ├── web_access.rs     # Web access control: pairing token, Host/Origin/Content-Type checks, allowed folders
 │   ├── discovery.rs      # SSDP UDP multicast discovery (239.255.255.250:1900), XML device parsing
@@ -114,7 +114,7 @@ quickstream/
     ├── test_search.rs        # Multi-threaded fuzzy search, scoped scan, and modal navigation
     ├── test_ui_chrome.rs     # Theme palettes, key row trimming, meters, text fitting, width tiers; rendered chrome
     ├── test_ui_panels.rs     # Panel header rows/colours, compact footnote, visible_window vs ratatui List, list_row columns, cursor, ▸
-    ├── test_queue_revision.rs # PlaybackQueue::revision bumps on every mutation, not on reads or no-ops; truncate_after
+    ├── test_queue_revision.rs # PlaybackQueue::revision bumps on every mutation, not on reads or no-ops, never shared by two queues; truncate_after
     ├── test_ui_lists.rs      # Tab 2 and tab 5 panels: columns, IN QUEUE / ▪ / ▶, cursor vs ▸, width rules, spotlight, CJK, folder duration, MISSING FILE, playlist file footnote
     ├── test_shared_tag_reads.rs # No concurrent duplicate tag reads; skipped/waiting requests still get tags
     ├── test_upnp.rs          # UPnP SOAP XML generation, AVTransport state machine, continuous stream
