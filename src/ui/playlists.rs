@@ -1330,13 +1330,10 @@ fn render_confirm_delete(f: &mut Frame, name: &str, count: usize) {
     };
     // Too narrow for both (under about 42 columns), `ANY KEY CANCEL` goes; the screen's key
     // row, which never drops it, still shows it.
-    let mut hints = confirm_delete_hints();
-    if kit::top_priority_width(&hints) > usize::from(inner.width) {
-        hints.truncate(1);
-    }
+    let hints = kit::fit_top_hints(&confirm_delete_hints(), usize::from(inner.width));
     let mut line = kit::key_row(&hints, inner.width, None);
     // The `Y` keycap is ERROR, like the chip.
-    if let Some(keycap) = line.spans.first_mut() {
+    if let Some(keycap) = line.spans.first_mut().filter(|_| !hints.is_empty()) {
         keycap.style = theme::chip(true);
     }
     buf.set_line(inner.x, keys_y, &line, inner.width);

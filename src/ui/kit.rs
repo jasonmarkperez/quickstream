@@ -128,6 +128,25 @@ pub fn top_priority_width(hints: &[KeyHint]) -> usize {
     widths.iter().sum::<usize>() + KEY_GAP * widths.len().saturating_sub(1)
 }
 
+/// The hints a key row `width` columns wide can show whole, before [`key_row`] trims to its
+/// right part: while the hints with the highest priority (which [`key_row`] never drops) are too
+/// wide together, the rightmost of them gives way; once none of them fits, the next priority
+/// takes their place. So a keycap never shows without its label, and when not even one hint
+/// fits whole the row has none.
+pub fn fit_top_hints(hints: &[KeyHint], width: usize) -> Vec<KeyHint> {
+    let mut hints = hints.to_vec();
+    while top_priority_width(&hints) > width {
+        let top = hints.iter().map(|h| h.priority).max().unwrap_or_default();
+        match hints.iter().rposition(|h| h.priority == top) {
+            Some(last) => {
+                hints.remove(last);
+            }
+            None => break,
+        }
+    }
+    hints
+}
+
 /// A key row `width` columns wide: the hints from the left, 4 columns apart, and `right` (a status
 /// message or the volume meter) against the right edge.
 ///

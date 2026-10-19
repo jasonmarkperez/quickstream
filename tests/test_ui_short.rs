@@ -483,3 +483,63 @@ fn press_open(app: &mut AppUI, key: char) {
     app.active_tab = tab;
     app.playlists.tracks_focus = focus;
 }
+
+/// The key row at every width from 1 to 25 columns, on every tab and pane: each keycap is
+/// followed by its whole label (no bare or half-labelled key, however narrow), and Now
+/// Playing's `N QUEUE` (#57) stays whenever it fits whole.
+#[test]
+fn a_key_row_shows_only_whole_keys_at_every_narrow_width() {
+    common::isolate();
+    let (mut app, dir) = short_app("narrow_key_widths");
+    app.status_message.clear();
+    let rule = theme::palette().rule;
+    for (tab, tracks_focus, queue_focus) in [
+        (0, false, false),
+        (1, false, false),
+        (1, false, true),
+        (2, false, false),
+        (3, false, false),
+        (4, false, false),
+        (4, true, false),
+    ] {
+        app.active_tab = tab;
+        app.playlists.tracks_focus = tracks_focus;
+        app.queue_focus = queue_focus;
+        let hints = app.tab_key_hints();
+        for w in 1..=25u16 {
+            let h = 8;
+            let buffer = tui::render(&mut app, w, h);
+            let what = format!("tab {} ({tracks_focus}, {queue_focus}) at {w}x{h}", tab + 1);
+            let y = h - 1;
+            let cells = tui::cells(&buffer, y);
+            let row = cells.concat();
+            let mut x = 0;
+            while x < usize::from(w) {
+                if buffer[(x as u16, y)].bg != rule {
+                    x += 1;
+                    continue;
+                }
+                let start = x;
+                while x < usize::from(w) && buffer[(x as u16, y)].bg == rule {
+                    x += 1;
+                }
+                let keys = cells[start..x].concat();
+                let hint = hints
+                    .iter()
+                    .find(|h| format!(" {} ", h.keys) == keys)
+                    .unwrap_or_else(|| panic!("{what}: keycap {keys:?} is no whole key of {hints:?}: {row:?}"));
+                let label = format!(" {}", hint.label);
+                let after = cells[x..].concat();
+                assert!(
+                    after.starts_with(&label),
+                    "{what}: keycap {keys:?} without its whole label {label:?}: {row:?}"
+                );
+            }
+            // `N QUEUE` takes 9 columns, inside the 2-column gutters.
+            if tab == 0 && w >= 9 + 4 {
+                assert!(row.contains(" N  QUEUE"), "{what}: N QUEUE fits: {row:?}");
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -260,6 +260,35 @@ fn key_row_truncates_the_right_part_when_only_top_hints_remain() {
     assert_eq!(last.style, theme::error(), "the cut part keeps its style");
 }
 
+/// `kit::fit_top_hints`: the rightmost top hint gives way while the top hints are too wide,
+/// then the next priority takes their place; only hints that fit whole are kept, none when
+/// even one doesn't.
+#[test]
+fn fit_top_hints_keeps_only_whole_hints() {
+    common::isolate();
+    let keys = |hints: &[kit::KeyHint]| hints.iter().map(|h| h.keys.clone()).collect::<Vec<_>>();
+    let hints = now_playing_hints();
+    assert_eq!(
+        kit::fit_top_hints(&hints, 21),
+        hints,
+        "room for both top hints: nothing goes"
+    );
+    // `? KEYS` (rightmost) gives way; `N QUEUE` (9 columns) stays while it fits.
+    let fitted = kit::fit_top_hints(&hints, 20);
+    assert!(!keys(&fitted).contains(&"?".to_string()), "{fitted:?}");
+    assert!(keys(&fitted).contains(&"N".to_string()), "{fitted:?}");
+    assert_eq!(kit::top_priority_width(&kit::fit_top_hints(&hints, 9)), 9);
+    // Narrower than `N QUEUE`: the next priority's hints that fit whole, then none.
+    for width in 0..9 {
+        let fitted = kit::fit_top_hints(&hints, width);
+        assert!(kit::top_priority_width(&fitted) <= width, "{width}: {fitted:?}");
+        let line = kit::key_row(&fitted, width as u16, None);
+        assert!(line_width(&line) <= width, "{width}: {:?}", line_text(&line));
+    }
+    assert!(kit::fit_top_hints(&hints, 0).is_empty());
+    assert!(kit::fit_top_hints(&[hint("ENTER", "SAVE", 1)], 9).is_empty());
+}
+
 #[test]
 fn top_priority_width_measures_the_hints_never_dropped() {
     common::isolate();

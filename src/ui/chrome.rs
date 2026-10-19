@@ -536,13 +536,8 @@ impl AppUI {
         }
         let width = usize::from(area.width);
         // Too narrow even for the never-dropped keys (Now Playing's `N QUEUE` and `? KEYS` need
-        // 21 columns): the rightmost of them gives way, so no keycap is drawn without its label.
-        while kit::top_priority_width(&hints) > width && hints.len() > 1 {
-            let top = hints.iter().map(|h| h.priority).max().unwrap_or_default();
-            if let Some(last) = hints.iter().rposition(|h| h.priority == top) {
-                hints.remove(last);
-            }
-        }
+        // 21 columns): only whole keys are drawn, never a keycap without its label.
+        let hints = kit::fit_top_hints(&hints, width);
         let meter = (self.active_tab == 0).then(|| {
             let vol = self.player.volume();
             if screen.tier >= WidthTier::Medium {
