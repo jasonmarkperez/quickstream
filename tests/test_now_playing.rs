@@ -851,3 +851,37 @@ fn test_now_playing_unread_tags_show_no_made_up_signal() {
     assert_eq!(tech, "OGG", "{}", rows.join("\n"));
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// UP NEXT does not depend on whether the features have arrived: on a mid-height terminal the
+/// SIGNAL rows that don't fit beside the hero are cut (least useful first) before UP NEXT goes.
+#[test]
+fn test_now_playing_up_next_stays_when_features_arrive_at_120x30() {
+    common::isolate();
+    let (mut app, dir) = np_app("signal_vs_up_next");
+    let screen = common::tui::render_text(&mut app, 120, 30);
+    assert!(screen.contains("UP NEXT"), "before the features:\n{screen}");
+
+    app.set_track_feature_source(fixed_features());
+    app.poll_track_features();
+    wait_for_features(&mut app);
+    let buffer = common::tui::render(&mut app, 120, 30);
+    let screen = common::tui::rows(&buffer).join("\n");
+    assert!(screen.contains("UP NEXT"), "after the features:\n{screen}");
+    assert!(screen.contains("ELAPSED 02:41"), "the elapsed row stays:\n{screen}");
+    // The most useful rows stay, in the 2b order; SIZE goes first.
+    let lines = signal_lines(&buffer);
+    for label in ["FORMAT", "RATE", "BPM", "KEY"] {
+        assert!(signal_row(&lines, label).is_some(), "{label}:\n{screen}");
+    }
+    assert!(signal_row(&lines, "SIZE").is_none(), "{screen}");
+    let shown: Vec<&str> = ["FORMAT", "RATE", "BITRATE", "CHANNELS", "GENRE", "BPM", "KEY", "ENERGY", "SIZE"]
+        .into_iter()
+        .filter(|l| signal_row(&lines, l).is_some())
+        .collect();
+    let positions: Vec<usize> = shown
+        .iter()
+        .map(|l| lines.iter().position(|r| r.starts_with(&format!("{l} "))).unwrap())
+        .collect();
+    assert!(positions.windows(2).all(|w| w[0] < w[1]), "2b order:\n{screen}");
+    let _ = fs::remove_dir_all(&dir);
+}

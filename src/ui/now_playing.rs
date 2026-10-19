@@ -181,6 +181,27 @@ fn signal_rows(track: &AudioMetadata, features: Option<&TrackFeatures>) -> Vec<(
     rows
 }
 
+/// SIGNAL labels from the most useful to the least: when the rows don't all fit, the last ones
+/// here are cut first.
+const SIGNAL_VALUE_ORDER: [&str; 9] = [
+    "FORMAT", "RATE", "BPM", "KEY", "BITRATE", "GENRE", "ENERGY", "CHANNELS", "SIZE",
+];
+
+/// At most `n` of `rows`, keeping the most useful ([`SIGNAL_VALUE_ORDER`]) in their own order.
+fn fit_signal_rows(rows: Vec<(&'static str, String)>, n: usize) -> Vec<(&'static str, String)> {
+    if rows.len() <= n {
+        return rows;
+    }
+    let rank = |label: &str| SIGNAL_VALUE_ORDER.iter().position(|l| *l == label).unwrap_or(usize::MAX);
+    let mut ranks: Vec<usize> = rows.iter().map(|(label, _)| rank(label)).collect();
+    ranks.sort_unstable();
+    let cutoff = ranks.get(n.wrapping_sub(1)).copied();
+    match cutoff {
+        Some(cutoff) => rows.into_iter().filter(|(label, _)| rank(label) <= cutoff).collect(),
+        None => Vec::new(),
+    }
+}
+
 /// The fields of the tech line under the bar (under 110 columns, 3f), most important first.
 fn tech_parts(track: &AudioMetadata, features: Option<&TrackFeatures>) -> Vec<String> {
     let mut parts = Vec::new();
@@ -387,23 +408,28 @@ impl AppUI {
         // the body (numerals; from 110 columns also a blank, the title and the artist line, or
         // the SIGNAL rows when there are more), a blank, the bar, the tech line (under 110
         // columns), the elapsed row, then UP NEXT.
+        // SIGNAL rows beyond the hero's own come last: the layout is decided with the hero's
+        // rows alone, so UP NEXT and the elapsed row never depend on whether features have
+        // arrived, and SIGNAL gets the rows left over (its least useful rows cut first).
         let header_rows: u16 = if compact { 3 } else { 4 };
         let height = area.height;
-        let body = if full {
+        let hero_body = if full {
             let has_meta = artist.is_some() || album.is_some() || year.is_some();
-            let hero_body = 5 + u16::from(has_meta);
-            // SIGNAL rows beyond the hero's own never push the bar off a short screen.
-            let signal_room = height.saturating_sub(header_rows + 2).max(hero_body);
-            hero_body.max((signal.len() as u16).min(signal_room))
+            5 + u16::from(has_meta)
         } else {
             3
         };
-        let top = header_rows + body;
-        let core = top + 2 + u16::from(!tech.is_empty());
+        let base_core = header_rows + hero_body + 2 + u16::from(!tech.is_empty());
         let wanted = (summary.remaining.max(1)).min(usize::from(MIN_UP_NEXT_ROWS)) as u16;
         let up_next_rows = 1 + PLAIN_HEADER_ROWS + wanted;
-        let show_up_next = !screen.short && core + up_next_rows <= height;
-        let show_info = core + 1 + if show_up_next { up_next_rows } else { 0 } <= height;
+        let show_up_next = !screen.short && base_core + up_next_rows <= height;
+        let show_info = base_core + 1 + if show_up_next { up_next_rows } else { 0 } <= height;
+        let used = base_core + u16::from(show_info) + if show_up_next { up_next_rows } else { 0 };
+        let spare = height.saturating_sub(used);
+        let body = hero_body.max((signal.len() as u16).min(hero_body + spare));
+        let signal = fit_signal_rows(signal, usize::from(body));
+        let top = header_rows + body;
+        let core = top + 2 + u16::from(!tech.is_empty());
 
         let (pos, dur) = self.hero_times(&track);
         let elapsed = kit::duration(pos);
