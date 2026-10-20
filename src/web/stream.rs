@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::state::{NowPlayingState, WebCommand};
 
@@ -44,19 +44,34 @@ pub(super) fn is_continuous_route(route: &str) -> bool {
     route == "/stream/continuous.wav" || route == "/stream/autopilot.wav" || continuous_route_nonce(route).is_some()
 }
 
+/// A skip or seek for the continuous stream (`skip_to_index` / `seek_to`), pending until the
+/// stream picks its next track.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StreamRequest {
+    /// The queue index to play: the track skipped to, or for a seek the track it was asked on.
+    pub index: usize,
+    /// Where to start it, in seconds.
+    pub position: f64,
+}
+
 /// Controls continuous PCM gapless streaming for DLNA renderers.
 #[derive(Debug, Default)]
 pub struct ContinuousStreamController {
     pub is_active: Arc<AtomicBool>,
     pub active_conn_id: Arc<AtomicU64>,
+    /// The track the stream plays, or was last asked to play: set by `skip_to_index` at once and
+    /// by the stream when a track starts giving audio (lock order: the web state, then `request`,
+    /// then this).
     pub current_track_index: Arc<Mutex<usize>>,
     pub current_position: Arc<Mutex<f64>>,
     pub current_duration: Arc<Mutex<f64>>,
-    pub skip_requested: Arc<AtomicBool>,
-    pub target_index: Arc<Mutex<Option<usize>>>,
-    pub seek_requested: Arc<AtomicBool>,
-    pub target_seek: Arc<Mutex<Option<f64>>>,
-    pub active_child: Arc<Mutex<Option<std::process::Child>>>,
+    /// The running decoder and the connection that started it.
+    decoder_child: Mutex<Option<(u64, std::process::Child)>>,
+    /// The skip or seek the stream hasn't acted on yet. Set before the decoder is killed and
+    /// taken in one step when the stream picks its next track, so none is lost or applied twice.
+    request: Mutex<Option<StreamRequest>>,
+    /// The ffmpeg the stream runs (`None`: `ffmpeg` on `PATH`); see [`Self::set_decoder`].
+    decoder: Mutex<Option<PathBuf>>,
     session: Mutex<Option<ContinuousSession>>,
     /// The track being decoded: its queue index and path. Set with `current_duration` held, so
     /// the two always name the same track (lock order: the web state, then `current_duration`,
@@ -70,17 +85,20 @@ impl ContinuousStreamController {
     }
 
     /// Start a new continuous session (replacing any previous one) and return the URL path the
-    /// renderer must request.
+    /// renderer must request. It starts at `current_track_index`, with no request pending.
     pub fn arm_session(&self) -> String {
         let nonce = crate::web_access::generate_token();
         let path = format!("{}{}{}", CONTINUOUS_PREFIX, nonce, CONTINUOUS_SUFFIX);
         *self.session.lock().unwrap() = Some(ContinuousSession { nonce, peer: None });
+        *self.request.lock().unwrap() = None;
         path
     }
 
-    /// End the continuous session: its path stops being served.
+    /// End the continuous session: its path stops being served, and a skip or seek it never
+    /// acted on goes with it.
     pub fn disarm_session(&self) {
         *self.session.lock().unwrap() = None;
+        *self.request.lock().unwrap() = None;
     }
 
     /// The URL path of the armed session, if any.
@@ -177,20 +195,145 @@ impl ContinuousStreamController {
         true
     }
 
+    /// Play the track at `index` from its start. Replaces any pending request (a seek asked
+    /// before it was for the track it leaves). `current_track_index` names it at once, so the UI
+    /// following that index stays on it while the stream is busy (blocked writing to the
+    /// renderer) and a second skip goes on from it.
     pub fn skip_to_index(&self, index: usize) {
-        *self.target_index.lock().unwrap() = Some(index);
-        self.skip_requested.store(true, Ordering::SeqCst);
+        {
+            let mut request = self.request.lock().unwrap();
+            *request = Some(StreamRequest { index, position: 0.0 });
+            *self.current_track_index.lock().unwrap() = index;
+        }
         self.kill_active_decoder();
     }
 
+    /// Restart the track at `position` seconds: the track skipped to when a skip is pending,
+    /// else the one `current_track_index` names, so a seek that arrives as a track ends is never
+    /// applied to the next one.
     pub fn seek_to(&self, position: f64) {
-        *self.target_seek.lock().unwrap() = Some(position);
-        self.seek_requested.store(true, Ordering::SeqCst);
+        {
+            let mut request = self.request.lock().unwrap();
+            match request.as_mut() {
+                Some(pending) => pending.position = position,
+                None => {
+                    let index = *self.current_track_index.lock().unwrap();
+                    *request = Some(StreamRequest { index, position });
+                }
+            }
+        }
         self.kill_active_decoder();
+    }
+
+    /// The skip or seek the stream hasn't acted on yet, if any.
+    pub fn pending_request(&self) -> Option<StreamRequest> {
+        *self.request.lock().unwrap()
+    }
+
+    fn has_request(&self) -> bool {
+        self.request.lock().unwrap().is_some()
+    }
+
+    /// Whether connection `cid` still owns the stream (0: a connection that couldn't be tracked).
+    fn owns(&self, cid: u64) -> bool {
+        cid == 0 || self.active_conn_id.load(Ordering::SeqCst) == cid
+    }
+
+    /// Register `child` as connection `cid`'s decoder. A decoder of a connection `cid` has
+    /// superseded is stopped first, never left running. If `cid` has been superseded itself,
+    /// `child` is stopped instead, `taken` (the request this pass took) is handed back for the
+    /// connection that took over, and it returns false.
+    fn register_decoder(&self, cid: u64, mut child: std::process::Child, taken: Option<StreamRequest>) -> bool {
+        {
+            let mut slot = self.decoder_child.lock().unwrap();
+            if self.owns(cid) {
+                if let Some((_, mut superseded)) = slot.take() {
+                    let _ = superseded.kill();
+                    let _ = superseded.wait();
+                }
+                *slot = Some((cid, child));
+                return true;
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(taken) = taken {
+            self.request.lock().unwrap().get_or_insert(taken);
+        }
+        false
+    }
+
+    /// Stop connection `cid`'s decoder, if it is the one running.
+    fn kill_decoder_of(&self, cid: u64) {
+        let mut slot = self.decoder_child.lock().unwrap();
+        if slot.as_ref().is_some_and(|(owner, _)| *owner == cid) {
+            if let Some((_, mut child)) = slot.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// Show the track the stream has started: its index (unless a skip or seek has come since,
+    /// or the connection or session is no longer the stream's), length and start position, and
+    /// in `state` as now playing.
+    #[allow(clippy::too_many_arguments)]
+    fn publish_track(
+        &self,
+        state: &RwLock<NowPlayingState>,
+        cid: u64,
+        session: &str,
+        index: usize,
+        path: &Path,
+        duration: f64,
+        position: f64,
+        queue_len: usize,
+    ) {
+        let Ok(mut s) = state.write() else {
+            return;
+        };
+        {
+            let request = self.request.lock().unwrap();
+            if request.is_none() && self.owns(cid) && self.is_session(session) {
+                *self.current_track_index.lock().unwrap() = index;
+            }
+        }
+        self.start_track(index, path, duration);
+        *self.current_position.lock().unwrap() = position;
+
+        s.queue_index = index;
+        if let Some(t) = s.queue.get(index).cloned() {
+            s.title = t.title;
+            s.artist = t.artist;
+            s.album = t.album;
+            s.duration_seconds = t.duration_seconds;
+            s.filepath = Some(PathBuf::from(&t.filepath));
+            s.position_seconds = position;
+            s.is_playing = true;
+            s.is_paused = false;
+        }
+        if queue_len > 1 {
+            let next_idx = (index + 1) % queue_len;
+            s.next_track_title = s.queue.get(next_idx).map(|t| t.title.clone());
+        }
+    }
+
+    /// Run `binary` as the stream's ffmpeg instead of `ffmpeg` on `PATH` (the test seam for a
+    /// fake decoder).
+    pub fn set_decoder(&self, binary: impl Into<PathBuf>) {
+        *self.decoder.lock().unwrap() = Some(binary.into());
+    }
+
+    fn decoder(&self) -> PathBuf {
+        self.decoder
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("ffmpeg"))
     }
 
     pub fn kill_active_decoder(&self) {
-        if let Some(mut child) = self.active_child.lock().unwrap().take() {
+        if let Some((_, mut child)) = self.decoder_child.lock().unwrap().take() {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -970,6 +1113,54 @@ pub fn make_continuous_wav_header() -> [u8; 44] {
     hdr
 }
 
+/// Bytes per second of the continuous stream's PCM (44.1 kHz, 16-bit, stereo).
+const PCM_BYTES_PER_SEC: f64 = 176_400.0;
+/// How often idle silence is sent.
+const SILENCE_TICK: Duration = Duration::from_millis(50);
+/// How far ahead of real time idle silence runs, so a renderer reading at real time never drains.
+const SILENCE_LEAD: Duration = Duration::from_millis(100);
+/// The most silence one tick sends after a write blocked: a stalled renderer is not owed it all.
+const SILENCE_MAX_BURST: Duration = Duration::from_secs(1);
+/// How often a queue whose files are all missing is looked through again.
+const MISSING_RECHECK: Duration = Duration::from_secs(1);
+
+/// The PCM bytes in `duration`, whole 4-byte frames.
+fn pcm_bytes(duration: Duration) -> u64 {
+    (duration.as_secs_f64() * PCM_BYTES_PER_SEC) as u64 / 4 * 4
+}
+
+/// Sends silence at the stream's real-time byte rate while there is nothing to decode (empty
+/// queue, every file missing). Measured from when it started, so sleep overshoot doesn't add up.
+struct SilencePacer {
+    started: Instant,
+    sent: u64,
+}
+
+impl SilencePacer {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            sent: 0,
+        }
+    }
+
+    /// Write the silence due by now (plus `SILENCE_LEAD`), then wait one tick. Returns the write
+    /// error, which means the renderer has gone.
+    fn send(&mut self, stream: &mut impl Write) -> std::io::Result<()> {
+        let due = pcm_bytes(self.started.elapsed() + SILENCE_LEAD);
+        let mut owed = due.saturating_sub(self.sent).min(pcm_bytes(SILENCE_MAX_BURST));
+        self.sent = due;
+        let chunk = [0u8; 8820];
+        while owed > 0 {
+            let n = owed.min(chunk.len() as u64) as usize;
+            stream.write_all(&chunk[..n])?;
+            owed -= n as u64;
+        }
+        std::thread::sleep(SILENCE_TICK);
+        Ok(())
+    }
+}
+
 /// Serve a continuous 16-bit 44.1kHz PCM WAV stream to DLNA renderers.
 /// Slices tracks sequentially directly into the exact same TCP socket without drops or DAC resets.
 /// `session` is the nonce of the armed session the request was admitted to; the stream ends when
@@ -1055,6 +1246,26 @@ pub fn serve_continuous_stream(
     stream.write_all(&wav_hdr)?;
     stream.flush()?;
 
+    // Silence paced at real time while there is nothing to decode; `None` while audio plays.
+    let mut silence: Option<SilencePacer> = None;
+    // Set when the whole queue gave nothing to play (no file found, or every decoder run ended
+    // without audio): the queue's paths then, and when. Until the queue changes, a request
+    // arrives or `MISSING_RECHECK` passes, the stream sends silence without looking again.
+    let mut nothing_playable: Option<(Vec<String>, Instant)> = None;
+    // Tracks in a row that gave no audio (missing files passed over, decoder runs that ended
+    // without output: files ffmpeg can't decode). Once the whole queue has, the stream idles as
+    // when every file is missing, then tries one file a recheck. A run that gave audio, a
+    // request or a changed queue starts the count again.
+    let mut silent_runs: usize = 0;
+    // Where the stream goes on when no request is pending: the track after one that ended, or
+    // the same one after a read error. `None`: from `current_track_index`.
+    let mut next_index: Option<usize> = None;
+    // Whether audio went out since the stream last wrapped: a wrap without any asks for no
+    // reshuffle, so a queue that gives no audio is not reshuffled on every pass.
+    let mut streamed_since_wrap = false;
+    // Whether a decoder that couldn't start (no ffmpeg) was logged since audio last went out.
+    let mut spawn_failure_logged = false;
+
     while controller.is_active.load(Ordering::SeqCst) {
         if !controller.is_session(session) {
             crate::log_info!(
@@ -1064,7 +1275,7 @@ pub fn serve_continuous_stream(
             );
             return Ok(());
         }
-        if cid != 0 && controller.active_conn_id.load(Ordering::SeqCst) != cid {
+        if !controller.owns(cid) {
             crate::log_info!(
                 "web",
                 "Continuous stream connection {} superseded by newer connection {}, closing older stream",
@@ -1074,56 +1285,117 @@ pub fn serve_continuous_stream(
             return Ok(());
         }
 
-        // 1. Get current track information
-        let (track_path, track_duration, track_index, queue_len) = {
-            let s = state.read().unwrap();
-            if s.queue.is_empty() {
-                drop(s);
-                // Send a small burst of silence PCM frames so renderer buffer doesn't starve
-                let silence = [0u8; 4096];
-                if let Err(e) = stream.write_all(&silence) {
-                    crate::log_info!("web", "Continuous stream socket closed while idle: {}", e);
+        // 1. Pick the track: the first from the requested (else the next) index whose file
+        // exists, and where to start it. `None`: nothing to decode yet, so send silence.
+        let picked = 'pick: {
+            let (index, request, tracks, tentative, queue_changed) = {
+                let s = state.read().unwrap();
+                // The connection is checked under the lock the request is taken with, so one a
+                // reconnect has superseded never takes the request meant for the new one.
+                let mut pending = controller.request.lock().unwrap();
+                if !controller.owns(cid) {
+                    crate::log_info!("web", "Continuous stream connection {} superseded, closing", cid);
                     return Ok(());
                 }
-                std::thread::sleep(Duration::from_millis(50));
-                continue;
-            }
-            let idx = *controller.current_track_index.lock().unwrap();
-            let safe_idx = if idx < s.queue.len() { idx } else { 0 };
-            let track = &s.queue[safe_idx];
-            (
-                PathBuf::from(&track.filepath),
-                track.duration_seconds,
-                safe_idx,
-                s.queue.len(),
-            )
+                if s.queue.is_empty() {
+                    // A skip or seek asked for a queue that is gone is not for the next one,
+                    // which starts at its top.
+                    *pending = None;
+                    *controller.current_track_index.lock().unwrap() = 0;
+                    next_index = None;
+                    break 'pick None;
+                }
+                let mut queue_changed = false;
+                if let Some((paths, checked)) = &nothing_playable {
+                    let recheck = checked.elapsed() >= MISSING_RECHECK;
+                    // Another length shows at once, other files at the next recheck or request
+                    // (the UI publishes a new queue before it skips): an idle tick never compares
+                    // the whole queue.
+                    queue_changed = s.queue.len() != paths.len()
+                        || ((recheck || pending.is_some()) && !s.queue.iter().map(|t| &t.filepath).eq(paths.iter()));
+                    if !queue_changed && !recheck && pending.is_none() {
+                        break 'pick None;
+                    }
+                }
+                // Taken in one step with the decision it drives, so a request that arrives later
+                // stays pending for the next pass.
+                let request = pending.take();
+                // A changed queue or a request gets every file tried again.
+                if queue_changed || request.is_some() {
+                    silent_runs = 0;
+                }
+                // While nothing gives audio, a file tried without being asked for is not shown
+                // as playing until it gives some.
+                let tentative = request.is_none() && (silent_runs > 0 || nothing_playable.is_some());
+                let index = match request {
+                    Some(r) => r.index,
+                    None => next_index.unwrap_or_else(|| *controller.current_track_index.lock().unwrap()),
+                };
+                drop(pending);
+                let index = if index < s.queue.len() { index } else { 0 };
+                let tracks: Vec<(String, f64)> = s
+                    .queue
+                    .iter()
+                    .map(|t| (t.filepath.clone(), t.duration_seconds))
+                    .collect();
+                (index, request, tracks, tentative, queue_changed)
+            };
+            // The paths were copied out, so a slow share never holds the web state's lock.
+            let queue_len = tracks.len();
+            // Logged once per queue, not again while the stream idles on it.
+            let quiet = nothing_playable.is_some() && !queue_changed;
+            let found = (0..queue_len).map(|step| (index + step) % queue_len).find(|&i| {
+                let exists = Path::new(&tracks[i].0).exists();
+                if !exists && !quiet {
+                    crate::log_warn!("web", "Continuous stream track missing: {}", tracks[i].0);
+                }
+                exists
+            });
+            let Some(found) = found else {
+                if !quiet {
+                    crate::log_warn!(
+                        "web",
+                        "All {} queued tracks are missing; sending silence until one is found",
+                        queue_len
+                    );
+                }
+                next_index = Some(index);
+                nothing_playable = Some((tracks.into_iter().map(|(path, _)| path).collect(), Instant::now()));
+                break 'pick None;
+            };
+            // The missing files passed over gave no audio either.
+            silent_runs += (found + queue_len - index) % queue_len;
+            // A seek is for the track it was asked on; one played in its place starts at 0.
+            let start_pos = match request {
+                Some(r) if found == index => r.position,
+                _ => 0.0,
+            };
+            let (path, duration) = &tracks[found];
+            let (path, duration) = (PathBuf::from(path), *duration);
+            Some((found, path, duration, start_pos, request, tentative, tracks))
         };
-
-        *controller.current_track_index.lock().unwrap() = track_index;
-        controller.start_track(track_index, &track_path, track_duration);
-        *controller.current_position.lock().unwrap() = 0.0;
-
-        let start_pos = controller.target_seek.lock().unwrap().take().unwrap_or(0.0);
-        controller.seek_requested.store(false, Ordering::SeqCst);
-        controller.skip_requested.store(false, Ordering::SeqCst);
-
-        // Synchronize track info into NowPlayingState
-        if let Ok(mut s) = state.write() {
-            s.queue_index = track_index;
-            if let Some(t) = s.queue.get(track_index).cloned() {
-                s.title = t.title;
-                s.artist = t.artist;
-                s.album = t.album;
-                s.duration_seconds = t.duration_seconds;
-                s.filepath = Some(PathBuf::from(&t.filepath));
-                s.position_seconds = start_pos;
-                s.is_playing = true;
-                s.is_paused = false;
+        let Some((track_index, track_path, track_duration, start_pos, request, tentative, tracks)) = picked else {
+            if let Err(e) = silence.get_or_insert_with(SilencePacer::new).send(&mut stream) {
+                crate::log_info!("web", "Continuous stream socket closed while idle: {}", e);
+                return Ok(());
             }
-            if queue_len > 1 {
-                let next_idx = (track_index + 1) % queue_len;
-                s.next_track_title = s.queue.get(next_idx).map(|t| t.title.clone());
-            }
+            continue;
+        };
+        let queue_len = tracks.len();
+        next_index = None;
+
+        // A file tried while nothing gives audio is shown once it gives some (below).
+        if !tentative {
+            controller.publish_track(
+                state,
+                cid,
+                session,
+                track_index,
+                &track_path,
+                track_duration,
+                start_pos,
+                queue_len,
+            );
         }
 
         crate::log_info!(
@@ -1135,15 +1407,8 @@ pub fn serve_continuous_stream(
             start_pos
         );
 
-        if !track_path.exists() {
-            crate::log_warn!("web", "Continuous stream track missing: {}", track_path.display());
-            let next_idx = (track_index + 1) % queue_len;
-            *controller.current_track_index.lock().unwrap() = next_idx;
-            continue;
-        }
-
         // 2. Spawn ffmpeg to decode to 44.1kHz 16-bit LE stereo raw PCM
-        let mut cmd = std::process::Command::new("ffmpeg");
+        let mut cmd = std::process::Command::new(controller.decoder());
         if start_pos > 0.0 {
             cmd.arg("-ss").arg(format!("{:.3}", start_pos));
         }
@@ -1161,68 +1426,97 @@ pub fn serve_continuous_stream(
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
 
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
+        // Whether the decoder's output ended. A decoder that can't start ends the track at once,
+        // without audio, like one that can't decode the file.
+        let mut ended = false;
+        let mut streamed = false;
+        let mut stdout = match cmd.spawn() {
+            Ok(mut child) => match child.stdout.take() {
+                Some(stdout) => {
+                    // Registered before the first request check below, so a request that arrived
+                    // since the top of the pass (its kill found no decoder) still stops this one.
+                    if !controller.register_decoder(cid, child, request) {
+                        return Ok(());
+                    }
+                    Some(stdout)
+                }
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    continue;
+                }
+            },
             Err(e) => {
-                crate::log_warn!("web", "Failed to spawn ffmpeg for continuous stream: {}", e);
-                std::thread::sleep(Duration::from_millis(500));
-                let next_idx = (track_index + 1) % queue_len;
-                *controller.current_track_index.lock().unwrap() = next_idx;
-                continue;
+                // Once until audio goes out again: a missing ffmpeg fails every try.
+                if !spawn_failure_logged {
+                    crate::log_warn!(
+                        "web",
+                        "Failed to spawn {} for continuous stream: {}",
+                        controller.decoder().display(),
+                        e
+                    );
+                    spawn_failure_logged = true;
+                }
+                ended = true;
+                None
             }
         };
-
-        let mut stdout = match child.stdout.take() {
-            Some(s) => s,
-            None => {
-                let _ = child.kill();
-                continue;
-            }
-        };
-
-        *controller.active_child.lock().unwrap() = Some(child);
 
         // 3. Stream PCM chunks
         let mut buf = [0u8; 32768];
-        let mut bytes_streamed: u64 = (start_pos * 176400.0) as u64;
+        let mut bytes_streamed: u64 = (start_pos * PCM_BYTES_PER_SEC) as u64;
         let mut last_pos_update = std::time::Instant::now();
-        let mut track_finished_normally = false;
 
-        loop {
+        while let Some(stdout) = stdout.as_mut() {
             if !controller.is_active.load(Ordering::SeqCst) {
                 controller.kill_active_decoder();
                 return Ok(());
             }
 
-            if cid != 0 && controller.active_conn_id.load(Ordering::SeqCst) != cid {
-                controller.kill_active_decoder();
+            if !controller.owns(cid) {
+                controller.kill_decoder_of(cid);
                 return Ok(());
             }
 
-            if controller.skip_requested.load(Ordering::SeqCst) || controller.seek_requested.load(Ordering::SeqCst) {
-                controller.kill_active_decoder();
-                if let Some(target) = controller.target_index.lock().unwrap().take() {
-                    *controller.current_track_index.lock().unwrap() = target;
-                }
+            // The next pass takes the request.
+            if controller.has_request() {
                 break;
             }
 
             match stdout.read(&mut buf) {
                 Ok(0) => {
-                    track_finished_normally = true;
+                    ended = true;
                     break;
                 }
                 Ok(n) => {
+                    if !streamed {
+                        streamed = true;
+                        streamed_since_wrap = true;
+                        spawn_failure_logged = false;
+                        silence = None;
+                        if tentative {
+                            controller.publish_track(
+                                state,
+                                cid,
+                                session,
+                                track_index,
+                                &track_path,
+                                track_duration,
+                                start_pos,
+                                queue_len,
+                            );
+                        }
+                    }
                     if let Err(e) = stream.write_all(&buf[..n]) {
                         crate::log_info!("web", "Continuous stream socket closed: {}", e);
-                        controller.kill_active_decoder();
+                        controller.kill_decoder_of(cid);
                         return Ok(());
                     }
                     bytes_streamed += n as u64;
 
                     if last_pos_update.elapsed() >= Duration::from_millis(250) {
                         last_pos_update = std::time::Instant::now();
-                        let pos = bytes_streamed as f64 / 176400.0;
+                        let pos = bytes_streamed as f64 / PCM_BYTES_PER_SEC;
                         *controller.current_position.lock().unwrap() = pos;
                         if let Ok(mut s) = state.write() {
                             s.position_seconds = pos;
@@ -1237,18 +1531,56 @@ pub fn serve_continuous_stream(
             }
         }
 
-        controller.kill_active_decoder();
+        controller.kill_decoder_of(cid);
 
-        if track_finished_normally {
-            // Reshuffle once per wrap, and only from the current connection of the armed session.
-            let owns_session =
-                controller.is_session(session) && (cid == 0 || controller.active_conn_id.load(Ordering::SeqCst) == cid);
-            if track_index + 1 >= queue_len && queue_len > 1 && owns_session {
+        if streamed {
+            silent_runs = 0;
+        }
+        // A skip or seek kills the decoder, which also ends its output: only an end with no
+        // request pending is the end of the track. Decided under the request lock, so a request
+        // that arrives later is for whatever this end decides.
+        let pending = controller.request.lock().unwrap();
+        if ended && pending.is_none() {
+            let wraps = track_index + 1 >= queue_len;
+            // Reshuffle once per wrap that played something, and only from the current
+            // connection of the armed session.
+            let owns_session = controller.is_session(session) && controller.owns(cid);
+            if wraps && queue_len > 1 && owns_session && streamed_since_wrap {
+                // The UI's shuffle keeps the track `current_track_index` names in front, so it
+                // names the first track before the UI is asked: never the one that just ended,
+                // which would play again. A seek from here on is for that first track, since
+                // after the reshuffle no index names the track that ended.
+                *controller.current_track_index.lock().unwrap() = 0;
                 let _ = cmd_tx.send(WebCommand::ShuffleQueue);
             }
-            let next_idx = (track_index + 1) % queue_len;
-            *controller.current_track_index.lock().unwrap() = next_idx;
-            *controller.current_position.lock().unwrap() = 0.0;
+            drop(pending);
+            if wraps {
+                streamed_since_wrap = false;
+            }
+            // Otherwise `current_track_index` moves when the next track starts, so a seek that
+            // arrives before then is still for this one.
+            next_index = Some((track_index + 1) % queue_len);
+
+            if !streamed {
+                silent_runs += 1;
+            }
+            if silent_runs >= queue_len {
+                if silent_runs == queue_len {
+                    crate::log_warn!(
+                        "web",
+                        "None of the {} queued tracks gave any audio; sending silence until the queue changes",
+                        queue_len
+                    );
+                }
+                nothing_playable = Some((tracks.into_iter().map(|(path, _)| path).collect(), Instant::now()));
+            } else {
+                nothing_playable = None;
+            }
+        } else {
+            drop(pending);
+            // The next pass takes the request, or after a read error tries the track again.
+            next_index = Some(track_index);
+            nothing_playable = None;
         }
     }
 

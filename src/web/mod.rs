@@ -18,5 +18,5 @@ pub use state::{
 };
 pub use stream::{
     calculate_stream_offset, make_continuous_wav_header, parse_byte_range, serve_continuous_stream, wav_header_sizes,
-    ByteRange, ContinuousAdmission, ContinuousStreamController, StreamOffset, StreamServerState,
+    ByteRange, ContinuousAdmission, ContinuousStreamController, StreamOffset, StreamRequest, StreamServerState,
 };

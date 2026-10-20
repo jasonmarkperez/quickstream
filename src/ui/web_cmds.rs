@@ -149,6 +149,10 @@ impl AppUI {
                     }
                 }
                 crate::web::WebCommand::ShuffleQueue => {
+                    // The shuffle keeps the current track in front: for the continuous stream's
+                    // wrap that is the track it plays next, which it may have named since this
+                    // tick's sync.
+                    self.sync_continuous_stream_index();
                     if !self.queue.is_empty() {
                         self.queue.shuffle();
                         self.status_message = "🔀 Queue shuffled (web)".to_string();

@@ -161,8 +161,10 @@ impl AppUI {
                 .is_active
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
-                ws.stream_state().continuous.skip_to_index(self.queue.current_index());
+                // Published first: the stream drops a request made while the queue it sees is empty.
+                let continuous = ws.stream_state().continuous.clone();
                 self.update_web_state();
+                continuous.skip_to_index(self.queue.current_index());
                 return None;
             }
         }
@@ -221,8 +223,10 @@ impl AppUI {
                 let next_idx = (self.queue.current_index() + 1) % self.queue.len();
                 self.queue.set_current_index(next_idx);
                 self.queue_cursor = next_idx;
-                ws.stream_state().continuous.skip_to_index(next_idx);
+                // Published first: the stream drops a request made while the queue it sees is empty.
+                let continuous = ws.stream_state().continuous.clone();
                 self.update_web_state();
+                continuous.skip_to_index(next_idx);
                 return;
             }
         }
@@ -270,8 +274,10 @@ impl AppUI {
                 };
                 self.queue.set_current_index(prev_idx);
                 self.queue_cursor = prev_idx;
-                ws.stream_state().continuous.skip_to_index(prev_idx);
+                // Published first: the stream drops a request made while the queue it sees is empty.
+                let continuous = ws.stream_state().continuous.clone();
                 self.update_web_state();
+                continuous.skip_to_index(prev_idx);
                 return;
             }
         }
