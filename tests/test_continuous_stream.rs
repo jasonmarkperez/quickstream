@@ -6,7 +6,7 @@ mod common;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -516,7 +516,7 @@ fn test_upnp_continuous_seek_is_clamped_to_the_known_length() {
     let ss = Arc::new(StreamServerState::new());
     ss.continuous.is_active.store(true, Ordering::SeqCst);
     let mut player = UPnPPlayer::new(device, 8080).with_stream_state(Some(ss.clone()));
-    let target = || *ss.continuous.target_seek.lock().unwrap();
+    let target = || ss.continuous.pending_request().map(|r| r.position);
 
     // Unknown length: any target from 0 up.
     player.seek_to(-5.0).unwrap();
@@ -532,4 +532,385 @@ fn test_upnp_continuous_seek_is_clamped_to_the_known_length() {
     assert_eq!(target(), Some(0.0));
     assert_eq!(player.duration_seconds(), 120.0);
     ss.continuous.is_active.store(false, Ordering::SeqCst);
+}
+
+/// A fake ffmpeg for the continuous stream (issues #106, #107): logs its arguments, one line per
+/// run, and its pid (so the test can kill any it leaves). An input whose name contains `short`
+/// gets 100 ms of PCM and ends 0.5 s later; any other input gets nothing, as while the real one
+/// opens a file on a slow share, until it is killed.
+#[cfg(unix)]
+struct FakeDecoder {
+    binary: PathBuf,
+    log: PathBuf,
+    pids: PathBuf,
+}
+
+#[cfg(unix)]
+impl FakeDecoder {
+    fn new(dir: &Path) -> Self {
+        let binary = dir.join("fake-ffmpeg");
+        let log = dir.join("ffmpeg.log");
+        let pids = dir.join("ffmpeg.pids");
+        let text = format!(
+            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$in\" in\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\nesac\nexec sleep 30\n",
+            pids = pids.display(),
+            log = log.display()
+        );
+        common::fake_exec::write_script(&binary, &text);
+        Self { binary, log, pids }
+    }
+
+    fn calls(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The runs so far, once there are `n` of them.
+    fn wait_for_calls(&self, n: usize) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let calls = self.calls();
+            if calls.len() >= n {
+                return calls;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected {} decoder runs, got {:?}",
+                n,
+                calls
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FakeDecoder {
+    fn drop(&mut self) {
+        let pids = std::fs::read_to_string(&self.pids).unwrap_or_default();
+        let pids: Vec<&str> = pids.split_whitespace().collect();
+        if !pids.is_empty() {
+            let _ = std::process::Command::new("kill")
+                .args(&pids)
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// A continuous stream being read by a renderer that keeps up, counting the bytes after the
+/// WAV header.
+struct Renderer {
+    received: Arc<AtomicU64>,
+    reading: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Renderer {
+    fn connect(port: u16, path: &str) -> Self {
+        let (status, mut reader) = open(port, path);
+        assert_eq!(status, 200);
+        let mut wav_hdr = [0u8; 44];
+        reader.read_exact(&mut wav_hdr).unwrap();
+        let received = Arc::new(AtomicU64::new(0));
+        let reading = Arc::new(AtomicBool::new(true));
+        let (received_t, reading_t) = (received.clone(), reading.clone());
+        let thread = std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            while reading_t.load(Ordering::SeqCst) {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        received_t.fetch_add(n as u64, Ordering::SeqCst);
+                    }
+                }
+            }
+        });
+        Self {
+            received,
+            reading,
+            thread: Some(thread),
+        }
+    }
+
+    /// Bytes per second received over `window`.
+    fn rate_over(&self, window: Duration) -> f64 {
+        let (start, before) = (Instant::now(), self.received.load(Ordering::SeqCst));
+        std::thread::sleep(window);
+        let after = self.received.load(Ordering::SeqCst);
+        (after - before) as f64 / start.elapsed().as_secs_f64()
+    }
+
+    /// Stop reading and close the connection.
+    fn hang_up(mut self) {
+        self.reading.store(false, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// 44.1 kHz, 16-bit stereo: what a renderer playing at real time reads per second.
+const REAL_TIME_BYTES_PER_SEC: f64 = 176_400.0;
+
+fn assert_about_real_time(rate: f64, what: &str) {
+    assert!(
+        (0.85 * REAL_TIME_BYTES_PER_SEC..=1.3 * REAL_TIME_BYTES_PER_SEC).contains(&rate),
+        "{}: {:.0} B/s, real time is {:.0} B/s",
+        what,
+        rate,
+        REAL_TIME_BYTES_PER_SEC
+    );
+}
+
+/// A web server streaming `names` (files in a fresh folder, starting at `first`) through a
+/// [`FakeDecoder`] to a renderer that keeps reading.
+#[cfg(unix)]
+struct DecoderFixture {
+    dir: PathBuf,
+    tracks: Vec<PathBuf>,
+    state: Arc<RwLock<NowPlayingState>>,
+    rx: mpsc::Receiver<WebCommand>,
+    controller: Arc<ContinuousStreamController>,
+    renderer: Option<Renderer>,
+    handle: Option<WebServerHandle>,
+    decoder: FakeDecoder,
+}
+
+#[cfg(unix)]
+impl DecoderFixture {
+    fn start(name: &str, names: &[&str], first: usize) -> Self {
+        let dir = temp_dir(name);
+        let decoder = FakeDecoder::new(&dir);
+        let tracks: Vec<PathBuf> = names.iter().map(|n| dir.join(n)).collect();
+        for track in &tracks {
+            std::fs::write(track, b"never opened: the fake decoder makes up its output").unwrap();
+        }
+        let state = Arc::new(RwLock::new(NowPlayingState::default()));
+        state.write().unwrap().queue = tracks.iter().enumerate().map(|(i, p)| queue_item(i, p)).collect();
+        let (handle, rx) = start(state.clone());
+        let controller = handle.stream_state().continuous.clone();
+        controller.set_decoder(&decoder.binary);
+        *controller.current_track_index.lock().unwrap() = first;
+        let path = handle.stream_state().arm_continuous_session();
+        let renderer = Renderer::connect(handle.port, &path);
+        Self {
+            dir,
+            tracks,
+            state,
+            rx,
+            controller,
+            renderer: Some(renderer),
+            handle: Some(handle),
+            decoder,
+        }
+    }
+
+    /// Wait for decoder run `n` (from 1) and return its input and `-ss` offset (`None`: from
+    /// the start).
+    fn run(&self, n: usize) -> (PathBuf, Option<String>) {
+        let calls = self.decoder.wait_for_calls(n);
+        let call = &calls[n - 1];
+        let input = call
+            .split(" -i ")
+            .nth(1)
+            .and_then(|rest| rest.split(" -f ").next())
+            .unwrap_or_else(|| panic!("no -i in {:?}", call));
+        let seek = call
+            .strip_prefix("-ss ")
+            .and_then(|rest| rest.split(' ').next())
+            .map(str::to_string);
+        (PathBuf::from(input), seek)
+    }
+
+    /// Wait for decoder run `n`, then long enough for the stream to be blocked reading its
+    /// (empty) output.
+    fn wait_for_startup(&self, n: usize) -> (PathBuf, Option<String>) {
+        let run = self.run(n);
+        std::thread::sleep(Duration::from_millis(300));
+        run
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DecoderFixture {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.stream_state().close_active_streams();
+            if let Some(renderer) = self.renderer.take() {
+                renderer.hang_up();
+            }
+            handle.stop();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A seek while the decoder is still starting (no output yet) restarts the same track at the
+/// offset, twice in a row too: it is not taken for the end of the track (#106).
+#[cfg(unix)]
+#[test]
+fn test_continuous_seek_while_the_decoder_starts_restarts_the_same_track() {
+    common::isolate();
+    let f = DecoderFixture::start("seek_startup", &["t0.wav", "t1.wav", "t2.wav", "t3.wav"], 0);
+    assert_eq!(f.wait_for_startup(1), (f.tracks[0].clone(), None));
+
+    f.controller.seek_to(42.0);
+    assert_eq!(f.wait_for_startup(2), (f.tracks[0].clone(), Some("42.000".to_string())));
+    f.controller.seek_to(10.0);
+    assert_eq!(f.wait_for_startup(3), (f.tracks[0].clone(), Some("10.000".to_string())));
+
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 0);
+    assert_eq!(f.state.read().unwrap().queue_index, 0);
+    assert_eq!(f.state.read().unwrap().position_seconds, 10.0);
+    assert!(f.rx.try_recv().is_err(), "nothing wrapped");
+}
+
+/// A skip while the decoder is still starting plays the track asked for, from its start, and
+/// leaves nothing behind for a later seek to pick up (#106).
+#[cfg(unix)]
+#[test]
+fn test_continuous_skip_while_the_decoder_starts_plays_the_requested_track() {
+    common::isolate();
+    let f = DecoderFixture::start("skip_startup", &["t0.wav", "t1.wav", "t2.wav", "t3.wav"], 0);
+    f.wait_for_startup(1);
+
+    f.controller.skip_to_index(2);
+    assert_eq!(f.wait_for_startup(2), (f.tracks[2].clone(), None));
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 2);
+    assert_eq!(f.state.read().unwrap().queue_index, 2);
+
+    // A later seek is for track 2, not a stale target.
+    f.controller.seek_to(7.0);
+    assert_eq!(f.wait_for_startup(3), (f.tracks[2].clone(), Some("7.000".to_string())));
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 2);
+    assert!(f.rx.try_recv().is_err(), "nothing wrapped");
+}
+
+/// A seek on the last track restarts it: nothing wrapped, so the queue is not reshuffled (#106).
+#[cfg(unix)]
+#[test]
+fn test_continuous_seek_on_the_last_track_sends_no_shuffle() {
+    common::isolate();
+    let f = DecoderFixture::start("seek_last", &["t0.wav", "t1.wav"], 1);
+    assert_eq!(f.wait_for_startup(1), (f.tracks[1].clone(), None));
+
+    f.controller.seek_to(5.0);
+    assert_eq!(f.wait_for_startup(2), (f.tracks[1].clone(), Some("5.000".to_string())));
+    if let Ok(cmd) = f.rx.recv_timeout(Duration::from_millis(300)) {
+        panic!("a seek on the last track sent {:?}", cmd);
+    }
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 1);
+}
+
+/// A skip that arrives as a track ends, while the stream waits to pick the next one, is not
+/// lost: the stream plays the track asked for, not the one after the track that ended (#106).
+#[cfg(unix)]
+#[test]
+fn test_continuous_skip_at_a_track_boundary_is_not_lost() {
+    common::isolate();
+    let f = DecoderFixture::start("skip_boundary", &["t0_short.wav", "t1.wav", "t2.wav", "t3.wav"], 0);
+    assert_eq!(f.run(1), (f.tracks[0].clone(), None));
+
+    {
+        // Hold the web state while track 0 ends, so the stream waits at the top of its loop.
+        let _held = f.state.write().unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(f.decoder.calls().len(), 1, "the stream waits for the web state");
+        f.controller.skip_to_index(3);
+    }
+    assert_eq!(f.wait_for_startup(2), (f.tracks[3].clone(), None));
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 3);
+    assert_eq!(f.controller.pending_request(), None);
+}
+
+/// A track that ends with no request pending still moves the stream on to the next one.
+#[cfg(unix)]
+#[test]
+fn test_continuous_track_end_without_a_request_moves_on() {
+    common::isolate();
+    let f = DecoderFixture::start("natural_end", &["t0_short.wav", "t1.wav"], 0);
+    assert_eq!(f.run(1), (f.tracks[0].clone(), None));
+    assert_eq!(f.wait_for_startup(2), (f.tracks[1].clone(), None));
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 1);
+    assert!(f.rx.try_recv().is_err(), "not the last track: no reshuffle");
+}
+
+/// With an empty queue the stream sends silence at real time, so a renderer doesn't run dry
+/// (#107).
+#[test]
+fn test_continuous_stream_sends_silence_at_real_time_while_the_queue_is_empty() {
+    common::isolate();
+    let (handle, _rx) = start(Arc::new(RwLock::new(NowPlayingState::default())));
+    let path = handle.stream_state().arm_continuous_session();
+    let renderer = Renderer::connect(handle.port, &path);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_about_real_time(renderer.rate_over(Duration::from_millis(1500)), "empty queue");
+
+    handle.stream_state().close_active_streams();
+    renderer.hang_up();
+    handle.stop();
+}
+
+/// Lines of the log naming `needle`.
+fn log_lines_naming(needle: &str) -> usize {
+    assert!(quickstream::logger::flush(), "the log was flushed");
+    let log = std::fs::read_to_string(quickstream::logger::get_log_file_path()).unwrap_or_default();
+    log.lines().filter(|line| line.contains(needle)).count()
+}
+
+/// A queue whose files are all missing (the share was unmounted) doesn't make the stream spin:
+/// it logs them once, sends silence at real time, notices the renderer leave, and plays a file
+/// once it is there again (#107).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_with_every_file_missing_sends_silence_without_spinning() {
+    common::isolate();
+    quickstream::logger::init();
+    let dir = temp_dir("all_missing");
+    let decoder = FakeDecoder::new(&dir);
+    let missing = [dir.join("gone/a.wav"), dir.join("gone/b.wav")];
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    state.write().unwrap().queue = missing.iter().enumerate().map(|(i, p)| queue_item(i, p)).collect();
+    let (handle, _rx) = start(state.clone());
+    let controller = handle.stream_state().continuous.clone();
+    controller.set_decoder(&decoder.binary);
+    let path = handle.stream_state().arm_continuous_session();
+
+    let renderer = Renderer::connect(handle.port, &path);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_about_real_time(renderer.rate_over(Duration::from_millis(1500)), "every file missing");
+    let lines = log_lines_naming(&dir.join("gone").display().to_string());
+    assert!(
+        (1..=6).contains(&lines),
+        "the missing files are logged once, not on every pass: {} lines",
+        lines
+    );
+    assert!(decoder.calls().is_empty(), "nothing to decode");
+
+    // The renderer leaves: the stream notices through its silence writes.
+    renderer.hang_up();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while controller.is_active.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the stream outlived its renderer");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // It comes back, and so does a file: the stream plays it.
+    let renderer = Renderer::connect(handle.port, &path);
+    std::thread::sleep(Duration::from_millis(200));
+    std::fs::create_dir_all(dir.join("gone")).unwrap();
+    std::fs::write(&missing[1], b"back").unwrap();
+    let calls = decoder.wait_for_calls(1);
+    assert!(calls[0].contains(&missing[1].display().to_string()), "{:?}", calls);
+    assert_eq!(*controller.current_track_index.lock().unwrap(), 1);
+
+    handle.stream_state().close_active_streams();
+    renderer.hang_up();
+    handle.stop();
+    drop(decoder);
+    let _ = std::fs::remove_dir_all(&dir);
 }

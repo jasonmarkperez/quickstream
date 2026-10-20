@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::state::{NowPlayingState, WebCommand};
 
@@ -44,6 +44,16 @@ pub(super) fn is_continuous_route(route: &str) -> bool {
     route == "/stream/continuous.wav" || route == "/stream/autopilot.wav" || continuous_route_nonce(route).is_some()
 }
 
+/// A skip or seek for the continuous stream (`skip_to_index` / `seek_to`), pending until the
+/// stream picks its next track.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StreamRequest {
+    /// The queue index to play; `None` restarts the track being played.
+    pub index: Option<usize>,
+    /// Where to start it, in seconds.
+    pub position: f64,
+}
+
 /// Controls continuous PCM gapless streaming for DLNA renderers.
 #[derive(Debug, Default)]
 pub struct ContinuousStreamController {
@@ -52,11 +62,12 @@ pub struct ContinuousStreamController {
     pub current_track_index: Arc<Mutex<usize>>,
     pub current_position: Arc<Mutex<f64>>,
     pub current_duration: Arc<Mutex<f64>>,
-    pub skip_requested: Arc<AtomicBool>,
-    pub target_index: Arc<Mutex<Option<usize>>>,
-    pub seek_requested: Arc<AtomicBool>,
-    pub target_seek: Arc<Mutex<Option<f64>>>,
     pub active_child: Arc<Mutex<Option<std::process::Child>>>,
+    /// The skip or seek the stream hasn't acted on yet. Set before the decoder is killed and
+    /// taken in one step when the stream picks its next track, so none is lost or applied twice.
+    request: Mutex<Option<StreamRequest>>,
+    /// The ffmpeg the stream runs (`None`: `ffmpeg` on `PATH`); see [`Self::set_decoder`].
+    decoder: Mutex<Option<PathBuf>>,
     session: Mutex<Option<ContinuousSession>>,
     /// The track being decoded: its queue index and path. Set with `current_duration` held, so
     /// the two always name the same track (lock order: the web state, then `current_duration`,
@@ -177,16 +188,54 @@ impl ContinuousStreamController {
         true
     }
 
+    /// Play the track at `index` from its start. Replaces any pending request (a seek asked
+    /// before it was for the track it leaves).
     pub fn skip_to_index(&self, index: usize) {
-        *self.target_index.lock().unwrap() = Some(index);
-        self.skip_requested.store(true, Ordering::SeqCst);
+        *self.request.lock().unwrap() = Some(StreamRequest {
+            index: Some(index),
+            position: 0.0,
+        });
         self.kill_active_decoder();
     }
 
+    /// Restart the track at `position` seconds. After a skip the stream hasn't acted on yet, the
+    /// seek is for the track skipped to.
     pub fn seek_to(&self, position: f64) {
-        *self.target_seek.lock().unwrap() = Some(position);
-        self.seek_requested.store(true, Ordering::SeqCst);
+        {
+            let mut request = self.request.lock().unwrap();
+            match request.as_mut() {
+                Some(pending) => pending.position = position,
+                None => *request = Some(StreamRequest { index: None, position }),
+            }
+        }
         self.kill_active_decoder();
+    }
+
+    /// The skip or seek the stream hasn't acted on yet, if any.
+    pub fn pending_request(&self) -> Option<StreamRequest> {
+        *self.request.lock().unwrap()
+    }
+
+    fn take_request(&self) -> Option<StreamRequest> {
+        self.request.lock().unwrap().take()
+    }
+
+    fn has_request(&self) -> bool {
+        self.request.lock().unwrap().is_some()
+    }
+
+    /// Run `binary` as the stream's ffmpeg instead of `ffmpeg` on `PATH` (the test seam for a
+    /// fake decoder).
+    pub fn set_decoder(&self, binary: impl Into<PathBuf>) {
+        *self.decoder.lock().unwrap() = Some(binary.into());
+    }
+
+    fn decoder(&self) -> PathBuf {
+        self.decoder
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("ffmpeg"))
     }
 
     pub fn kill_active_decoder(&self) {
@@ -851,6 +900,54 @@ pub fn make_continuous_wav_header() -> [u8; 44] {
     hdr
 }
 
+/// Bytes per second of the continuous stream's PCM (44.1 kHz, 16-bit, stereo).
+const PCM_BYTES_PER_SEC: f64 = 176_400.0;
+/// How often idle silence is sent.
+const SILENCE_TICK: Duration = Duration::from_millis(50);
+/// How far ahead of real time idle silence runs, so a renderer reading at real time never drains.
+const SILENCE_LEAD: Duration = Duration::from_millis(100);
+/// The most silence one tick sends after a write blocked: a stalled renderer is not owed it all.
+const SILENCE_MAX_BURST: Duration = Duration::from_secs(1);
+/// How often a queue whose files are all missing is looked through again.
+const MISSING_RECHECK: Duration = Duration::from_secs(1);
+
+/// The PCM bytes in `duration`, whole 4-byte frames.
+fn pcm_bytes(duration: Duration) -> u64 {
+    (duration.as_secs_f64() * PCM_BYTES_PER_SEC) as u64 / 4 * 4
+}
+
+/// Sends silence at the stream's real-time byte rate while there is nothing to decode (empty
+/// queue, every file missing). Measured from when it started, so sleep overshoot doesn't add up.
+struct SilencePacer {
+    started: Instant,
+    sent: u64,
+}
+
+impl SilencePacer {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            sent: 0,
+        }
+    }
+
+    /// Write the silence due by now (plus `SILENCE_LEAD`), then wait one tick. Returns the write
+    /// error, which means the renderer has gone.
+    fn send(&mut self, stream: &mut impl Write) -> std::io::Result<()> {
+        let due = pcm_bytes(self.started.elapsed() + SILENCE_LEAD);
+        let mut owed = due.saturating_sub(self.sent).min(pcm_bytes(SILENCE_MAX_BURST));
+        self.sent = due;
+        let chunk = [0u8; 8820];
+        while owed > 0 {
+            let n = owed.min(chunk.len() as u64) as usize;
+            stream.write_all(&chunk[..n])?;
+            owed -= n as u64;
+        }
+        std::thread::sleep(SILENCE_TICK);
+        Ok(())
+    }
+}
+
 /// Serve a continuous 16-bit 44.1kHz PCM WAV stream to DLNA renderers.
 /// Slices tracks sequentially directly into the exact same TCP socket without drops or DAC resets.
 /// `session` is the nonce of the armed session the request was admitted to; the stream ends when
@@ -936,6 +1033,13 @@ pub fn serve_continuous_stream(
     stream.write_all(&wav_hdr)?;
     stream.flush()?;
 
+    // Silence paced at real time while there is nothing to decode; `None` while a track plays.
+    let mut silence: Option<SilencePacer> = None;
+    // Set when a look through the whole queue found no file: the queue's paths then, and when.
+    // Until the queue changes, a request arrives or `MISSING_RECHECK` passes, the stream sends
+    // silence without looking again.
+    let mut all_missing: Option<(Vec<String>, Instant)> = None;
+
     while controller.is_active.load(Ordering::SeqCst) {
         if !controller.is_session(session) {
             crate::log_info!(
@@ -955,38 +1059,80 @@ pub fn serve_continuous_stream(
             return Ok(());
         }
 
-        // 1. Get current track information
-        let (track_path, track_duration, track_index, queue_len) = {
-            let s = state.read().unwrap();
-            if s.queue.is_empty() {
-                drop(s);
-                // Send a small burst of silence PCM frames so renderer buffer doesn't starve
-                let silence = [0u8; 4096];
-                if let Err(e) = stream.write_all(&silence) {
-                    crate::log_info!("web", "Continuous stream socket closed while idle: {}", e);
-                    return Ok(());
+        // 1. Pick the track: the first from the requested (else the current) index whose file
+        // exists, and where to start it. `None`: nothing to decode yet, so send silence.
+        let picked = 'pick: {
+            let (index, request, tracks) = {
+                let s = state.read().unwrap();
+                if s.queue.is_empty() {
+                    break 'pick None;
                 }
-                std::thread::sleep(Duration::from_millis(50));
-                continue;
-            }
-            let idx = *controller.current_track_index.lock().unwrap();
-            let safe_idx = if idx < s.queue.len() { idx } else { 0 };
-            let track = &s.queue[safe_idx];
-            (
-                PathBuf::from(&track.filepath),
-                track.duration_seconds,
-                safe_idx,
-                s.queue.len(),
-            )
+                let unchanged = |paths: &Vec<String>| s.queue.iter().map(|t| &t.filepath).eq(paths.iter());
+                if all_missing
+                    .as_ref()
+                    .is_some_and(|(paths, checked)| checked.elapsed() < MISSING_RECHECK && unchanged(paths))
+                    && !controller.has_request()
+                {
+                    break 'pick None;
+                }
+                // Taken in one step with the decision it drives, so a request that arrives later
+                // stays pending for the next pass.
+                let request = controller.take_request();
+                let index = request
+                    .and_then(|r| r.index)
+                    .unwrap_or_else(|| *controller.current_track_index.lock().unwrap());
+                let index = if index < s.queue.len() { index } else { 0 };
+                let tracks: Vec<(String, f64)> = s
+                    .queue
+                    .iter()
+                    .map(|t| (t.filepath.clone(), t.duration_seconds))
+                    .collect();
+                (index, request, tracks)
+            };
+            // The paths were copied out, so a slow share never holds the web state's lock.
+            let queue_len = tracks.len();
+            let found = (0..queue_len).map(|step| (index + step) % queue_len).find(|&i| {
+                let exists = Path::new(&tracks[i].0).exists();
+                if !exists && all_missing.is_none() {
+                    crate::log_warn!("web", "Continuous stream track missing: {}", tracks[i].0);
+                }
+                exists
+            });
+            let Some(found) = found else {
+                if all_missing.is_none() {
+                    crate::log_warn!(
+                        "web",
+                        "All {} queued tracks are missing; sending silence until one is found",
+                        queue_len
+                    );
+                }
+                if request.is_some_and(|r| r.index.is_some()) {
+                    *controller.current_track_index.lock().unwrap() = index;
+                }
+                all_missing = Some((tracks.into_iter().map(|(path, _)| path).collect(), Instant::now()));
+                break 'pick None;
+            };
+            all_missing = None;
+            // A seek is for the track it was asked on; one played in its place starts at 0.
+            let start_pos = match request {
+                Some(r) if found == index => r.position,
+                _ => 0.0,
+            };
+            let (path, duration) = &tracks[found];
+            Some((found, PathBuf::from(path), *duration, start_pos, queue_len))
         };
+        let Some((track_index, track_path, track_duration, start_pos, queue_len)) = picked else {
+            if let Err(e) = silence.get_or_insert_with(SilencePacer::new).send(&mut stream) {
+                crate::log_info!("web", "Continuous stream socket closed while idle: {}", e);
+                return Ok(());
+            }
+            continue;
+        };
+        silence = None;
 
         *controller.current_track_index.lock().unwrap() = track_index;
         controller.start_track(track_index, &track_path, track_duration);
         *controller.current_position.lock().unwrap() = 0.0;
-
-        let start_pos = controller.target_seek.lock().unwrap().take().unwrap_or(0.0);
-        controller.seek_requested.store(false, Ordering::SeqCst);
-        controller.skip_requested.store(false, Ordering::SeqCst);
 
         // Synchronize track info into NowPlayingState
         if let Ok(mut s) = state.write() {
@@ -1016,15 +1162,8 @@ pub fn serve_continuous_stream(
             start_pos
         );
 
-        if !track_path.exists() {
-            crate::log_warn!("web", "Continuous stream track missing: {}", track_path.display());
-            let next_idx = (track_index + 1) % queue_len;
-            *controller.current_track_index.lock().unwrap() = next_idx;
-            continue;
-        }
-
         // 2. Spawn ffmpeg to decode to 44.1kHz 16-bit LE stereo raw PCM
-        let mut cmd = std::process::Command::new("ffmpeg");
+        let mut cmd = std::process::Command::new(controller.decoder());
         if start_pos > 0.0 {
             cmd.arg("-ss").arg(format!("{:.3}", start_pos));
         }
@@ -1061,6 +1200,8 @@ pub fn serve_continuous_stream(
             }
         };
 
+        // Registered before the first request check below, so a request that arrived since the
+        // top of the pass (its kill found no decoder) still stops this one.
         *controller.active_child.lock().unwrap() = Some(child);
 
         // 3. Stream PCM chunks
@@ -1080,17 +1221,16 @@ pub fn serve_continuous_stream(
                 return Ok(());
             }
 
-            if controller.skip_requested.load(Ordering::SeqCst) || controller.seek_requested.load(Ordering::SeqCst) {
-                controller.kill_active_decoder();
-                if let Some(target) = controller.target_index.lock().unwrap().take() {
-                    *controller.current_track_index.lock().unwrap() = target;
-                }
+            // The next pass takes the request.
+            if controller.has_request() {
                 break;
             }
 
             match stdout.read(&mut buf) {
                 Ok(0) => {
-                    track_finished_normally = true;
+                    // A skip or seek kills the decoder, which also ends its output: only an end
+                    // with no request pending is the end of the track.
+                    track_finished_normally = !controller.has_request();
                     break;
                 }
                 Ok(n) => {
