@@ -13,6 +13,9 @@ use ratatui::style::Modifier;
 
 use common::fake_player::FakePlayer;
 use common::tui;
+use quickstream::analysis::bpm::FfmpegConfig;
+use quickstream::analysis::worker::AnalysisWorker;
+use quickstream::analysis::{AnalysisDatabase, TrackFeatures};
 use quickstream::settings::{SettingGroup, SettingsManager, SETTING_DEFINITIONS, SETTING_DISPLAY_ORDER};
 use quickstream::ui::theme::Palette;
 use quickstream::ui::{kit, AppUI};
@@ -160,6 +163,9 @@ fn settings_list_is_grouped_in_display_order() {
         }
         want.push(kit::upper(def.label));
     }
+    // The LIBRARY group ends with the read-only TRACK ANALYSIS row (#30).
+    let web = want.iter().position(|row| row == "WEB").unwrap();
+    want.insert(web - 1, "TRACK ANALYSIS".to_string());
     let got: Vec<String> = (first..first + want.len() as u16)
         .map(|y| span(&buf, y, LABEL_X, VALUE_X))
         .collect();
@@ -896,4 +902,170 @@ fn compact_pairing_link_takes_two_rows_on_short_terminals() {
             }
         }
     }
+}
+
+// ---------- track analysis (#30) ----------
+
+const ANALYSIS: &str = "TRACK ANALYSIS";
+
+/// A worker on its own database in `dir` whose counters read `analysed` analysed, `up_to_date`
+/// skipped (their rows match the files) and `pending` waiting, the first of those in flight: a
+/// fake ffmpeg answers the others at once with 10 s of silence (a real result, stored without a
+/// BPM) and sleeps on files named `slow-*` until the worker shuts down. The files are not audio:
+/// with no tags to read, every one goes to ffmpeg.
+#[cfg(unix)]
+fn analysis_worker(dir: &std::path::Path, analysed: usize, up_to_date: usize, pending: usize) -> AnalysisWorker {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+    let script = dir.join("fake-ffmpeg");
+    common::fake_exec::write_script(
+        &script,
+        "#!/bin/sh\ncase \"$*\" in *slow-*) exec sleep 60;; esac\nhead -c 220500 /dev/zero\nexit 0\n",
+    );
+    let file = |name: String| {
+        let path = dir.join(name);
+        fs::write(&path, b"not audio").unwrap();
+        path
+    };
+
+    let db = AnalysisDatabase::open_at(&dir.join("track_analysis.db")).unwrap();
+    let skipped: Vec<_> = (0..up_to_date).map(|i| file(format!("done-{i}.flac"))).collect();
+    for path in &skipped {
+        let md = fs::metadata(path).unwrap();
+        db.upsert_track(&TrackFeatures {
+            filepath: path.clone(),
+            mtime: md.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            file_size: md.len(),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    let ffmpeg = FfmpegConfig {
+        binary: script,
+        ..FfmpegConfig::default()
+    };
+    let worker = AnalysisWorker::spawn_with_ffmpeg(db, 1, ffmpeg);
+    worker.enqueue(
+        skipped
+            .into_iter()
+            .chain((0..analysed).map(|i| file(format!("new-{i}.flac")))),
+    );
+    assert!(worker.wait_until_idle(Duration::from_secs(20)), "worker did not finish");
+    worker.enqueue((0..pending).map(|i| file(format!("slow-{i}.flac"))));
+    let progress = worker.progress();
+    assert_eq!(
+        (progress.analyzed, progress.skipped, progress.failed, progress.pending),
+        (analysed, up_to_date, 0, pending)
+    );
+    worker
+}
+
+/// The value of the TRACK ANALYSIS row and the row, if it is on screen.
+fn analysis_row(buf: &Buffer) -> Option<(u16, String)> {
+    let y = (0..buf.area.height).find(|&y| span(buf, y, LABEL_X, VALUE_X) == ANALYSIS)?;
+    Some((y, span(buf, y, VALUE_X, buf.area.width)))
+}
+
+#[cfg(unix)]
+#[test]
+fn track_analysis_row_shows_the_workers_counters_at_every_size() {
+    common::isolate();
+    let mut app = settings_app("analysis_sizes");
+    let dir = std::env::temp_dir().join(format!("qs_settings_analysis_{}", std::process::id()));
+    app.analysis_worker = analysis_worker(&dir, 2, 1, 3);
+
+    let last_library = SETTING_DISPLAY_ORDER
+        .iter()
+        .rev()
+        .find(|&&i| SETTING_DEFINITIONS[i].group == SettingGroup::Library)
+        .copied()
+        .unwrap();
+    // Every size from mockup 2e down to a short terminal (3h). Where the list scrolls, moving
+    // down to the LIBRARY group's last setting brings the row under it into view.
+    for (w, h) in [(120, 40), (100, 30), (80, 24), (80, 20)] {
+        app.settings_cursor = SETTING_DISPLAY_ORDER[0];
+        tui::render(&mut app, w, h);
+        while app.settings_cursor != last_library {
+            press(&mut app, KeyCode::Char('j'));
+            tui::render(&mut app, w, h);
+        }
+        let buf = tui::render(&mut app, w, h);
+        let (y, value) = analysis_row(&buf).unwrap_or_else(|| panic!("{w}x{h}: no {ANALYSIS} row:\n{}", dump(&buf)));
+        assert_eq!(
+            value,
+            "3 PENDING  ·  2 ANALYSED  ·  1 SKIPPED",
+            "{w}x{h}:\n{}",
+            dump(&buf)
+        );
+        // The LIBRARY group's last row, read-only: label and value MID, never the cursor bar.
+        assert_eq!(must_row(&buf, last_library) + 1, y, "{w}x{h}:\n{}", dump(&buf));
+        assert!(is_cursor(&buf, LABEL_X, y - 1), "{w}x{h}: the cursor stays on its row");
+        assert_eq!(tui::cell_style(&buf, LABEL_X, y).fg, Some(P.mid), "{w}x{h}");
+        assert_eq!(tui::cell_style(&buf, VALUE_X, y).fg, Some(P.mid), "{w}x{h}");
+        assert!(!is_cursor(&buf, LABEL_X, y), "{w}x{h}");
+    }
+
+    // The cursor never lands on it: down from the LIBRARY group's last setting is the WEB group.
+    let order = &SETTING_DISPLAY_ORDER;
+    let at = order
+        .iter()
+        .rposition(|&i| SETTING_DEFINITIONS[i].group == SettingGroup::Library)
+        .unwrap();
+    app.settings_cursor = order[at];
+    press(&mut app, KeyCode::Char('j'));
+    assert_eq!(app.settings_cursor, order[at + 1]);
+    assert_eq!(SETTING_DEFINITIONS[app.settings_cursor].group, SettingGroup::Web);
+
+    drop(app);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn track_analysis_row_follows_the_worker_and_leaves_out_what_is_zero() {
+    common::isolate();
+    let mut app = settings_app("analysis_live");
+    let buf = tui::render(&mut app, 120, 40);
+    assert_eq!(
+        analysis_row(&buf).map(|r| r.1).as_deref(),
+        Some("IDLE"),
+        "nothing analysed yet:\n{}",
+        dump(&buf)
+    );
+
+    let dir = std::env::temp_dir().join(format!("qs_settings_analysis_live_{}", std::process::id()));
+    app.analysis_worker = analysis_worker(&dir, 4, 0, 0);
+    let buf = tui::render(&mut app, 120, 40);
+    assert_eq!(analysis_row(&buf).map(|r| r.1).as_deref(), Some("4 ANALYSED"));
+    // Tracks queued later show at once: the counters are read on every frame (atomics).
+    let late = dir.join("slow-late.flac");
+    fs::write(&late, b"not audio").unwrap();
+    app.analysis_worker.enqueue([late]);
+    let buf = tui::render(&mut app, 120, 40);
+    assert_eq!(
+        analysis_row(&buf).map(|r| r.1).as_deref(),
+        Some("1 PENDING  ·  4 ANALYSED")
+    );
+
+    drop(app);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn track_analysis_value_is_cut_from_its_end_keeping_pending() {
+    common::isolate();
+    let mut app = settings_app("analysis_narrow");
+    let dir = std::env::temp_dir().join(format!("qs_settings_analysis_narrow_{}", std::process::id()));
+    app.analysis_worker = analysis_worker(&dir, 2, 1, 3);
+    app.settings_cursor = SETTING_DISPLAY_ORDER[0];
+    // 60 columns leave the value 22: pending comes first, so it stays.
+    let buf = tui::render(&mut app, 60, 30);
+    let (_, value) = analysis_row(&buf).unwrap_or_else(|| panic!("no {ANALYSIS} row:\n{}", dump(&buf)));
+    assert_eq!(value, "3 PENDING  ·  2 ANALY…", "\n{}", dump(&buf));
+
+    drop(app);
+    let _ = fs::remove_dir_all(&dir);
 }

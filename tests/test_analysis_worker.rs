@@ -671,3 +671,221 @@ fn test_decode_retries_from_zero_when_first_decode_is_too_short() {
     assert_eq!(seek_offsets(&log), vec![Some(30.0), Some(0.0)]);
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// The autopilot candidate pool (#30): queued tracks first, candidates bounded
+// ---------------------------------------------------------------------------
+
+use quickstream::analysis::worker::{AnalysisQueue, MAX_PENDING_CANDIDATES};
+use quickstream::library::AutopilotEvent;
+use quickstream::settings::SettingsManager;
+use quickstream::ui::AppUI;
+
+fn paths(names: &[&str]) -> Vec<PathBuf> {
+    names
+        .iter()
+        .map(|n| PathBuf::from(format!("/music/{n}.flac")))
+        .collect()
+}
+
+fn path(name: &str) -> PathBuf {
+    paths(&[name]).remove(0)
+}
+
+fn drain(queue: &mut AnalysisQueue) -> Vec<PathBuf> {
+    std::iter::from_fn(|| queue.pop()).collect()
+}
+
+#[test]
+fn queued_tracks_are_analysed_before_candidates() {
+    common::isolate();
+    let mut queue = AnalysisQueue::new(10);
+    for p in paths(&["c1", "c2", "c3"]) {
+        assert!(queue.push_candidate(p));
+    }
+    for p in paths(&["t1", "t2"]) {
+        assert!(queue.push_queued(p));
+    }
+    assert_eq!(queue.len(), 5);
+    assert_eq!(drain(&mut queue), paths(&["t1", "t2", "c1", "c2", "c3"]));
+    assert!(queue.is_empty());
+}
+
+#[test]
+fn a_candidate_that_reaches_the_queue_moves_ahead_once() {
+    common::isolate();
+    let mut queue = AnalysisQueue::new(10);
+    for p in paths(&["c1", "c2", "c3"]) {
+        queue.push_candidate(p);
+    }
+    // Already pending as a candidate: promoted, not added twice.
+    assert!(!queue.push_queued(path("c3")));
+    assert_eq!(queue.len(), 3);
+    assert_eq!(drain(&mut queue), paths(&["c3", "c1", "c2"]));
+}
+
+#[test]
+fn a_path_is_never_queued_twice_in_a_session() {
+    common::isolate();
+    let mut queue = AnalysisQueue::new(10);
+    let (t, c) = (path("t"), path("c"));
+    assert!(queue.push_queued(t.clone()));
+    assert!(!queue.push_queued(t.clone()));
+    assert!(
+        !queue.push_candidate(t.clone()),
+        "a queued track is not a candidate too"
+    );
+    assert!(queue.push_candidate(c.clone()));
+    assert!(!queue.push_candidate(c.clone()));
+    assert_eq!(drain(&mut queue), vec![t.clone(), c.clone()]);
+    // Analysed (or being analysed) this session: offered again, ignored.
+    assert!(!queue.push_queued(t));
+    assert!(!queue.push_candidate(c));
+    assert!(queue.is_empty());
+}
+
+#[test]
+fn candidates_are_bounded_and_the_oldest_give_way() {
+    common::isolate();
+    let mut queue = AnalysisQueue::new(3);
+    for p in paths(&["c1", "c2", "c3", "c4", "c5"]) {
+        queue.push_candidate(p);
+    }
+    assert_eq!(queue.len(), 3, "candidates never exceed the bound");
+    // A dropped candidate may be offered again by a later run.
+    assert!(queue.push_candidate(path("c1")));
+    // Queued tracks are never dropped, however many candidates arrive.
+    for p in paths(&["t1", "t2", "t3", "t4"]) {
+        queue.push_queued(p);
+    }
+    for p in paths(&["c6", "c7"]) {
+        queue.push_candidate(p);
+    }
+    assert_eq!(drain(&mut queue), paths(&["t1", "t2", "t3", "t4", "c1", "c6", "c7"]));
+}
+
+#[test]
+fn a_burst_of_candidates_keeps_the_worker_queue_bounded() {
+    common::isolate();
+    let cache = scratch_dir("worker_burst_db");
+    let db = AnalysisDatabase::open_at(&cache.join("track_analysis.db")).unwrap();
+    let mut worker = AnalysisWorker::spawn(db, 1);
+    let burst: Vec<PathBuf> = (0..MAX_PENDING_CANDIDATES * 3)
+        .map(|i| cache.join(format!("missing-{i}.flac")))
+        .collect();
+    worker.enqueue_candidates(burst);
+    // At most the bound waiting, plus the one being analysed.
+    assert!(worker.progress().pending <= MAX_PENDING_CANDIDATES + 1);
+    assert!(worker.wait_until_idle(Duration::from_secs(20)));
+    worker.shutdown();
+    let _ = fs::remove_dir_all(&cache);
+}
+
+#[test]
+fn the_worker_analyses_candidates_into_the_database() {
+    common::isolate();
+    let music = scratch_dir("worker_candidates");
+    let cache = scratch_dir("worker_candidates_db");
+    let a = music.join("a.wav");
+    let b = music.join("b.wav");
+    write_tagged_wav(&a, "122", "8A");
+    write_tagged_wav(&b, "90", "3B");
+    let before = snapshot(&music);
+
+    let db = AnalysisDatabase::open_at(&cache.join("track_analysis.db")).unwrap();
+    let mut worker = AnalysisWorker::spawn(db.clone(), 1);
+    worker.enqueue_candidates(vec![a.clone(), b.clone()]);
+    assert!(worker.wait_until_idle(Duration::from_secs(20)));
+    assert_eq!(worker.progress().analyzed, 2);
+    assert_eq!(db.get_track(&a).and_then(|f| f.bpm), Some(122.0));
+    assert_eq!(db.get_track(&b).and_then(|f| f.bpm), Some(90.0));
+    worker.shutdown();
+
+    assert_eq!(snapshot(&music), before, "music library must be untouched");
+    let _ = fs::remove_dir_all(&music);
+    let _ = fs::remove_dir_all(&cache);
+}
+
+/// The order a fake ffmpeg was first called on each of `tracks`, from its argument log.
+#[cfg(unix)]
+fn first_calls(log: &Path, tracks: &[PathBuf]) -> Vec<PathBuf> {
+    let text = fs::read_to_string(log).unwrap_or_default();
+    let mut order: Vec<(usize, PathBuf)> = tracks
+        .iter()
+        .filter_map(|t| {
+            let name = t.to_string_lossy().to_string();
+            text.lines().position(|l| l.contains(&name)).map(|i| (i, t.clone()))
+        })
+        .collect();
+    order.sort();
+    order.into_iter().map(|(_, t)| t).collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_track_queued_during_a_candidate_burst_is_analysed_next() {
+    common::isolate();
+    let music = scratch_dir("worker_priority");
+    let cache = scratch_dir("worker_priority_db");
+    let candidates: Vec<PathBuf> = (1..=4).map(|i| music.join(format!("cand{i}.wav"))).collect();
+    let queued = music.join("queued.wav");
+    for t in candidates.iter().chain([&queued]) {
+        write_wav(t, &click_track(120.0, 2.0));
+    }
+    let log = cache.join("calls.log");
+    let args = cache.join("args.log");
+    // Each call takes a moment, so the queued track arrives while a candidate is analysed.
+    let body = format!("printf '%s\\n' \"$*\" >> '{}'\nsleep 0.2\nexit 0", args.display());
+    let cfg = FfmpegConfig {
+        binary: fake_ffmpeg(&cache, &log, &body),
+        ..FfmpegConfig::default()
+    };
+    let db = AnalysisDatabase::open_at(&cache.join("track_analysis.db")).unwrap();
+    let mut worker = AnalysisWorker::spawn_with_ffmpeg(db, 1, cfg);
+    worker.enqueue_candidates(candidates.clone());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while invocations(&log) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    worker.enqueue(vec![queued.clone()]);
+    assert!(worker.wait_until_idle(Duration::from_secs(30)));
+    worker.shutdown();
+
+    let all: Vec<PathBuf> = candidates.iter().cloned().chain([queued.clone()]).collect();
+    let order = first_calls(&args, &all);
+    assert_eq!(order.len(), 5, "every track reached ffmpeg: {order:?}");
+    assert_eq!(order[0], candidates[0], "the candidate already started comes first");
+    assert_eq!(
+        order[1], queued,
+        "the queued track goes before the other candidates: {order:?}"
+    );
+    let _ = fs::remove_dir_all(&music);
+    let _ = fs::remove_dir_all(&cache);
+}
+
+#[test]
+fn autopilot_candidates_reach_the_analysis_worker_but_not_the_queue() {
+    common::isolate();
+
+    let music = scratch_dir("ui_candidates");
+    let a = music.join("a.wav");
+    let b = music.join("b.wav");
+    write_tagged_wav(&a, "118", "8A");
+    write_tagged_wav(&b, "119", "9A");
+
+    let mut mgr = SettingsManager::new();
+    mgr.settings.web_server_enabled = false;
+    let mut app = AppUI::new(Some(music.clone()), mgr);
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.autopilot_rx = Some(rx);
+    app.is_autopilot_scanning = true;
+    tx.send(AutopilotEvent::Candidates(vec![a.clone(), b.clone()])).unwrap();
+    tx.send(AutopilotEvent::Finished(0)).unwrap();
+    app.poll_background_autopilot();
+
+    assert!(app.queue.is_empty(), "candidates are analysed, not queued");
+    assert!(app.analysis_worker.wait_until_idle(Duration::from_secs(20)));
+    assert_eq!(app.analysis_worker.progress().analyzed, 2);
+    assert_eq!(app.analysis_db.get_track(&a).and_then(|f| f.bpm), Some(118.0));
+    let _ = fs::remove_dir_all(&music);
+}

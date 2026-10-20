@@ -162,7 +162,7 @@ fn test_autopilot_placeholders_leave_audio_properties_unknown() {
         .try_iter()
         .filter_map(|e| match e {
             AutopilotEvent::Track(t) => Some(t),
-            AutopilotEvent::Finished(_) => None,
+            AutopilotEvent::Candidates(_) | AutopilotEvent::Finished(_) => None,
         })
         .collect();
     for path in [&unreadable, &analysed] {

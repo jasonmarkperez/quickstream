@@ -111,7 +111,7 @@ fn test_autopilot_scanner_reads_shared_cache() {
         .try_iter()
         .filter_map(|e| match e {
             AutopilotEvent::Track(t) => Some(t.title),
-            AutopilotEvent::Finished(_) => None,
+            AutopilotEvent::Candidates(_) | AutopilotEvent::Finished(_) => None,
         })
         .collect();
     assert_eq!(titles, vec!["From Shared Cache".to_string()]);

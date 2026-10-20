@@ -374,6 +374,9 @@ fn test_autopilot_progressive_streaming_events() {
                 tracks_received += 1;
                 assert!(!t.title.is_empty());
             }
+            AutopilotEvent::Candidates(paths) => {
+                panic!("Diverse Shuffle has no pool beyond what it queues: {paths:?}");
+            }
             AutopilotEvent::Finished(cnt) => {
                 finished = true;
                 assert_eq!(cnt, 3);
@@ -385,6 +388,98 @@ fn test_autopilot_progressive_streaming_events() {
     handle.join().unwrap();
     assert!(finished);
     assert_eq!(tracks_received, 3);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+/// A BPM Flow mix sends its candidate pool for analysis (issue #30): the candidates it gathered
+/// but did not queue, without those already analysed, once, before `Finished`.
+#[test]
+fn test_profile_mix_sends_its_unqueued_candidates_for_analysis() {
+    common::isolate();
+    use quickstream::analysis::{AnalysisDatabase, MixProfile, TrackFeatures};
+    use quickstream::library::{AutopilotEvent, LibraryManager, MetadataCache};
+    use std::collections::HashSet;
+    use std::sync::atomic::AtomicBool;
+
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_pool_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let db = AnalysisDatabase::open_in_memory().unwrap();
+    let row = |path: &Path, bpm: f64| {
+        let md = fs::metadata(path).unwrap();
+        let mtime = md
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        TrackFeatures {
+            filepath: path.to_path_buf(),
+            mtime,
+            file_size: md.len(),
+            title: path.file_stem().unwrap().to_string_lossy().to_string(),
+            artist: path.file_stem().unwrap().to_string_lossy().to_string(),
+            bpm: Some(bpm),
+            ..Default::default()
+        }
+    };
+
+    // A small flat folder: three tracks in the BPM range (the mix), one analysed out of range
+    // (up to date: not sent again) and four never analysed (the pool to analyse).
+    let mut unanalysed = HashSet::new();
+    for i in 1..=8 {
+        let path = temp_dir.join(format!("{i:02} Song.wav"));
+        create_dummy_audio(&path);
+        match i {
+            1..=3 => db.upsert_track(&row(&path, 120.0)).unwrap(),
+            4 => db.upsert_track(&row(&path, 90.0)).unwrap(),
+            _ => {
+                unanalysed.insert(path);
+            }
+        }
+    }
+
+    let (tx, rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (dir, scan_db) = (temp_dir.clone(), db.clone());
+    let handle = std::thread::spawn(move || {
+        LibraryManager::scan_directory_autopilot_with_profile(
+            dir,
+            Vec::new(),
+            MetadataCache::default(),
+            MixProfile::BpmFlow {
+                target_bpm: 120.0,
+                tolerance: 0.05,
+            },
+            scan_db,
+            tx,
+            stop,
+        );
+    });
+
+    let mut queued = HashSet::new();
+    let mut candidates = Vec::new();
+    let mut finished = false;
+    while let Ok(event) = rx.recv_timeout(Duration::from_secs(5)) {
+        match event {
+            AutopilotEvent::Track(t) => {
+                assert!(candidates.is_empty(), "candidates come after the mix");
+                queued.insert(t.filepath);
+            }
+            AutopilotEvent::Candidates(paths) => candidates.extend(paths),
+            AutopilotEvent::Finished(_) => {
+                finished = true;
+                break;
+            }
+        }
+    }
+    handle.join().unwrap();
+    assert!(finished);
+    assert_eq!(queued.len(), 3, "the three tracks in range make the mix");
+    let sent: HashSet<PathBuf> = candidates.iter().cloned().collect();
+    assert_eq!(sent.len(), candidates.len(), "each candidate is sent once");
+    assert_eq!(sent, unanalysed, "the pool minus queued and up-to-date tracks");
 
     let _ = fs::remove_dir_all(&temp_dir);
 }

@@ -17,6 +17,11 @@ use crate::paths;
 #[derive(Debug, Clone, PartialEq)]
 pub enum AutopilotEvent {
     Track(AudioMetadata),
+    /// A profile mix's candidate pool for the analysis worker (issue #30): the tracks it gathered
+    /// but did not queue and that have no up-to-date analysis row, so BPM Flow and the moods
+    /// have more to choose from on the next run. Sent once, after the mix's tracks and before
+    /// `Finished`; never queued.
+    Candidates(Vec<PathBuf>),
     Finished(usize),
 }
 
@@ -1005,6 +1010,17 @@ impl LibraryManager {
                 return;
             }
 
+            // The whole pool, before the mix takes its share: what the mix leaves out goes to the
+            // analysis worker (issue #30). The size comes from the reads above, so no file is
+            // read again here.
+            let mut pool_seen = std::collections::HashSet::new();
+            let pool: Vec<(PathBuf, u64)> = matched_candidates
+                .iter()
+                .chain(&all_candidates)
+                .filter(|m| pool_seen.insert(m.filepath.clone()))
+                .map(|m| (m.filepath.clone(), m.file_size))
+                .collect();
+
             let remaining_limit = target_limit - total_sent;
             let filtered: Vec<AudioMetadata> = if matched_candidates.len() >= remaining_limit {
                 matched_candidates
@@ -1048,6 +1064,11 @@ impl LibraryManager {
                 sequence_start.elapsed()
             ));
 
+            let queued: std::collections::HashSet<PathBuf> = first_sent
+                .iter()
+                .chain(&sequenced)
+                .map(|t| t.filepath.clone())
+                .collect();
             for track in sequenced {
                 if stop_flag.load(Ordering::Relaxed) {
                     return;
@@ -1055,6 +1076,21 @@ impl LibraryManager {
                 if tx.send(AutopilotEvent::Track(track)).is_ok() {
                     total_sent += 1;
                 }
+            }
+
+            // The candidates the mix didn't queue, less those with an analysis row for the file
+            // as it is (the worker skips those anyway): analysed in the background, so the next
+            // mix has more tracks with a BPM and energy to choose from.
+            let unanalysed: Vec<PathBuf> = pool
+                .into_iter()
+                .filter(|(path, size)| {
+                    !queued.contains(path) && db.get_track(path).is_none_or(|row| row.file_size != *size)
+                })
+                .map(|(path, _)| path)
+                .collect();
+            if !unanalysed.is_empty() && !stop_flag.load(Ordering::Relaxed) {
+                log_autopilot(format!("candidates sent for analysis={}", unanalysed.len()));
+                let _ = tx.send(AutopilotEvent::Candidates(unanalysed));
             }
 
             if !stop_flag.load(Ordering::Relaxed) {

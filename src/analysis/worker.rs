@@ -7,14 +7,17 @@
 //!   BPM tag is missing.
 //! - Resumable: tracks whose row already matches the file's mtime and size are skipped.
 //! - Bounded concurrency (a small fixed pool of threads), never on the UI thread.
+//! - Two queues ([`AnalysisQueue`]): tracks that reached the playback queue go first; an
+//!   autopilot run's candidate pool (the tracks it gathered but did not queue, #30) waits behind
+//!   them, at most [`MAX_PENDING_CANDIDATES`] (the oldest give way), so a 200-track pool delays
+//!   a queued track by at most the one candidate being analysed.
 //! - Read-only towards the music library: the only writes go to the analysis database.
 //! - Stops promptly: the stop flag is checked between tracks and while ffmpeg runs.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,19 +39,115 @@ pub struct AnalysisProgress {
     pub pending: usize,
 }
 
+/// At most this many autopilot candidates wait for analysis (one run's pool); a later run's
+/// candidates push out the oldest.
+pub const MAX_PENDING_CANDIDATES: usize = 200;
+
+/// The tracks waiting for analysis: tracks that reached the playback queue first, in the order
+/// they came, then autopilot candidates (bounded, the oldest dropped first). A path is taken at
+/// most once a session: offered again while it waits, while it is analysed or after, it is
+/// ignored, except that a waiting candidate that reaches the queue moves to the queued tracks. A
+/// dropped candidate is forgotten, so a later run may offer it again.
+#[derive(Debug)]
+pub struct AnalysisQueue {
+    queued: VecDeque<PathBuf>,
+    candidates: VecDeque<PathBuf>,
+    candidate_limit: usize,
+    seen: HashSet<PathBuf>,
+}
+
+impl AnalysisQueue {
+    /// An empty queue holding at most `candidate_limit` candidates.
+    pub fn new(candidate_limit: usize) -> Self {
+        Self {
+            queued: VecDeque::new(),
+            candidates: VecDeque::new(),
+            candidate_limit,
+            seen: HashSet::new(),
+        }
+    }
+
+    /// Add a track that reached the playback queue. Returns whether it is new work (a waiting
+    /// candidate moved ahead is not).
+    pub fn push_queued(&mut self, path: PathBuf) -> bool {
+        if self.seen.insert(path.clone()) {
+            self.queued.push_back(path);
+            return true;
+        }
+        if let Some(at) = self.candidates.iter().position(|c| *c == path) {
+            self.candidates.remove(at);
+            self.queued.push_back(path);
+        }
+        false
+    }
+
+    /// Add an autopilot candidate behind the queued tracks, dropping the oldest candidate when
+    /// the bound is reached. Returns whether it was added.
+    pub fn push_candidate(&mut self, path: PathBuf) -> bool {
+        if self.candidate_limit == 0 || self.seen.contains(&path) {
+            return false;
+        }
+        while self.candidates.len() >= self.candidate_limit {
+            if let Some(oldest) = self.candidates.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+        self.seen.insert(path.clone());
+        self.candidates.push_back(path);
+        true
+    }
+
+    /// The next track to analyse: the oldest queued track, else the oldest candidate.
+    pub fn pop(&mut self) -> Option<PathBuf> {
+        self.queued.pop_front().or_else(|| self.candidates.pop_front())
+    }
+
+    /// Tracks waiting, queued and candidates.
+    pub fn len(&self) -> usize {
+        self.queued.len() + self.candidates.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// The queue and the threads' bookkeeping, behind one lock that is never held while a track is
+/// analysed (so `enqueue` on the UI thread never waits for an analysis).
+struct Work {
+    queue: AnalysisQueue,
+    /// Tracks being analysed right now.
+    in_flight: usize,
+    /// Set on shutdown: nothing more is queued.
+    closed: bool,
+}
+
 struct Shared {
     stop: AtomicBool,
     analyzed: AtomicUsize,
     skipped: AtomicUsize,
     failed: AtomicUsize,
+    /// Waiting plus in flight: written under the `work` lock, read without it.
     pending: AtomicUsize,
-    seen: Mutex<HashSet<PathBuf>>,
+    work: Mutex<Work>,
+    /// Signalled when work is queued and on shutdown.
+    ready: Condvar,
     ffmpeg: FfmpegConfig,
+}
+
+impl Shared {
+    fn work(&self) -> MutexGuard<'_, Work> {
+        self.work.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Republish the pending count after a change to `work` (its lock held).
+    fn publish_pending(&self, work: &Work) {
+        self.pending.store(work.queue.len() + work.in_flight, Ordering::SeqCst);
+    }
 }
 
 /// Handle to the background analysis thread pool. Dropping it stops and joins the threads.
 pub struct AnalysisWorker {
-    tx: Option<Sender<PathBuf>>,
     shared: Arc<Shared>,
     handles: Vec<JoinHandle<()>>,
 }
@@ -61,48 +160,61 @@ impl AnalysisWorker {
 
     /// Like [`Self::spawn`], but with an explicit ffmpeg binary / timeout for acoustic analysis.
     pub fn spawn_with_ffmpeg(db: AnalysisDatabase, threads: usize, ffmpeg: FfmpegConfig) -> Self {
-        let (tx, rx) = mpsc::channel::<PathBuf>();
-        let rx = Arc::new(Mutex::new(rx));
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             analyzed: AtomicUsize::new(0),
             skipped: AtomicUsize::new(0),
             failed: AtomicUsize::new(0),
             pending: AtomicUsize::new(0),
-            seen: Mutex::new(HashSet::new()),
+            work: Mutex::new(Work {
+                queue: AnalysisQueue::new(MAX_PENDING_CANDIDATES),
+                in_flight: 0,
+                closed: false,
+            }),
+            ready: Condvar::new(),
             ffmpeg,
         });
 
         let handles = (0..threads.clamp(1, 2))
             .filter_map(|i| {
-                let rx = Arc::clone(&rx);
                 let shared = Arc::clone(&shared);
                 let db = db.clone();
                 std::thread::Builder::new()
                     .name(format!("qs-analysis-{}", i))
-                    .spawn(move || worker_loop(rx, shared, db))
+                    .spawn(move || worker_loop(shared, db))
                     .ok()
             })
             .collect();
 
-        Self {
-            tx: Some(tx),
-            shared,
-            handles,
-        }
+        Self { shared, handles }
     }
 
-    /// Queue tracks for analysis. Paths already queued this session are ignored.
+    /// Queue tracks that reached the playback queue: they are analysed before any candidate.
+    /// Paths already queued this session are ignored (a waiting candidate moves ahead).
     pub fn enqueue<I: IntoIterator<Item = PathBuf>>(&self, paths: I) {
-        let Some(tx) = self.tx.as_ref() else { return };
-        let mut seen = self.shared.seen.lock().unwrap();
+        self.push(paths, AnalysisQueue::push_queued);
+    }
+
+    /// Queue an autopilot run's candidate pool behind the queued tracks, at most
+    /// [`MAX_PENDING_CANDIDATES`] waiting (the oldest give way). Paths already queued this
+    /// session are ignored.
+    pub fn enqueue_candidates<I: IntoIterator<Item = PathBuf>>(&self, paths: I) {
+        self.push(paths, AnalysisQueue::push_candidate);
+    }
+
+    fn push<I: IntoIterator<Item = PathBuf>>(&self, paths: I, add: fn(&mut AnalysisQueue, PathBuf) -> bool) {
+        let mut work = self.shared.work();
+        if work.closed {
+            return;
+        }
+        let mut added = false;
         for path in paths {
-            if seen.insert(path.clone()) {
-                self.shared.pending.fetch_add(1, Ordering::SeqCst);
-                if tx.send(path).is_err() {
-                    self.shared.pending.fetch_sub(1, Ordering::SeqCst);
-                }
-            }
+            added |= add(&mut work.queue, path);
+        }
+        self.shared.publish_pending(&work);
+        drop(work);
+        if added {
+            self.shared.ready.notify_all();
         }
     }
 
@@ -132,7 +244,8 @@ impl AnalysisWorker {
     /// Signal all threads to stop, abort any running ffmpeg call and join the threads.
     pub fn shutdown(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
-        self.tx.take();
+        self.shared.work().closed = true;
+        self.shared.ready.notify_all();
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
@@ -145,23 +258,29 @@ impl Drop for AnalysisWorker {
     }
 }
 
-fn worker_loop(rx: Arc<Mutex<Receiver<PathBuf>>>, shared: Arc<Shared>, db: AnalysisDatabase) {
+fn worker_loop(shared: Arc<Shared>, db: AnalysisDatabase) {
     loop {
-        if shared.stop.load(Ordering::SeqCst) {
-            return;
-        }
-        let next = {
-            let rx = rx.lock().unwrap();
-            rx.recv_timeout(Duration::from_millis(100))
-        };
-        let path = match next {
-            Ok(p) => p,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => return,
+        let path = {
+            let mut work = shared.work();
+            loop {
+                if shared.stop.load(Ordering::SeqCst) || work.closed {
+                    return;
+                }
+                if let Some(path) = work.queue.pop() {
+                    work.in_flight += 1;
+                    break path;
+                }
+                work = match shared.ready.wait_timeout(work, Duration::from_millis(100)) {
+                    Ok((work, _)) => work,
+                    Err(e) => e.into_inner().0,
+                };
+            }
         };
 
         process_track(&path, &shared, &db);
-        shared.pending.fetch_sub(1, Ordering::SeqCst);
+        let mut work = shared.work();
+        work.in_flight -= 1;
+        shared.publish_pending(&work);
     }
 }
 

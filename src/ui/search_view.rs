@@ -132,8 +132,11 @@ fn split(area: Rect, detail: bool) -> (Rect, Option<Rect>) {
 fn draw_query_row(f: &mut Frame, area: Rect, modal: &SearchModalState) {
     let width = area.width as usize;
     let counts = vec![
-        Span::styled(grouped(modal.filtered.len()), theme::bold()),
-        Span::styled(format!(" / {} MATCHED", grouped(modal.all_tracks.len())), theme::dim()),
+        Span::styled(kit::grouped(modal.filtered.len()), theme::bold()),
+        Span::styled(
+            format!(" / {} MATCHED", kit::grouped(modal.all_tracks.len())),
+            theme::dim(),
+        ),
     ];
     let counts_width = kit::spans_width(&counts);
     let label = "QUERY  ";
@@ -155,19 +158,6 @@ fn draw_query_row(f: &mut Frame, area: Rect, modal: &SearchModalState) {
         let x = area.right() - counts_width as u16;
         buf.set_line(x, area.y, &Line::from(counts), counts_width as u16);
     }
-}
-
-/// `4812` as `4,812`.
-fn grouped(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// The RANKED MATCHES panel: `TITLE  ARTIST  05:52` rows (only the visible ones), the cursor bar
@@ -373,7 +363,7 @@ pub(super) fn footer_hints(matches: usize) -> Vec<KeyHint> {
     vec![
         KeyHint::new("ENTER", "ADD & CLOSE", 3),
         KeyHint::new("TAB", "ADD TO QUEUE", 2),
-        KeyHint::new("⇧TAB", format!("ADD ALL ({})", grouped(matches)), 1),
+        KeyHint::new("⇧TAB", format!("ADD ALL ({})", kit::grouped(matches)), 1),
         KeyHint::new("ESC", "CANCEL", 4),
     ]
 }

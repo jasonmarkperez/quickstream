@@ -1226,6 +1226,7 @@ impl AppUI {
 
     pub fn poll_background_autopilot(&mut self) {
         let mut new_tracks = Vec::new();
+        let mut candidates = Vec::new();
         let mut finished = false;
 
         if let Some(ref rx) = self.autopilot_rx {
@@ -1233,6 +1234,9 @@ impl AppUI {
                 match event {
                     crate::library::AutopilotEvent::Track(track) => {
                         new_tracks.push(track);
+                    }
+                    crate::library::AutopilotEvent::Candidates(paths) => {
+                        candidates.extend(paths);
                     }
                     crate::library::AutopilotEvent::Finished(_) => {
                         finished = true;
@@ -1244,6 +1248,12 @@ impl AppUI {
         if finished {
             self.is_autopilot_scanning = false;
             self.autopilot_rx = None;
+        }
+
+        // The mix's candidate pool waits behind the queued tracks for analysis (issue #30), so
+        // the next BPM Flow or mood mix has more analysed tracks to choose from.
+        if !candidates.is_empty() {
+            self.analysis_worker.enqueue_candidates(candidates);
         }
 
         if new_tracks.is_empty() {

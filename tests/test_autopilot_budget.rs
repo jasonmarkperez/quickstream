@@ -88,6 +88,7 @@ fn run_chill_mix(limits: ProfileScanLimits) -> MixRun {
             AutopilotEvent::Track(_) => {
                 first_track_at.get_or_insert(start.elapsed());
             }
+            AutopilotEvent::Candidates(_) => {}
             AutopilotEvent::Finished(_) => break start.elapsed(),
         }
     };
