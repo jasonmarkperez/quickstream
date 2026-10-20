@@ -57,6 +57,25 @@ impl AppUI {
         true
     }
 
+    /// While the continuous stream plays, follow its track index (`current_track_index`) in the
+    /// queue. Called once per tick by the event loop.
+    pub fn sync_continuous_stream_index(&mut self) {
+        if let Some(ref ws) = self.web_server {
+            if ws
+                .stream_state()
+                .continuous
+                .is_active
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                let cur_idx = *ws.stream_state().continuous.current_track_index.lock().unwrap();
+                if cur_idx != self.queue.current_index() && cur_idx < self.queue.len() {
+                    self.queue.set_current_index(cur_idx);
+                    self.queue_cursor = cur_idx;
+                }
+            }
+        }
+    }
+
     pub fn run(&mut self) -> anyhow::Result<()> {
         self.device_manager.start_background_scan();
         enable_raw_mode()?;
@@ -93,21 +112,7 @@ impl AppUI {
                 self.handle_track_finished();
             }
 
-            // Synchronize continuous gapless stream track index
-            if let Some(ref ws) = self.web_server {
-                if ws
-                    .stream_state()
-                    .continuous
-                    .is_active
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    let cur_idx = *ws.stream_state().continuous.current_track_index.lock().unwrap();
-                    if cur_idx != self.queue.current_index() && cur_idx < self.queue.len() {
-                        self.queue.set_current_index(cur_idx);
-                        self.queue_cursor = cur_idx;
-                    }
-                }
-            }
+            self.sync_continuous_stream_index();
 
             // Process remote web commands
             self.handle_web_commands();

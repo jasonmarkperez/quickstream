@@ -536,8 +536,10 @@ fn test_upnp_continuous_seek_is_clamped_to_the_known_length() {
 
 /// A fake ffmpeg for the continuous stream (issues #106, #107): logs its arguments, one line per
 /// run, and its pid (so the test can kill any it leaves). An input whose name contains `short`
-/// gets 100 ms of PCM and ends 0.5 s later; one with `endless` gets PCM until it is killed; one
-/// with `bad` gets nothing and an exit at once (a file ffmpeg can't decode); any other input gets
+/// gets 100 ms of PCM and ends 0.5 s later; one with `endless` gets PCM as fast as it is read
+/// until it is killed (for a renderer that stops reading); one with `live` gets PCM at about real
+/// time until it is killed (for one that keeps reading, so it doesn't load the machine); one with
+/// `bad` gets nothing and an exit at once (a file ffmpeg can't decode); any other input gets
 /// nothing, as while the real one opens a file on a slow share, until it is killed.
 #[cfg(unix)]
 struct FakeDecoder {
@@ -553,7 +555,7 @@ impl FakeDecoder {
         let log = dir.join("ffmpeg.log");
         let pids = dir.join("ffmpeg.pids");
         let text = format!(
-            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$in\" in\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *endless*) exec cat /dev/zero ;;\n  *bad*) exit 1 ;;\nesac\nexec sleep 30\n",
+            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$in\" in\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *endless*) exec cat /dev/zero ;;\n  *live*) while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *bad*) exit 1 ;;\nesac\nexec sleep 30\n",
             pids = pids.display(),
             log = log.display()
         );
@@ -567,6 +569,15 @@ impl FakeDecoder {
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    /// The pid of decoder run `n` (from 1).
+    fn pid(&self, n: usize) -> String {
+        let pids = std::fs::read_to_string(&self.pids).unwrap_or_default();
+        pids.split_whitespace()
+            .nth(n - 1)
+            .unwrap_or_else(|| panic!("no pid for decoder run {}: {:?}", n, pids))
+            .to_string()
     }
 
     /// The runs so far, once there are `n` of them.
@@ -585,6 +596,25 @@ impl FakeDecoder {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+}
+
+/// Whether process `pid` is still running (or not yet reaped).
+#[cfg(unix)]
+fn pid_alive(pid: &str) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", pid])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Wait up to 10 s for `done`.
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "{}", what);
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -645,6 +675,18 @@ impl Renderer {
         (after - before) as f64 / start.elapsed().as_secs_f64()
     }
 
+    /// Whether the stream closes the connection within `window`.
+    fn closed_within(&self, window: Duration) -> bool {
+        let deadline = Instant::now() + window;
+        while !self.thread.as_ref().is_some_and(|t| t.is_finished()) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
     /// Stop reading and close the connection.
     fn hang_up(mut self) {
         self.reading.store(false, Ordering::SeqCst);
@@ -676,6 +718,9 @@ struct DecoderFixture {
     state: Arc<RwLock<NowPlayingState>>,
     rx: mpsc::Receiver<WebCommand>,
     controller: Arc<ContinuousStreamController>,
+    /// The web server's port and the session's path, for a second connection.
+    port: u16,
+    path: String,
     renderer: Option<Renderer>,
     handle: Option<WebServerHandle>,
     decoder: FakeDecoder,
@@ -704,6 +749,8 @@ impl DecoderFixture {
             state,
             rx,
             controller,
+            port: handle.port,
+            path,
             renderer: Some(renderer),
             handle: Some(handle),
             decoder,
@@ -873,7 +920,7 @@ fn test_continuous_request_pending_at_session_end_is_not_carried_over() {
     controller.skip_to_index(2);
     controller.seek_to(30.0);
     let stale = StreamRequest {
-        index: Some(2),
+        index: 2,
         position: 30.0,
     };
     assert_eq!(
@@ -906,12 +953,16 @@ fn test_continuous_request_pending_at_session_end_is_not_carried_over() {
 
 /// A queue whose files all exist but give no audio (ffmpeg can't decode them) doesn't make the
 /// stream spin either: after one try of each it sends silence at real time, tries again once a
-/// second, asks for no reshuffle, and plays a file that joins the queue (#107).
+/// second, asks for no reshuffle, and plays a file that joins the queue, shown as playing once
+/// it gives audio (#107).
 #[cfg(unix)]
 #[test]
 fn test_continuous_stream_with_no_decodable_file_sends_silence_without_spinning() {
     common::isolate();
     let f = DecoderFixture::start("none_decodable", &["a_bad.wav", "b_bad.wav", "c_bad.wav"], 0);
+    // Measured once each file has been tried: the first run of a script just written can take
+    // seconds to start on macOS while other tests start theirs.
+    f.decoder.wait_for_calls(3);
     std::thread::sleep(Duration::from_millis(300));
     let renderer = f.renderer.as_ref().unwrap();
     assert_about_real_time(renderer.rate_over(Duration::from_millis(1500)), "no decodable file");
@@ -923,7 +974,7 @@ fn test_continuous_stream_with_no_decodable_file_sends_silence_without_spinning(
     );
     assert!(f.rx.try_recv().is_err(), "nothing played, so nothing to reshuffle");
 
-    let good = f.dir.join("d.wav");
+    let good = f.dir.join("d_live.wav");
     std::fs::write(&good, b"never opened: the fake decoder makes up its output").unwrap();
     {
         let mut s = f.state.write().unwrap();
@@ -944,8 +995,9 @@ fn test_continuous_stream_with_no_decodable_file_sends_silence_without_spinning(
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 3);
+    wait_until("the new file was never shown as playing", || {
+        *f.controller.current_track_index.lock().unwrap() == 3
+    });
 }
 
 /// With an empty queue the stream sends silence at real time, so a renderer doesn't run dry
@@ -973,7 +1025,7 @@ fn log_lines_naming(needle: &str) -> usize {
 
 /// A queue whose files are all missing (the share was unmounted) doesn't make the stream spin:
 /// it logs them once, sends silence at real time, notices the renderer leave, and plays a file
-/// once it is there again (#107).
+/// once it is there again, shown as playing once it gives audio (#107).
 #[cfg(unix)]
 #[test]
 fn test_continuous_stream_with_every_file_missing_sends_silence_without_spinning() {
@@ -981,7 +1033,7 @@ fn test_continuous_stream_with_every_file_missing_sends_silence_without_spinning
     quickstream::logger::init();
     let dir = temp_dir("all_missing");
     let decoder = FakeDecoder::new(&dir);
-    let missing = [dir.join("gone/a.wav"), dir.join("gone/b.wav")];
+    let missing = [dir.join("gone/a.wav"), dir.join("gone/b_live.wav")];
     let state = Arc::new(RwLock::new(NowPlayingState::default()));
     state.write().unwrap().queue = missing.iter().enumerate().map(|(i, p)| queue_item(i, p)).collect();
     let (handle, _rx) = start(state.clone());
@@ -1015,7 +1067,281 @@ fn test_continuous_stream_with_every_file_missing_sends_silence_without_spinning
     std::fs::write(&missing[1], b"back").unwrap();
     let calls = decoder.wait_for_calls(1);
     assert!(calls[0].contains(&missing[1].display().to_string()), "{:?}", calls);
-    assert_eq!(*controller.current_track_index.lock().unwrap(), 1);
+    wait_until("the file that came back was never shown as playing", || {
+        *controller.current_track_index.lock().unwrap() == 1
+    });
+
+    handle.stream_state().close_active_streams();
+    renderer.hang_up();
+    handle.stop();
+    drop(decoder);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A track that gave audio starts the count of silent tracks afresh, however it was stopped: a
+/// skip out of it doesn't leave the earlier failures counted, so the bad files after it don't
+/// make the stream idle with a playable file in the queue (#107).
+#[cfg(unix)]
+#[test]
+fn test_continuous_audio_resets_the_silent_count_when_skipped_out_of() {
+    common::isolate();
+    let f = DecoderFixture::start("silent_count", &["a_live.wav", "b_bad.wav", "c_bad.wav"], 1);
+    // b and c give nothing, then a plays.
+    assert_eq!(f.run(3).0, f.tracks[0]);
+    wait_until("a never played", || {
+        *f.controller.current_track_index.lock().unwrap() == 0
+    });
+
+    f.controller.skip_to_index(1);
+    let asked = Instant::now();
+    assert_eq!(f.run(4).0, f.tracks[1]);
+    assert_eq!(f.run(5).0, f.tracks[2]);
+    assert_eq!(f.run(6).0, f.tracks[0]);
+    assert!(
+        asked.elapsed() < Duration::from_secs(1),
+        "b and c failing again is not the whole queue failing: a came back after {:?}",
+        asked.elapsed()
+    );
+}
+
+/// Next twice in a row while the stream is blocked writing (the renderer reads slowly) lands two
+/// tracks on: `skip_to_index` moves `current_track_index` at once, so the event loop's sync
+/// doesn't put the queue back on the old track before the stream acts on the skip (#106).
+#[cfg(unix)]
+#[test]
+fn test_continuous_two_skips_while_the_stream_is_blocked_land_two_tracks_on() {
+    common::isolate();
+    let dir = temp_dir("double_skip");
+    let decoder = FakeDecoder::new(&dir);
+    let tracks: Vec<PathBuf> = ["t0_endless.wav", "t1.wav", "t2.wav", "t3.wav"]
+        .iter()
+        .map(|n| dir.join(n))
+        .collect();
+    for track in &tracks {
+        std::fs::write(track, b"never opened: the fake decoder makes up its output").unwrap();
+    }
+    let settings = SettingsManager::with_path(dir.join("config.json"));
+    let mut app = AppUI::new(Some(dir.clone()), settings);
+    app.queue.add_tracks(
+        tracks
+            .iter()
+            .enumerate()
+            .map(|(i, p)| track_meta(p, &format!("Track {}", i), 60.0))
+            .collect(),
+    );
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, app.web_state.clone(), tx).expect("start web server");
+    let port = handle.port;
+    let controller = handle.stream_state().continuous.clone();
+    controller.set_decoder(&decoder.binary);
+    let path = handle.stream_state().arm_continuous_session();
+    app.web_server = Some(handle);
+    app.update_web_state();
+
+    // Reads nothing after the response head, so the stream ends up blocked writing t0.
+    let (status, stalled) = open(port, &path);
+    assert_eq!(status, 200);
+    assert!(decoder.wait_for_calls(1)[0].contains("t0_endless"));
+    std::thread::sleep(Duration::from_millis(500));
+
+    app.play_next_track();
+    assert_eq!(
+        *controller.current_track_index.lock().unwrap(),
+        1,
+        "the stream's index follows the skip at once"
+    );
+    app.sync_continuous_stream_index();
+    assert_eq!(app.queue.current_index(), 1, "the event loop's sync keeps the skip");
+    app.play_next_track();
+    app.sync_continuous_stream_index();
+    assert_eq!(app.queue.current_index(), 2);
+    assert_eq!(*controller.current_track_index.lock().unwrap(), 2);
+    assert_eq!(controller.pending_request().map(|r| r.position), Some(0.0));
+    assert_eq!(decoder.calls().len(), 1, "the stream is still blocked writing t0");
+
+    if let Some(handle) = app.web_server.take() {
+        handle.stream_state().close_active_streams();
+        drop(stalled);
+        handle.stop();
+    }
+    drop(decoder);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A seek that arrives after a track has ended, before the stream starts the next one, is for
+/// the track it was asked on: that track restarts at the offset, and the next one still starts
+/// from its beginning (#106).
+#[cfg(unix)]
+#[test]
+fn test_continuous_seek_just_after_a_track_ends_is_not_applied_to_the_next_track() {
+    common::isolate();
+    let f = DecoderFixture::start("seek_after_end", &["t0_short.wav", "t1.wav", "t2.wav"], 0);
+    assert_eq!(f.run(1), (f.tracks[0].clone(), None));
+
+    {
+        // Hold the web state while track 0 ends, so the stream waits to pick the next track.
+        let _held = f.state.write().unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(f.decoder.calls().len(), 1, "the stream waits for the web state");
+        f.controller.seek_to(40.0);
+    }
+    assert_eq!(f.run(2), (f.tracks[0].clone(), Some("40.000".to_string())));
+    assert_eq!(f.run(3), (f.tracks[1].clone(), None), "the next track from its start");
+}
+
+/// A skip or seek asked while the queue is empty is dropped: the next queue starts at its top,
+/// from its start, not at a stale index or offset (#106).
+#[cfg(unix)]
+#[test]
+fn test_continuous_request_made_while_the_queue_is_empty_is_dropped() {
+    common::isolate();
+    let f = DecoderFixture::start("empty_queue_request", &[], 0);
+    std::thread::sleep(Duration::from_millis(200));
+    f.controller.skip_to_index(5);
+    f.controller.seek_to(40.0);
+    wait_until("the request stayed pending", || {
+        f.controller.pending_request().is_none()
+    });
+
+    let tracks: Vec<PathBuf> = (0..6).map(|i| f.dir.join(format!("t{}.wav", i))).collect();
+    for track in &tracks {
+        std::fs::write(track, b"never opened: the fake decoder makes up its output").unwrap();
+    }
+    f.state.write().unwrap().queue = tracks.iter().enumerate().map(|(i, p)| queue_item(i, p)).collect();
+    assert_eq!(f.run(1), (tracks[0].clone(), None));
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 0);
+}
+
+/// A renderer that reconnects to its session supersedes the old connection: the new connection's
+/// decoder takes the old one's place without leaving it running, the old connection closes, and
+/// a skip then stops the new connection's decoder.
+#[cfg(unix)]
+#[test]
+fn test_continuous_reconnect_stops_the_old_connections_decoder() {
+    common::isolate();
+    let f = DecoderFixture::start("reconnect", &["t0.wav", "t1.wav"], 0);
+    f.wait_for_startup(1);
+    let old_decoder = f.decoder.pid(1);
+
+    let second = Renderer::connect(f.port, &f.path);
+    assert_eq!(f.wait_for_startup(2), (f.tracks[0].clone(), None));
+    wait_until("the old connection's decoder was left running", || {
+        !pid_alive(&old_decoder)
+    });
+    assert!(
+        f.renderer.as_ref().unwrap().closed_within(Duration::from_secs(3)),
+        "the old connection was not closed"
+    );
+
+    let new_decoder = f.decoder.pid(2);
+    f.controller.skip_to_index(1);
+    assert_eq!(f.wait_for_startup(3), (f.tracks[1].clone(), None));
+    wait_until("the skip didn't stop the new connection's decoder", || {
+        !pid_alive(&new_decoder)
+    });
+
+    f.controller.kill_active_decoder();
+    if let Some(handle) = f.handle.as_ref() {
+        handle.stream_state().close_active_streams();
+    }
+    second.hang_up();
+}
+
+/// While the stream idles on a queue that gives no audio, the files it tries again once a
+/// second are not shown as playing: the stream's track index and the web state stay on the
+/// track that was playing or asked for (#107).
+#[cfg(unix)]
+#[test]
+fn test_continuous_idle_rechecks_do_not_step_now_playing_through_the_queue() {
+    common::isolate();
+    let f = DecoderFixture::start("idle_now_playing", &["a_bad.wav", "b_bad.wav", "c_bad.wav"], 0);
+    f.run(3);
+    std::thread::sleep(Duration::from_millis(300));
+    let shown = || {
+        let s = f.state.read().unwrap();
+        let index = *f.controller.current_track_index.lock().unwrap();
+        (index, s.queue_index, s.title.clone())
+    };
+    let before = shown();
+    assert_eq!(before, (0, 0, "Track 0".to_string()));
+    let runs = f.decoder.calls().len();
+    std::thread::sleep(Duration::from_millis(2500));
+    assert!(f.decoder.calls().len() >= runs + 2, "the stream kept trying");
+    assert_eq!(shown(), before, "a file tried again is not playing");
+}
+
+/// Without a decoder to run (ffmpeg not installed) the stream sends silence, logs the failure
+/// once rather than on every try, and doesn't step now playing through the queue (#107).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_without_a_decoder_logs_the_failure_once() {
+    common::isolate();
+    quickstream::logger::init();
+    let dir = temp_dir("no_decoder");
+    let tracks = [dir.join("a.wav"), dir.join("b.wav")];
+    for track in &tracks {
+        std::fs::write(track, b"never opened").unwrap();
+    }
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    state.write().unwrap().queue = tracks.iter().enumerate().map(|(i, p)| queue_item(i, p)).collect();
+    let (handle, _rx) = start(state.clone());
+    let controller = handle.stream_state().continuous.clone();
+    let missing = dir.join("no-such-ffmpeg");
+    controller.set_decoder(&missing);
+    let path = handle.stream_state().arm_continuous_session();
+
+    let renderer = Renderer::connect(handle.port, &path);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_about_real_time(renderer.rate_over(Duration::from_millis(2500)), "no decoder");
+    assert_eq!(
+        log_lines_naming(&missing.display().to_string()),
+        1,
+        "the spawn failure is logged once"
+    );
+    assert_eq!(*controller.current_track_index.lock().unwrap(), 0);
+    assert_eq!(state.read().unwrap().queue_index, 0);
+
+    handle.stream_state().close_active_streams();
+    renderer.hang_up();
+    handle.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A queue whose files are all missing is logged once, and so is a queue that replaces it, also
+/// one of the same length (#107).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_logs_each_missing_queue_once() {
+    common::isolate();
+    quickstream::logger::init();
+    let dir = temp_dir("missing_queues");
+    let decoder = FakeDecoder::new(&dir);
+    let (first, second) = (dir.join("gone1"), dir.join("gone2"));
+    let queue = |folder: &Path| -> Vec<WebQueueItem> {
+        ["a.wav", "b.wav"]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| queue_item(i, &folder.join(n)))
+            .collect()
+    };
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    state.write().unwrap().queue = queue(&first);
+    let (handle, _rx) = start(state.clone());
+    handle.stream_state().continuous.set_decoder(&decoder.binary);
+    let path = handle.stream_state().arm_continuous_session();
+    let renderer = Renderer::connect(handle.port, &path);
+
+    let first_name = first.display().to_string();
+    wait_until("the first queue was never logged", || log_lines_naming(&first_name) > 0);
+    state.write().unwrap().queue = queue(&second);
+    let second_name = second.display().to_string();
+    wait_until("the queue that replaced it was never logged", || {
+        log_lines_naming(&second_name) > 0
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(log_lines_naming(&first_name), 2, "each missing file once");
+    assert_eq!(log_lines_naming(&second_name), 2, "each missing file once");
+    assert!(decoder.calls().is_empty(), "nothing to decode");
 
     handle.stream_state().close_active_streams();
     renderer.hang_up();
