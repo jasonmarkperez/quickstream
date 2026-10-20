@@ -222,9 +222,7 @@ while True:
                 reply["request_id"] = req["request_id"]
             conn.sendall((json.dumps(reply) + "\n").encode())
 "#;
-    std::fs::write(&script, body).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::fake_exec::write_script(&script, body);
     script
 }
 
@@ -440,9 +438,7 @@ while True:
             else:
                 send(conn, reply)
 "#;
-    std::fs::write(&script, body).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::fake_exec::write_script(&script, body);
     script
 }
 

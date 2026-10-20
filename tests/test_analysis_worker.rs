@@ -360,24 +360,13 @@ fn write_undecodable_mp3(path: &Path) {
 }
 
 /// Fake `ffmpeg` executable: appends its arguments to `log` (one line per invocation), then
-/// runs `body`.
-///
-/// The script is written by a short-lived `sh`, never through a descriptor of this process. On
-/// Linux exec fails with ETXTBSY while any process holds the file open for writing, and a child
-/// another test thread forks while this process has it open keeps that descriptor until the
-/// child's own exec. Writing to a temporary name and renaming it into place would not help: the
-/// inherited descriptor is on the same file.
+/// runs `body`. Written with [`common::fake_exec::write_script`], so it starts even while other
+/// test threads spawn processes (issue #71, #80).
 #[cfg(unix)]
 fn fake_ffmpeg(dir: &Path, log: &Path, body: &str) -> PathBuf {
     let script = dir.join("fake-ffmpeg");
     let text = format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{}\n", log.display(), body);
-    let status = std::process::Command::new("/bin/sh")
-        .args(["-c", "printf '%s' \"$1\" > \"$2\" && chmod 755 \"$2\"", "sh"])
-        .arg(&text)
-        .arg(&script)
-        .status()
-        .unwrap();
-    assert!(status.success(), "could not write {}", script.display());
+    common::fake_exec::write_script(&script, &text);
     script
 }
 
@@ -427,61 +416,6 @@ fn seek_offsets(log: &Path) -> Vec<Option<f64>> {
 #[cfg(unix)]
 fn invocations(log: &Path) -> usize {
     calls(log).len()
-}
-
-/// Issue #71: a [`fake_ffmpeg`] must start even while other threads of the test process start
-/// processes. On Linux exec fails with ETXTBSY while any process holds the script open for
-/// writing, and a child forked by another thread inherits this process's descriptors until its
-/// own exec, so a script this process had just written could fail to start (0 calls logged).
-/// Linux only: macOS runs a script that is open for writing, and spawning is slow enough there
-/// that this test would take most of a minute.
-#[cfg(target_os = "linux")]
-#[test]
-fn test_fake_ffmpeg_starts_while_other_threads_spawn_processes() {
-    common::isolate();
-    use std::process::Command;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    let dir = scratch_dir("fake_ffmpeg_spawn_race");
-    let stop = Arc::new(AtomicBool::new(false));
-    let spawners: Vec<_> = (0..4)
-        .map(|_| {
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let _ = Command::new("/bin/sh").args(["-c", ":"]).status();
-                }
-            })
-        })
-        .collect();
-
-    // About 2 ms a round. With a helper that wrote the script through this process (`fs::write`),
-    // about one round in 250 failed in a Linux container, so 1,000 rounds catch it on almost
-    // every run.
-    const ROUNDS: usize = 1000;
-    let mut failures = Vec::new();
-    for i in 0..ROUNDS {
-        let sub = dir.join(i.to_string());
-        fs::create_dir_all(&sub).unwrap();
-        let log = sub.join("calls.log");
-        let script = fake_ffmpeg(&sub, &log, "exit 0");
-        match Command::new(&script).status() {
-            Ok(status) if status.success() => {}
-            other => failures.push(format!("script {}: {:?}", i, other)),
-        }
-    }
-    stop.store(true, Ordering::Relaxed);
-    for spawner in spawners {
-        spawner.join().unwrap();
-    }
-    assert!(
-        failures.is_empty(),
-        "fake ffmpeg failed to start {} of {} times: {:?}",
-        failures.len(),
-        ROUNDS,
-        failures
-    );
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

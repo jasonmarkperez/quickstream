@@ -259,12 +259,10 @@ fn test_failed_mpv_connect_kills_and_reaps_spawned_child() {
     // A fake mpv that never creates the IPC socket and would otherwise linger for 60s.
     let pid_file = base.join("pids");
     let fake = base.join("fake-mpv");
-    fs::write(
+    common::fake_exec::write_script(
         &fake,
-        format!("#!/bin/sh\necho $$ >> '{}'\nexec sleep 60\n", pid_file.display()),
-    )
-    .unwrap();
-    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        &format!("#!/bin/sh\necho $$ >> '{}'\nexec sleep 60\n", pid_file.display()),
+    );
 
     let mut player = LocalPlayer::with_mpv_binary("mpv", &fake);
     // Each attempt fails to connect and falls back to (silent) ffplay playback.

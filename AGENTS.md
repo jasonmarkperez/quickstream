@@ -113,6 +113,7 @@ quickstream/
     ├── test_browser.rs       # File browser navigation, bookmarks, cache, and metadata toggles
     ├── test_devices_tab.rs   # Tab 3 Devices (2d): table columns, active ●/ACTIVE, any IPv4 host:port whole at every width, IPv6 `[host]:port` keeping its port, MODEL left out when it repeats the name, cursor + j/k wrap, FOUND · SSDP footnote, SCANNING note, detail panel at 120 / none at 100, no inactive volume, 120×40/100×30/80×24, narrow widths keep the cursor row, under 24 rows the DEVICE panel's fields take part in the spacer decision
     ├── test_discovery.rs     # SSDP discovery packet parsing and device extraction
+    ├── test_fake_exec.rs     # common::fake_exec::write_script: exact text, mode 755, replaces; Linux: a written script starts while other threads spawn processes (no ETXTBSY)
     ├── test_local_player.rs  # mpv / ffplay local audio backend lifecycle
     ├── test_local_player_resume.rs # play_at start positions (mpv `start` option, ffplay `-ss`, slow sources); an mpv start past the file's end counts as finished, a missing or corrupt file started past 0:00 is an error (not finished), a replaced load's late end-file is ignored (fake mpv); `MpvLoadTracker` fed each mpv generation's messages (entry id in the answer, only in the events, none at all)
     ├── test_output_switch.rs # resume_position; switching output (FakePlayer outputs, no mpv or renderer) mid-track resumes, in the last second / past the end moves on (loop, repeat-one, stop at end, paused, tag length when the player has none, an end the old player reported but the event loop hadn't handled; a stopped player stays stopped), pending skip / seek (keys and web), current track removed or queue refilled, a failed next track's error kept
@@ -148,7 +149,7 @@ quickstream/
     └── test_web_playlists.rs # Web playlists: snapshot, GET /api/playlists, play/append, edits, path checks
 ```
 
-TUI tests render through the shared helpers in `tests/common/tui.rs` (`render`, `rows`, `find_row`, `find_text`, `cell_style`, `text_styles`): find chrome rows by their text, not by row number. `tests/common/fake_player.rs` (`FakePlayer`) stands in for the player when a test needs a given position, play state or backend; its `calls` log records `play` / `play_at` / `pause`.
+TUI tests render through the shared helpers in `tests/common/tui.rs` (`render`, `rows`, `find_row`, `find_text`, `cell_style`, `text_styles`): find chrome rows by their text, not by row number. `tests/common/fake_player.rs` (`FakePlayer`) stands in for the player when a test needs a given position, play state or backend; its `calls` log records `play` / `play_at` / `pause`. `tests/common/fake_exec.rs` (`write_script`, Unix only) writes the fake `mpv` and `ffmpeg` scripts tests run (see section 5).
 
 The background writer's create, delete and rename tests (used by `PlaylistStore`), including the failure reports, are in the existing `tests/test_persistence_worker.rs`, which the map above does not list.
 
@@ -600,5 +601,6 @@ cargo build --release
 ### Important Rules for Future Agents
 - **No Temporary Root Scripts**: Do not create ad-hoc test scripts (e.g. `test_something.py`, `scratch.rs`, `patch.py`) in the repository root. Always place unit and integration tests inside `tests/` following the `test_*.rs` naming convention.
 - **Test Isolation**: Every integration test file declares `mod common;` and every `#[test]` starts with `common::isolate();` (`tests/common/mod.rs`), which points `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` / `XDG_DATA_HOME` at a per-process temp dir so tests never read or write the real `~/.config`, `~/.cache` or `~/.local/share` quickstream dirs. `tests/test_isolation.rs` fails if a test skips it.
+- **Fake Executables**: A test that writes a script and then runs it (a fake `mpv`, `ffplay` or `ffmpeg`) writes it with `common::fake_exec::write_script`, never through the test process's own file descriptor (`fs::write` + `set_permissions`). On Linux exec fails with ETXTBSY while any process holds the file open for writing, and a child another test thread forks meanwhile inherits that descriptor until its own exec; the helper writes through a short-lived `/bin/sh` instead (`tests/test_fake_exec.rs` races it on Linux).
 - **Graceful Resource Cleanup**: All networking threads (`DLNAScanner`), streaming HTTP sockets, Tokio runtimes, and subprocesses (`mpv`, `ffplay`) must terminate cleanly upon shutdown or `ctrlc` signal.
 - **File Modifications**: Use targeted file editing tools (`replace_file_content` or `write_to_file`) rather than shell sed/cat scripts.
