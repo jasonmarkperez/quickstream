@@ -9,7 +9,12 @@ use quickstream::player::AudioPlayer;
 
 /// 10s of silence, so running the suite never makes audible noise.
 fn ensure_test_file() -> PathBuf {
-    let path = std::env::temp_dir().join("quickstream_test_silence_10s.mp3");
+    silence_file("quickstream_test_silence_10s.mp3", 10)
+}
+
+/// `seconds` of silence at `name` in the temp dir, made once.
+fn silence_file(name: &str, seconds: u32) -> PathBuf {
+    let path = std::env::temp_dir().join(name);
     if !path.exists() {
         let _ = std::process::Command::new("ffmpeg")
             .args([
@@ -21,7 +26,7 @@ fn ensure_test_file() -> PathBuf {
                 "-i",
                 "anullsrc=r=44100:cl=stereo",
                 "-t",
-                "10",
+                &seconds.to_string(),
                 path.to_str().unwrap(),
             ])
             .output();
@@ -56,7 +61,9 @@ fn test_local_playback_lifecycle() {
         eprintln!("SKIPPED: mpv not installed");
         return;
     }
-    let test_file = ensure_test_file();
+    // 60 s, so every seek target is further than playback gets in a wait's 5 s: a seek mpv
+    // ignored cannot reach the expected range by playing on.
+    let test_file = silence_file("quickstream_test_silence_60s.mp3", 60);
     assert!(test_file.exists(), "test file must exist");
 
     let mut player = LocalPlayer::new("mpv");
@@ -68,7 +75,7 @@ fn test_local_playback_lifecycle() {
     let started = wait_until(Duration::from_secs(10), || player.position_seconds() > 0.0);
     let pos = player.position_seconds();
     println!("Reported position: {:.3}s", pos);
-    assert!(started, "mpv never reported a position");
+    assert!(started, "mpv never reported a position: {:?}", player.take_error());
     assert!(player.is_playing(), "player should be playing");
     assert!(!player.is_paused(), "player should not be paused");
     assert!(!player.is_track_finished(), "track should not be finished yet");
@@ -83,37 +90,37 @@ fn test_local_playback_lifecycle() {
     assert!(!player.is_paused());
     assert!(player.is_playing());
 
-    // Test seek forward
-    assert!(player.seek_to(4.0).is_ok());
-    wait_until(Duration::from_secs(5), || {
-        (3.8..=4.5).contains(&player.position_seconds())
-    });
-    let pos_after_seek = player.position_seconds();
+    // seek_to writes its target as the position at once, so each seek waits for a position mpv
+    // reported after it: playing, mpv moves on past the target. mpv sends its events in order,
+    // so by then the pause and resume events above have been read too.
+    assert!(player.seek_to(30.0).is_ok());
+    let expected = 30.05..=31.0;
     assert!(
-        (3.8..=4.5).contains(&pos_after_seek),
-        "Position after seek_to(4.0) should be around 4.0s, got {:.3}s",
-        pos_after_seek
+        wait_until(Duration::from_secs(5), || expected.contains(&player.position_seconds())),
+        "Position after seek_to(30.0) should move on from 30.0s, got {:.3}s",
+        player.position_seconds()
     );
 
-    // Test relative seek backward
+    // Test relative seek backward: without the seek, playback would stay past `before`.
+    let before = player.position_seconds();
     assert!(player.seek(-1.5).is_ok());
-    wait_until(Duration::from_secs(5), || {
-        (2.0..=3.3).contains(&player.position_seconds())
-    });
-    let pos_after_rel = player.position_seconds();
+    let target = before - 1.5;
+    let expected = target + 0.05..=target + 1.0;
     assert!(
-        (2.0..=3.3).contains(&pos_after_rel),
-        "Position after seek(-1.5) should be around 2.5s, got {:.3}s",
-        pos_after_rel
+        wait_until(Duration::from_secs(5), || expected.contains(&player.position_seconds())),
+        "Position after seek(-1.5) from {:.3}s should move on from {:.3}s, got {:.3}s",
+        before,
+        target,
+        player.position_seconds()
     );
 
     // Test seek while paused
     assert!(player.pause().is_ok());
     assert!(player.is_paused());
-    assert!(player.seek_to(6.0).is_ok());
+    assert!(player.seek_to(45.0).is_ok());
     assert!(
-        player.position_seconds() >= 5.8,
-        "Position when seeking while paused should be ~6.0s, got {:.3}s",
+        wait_until(Duration::from_secs(5), || player.position_seconds() >= 44.8),
+        "Position when seeking while paused should be ~45.0s, got {:.3}s",
         player.position_seconds()
     );
     assert!(
@@ -122,6 +129,13 @@ fn test_local_playback_lifecycle() {
     );
     assert!(player.resume().is_ok());
     assert!(player.is_playing());
+    // mpv carries on from the paused seek's target.
+    let expected = 45.05..=46.0;
+    assert!(
+        wait_until(Duration::from_secs(5), || expected.contains(&player.position_seconds())),
+        "Position after resuming should move on from 45.0s, got {:.3}s",
+        player.position_seconds()
+    );
 
     // Test volume
     assert!(player.set_volume(80).is_ok());
