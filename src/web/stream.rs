@@ -81,17 +81,20 @@ impl ContinuousStreamController {
     }
 
     /// Start a new continuous session (replacing any previous one) and return the URL path the
-    /// renderer must request.
+    /// renderer must request. It starts at `current_track_index`, with no request pending.
     pub fn arm_session(&self) -> String {
         let nonce = crate::web_access::generate_token();
         let path = format!("{}{}{}", CONTINUOUS_PREFIX, nonce, CONTINUOUS_SUFFIX);
         *self.session.lock().unwrap() = Some(ContinuousSession { nonce, peer: None });
+        *self.request.lock().unwrap() = None;
         path
     }
 
-    /// End the continuous session: its path stops being served.
+    /// End the continuous session: its path stops being served, and a skip or seek it never
+    /// acted on goes with it.
     pub fn disarm_session(&self) {
         *self.session.lock().unwrap() = None;
+        *self.request.lock().unwrap() = None;
     }
 
     /// The URL path of the armed session, if any.
@@ -1033,12 +1036,19 @@ pub fn serve_continuous_stream(
     stream.write_all(&wav_hdr)?;
     stream.flush()?;
 
-    // Silence paced at real time while there is nothing to decode; `None` while a track plays.
+    // Silence paced at real time while there is nothing to decode; `None` while audio plays.
     let mut silence: Option<SilencePacer> = None;
-    // Set when a look through the whole queue found no file: the queue's paths then, and when.
-    // Until the queue changes, a request arrives or `MISSING_RECHECK` passes, the stream sends
-    // silence without looking again.
-    let mut all_missing: Option<(Vec<String>, Instant)> = None;
+    // Set when the whole queue gave nothing to play (no file found, or every decoder run ended
+    // without audio): the queue's paths then, and when. Until the queue changes, a request
+    // arrives or `MISSING_RECHECK` passes, the stream sends silence without looking again.
+    let mut nothing_playable: Option<(Vec<String>, Instant)> = None;
+    // Tracks in a row that gave no audio (missing files passed over, decoder runs that ended
+    // without output: files ffmpeg can't decode). Once the whole queue has, the stream idles as
+    // when every file is missing, then tries one file a recheck.
+    let mut silent_runs: usize = 0;
+    // Whether audio went out since the stream last wrapped: a wrap without any asks for no
+    // reshuffle, so a queue that gives no audio is not reshuffled on every pass.
+    let mut streamed_since_wrap = false;
 
     while controller.is_active.load(Ordering::SeqCst) {
         if !controller.is_session(session) {
@@ -1067,13 +1077,15 @@ pub fn serve_continuous_stream(
                 if s.queue.is_empty() {
                     break 'pick None;
                 }
-                let unchanged = |paths: &Vec<String>| s.queue.iter().map(|t| &t.filepath).eq(paths.iter());
-                if all_missing
-                    .as_ref()
-                    .is_some_and(|(paths, checked)| checked.elapsed() < MISSING_RECHECK && unchanged(paths))
-                    && !controller.has_request()
-                {
-                    break 'pick None;
+                if let Some((paths, checked)) = &nothing_playable {
+                    let fresh = !s.queue.iter().map(|t| &t.filepath).eq(paths.iter()) || controller.has_request();
+                    if !fresh && checked.elapsed() < MISSING_RECHECK {
+                        break 'pick None;
+                    }
+                    // A changed queue or a request gets every file tried again.
+                    if fresh {
+                        silent_runs = 0;
+                    }
                 }
                 // Taken in one step with the decision it drives, so a request that arrives later
                 // stays pending for the next pass.
@@ -1091,15 +1103,17 @@ pub fn serve_continuous_stream(
             };
             // The paths were copied out, so a slow share never holds the web state's lock.
             let queue_len = tracks.len();
+            let paths = || tracks.iter().map(|(path, _)| path.clone()).collect::<Vec<_>>();
+            let logged = nothing_playable.is_some();
             let found = (0..queue_len).map(|step| (index + step) % queue_len).find(|&i| {
                 let exists = Path::new(&tracks[i].0).exists();
-                if !exists && all_missing.is_none() {
+                if !exists && !logged {
                     crate::log_warn!("web", "Continuous stream track missing: {}", tracks[i].0);
                 }
                 exists
             });
             let Some(found) = found else {
-                if all_missing.is_none() {
+                if !logged {
                     crate::log_warn!(
                         "web",
                         "All {} queued tracks are missing; sending silence until one is found",
@@ -1109,26 +1123,27 @@ pub fn serve_continuous_stream(
                 if request.is_some_and(|r| r.index.is_some()) {
                     *controller.current_track_index.lock().unwrap() = index;
                 }
-                all_missing = Some((tracks.into_iter().map(|(path, _)| path).collect(), Instant::now()));
+                nothing_playable = Some((paths(), Instant::now()));
                 break 'pick None;
             };
-            all_missing = None;
+            // The missing files passed over gave no audio either.
+            silent_runs += (found + queue_len - index) % queue_len;
             // A seek is for the track it was asked on; one played in its place starts at 0.
             let start_pos = match request {
                 Some(r) if found == index => r.position,
                 _ => 0.0,
             };
             let (path, duration) = &tracks[found];
-            Some((found, PathBuf::from(path), *duration, start_pos, queue_len))
+            Some((found, PathBuf::from(path), *duration, start_pos, paths()))
         };
-        let Some((track_index, track_path, track_duration, start_pos, queue_len)) = picked else {
+        let Some((track_index, track_path, track_duration, start_pos, queue_paths)) = picked else {
             if let Err(e) = silence.get_or_insert_with(SilencePacer::new).send(&mut stream) {
                 crate::log_info!("web", "Continuous stream socket closed while idle: {}", e);
                 return Ok(());
             }
             continue;
         };
-        silence = None;
+        let queue_len = queue_paths.len();
 
         *controller.current_track_index.lock().unwrap() = track_index;
         controller.start_track(track_index, &track_path, track_duration);
@@ -1181,36 +1196,37 @@ pub fn serve_continuous_stream(
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
 
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
+        // A decoder that can't start ends the track at once, without audio, like one that can't
+        // decode the file.
+        let mut track_finished_normally = false;
+        let mut streamed = false;
+        let mut stdout = match cmd.spawn() {
+            Ok(mut child) => match child.stdout.take() {
+                Some(stdout) => {
+                    // Registered before the first request check below, so a request that arrived
+                    // since the top of the pass (its kill found no decoder) still stops this one.
+                    *controller.active_child.lock().unwrap() = Some(child);
+                    Some(stdout)
+                }
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    continue;
+                }
+            },
             Err(e) => {
                 crate::log_warn!("web", "Failed to spawn ffmpeg for continuous stream: {}", e);
-                std::thread::sleep(Duration::from_millis(500));
-                let next_idx = (track_index + 1) % queue_len;
-                *controller.current_track_index.lock().unwrap() = next_idx;
-                continue;
+                track_finished_normally = true;
+                None
             }
         };
-
-        let mut stdout = match child.stdout.take() {
-            Some(s) => s,
-            None => {
-                let _ = child.kill();
-                continue;
-            }
-        };
-
-        // Registered before the first request check below, so a request that arrived since the
-        // top of the pass (its kill found no decoder) still stops this one.
-        *controller.active_child.lock().unwrap() = Some(child);
 
         // 3. Stream PCM chunks
         let mut buf = [0u8; 32768];
         let mut bytes_streamed: u64 = (start_pos * 176400.0) as u64;
         let mut last_pos_update = std::time::Instant::now();
-        let mut track_finished_normally = false;
 
-        loop {
+        while let Some(stdout) = stdout.as_mut() {
             if !controller.is_active.load(Ordering::SeqCst) {
                 controller.kill_active_decoder();
                 return Ok(());
@@ -1234,6 +1250,9 @@ pub fn serve_continuous_stream(
                     break;
                 }
                 Ok(n) => {
+                    silence = None;
+                    streamed = true;
+                    streamed_since_wrap = true;
                     if let Err(e) = stream.write_all(&buf[..n]) {
                         crate::log_info!("web", "Continuous stream socket closed: {}", e);
                         controller.kill_active_decoder();
@@ -1261,15 +1280,36 @@ pub fn serve_continuous_stream(
         controller.kill_active_decoder();
 
         if track_finished_normally {
-            // Reshuffle once per wrap, and only from the current connection of the armed session.
+            let wraps = track_index + 1 >= queue_len;
+            // Reshuffle once per wrap that played something, and only from the current
+            // connection of the armed session.
             let owns_session =
                 controller.is_session(session) && (cid == 0 || controller.active_conn_id.load(Ordering::SeqCst) == cid);
-            if track_index + 1 >= queue_len && queue_len > 1 && owns_session {
+            if wraps && queue_len > 1 && owns_session && streamed_since_wrap {
                 let _ = cmd_tx.send(WebCommand::ShuffleQueue);
+            }
+            if wraps {
+                streamed_since_wrap = false;
             }
             let next_idx = (track_index + 1) % queue_len;
             *controller.current_track_index.lock().unwrap() = next_idx;
             *controller.current_position.lock().unwrap() = 0.0;
+
+            silent_runs = if streamed { 0 } else { silent_runs + 1 };
+            if silent_runs >= queue_len {
+                if silent_runs == queue_len {
+                    crate::log_warn!(
+                        "web",
+                        "None of the {} queued tracks gave any audio; sending silence until the queue changes",
+                        queue_len
+                    );
+                }
+                nothing_playable = Some((queue_paths, Instant::now()));
+            } else {
+                nothing_playable = None;
+            }
+        } else {
+            nothing_playable = None;
         }
     }
 

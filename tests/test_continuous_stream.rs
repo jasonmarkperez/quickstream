@@ -18,8 +18,8 @@ use quickstream::player::AudioPlayer;
 use quickstream::settings::SettingsManager;
 use quickstream::ui::AppUI;
 use quickstream::web::{
-    ContinuousAdmission, ContinuousStreamController, NowPlayingState, StreamServerState, WebCommand, WebQueueItem,
-    WebServer, WebServerHandle,
+    ContinuousAdmission, ContinuousStreamController, NowPlayingState, StreamRequest, StreamServerState, WebCommand,
+    WebQueueItem, WebServer, WebServerHandle,
 };
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -536,8 +536,9 @@ fn test_upnp_continuous_seek_is_clamped_to_the_known_length() {
 
 /// A fake ffmpeg for the continuous stream (issues #106, #107): logs its arguments, one line per
 /// run, and its pid (so the test can kill any it leaves). An input whose name contains `short`
-/// gets 100 ms of PCM and ends 0.5 s later; any other input gets nothing, as while the real one
-/// opens a file on a slow share, until it is killed.
+/// gets 100 ms of PCM and ends 0.5 s later; one with `endless` gets PCM until it is killed; one
+/// with `bad` gets nothing and an exit at once (a file ffmpeg can't decode); any other input gets
+/// nothing, as while the real one opens a file on a slow share, until it is killed.
 #[cfg(unix)]
 struct FakeDecoder {
     binary: PathBuf,
@@ -552,7 +553,7 @@ impl FakeDecoder {
         let log = dir.join("ffmpeg.log");
         let pids = dir.join("ffmpeg.pids");
         let text = format!(
-            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$in\" in\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\nesac\nexec sleep 30\n",
+            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$in\" in\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *endless*) exec cat /dev/zero ;;\n  *bad*) exit 1 ;;\nesac\nexec sleep 30\n",
             pids = pids.display(),
             log = log.display()
         );
@@ -837,6 +838,114 @@ fn test_continuous_track_end_without_a_request_moves_on() {
     assert_eq!(f.wait_for_startup(2), (f.tracks[1].clone(), None));
     assert_eq!(*f.controller.current_track_index.lock().unwrap(), 1);
     assert!(f.rx.try_recv().is_err(), "not the last track: no reshuffle");
+}
+
+/// A skip and seek still pending when the session ends (the stream was blocked writing to a
+/// renderer that stopped reading) are dropped with it: the next session starts where the UI
+/// rewound it, not on the stale track or offset.
+#[cfg(unix)]
+#[test]
+fn test_continuous_request_pending_at_session_end_is_not_carried_over() {
+    common::isolate();
+    let dir = temp_dir("stale_request");
+    let decoder = FakeDecoder::new(&dir);
+    let tracks: Vec<PathBuf> = ["t0.wav", "t1_endless.wav", "t2.wav"]
+        .iter()
+        .map(|n| dir.join(n))
+        .collect();
+    for track in &tracks {
+        std::fs::write(track, b"never opened: the fake decoder makes up its output").unwrap();
+    }
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    state.write().unwrap().queue = tracks.iter().enumerate().map(|(i, p)| queue_item(i, p)).collect();
+    let (handle, _rx) = start(state);
+    let ss = handle.stream_state();
+    let controller = ss.continuous.clone();
+    controller.set_decoder(&decoder.binary);
+    *controller.current_track_index.lock().unwrap() = 1;
+    let path = ss.arm_continuous_session();
+
+    // Reads nothing after the response head, so the stream ends up blocked writing to it.
+    let (status, stalled) = open(handle.port, &path);
+    assert_eq!(status, 200);
+    assert!(decoder.wait_for_calls(1)[0].contains("t1_endless"));
+    std::thread::sleep(Duration::from_millis(500));
+    controller.skip_to_index(2);
+    controller.seek_to(30.0);
+    let stale = StreamRequest {
+        index: Some(2),
+        position: 30.0,
+    };
+    assert_eq!(
+        controller.pending_request(),
+        Some(stale),
+        "the blocked stream hasn't taken it"
+    );
+
+    // The session ends as `AppUI::end_continuous_stream` ends it.
+    ss.close_active_streams();
+    *controller.current_track_index.lock().unwrap() = 0;
+    drop(stalled);
+    assert_eq!(controller.pending_request(), None);
+
+    let path = ss.arm_continuous_session();
+    let renderer = Renderer::connect(handle.port, &path);
+    let calls = decoder.wait_for_calls(2);
+    assert!(
+        calls[1].contains(&tracks[0].display().to_string()) && !calls[1].contains("-ss"),
+        "the new session starts on track 0 from its start: {:?}",
+        calls[1]
+    );
+
+    ss.close_active_streams();
+    renderer.hang_up();
+    handle.stop();
+    drop(decoder);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A queue whose files all exist but give no audio (ffmpeg can't decode them) doesn't make the
+/// stream spin either: after one try of each it sends silence at real time, tries again once a
+/// second, asks for no reshuffle, and plays a file that joins the queue (#107).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_with_no_decodable_file_sends_silence_without_spinning() {
+    common::isolate();
+    let f = DecoderFixture::start("none_decodable", &["a_bad.wav", "b_bad.wav", "c_bad.wav"], 0);
+    std::thread::sleep(Duration::from_millis(300));
+    let renderer = f.renderer.as_ref().unwrap();
+    assert_about_real_time(renderer.rate_over(Duration::from_millis(1500)), "no decodable file");
+    let runs = f.decoder.calls().len();
+    assert!(
+        (3..=8).contains(&runs),
+        "one try of each file, then one a second: {} decoder runs",
+        runs
+    );
+    assert!(f.rx.try_recv().is_err(), "nothing played, so nothing to reshuffle");
+
+    let good = f.dir.join("d.wav");
+    std::fs::write(&good, b"never opened: the fake decoder makes up its output").unwrap();
+    {
+        let mut s = f.state.write().unwrap();
+        let index = s.queue.len();
+        s.queue.push(queue_item(index, &good));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !f
+        .decoder
+        .calls()
+        .iter()
+        .any(|c| c.contains(&good.display().to_string()))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the new file never played: {:?}",
+            f.decoder.calls()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 3);
 }
 
 /// With an empty queue the stream sends silence at real time, so a renderer doesn't run dry
