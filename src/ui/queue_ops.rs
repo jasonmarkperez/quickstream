@@ -4,17 +4,19 @@
 
 use std::path::PathBuf;
 
-use super::tag_reads::SharedTagReads;
+use super::tag_reads::{SharedTagReads, TagRead};
 use super::workers::WorkerRegistry;
 use super::AppUI;
 
 /// Start 4 threads that read tags for paths sent to the returned inbox through `tag_reads`, which
 /// reports results on `metadata_tx`. A path another worker is reading right now is skipped: that
-/// read reports it. The threads exit once the inbox sender is dropped or `stop` is set (paths
-/// still queued in the inbox are then skipped).
+/// read reports it. When a file's tags can't be read, its size alone is sent on `sizes`, since the
+/// queue's placeholders don't stat the file (issue #124). The threads exit once the inbox sender
+/// is dropped or `stop` is set (paths still queued in the inbox are then skipped).
 fn spawn_queue_metadata_workers(
     workers: &mut WorkerRegistry,
     tag_reads: SharedTagReads,
+    sizes: std::sync::mpsc::Sender<(PathBuf, u64)>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::sync::mpsc::Sender<PathBuf> {
     let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
@@ -22,6 +24,7 @@ fn spawn_queue_metadata_workers(
     for _ in 0..4 {
         let rx = rx.clone();
         let tag_reads = tag_reads.clone();
+        let sizes = sizes.clone();
         let stop = stop.clone();
         workers.spawn("queue-metadata", move || loop {
             let path = match rx.lock() {
@@ -34,7 +37,11 @@ fn spawn_queue_metadata_workers(
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
-            tag_reads.read_unless_busy(&path);
+            if tag_reads.read_unless_busy(&path) == TagRead::Failed {
+                if let Ok(md) = std::fs::metadata(&path) {
+                    let _ = sizes.send((path, md.len()));
+                }
+            }
         });
     }
     tx
@@ -62,10 +69,11 @@ impl AppUI {
         }
 
         let tag_reads = self.tag_reads.clone();
+        let sizes = self.queue_size_tx.clone();
         let (workers, stop) = (&mut self.workers, self.queue_metadata_stop.clone());
         let tx = self
             .queue_metadata_tx
-            .get_or_insert_with(|| spawn_queue_metadata_workers(workers, tag_reads, stop));
+            .get_or_insert_with(|| spawn_queue_metadata_workers(workers, tag_reads, sizes, stop));
         for path in new_paths {
             let _ = tx.send(path);
         }
@@ -83,11 +91,12 @@ impl AppUI {
         }
     }
 
-    /// Cached metadata for `path`, or a path-derived placeholder. Never reads the audio file.
+    /// Cached metadata for `path`, or a placeholder built from the path alone. Never touches the
+    /// disk, not even to stat the file (issue #124): the queue's tag read fills in the size.
     pub(super) fn quick_metadata(&self, path: &std::path::Path) -> crate::metadata::AudioMetadata {
         self.metadata_cache
             .get(path)
-            .unwrap_or_else(|| crate::metadata::fallback_metadata(path))
+            .unwrap_or_else(|| crate::metadata::path_metadata(path))
     }
 
     /// Append tracks to the queue and resolve missing tags on background workers.
@@ -173,6 +182,13 @@ impl AppUI {
                         }
                     }
                 }
+            }
+        }
+
+        // 3. Sizes of queued files whose tags couldn't be read
+        while let Ok((path, size)) = self.queue_size_rx.try_recv() {
+            if self.queue.set_file_size(&path, size) {
+                queue_updated = true;
             }
         }
 

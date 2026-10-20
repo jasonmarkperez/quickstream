@@ -301,6 +301,9 @@ pub struct AppUI {
     pub metadata_worker_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Inbox of the queue metadata worker pool (spawned on first use; workers exit when dropped).
     pub queue_metadata_tx: Option<std::sync::mpsc::Sender<PathBuf>>,
+    /// Sizes the queue metadata pool found for files whose tags it couldn't read (issue #124).
+    queue_size_tx: std::sync::mpsc::Sender<(PathBuf, u64)>,
+    queue_size_rx: std::sync::mpsc::Receiver<(PathBuf, u64)>,
     /// Tells the queue metadata pool to stop reading tags (set on shutdown).
     pub queue_metadata_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Paths already sent to the queue metadata workers this session.
@@ -441,6 +444,7 @@ impl AppUI {
 
         let (metadata_tx, metadata_rx) = std::sync::mpsc::channel();
         let (queue_add_tx, queue_add_rx) = std::sync::mpsc::channel();
+        let (queue_size_tx, queue_size_rx) = std::sync::mpsc::channel();
         let metadata_cache = crate::library::MetadataCache::from(crate::library::LibraryManager::load_cache_map());
         let tag_reads = SharedTagReads::new(metadata_cache.clone(), metadata_tx.clone());
         let (dir_scan_tx, dir_scan_rx) = std::sync::mpsc::channel();
@@ -492,6 +496,8 @@ impl AppUI {
             queue_add_rx,
             metadata_worker_stop: None,
             queue_metadata_tx: None,
+            queue_size_tx,
+            queue_size_rx,
             queue_metadata_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             queue_metadata_attempted: std::collections::HashSet::new(),
             tag_reads,

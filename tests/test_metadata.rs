@@ -104,6 +104,11 @@ fn test_fallback_metadata_leaves_audio_properties_unknown() {
     assert_eq!(meta.sample_rate_hz, 0, "sample rate unknown");
     assert_eq!(meta.channels, 0, "channels unknown");
     assert_eq!(meta.duration_seconds, 0.0, "length unknown");
+
+    // The UI thread's placeholder is the same, but never stats the file: no size (issue #124).
+    let from_path = quickstream::metadata::path_metadata(&path);
+    assert_eq!(from_path.file_size, 0);
+    assert_eq!(from_path, quickstream::metadata::AudioMetadata { file_size: 0, ..meta });
     let _ = fs::remove_dir_all(&dir);
 }
 
