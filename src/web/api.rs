@@ -11,10 +11,13 @@ use serde::Deserialize;
 
 use crate::metadata::{cover_image_mime, default_cover_svg, extract_cover_art};
 
-use super::server::{read_request_body, read_request_head, reject_request, ConnectionPermit, Rejection, ServerLimits};
+use super::server::{
+    read_request_body, read_request_head, reject_request, write_json, write_method_not_allowed, write_not_found,
+    write_plain, ConnectionPermit, Rejection, ServerLimits,
+};
 use super::state::{
     NowPlayingState, PlaylistEdit, PlaylistReply, WebBrowserEntry, WebBrowserResponse, WebCommand, WebPlaylistsState,
-    WebReply,
+    WebReply, PLAYLISTS_CHANGED,
 };
 use super::stream::{
     is_continuous_route, serve_audio_stream, serve_continuous_stream, ContinuousAdmission, StreamServerState,
@@ -167,12 +170,19 @@ fn ui_answer(answer: &mpsc::Receiver<PlaylistReply>) -> ActionResponse {
 /// Error when the UI thread did not answer an edit in time (or has gone away).
 const NO_ANSWER: &str = "Quickstream didn't answer; try again";
 
-/// Status for a playlist request whose index refers to a list that changed meanwhile.
-pub const PLAYLISTS_CHANGED: &str = "Playlists changed; try again";
-
 /// Error for a playlist request that names a track by index without the snapshot revision the
 /// index came from.
-pub const MISSING_REVISION: &str = "Missing revision: reload the playlists and try again";
+pub(super) const MISSING_REVISION: &str = "Missing revision: reload the playlists and try again";
+
+/// Error for an `/api/action` body that was cut short or didn't arrive in time.
+const INCOMPLETE_BODY: &str = "Incomplete request body";
+
+/// Error for an `/api/action` body that isn't a JSON action (not JSON, no `action`, a field of
+/// the wrong type).
+const INVALID_REQUEST: &str = "Invalid request";
+
+/// Error for an `/api/action` naming an action the server doesn't know.
+const UNKNOWN_ACTION: &str = "Unknown action";
 
 /// Error for a playlist action that names no playlist.
 const MISSING_NAME: &str = "Missing playlist name";
@@ -291,6 +301,64 @@ fn playlists_response(state: &Arc<RwLock<NowPlayingState>>) -> String {
     serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// The routes the server answers. A route matches the whole path (its query string and fragment
+/// set aside), so `/api/statusXYZ` matches nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Dashboard,
+    Status,
+    Playlists,
+    Cover,
+    Browser,
+    Action,
+    /// `/stream/continuous-<nonce>.wav` and the old fixed continuous names: only the armed
+    /// session's path is served, the others 404.
+    Continuous,
+    /// `/stream/<file name>`: one path segment, resolved by [`serve_audio_stream`].
+    Stream,
+}
+
+impl Route {
+    /// The route `route` (a path without its query string) names, if any.
+    fn find(route: &str) -> Option<Self> {
+        Some(match route {
+            "/" | "/index.html" => Route::Dashboard,
+            "/api/status" => Route::Status,
+            "/api/playlists" => Route::Playlists,
+            "/api/cover" => Route::Cover,
+            "/api/browser" => Route::Browser,
+            "/api/action" => Route::Action,
+            _ if is_continuous_route(route) => Route::Continuous,
+            _ if route
+                .strip_prefix("/stream/")
+                .is_some_and(|name| !name.is_empty() && !name.contains('/')) =>
+            {
+                Route::Stream
+            }
+            _ => return None,
+        })
+    }
+
+    /// The methods the route takes, as its `Allow` header lists them.
+    fn allow(self) -> &'static str {
+        match self {
+            Route::Action => "POST",
+            _ => "GET, HEAD",
+        }
+    }
+
+    fn takes(self, method: &str) -> bool {
+        match self {
+            Route::Action => method == "POST",
+            _ => method == "GET" || method == "HEAD",
+        }
+    }
+
+    fn is_stream(self) -> bool {
+        matches!(self, Route::Continuous | Route::Stream)
+    }
+}
+
 pub(super) fn handle_client(
     mut stream: TcpStream,
     permit: ConnectionPermit,
@@ -318,6 +386,8 @@ pub(super) fn handle_client(
     let path = head.path.as_str();
     // The path without its query string or fragment.
     let route = path.split(['?', '#']).next().unwrap_or(path);
+    let endpoint = Route::find(route);
+    let is_head = method == "HEAD";
     let content_length = head.content_length;
     let range_header = head.header("range").map(str::to_string);
     let mut auth_headers = crate::web_access::AuthHeaders::default();
@@ -327,7 +397,7 @@ pub(super) fn handle_client(
 
     // Streams can run for hours: move them to their own pool so they do not use up the slots
     // for short requests.
-    let _permit = if (method == "GET" || method == "HEAD") && path.starts_with("/stream") {
+    let _permit = if (method == "GET" || is_head) && endpoint.is_some_and(Route::is_stream) {
         match permit.into_stream() {
             Ok(stream_permit) => stream_permit,
             Err(_request_permit) => {
@@ -351,10 +421,22 @@ pub(super) fn handle_client(
         return Ok(());
     }
 
+    // An unknown path, or a method its route doesn't take. The body is read first (it is within
+    // the body limit), so closing with unread bytes doesn't reset the connection under the answer.
+    let endpoint = match endpoint {
+        Some(endpoint) if endpoint.takes(method) => endpoint,
+        unanswered => {
+            let _ = read_request_body(&mut reader, content_length, deadline);
+            return match unanswered {
+                Some(endpoint) => write_method_not_allowed(&mut stream, endpoint.allow()),
+                None => write_not_found(&mut stream),
+            };
+        }
+    };
+
     // Route dispatch
-    if method == "GET" || method == "HEAD" {
-        let is_head = method == "HEAD";
-        if route == "/" || route == "/index.html" {
+    match endpoint {
+        Route::Dashboard => {
             // Serve single-page dashboard
             let body = NOW_PLAYING_HTML.as_bytes();
             let header = format!(
@@ -366,7 +448,8 @@ pub(super) fn handle_client(
                 stream.write_all(body)?;
             }
             stream.flush()?;
-        } else if path.starts_with("/api/status") {
+        }
+        Route::Status => {
             // Serve JSON playback status
             let mut current = {
                 let s = state.read().unwrap();
@@ -403,32 +486,16 @@ pub(super) fn handle_client(
                 current.autopilot_dir = None;
             }
             let json = serde_json::to_string(&current).unwrap_or_else(|_| "{}".to_string());
-            let body = json.as_bytes();
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(header.as_bytes())?;
-            if !is_head {
-                stream.write_all(body)?;
-            }
-            stream.flush()?;
-        } else if route == "/api/playlists" {
+            write_json(&mut stream, "200 OK", "no-cache", &json, is_head)?;
+        }
+        Route::Playlists => {
             // The snapshot the UI thread published; the playlists folder is never read here.
             let json = playlists_response(state);
-            let body = json.as_bytes();
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(header.as_bytes())?;
-            if !is_head {
-                stream.write_all(body)?;
-            }
-            stream.flush()?;
+            write_json(&mut stream, "200 OK", "no-cache", &json, is_head)?;
             // Someone is looking at the playlists: have their files checked on workers.
             let _ = cmd_tx.send(WebCommand::CheckPlaylists);
-        } else if path.starts_with("/api/cover") {
+        }
+        Route::Cover => {
             // Serve cover art (JPEG/PNG/WebP/GIF) or SVG placeholder. `extract_cover_art` only
             // returns allowlisted MIME types; re-check here so a tag string never reaches the
             // response head.
@@ -464,7 +531,8 @@ pub(super) fn handle_client(
                 }
                 stream.flush()?;
             }
-        } else if path.starts_with("/api/browser") {
+        }
+        Route::Browser => {
             let requested_path = if let Some(query_idx) = path.find('?') {
                 let query_str = &path[query_idx + 1..];
                 let mut p_val = None;
@@ -561,17 +629,9 @@ pub(super) fn handle_client(
             };
 
             let json = serde_json::to_string(&resp_data).unwrap_or_else(|_| "{}".to_string());
-            let body = json.as_bytes();
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(header.as_bytes())?;
-            if !is_head {
-                stream.write_all(body)?;
-            }
-            stream.flush()?;
-        } else if is_continuous_route(route) {
+            write_json(&mut stream, "200 OK", "no-cache", &json, is_head)?;
+        }
+        Route::Continuous => {
             // Only the armed UPnP continuous session's path is served, to the first host that
             // connects to it.
             let peer = stream.peer_addr()?.ip();
@@ -579,195 +639,188 @@ pub(super) fn handle_client(
                 ContinuousAdmission::Admitted(nonce) => {
                     serve_continuous_stream(stream, is_head, state, cmd_tx, stream_state, &nonce)?;
                 }
-                ContinuousAdmission::NotFound => {
-                    stream.write_all(
-                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found",
-                    )?;
-                    stream.flush()?;
-                }
+                ContinuousAdmission::NotFound => write_not_found(&mut stream)?,
                 ContinuousAdmission::Conflict => {
                     crate::log_warn!(
                         "web",
                         "Refusing continuous stream request from {}: the session belongs to another host",
                         peer
                     );
-                    stream.write_all(
-                        b"HTTP/1.1 409 Conflict\r\nContent-Length: 8\r\nConnection: close\r\n\r\nConflict",
-                    )?;
-                    stream.flush()?;
+                    write_plain(&mut stream, "409 Conflict", "", "Conflict")?;
                 }
             }
-            return Ok(());
-        } else if path.starts_with("/stream") {
+        }
+        Route::Stream => {
             // Serve DLNA audio streaming with HTTP byte ranges
             serve_audio_stream(stream, path, range_header.as_deref(), is_head, state, stream_state)?;
-            return Ok(());
-        } else {
-            let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-            stream.write_all(not_found)?;
-            stream.flush()?;
         }
-    } else if method == "POST" && path.starts_with("/api/action") {
-        // content_length was checked against limits.max_body_bytes with the headers.
-        let body_bytes = read_request_body(&mut reader, content_length, deadline).unwrap_or_default();
+        Route::Action => {
+            // content_length was checked against limits.max_body_bytes with the headers. A body
+            // cut short or late is refused: part of a request is never acted on (issue #109).
+            let Some(body_bytes) = read_request_body(&mut reader, content_length, deadline) else {
+                let response = ActionResponse::refused("400 Bad Request", INCOMPLETE_BODY);
+                return write_json(
+                    &mut stream,
+                    response.status,
+                    "no-store",
+                    &response.body.to_string(),
+                    false,
+                );
+            };
 
-        // Paths must resolve inside the allowed folders; commands carry the resolved path.
-        let roots = state.read().unwrap().allowed_roots.clone();
-        let mut rejected: Option<PathBuf> = None;
-        // Canonicalized on first use, at most once per request.
-        let mut allowed: Option<crate::web_access::AllowedRoots> = None;
-        let mut allow = |p: String| -> Option<PathBuf> {
-            let resolved = allowed
-                .get_or_insert_with(|| crate::web_access::AllowedRoots::new(&roots))
-                .resolve(Path::new(&p));
-            if resolved.is_none() {
-                rejected = Some(PathBuf::from(p));
+            // Paths must resolve inside the allowed folders; commands carry the resolved path.
+            let roots = state.read().unwrap().allowed_roots.clone();
+            let mut rejected: Option<PathBuf> = None;
+            // Canonicalized on first use, at most once per request.
+            let mut allowed: Option<crate::web_access::AllowedRoots> = None;
+            let mut allow = |p: String| -> Option<PathBuf> {
+                let resolved = allowed
+                    .get_or_insert_with(|| crate::web_access::AllowedRoots::new(&roots))
+                    .resolve(Path::new(&p));
+                if resolved.is_none() {
+                    rejected = Some(PathBuf::from(p));
+                }
+                resolved
+            };
+            let mut response = ActionResponse::ok();
+            match serde_json::from_slice::<ActionPayload>(&body_bytes) {
+                Err(_) => response = ActionResponse::refused("400 Bad Request", INVALID_REQUEST),
+                Ok(payload) => match payload.action.as_str() {
+                    "toggle_pause" => {
+                        let _ = cmd_tx.send(WebCommand::TogglePause);
+                    }
+                    "play" => {
+                        let _ = cmd_tx.send(WebCommand::Play);
+                    }
+                    "pause" => {
+                        let _ = cmd_tx.send(WebCommand::Pause);
+                    }
+                    "next" => {
+                        let _ = cmd_tx.send(WebCommand::Next);
+                    }
+                    "prev" => {
+                        let _ = cmd_tx.send(WebCommand::Prev);
+                    }
+                    "volume" => {
+                        if let Some(vol) = payload.value {
+                            let _ = cmd_tx.send(WebCommand::SetVolume(vol.clamp(0.0, 100.0) as u8));
+                        }
+                    }
+                    "seek" => {
+                        if let Some(target) = payload.value {
+                            let _ = cmd_tx.send(WebCommand::SeekTo(target));
+                        }
+                    }
+                    "seek_relative" => {
+                        if let Some(delta) = payload.value {
+                            let _ = cmd_tx.send(WebCommand::SeekRelative(delta));
+                        }
+                    }
+                    "play_index" => {
+                        if let Some(idx) = payload.index {
+                            let _ = cmd_tx.send(WebCommand::PlayIndex(idx));
+                        }
+                    }
+                    "remove_index" => {
+                        if let Some(idx) = payload.index {
+                            let _ = cmd_tx.send(WebCommand::RemoveIndex(idx));
+                        }
+                    }
+                    "clear_queue" => {
+                        let _ = cmd_tx.send(WebCommand::ClearQueue);
+                    }
+                    "add_file" | "add_track" => {
+                        if let Some(p) = payload.path.and_then(&mut allow) {
+                            let _ = cmd_tx.send(WebCommand::AddFile(p));
+                        }
+                    }
+                    "add_folder" => {
+                        if let Some(p) = payload.path.and_then(&mut allow) {
+                            let _ = cmd_tx.send(WebCommand::AddFolder(p));
+                        }
+                    }
+                    "select_device" => {
+                        if let Some(id) = payload.id.or(payload.index) {
+                            let _ = cmd_tx.send(WebCommand::SelectDevice(id));
+                        }
+                    }
+                    "rescan_devices" => {
+                        let _ = cmd_tx.send(WebCommand::RescanDevices);
+                    }
+                    "set_queue_mode" => {
+                        if let Some(mode) = payload.mode {
+                            let _ = cmd_tx.send(WebCommand::SetQueueMode(mode));
+                        }
+                    }
+                    "set_home" => match payload.path {
+                        None => {
+                            let _ = cmd_tx.send(WebCommand::SetHome(None));
+                        }
+                        Some(p) => {
+                            if let Some(dir) = allow(p) {
+                                let _ = cmd_tx.send(WebCommand::SetHome(Some(dir.to_string_lossy().to_string())));
+                            }
+                        }
+                    },
+                    "autopilot" => match payload.path {
+                        None => {
+                            let _ = cmd_tx.send(WebCommand::Autopilot(None));
+                        }
+                        Some(p) => {
+                            if let Some(dir) = allow(p) {
+                                let _ = cmd_tx.send(WebCommand::Autopilot(Some(dir)));
+                            }
+                        }
+                    },
+                    "autopilot_reshuffle" | "reshuffle" => match payload.path {
+                        None => {
+                            let _ = cmd_tx.send(WebCommand::AutopilotReshuffle(None));
+                        }
+                        Some(p) => {
+                            if let Some(dir) = allow(p) {
+                                let _ = cmd_tx.send(WebCommand::AutopilotReshuffle(Some(dir)));
+                            }
+                        }
+                    },
+                    "shuffle" => {
+                        let _ = cmd_tx.send(WebCommand::ShuffleQueue);
+                    }
+                    "set_mix_profile" | "mix_profile" => {
+                        if let Some(profile_str) = payload.mode.or(payload.path) {
+                            let _ = cmd_tx.send(WebCommand::SetMixProfile(profile_str));
+                        }
+                    }
+                    "seed_radio" => {
+                        if let Some(p) = payload.path.and_then(&mut allow) {
+                            let _ = cmd_tx.send(WebCommand::SeedRadio(p));
+                        }
+                    }
+                    "playlist_play" | "playlist_append" => {
+                        let play = payload.action == "playlist_play";
+                        response = queue_playlist_action(&payload, play, state, cmd_tx, &mut rejected);
+                    }
+                    "playlist_create" | "playlist_rename" | "playlist_delete" | "playlist_add" | "playlist_remove"
+                    | "playlist_move" => {
+                        response = edit_playlist_action(&payload, cmd_tx, &mut allow);
+                    }
+                    _ => response = ActionResponse::refused("400 Bad Request", UNKNOWN_ACTION),
+                },
             }
-            resolved
-        };
-        let mut response = ActionResponse::ok();
-        if let Ok(payload) = serde_json::from_slice::<ActionPayload>(&body_bytes) {
-            match payload.action.as_str() {
-                "toggle_pause" => {
-                    let _ = cmd_tx.send(WebCommand::TogglePause);
-                }
-                "play" => {
-                    let _ = cmd_tx.send(WebCommand::Play);
-                }
-                "pause" => {
-                    let _ = cmd_tx.send(WebCommand::Pause);
-                }
-                "next" => {
-                    let _ = cmd_tx.send(WebCommand::Next);
-                }
-                "prev" => {
-                    let _ = cmd_tx.send(WebCommand::Prev);
-                }
-                "volume" => {
-                    if let Some(vol) = payload.value {
-                        let _ = cmd_tx.send(WebCommand::SetVolume(vol.clamp(0.0, 100.0) as u8));
-                    }
-                }
-                "seek" => {
-                    if let Some(target) = payload.value {
-                        let _ = cmd_tx.send(WebCommand::SeekTo(target));
-                    }
-                }
-                "seek_relative" => {
-                    if let Some(delta) = payload.value {
-                        let _ = cmd_tx.send(WebCommand::SeekRelative(delta));
-                    }
-                }
-                "play_index" => {
-                    if let Some(idx) = payload.index {
-                        let _ = cmd_tx.send(WebCommand::PlayIndex(idx));
-                    }
-                }
-                "remove_index" => {
-                    if let Some(idx) = payload.index {
-                        let _ = cmd_tx.send(WebCommand::RemoveIndex(idx));
-                    }
-                }
-                "clear_queue" => {
-                    let _ = cmd_tx.send(WebCommand::ClearQueue);
-                }
-                "add_file" | "add_track" => {
-                    if let Some(p) = payload.path.and_then(&mut allow) {
-                        let _ = cmd_tx.send(WebCommand::AddFile(p));
-                    }
-                }
-                "add_folder" => {
-                    if let Some(p) = payload.path.and_then(&mut allow) {
-                        let _ = cmd_tx.send(WebCommand::AddFolder(p));
-                    }
-                }
-                "select_device" => {
-                    if let Some(id) = payload.id.or(payload.index) {
-                        let _ = cmd_tx.send(WebCommand::SelectDevice(id));
-                    }
-                }
-                "rescan_devices" => {
-                    let _ = cmd_tx.send(WebCommand::RescanDevices);
-                }
-                "set_queue_mode" => {
-                    if let Some(mode) = payload.mode {
-                        let _ = cmd_tx.send(WebCommand::SetQueueMode(mode));
-                    }
-                }
-                "set_home" => match payload.path {
-                    None => {
-                        let _ = cmd_tx.send(WebCommand::SetHome(None));
-                    }
-                    Some(p) => {
-                        if let Some(dir) = allow(p) {
-                            let _ = cmd_tx.send(WebCommand::SetHome(Some(dir.to_string_lossy().to_string())));
-                        }
-                    }
-                },
-                "autopilot" => match payload.path {
-                    None => {
-                        let _ = cmd_tx.send(WebCommand::Autopilot(None));
-                    }
-                    Some(p) => {
-                        if let Some(dir) = allow(p) {
-                            let _ = cmd_tx.send(WebCommand::Autopilot(Some(dir)));
-                        }
-                    }
-                },
-                "autopilot_reshuffle" | "reshuffle" => match payload.path {
-                    None => {
-                        let _ = cmd_tx.send(WebCommand::AutopilotReshuffle(None));
-                    }
-                    Some(p) => {
-                        if let Some(dir) = allow(p) {
-                            let _ = cmd_tx.send(WebCommand::AutopilotReshuffle(Some(dir)));
-                        }
-                    }
-                },
-                "shuffle" => {
-                    let _ = cmd_tx.send(WebCommand::ShuffleQueue);
-                }
-                "set_mix_profile" | "mix_profile" => {
-                    if let Some(profile_str) = payload.mode.or(payload.path) {
-                        let _ = cmd_tx.send(WebCommand::SetMixProfile(profile_str));
-                    }
-                }
-                "seed_radio" => {
-                    if let Some(p) = payload.path.and_then(&mut allow) {
-                        let _ = cmd_tx.send(WebCommand::SeedRadio(p));
-                    }
-                }
-                "playlist_play" | "playlist_append" => {
-                    let play = payload.action == "playlist_play";
-                    response = queue_playlist_action(&payload, play, state, cmd_tx, &mut rejected);
-                }
-                "playlist_create" | "playlist_rename" | "playlist_delete" | "playlist_add" | "playlist_remove"
-                | "playlist_move" => {
-                    response = edit_playlist_action(&payload, cmd_tx, &mut allow);
-                }
-                _ => {}
+
+            if let Some(path) = rejected {
+                let _ = cmd_tx.send(WebCommand::PathRejected(path));
+                crate::web_access::write_path_forbidden(&mut stream)?;
+                return Ok(());
             }
-        }
 
-        if let Some(path) = rejected {
-            let _ = cmd_tx.send(WebCommand::PathRejected(path));
-            crate::web_access::write_path_forbidden(&mut stream)?;
-            return Ok(());
+            write_json(
+                &mut stream,
+                response.status,
+                "no-store",
+                &response.body.to_string(),
+                false,
+            )?;
         }
-
-        let body = response.body.to_string();
-        let header = format!(
-            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            response.status,
-            body.len()
-        );
-        stream.write_all(header.as_bytes())?;
-        stream.write_all(body.as_bytes())?;
-        stream.flush()?;
-    } else {
-        let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-        stream.write_all(not_found)?;
-        stream.flush()?;
     }
 
     Ok(())

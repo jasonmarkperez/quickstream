@@ -113,11 +113,11 @@ quickstream/
 │   ├── playlist_store.rs # In-memory PlaylistStore (sorted), write-through to disk via PersistHandle
 │   ├── persist.rs        # Background atomic writer: ordered save / create / delete / rename (PersistHandle), failures reported back
 │   ├── queue.rs          # PlaybackQueue (private fields, revision() bumped by every mutation, drawn from one process-wide counter so new/cloned queues never repeat one), upcoming(mode, wrap) (what plays next, with QueueEnd), FastRng (SplitMix64 deterministic PRNG), shuffle & loop
-│   ├── web/              # Embedded web server: every pub item re-exported as crate::web::X
+│   ├── web/              # Embedded web server: what the UI, the player and the tests use re-exported as crate::web::X; the rest pub(super)
 │   │   ├── mod.rs        # Module docs and the pub re-exports
-│   │   ├── state.rs      # NowPlayingState and the shared types (WebQueueItem, WebPlaylists, …), WebCommand, PlaylistEdit, WebReply
-│   │   ├── server.rs     # WebServer / WebServerHandle / WebBind / ServerLimits: listener, connection limits (ConnectionPermit), request parsing (read_request_head / read_request_body, RequestHead)
-│   │   ├── api.rs        # handle_client: route dispatch, REST API (/api/status, /api/browser, /api/playlists, /api/action incl. playlists), cover art, the dashboard page
+│   │   ├── state.rs      # NowPlayingState and the shared types (WebQueueItem, WebPlaylists, …), WebCommand, PlaylistEdit, WebReply, PLAYLISTS_CHANGED (the refusal both threads give)
+│   │   ├── server.rs     # WebServer / WebServerHandle / WebBind / ServerLimits: listener, connection limits (ConnectionPermit), request parsing (read_request_head / read_request_body, RequestHead), response writers (write_json, write_plain, write_not_found, write_method_not_allowed)
+│   │   ├── api.rs        # handle_client: route dispatch (Route: whole paths, query string aside; unknown path 404, a method the route doesn't take 405 with Allow), REST API (/api/status, /api/browser, /api/playlists, /api/action incl. playlists; a body cut short, not an action or naming an unknown action is 400 JSON), cover art, the dashboard page
 │   │   ├── stream.rs     # Byte-range file streaming (parse_byte_range, serve_audio_stream), `?pos=` seeks (calculate_stream_offset → StreamOffset; WAV chunks read with bounds), continuous WAV stream (serve_continuous_stream, ContinuousStreamController), StreamServerState
 │   │   └── assets/
 │   │       └── index.html # Dashboard HTML/CSS/JS, served as NOW_PLAYING_HTML via include_str!
@@ -168,6 +168,7 @@ quickstream/
     ├── test_upnp.rs          # UPnP SOAP XML generation, AVTransport state machine, continuous stream
     ├── test_continuous_stream.rs # Continuous stream: armed session path and peer, gapless queue and shuffle on wrap, length learned mid-track, seek clamp; with a fake ffmpeg (no output until killed): seek / skip during decoder startup, seek on the last track (no ShuffleQueue), skip at a track boundary; silence at real time on an empty queue, on an all-missing one (logged once, renderer leaving noticed, a file that comes back plays) and on one ffmpeg can't decode (bounded decoder runs, no ShuffleQueue, a file added to the queue plays once it gives audio, rechecks not shown as playing); no ffmpeg (failure logged once); a missing queue replaced by another, also just before a skip (each logged once); audio resets the silent count when skipped out of; two Nexts while the stream is blocked writing land two tracks on; a seek just after a track ends restarts that track, not the next; a wrap's reshuffle keeps the next track in front (the stream's index is on it first, and the UI follows it before shuffling), never the one that ended; a request made while the queue is empty is dropped; a reconnect stops the old connection's decoder; a request pending when the session ends is not carried into the next
     ├── test_web.rs           # Embedded web server, byte ranges, REST API, and command dispatch
+    ├── test_web_api.rs       # /api/action 400 JSON for a body cut short or timed out, not JSON / not an action, an unknown action (no command sent); known actions' answers unchanged; whole-path routes (prefixes 404, query strings kept); 405 with Allow for a method a route doesn't take; 404 and JSON response bytes
     ├── test_web_playlists.rs # Web playlists: snapshot, GET /api/playlists, play/append, edits, path checks
     └── test_web_wav_seek.rs  # WAV `?pos=` seeks through the server: own fmt chunk (extensible 24-bit), block-aligned audio in whole frames (truncated data, odd data sizes), byte rate from sample rate × block align, sizes match the body and ranges and are never half unknown, trailing chunks not sent, 0 / 0xFFFFFFFF data sizes, corrupt headers serve the whole file
 ```
@@ -471,6 +472,7 @@ The dashboard's `Playlists` tab uses the same store and code as tab `[5]`. On th
   - `revision` is required for remove and move (400 without it).
   - The web thread sends `WebCommand::EditPlaylist(PlaylistEdit, WebReply)` and waits up to 5 s for the UI's answer. `AppUI::apply_web_playlist_edit` applies it through `PlaylistStore` only (same `validate_name` rules, duplicate and reserved-name checks and messages as the name prompt), shows it in the status line, republishes the snapshot and answers: 200 `{"ok":true,"message":…}`, 409 with the store's message, 503 if the UI didn't answer.
   - Tab `[5]` keeps its playlist selected (following a web rename).
+- Before any action runs, `/api/action` refuses with 400 a body cut short or not received in time (`Incomplete request body`), one that isn't a JSON action (`Invalid request`) and an unknown action (`Unknown action`); nothing is sent to the UI.
 - All of these share the `web_access` checks (pairing token, Host, Origin, JSON Content-Type). The dashboard builds every row from text and `dataset` only (see `tests/support/dashboard_dom_harness.js`).
 
 ### 3.6 Modals

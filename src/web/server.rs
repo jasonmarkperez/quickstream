@@ -232,6 +232,55 @@ pub(super) fn reject_request(stream: &mut TcpStream, reader: &mut BufReader<TcpS
     }
 }
 
+/// Write a JSON response with `Cache-Control: <cache>`; a HEAD request gets the head only.
+pub(super) fn write_json(
+    out: &mut impl Write,
+    status: &str,
+    cache: &str,
+    body: &str,
+    is_head: bool,
+) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nCache-Control: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status,
+        cache,
+        body.len()
+    );
+    out.write_all(head.as_bytes())?;
+    if !is_head {
+        out.write_all(body.as_bytes())?;
+    }
+    out.flush()
+}
+
+/// Write a short plain-text response: the status line, `extra` header lines, then `text` as the body.
+pub(super) fn write_plain(out: &mut impl Write, status: &str, extra: &str, text: &str) -> std::io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status,
+        extra,
+        text.len(),
+        text
+    );
+    out.write_all(response.as_bytes())?;
+    out.flush()
+}
+
+/// Write a `404 Not Found`.
+pub(super) fn write_not_found(out: &mut impl Write) -> std::io::Result<()> {
+    write_plain(out, "404 Not Found", "", "Not Found")
+}
+
+/// Write a `405 Method Not Allowed` naming the methods the route takes (`allow`).
+pub(super) fn write_method_not_allowed(out: &mut impl Write, allow: &str) -> std::io::Result<()> {
+    write_plain(
+        out,
+        "405 Method Not Allowed",
+        &format!("Allow: {}\r\n", allow),
+        "Method Not Allowed",
+    )
+}
+
 /// Request line and headers of an incoming request.
 pub(super) struct RequestHead {
     pub(super) method: String,

@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use super::server::write_not_found;
 use super::state::{NowPlayingState, WebCommand};
 
 /// An armed continuous stream: the renderer must request `/stream/continuous-<nonce>.wav`.
@@ -656,16 +657,16 @@ fn find_wav_pcm_offset(
 
 /// What a `/stream/<name>?pos=` response sends: `header`, then the file's bytes `start..end`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamOffset {
+pub(super) struct StreamOffset {
     /// The first file byte sent.
-    pub start: u64,
+    pub(super) start: u64,
     /// One past the last file byte sent: the file's length, or the end of a WAV's last whole block.
-    pub end: u64,
+    pub(super) end: u64,
     /// A header sent before the file's bytes (a seeked WAV's new RIFF header).
-    pub header: Option<Vec<u8>>,
+    pub(super) header: Option<Vec<u8>>,
 }
 
-pub fn calculate_stream_offset(
+pub(super) fn calculate_stream_offset(
     filepath: &std::path::Path,
     file: &mut std::fs::File,
     offset_seconds: f64,
@@ -873,10 +874,7 @@ pub(super) fn serve_audio_stream(
                 "Stream 404: '{}' is not a registered or now-playing file",
                 decoded_path
             );
-            let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-            stream.write_all(not_found)?;
-            stream.flush()?;
-            return Ok(());
+            return write_not_found(&mut stream);
         }
     };
 
@@ -884,10 +882,7 @@ pub(super) fn serve_audio_stream(
         Ok(f) => f,
         Err(e) => {
             crate::log_warn!("web", "Stream 404: Failed to open '{}': {}", filepath.display(), e);
-            let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-            stream.write_all(not_found)?;
-            stream.flush()?;
-            return Ok(());
+            return write_not_found(&mut stream);
         }
     };
 
@@ -1165,7 +1160,7 @@ impl SilencePacer {
 /// Slices tracks sequentially directly into the exact same TCP socket without drops or DAC resets.
 /// `session` is the nonce of the armed session the request was admitted to; the stream ends when
 /// that session ends.
-pub fn serve_continuous_stream(
+pub(super) fn serve_continuous_stream(
     mut stream: TcpStream,
     is_head: bool,
     state: &Arc<RwLock<NowPlayingState>>,
