@@ -247,8 +247,11 @@ pub enum WebCommand {
     RescanDevices,
     SetQueueMode(String),
     SetHome(Option<String>),
-    Autopilot(Option<PathBuf>),
-    AutopilotReshuffle(Option<PathBuf>),
+    /// Start (or reshuffle) Autopilot in this folder: the one the request named, else the
+    /// terminal's (`current_browser_dir`), resolved inside the allowed folders by the web thread
+    /// (issue #102).
+    Autopilot(PathBuf),
+    AutopilotReshuffle(PathBuf),
     ShuffleQueue,
     SetMixProfile(String),
     SeedRadio(PathBuf),

@@ -171,13 +171,15 @@ impl AppUI {
         }
     }
 
-    /// Test helper: block, polling autopilot results, until the scan finishes or `timeout`
-    /// passes. It sleeps on the calling thread, so never call it from the TUI event loop. Public
-    /// only because integration tests in `tests/` drive `AppUI` directly.
+    /// Test helper: block, polling autopilot results (and the folder check a mix picker or Seed
+    /// Radio start waits for), until the scan finishes or `timeout` passes. It sleeps on the
+    /// calling thread, so never call it from the TUI event loop. Public only because integration
+    /// tests in `tests/` drive `AppUI` directly.
     #[doc(hidden)]
     pub fn wait_for_autopilot_scan(&mut self, timeout: std::time::Duration) {
         let start = std::time::Instant::now();
-        while self.is_autopilot_scanning && start.elapsed() < timeout {
+        while (self.is_autopilot_scanning || self.autopilot_check.is_some()) && start.elapsed() < timeout {
+            self.poll_folder_checks();
             self.poll_background_autopilot();
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -202,8 +204,10 @@ impl AppUI {
         self.start_autopilot_with_mode(dir, mode);
     }
 
-    /// Stop any autopilot scan: signal its worker and drop its channel.
+    /// Stop any autopilot scan: signal its worker and drop its channel. A start still waiting
+    /// for its folder check is dropped too.
     fn stop_autopilot_scan(&mut self) {
+        self.autopilot_check = None;
         if let Some(stop) = self.autopilot_scan_stop.take() {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -313,27 +317,21 @@ impl AppUI {
         let profiles = crate::analysis::MixProfile::picker_profiles();
         self.active_mix_profile = profiles.get(index).unwrap_or(&profiles[0]).clone();
         let profile_name = self.active_mix_profile.name();
-        let scan_dir = if self.browser_dir.exists() && !self.in_bookmarks_view {
-            self.browser_dir.clone()
-        } else if let Some(ref d) = self.autopilot_dir {
-            d.clone()
-        } else {
-            std::env::current_dir().unwrap_or_default()
-        };
+        // The browsed folder if it still exists, else the last mix's folder, else the current
+        // directory; checked on a worker (issue #103).
+        let preferred = (!self.in_bookmarks_view).then(|| self.browser_dir.clone());
         self.status_message = format!("⚡ Mix Profile: '{}' - Starting Autopilot...", profile_name);
-        self.start_autopilot(scan_dir);
+        self.start_autopilot_after_check(preferred, self.autopilot_dir.clone());
     }
 
     pub fn start_seed_radio(&mut self, seed_path: PathBuf) {
-        let scan_dir = if self.browser_dir.exists() && !self.in_bookmarks_view {
-            self.browser_dir.clone()
-        } else {
-            seed_path.parent().unwrap_or(&self.browser_dir).to_path_buf()
-        };
+        // The browsed folder if it still exists, else the seed's; checked on a worker (#103).
+        let preferred = (!self.in_bookmarks_view).then(|| self.browser_dir.clone());
+        let fallback = seed_path.parent().unwrap_or(&self.browser_dir).to_path_buf();
         self.active_mix_profile = crate::analysis::MixProfile::SeedRadio(seed_path.clone());
         let track_name = seed_path.file_stem().unwrap_or_default().to_string_lossy();
         self.status_message = format!("📻 Seed Radio: Initiating station from '{}'...", track_name);
-        self.start_autopilot(scan_dir);
+        self.start_autopilot_after_check(preferred, Some(fallback));
     }
 
     pub fn get_selected_track_path(&self) -> Option<PathBuf> {

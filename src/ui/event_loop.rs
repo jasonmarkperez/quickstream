@@ -146,6 +146,9 @@ impl AppUI {
         self.poll_playlists();
         self.poll_settings_status();
 
+        // Keys waiting for a folder check (mix picker, Seed Radio, `~`)
+        self.poll_folder_checks();
+
         // Poll progressive background autopilot discovery
         self.poll_background_autopilot();
 

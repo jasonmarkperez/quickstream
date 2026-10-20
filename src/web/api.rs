@@ -612,7 +612,10 @@ pub(super) fn handle_client(
         let body_bytes = read_request_body(&mut reader, content_length, deadline).unwrap_or_default();
 
         // Paths must resolve inside the allowed folders; commands carry the resolved path.
-        let roots = state.read().unwrap().allowed_roots.clone();
+        let (roots, terminal_dir) = {
+            let current = state.read().unwrap();
+            (current.allowed_roots.clone(), current.current_browser_dir.clone())
+        };
         let mut rejected: Option<PathBuf> = None;
         // Canonicalized on first use, at most once per request.
         let mut allowed: Option<crate::web_access::AllowedRoots> = None;
@@ -704,26 +707,18 @@ pub(super) fn handle_client(
                         }
                     }
                 },
-                "autopilot" => match payload.path {
-                    None => {
-                        let _ = cmd_tx.send(WebCommand::Autopilot(None));
+                // Without a path, the folder the terminal is browsing: resolved here, never on
+                // the UI thread (issue #102).
+                "autopilot" => {
+                    if let Some(dir) = allow(payload.path.unwrap_or(terminal_dir)) {
+                        let _ = cmd_tx.send(WebCommand::Autopilot(dir));
                     }
-                    Some(p) => {
-                        if let Some(dir) = allow(p) {
-                            let _ = cmd_tx.send(WebCommand::Autopilot(Some(dir)));
-                        }
+                }
+                "autopilot_reshuffle" | "reshuffle" => {
+                    if let Some(dir) = allow(payload.path.unwrap_or(terminal_dir)) {
+                        let _ = cmd_tx.send(WebCommand::AutopilotReshuffle(dir));
                     }
-                },
-                "autopilot_reshuffle" | "reshuffle" => match payload.path {
-                    None => {
-                        let _ = cmd_tx.send(WebCommand::AutopilotReshuffle(None));
-                    }
-                    Some(p) => {
-                        if let Some(dir) = allow(p) {
-                            let _ = cmd_tx.send(WebCommand::AutopilotReshuffle(Some(dir)));
-                        }
-                    }
-                },
+                }
                 "shuffle" => {
                     let _ = cmd_tx.send(WebCommand::ShuffleQueue);
                 }

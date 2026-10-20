@@ -56,6 +56,8 @@ mod autopilot;
 mod browser;
 mod event_loop;
 pub use event_loop::TickClock;
+mod folder_checks;
+pub use folder_checks::{PathCheck, PathKind};
 mod keys;
 mod output;
 mod playback;
@@ -253,6 +255,19 @@ pub struct AppUI {
     folder_open_deadline: Duration,
     /// Lists folders on the `dir-scan` worker (`set_dir_reader`).
     dir_reader: DirReader,
+    /// Looks paths up on `folder-check` workers (`set_path_check`).
+    path_check: PathCheck,
+    folder_check_tx: std::sync::mpsc::Sender<folder_checks::FolderCheckAnswer>,
+    folder_check_rx: std::sync::mpsc::Receiver<folder_checks::FolderCheckAnswer>,
+    /// The id of the last folder check started; answers to older ones are dropped.
+    folder_check_id: u64,
+    /// How many folder check answers `poll_folder_checks` has taken in (`folder_check_answers`).
+    folder_check_answers: u64,
+    /// The `~` key's check of the startup home, while it runs.
+    home_check: Option<folder_checks::HomeCheck>,
+    /// The id of the mix picker's or Seed Radio's check of the folder Autopilot is to scan,
+    /// while it runs; any other Autopilot start or the end of the session drops it.
+    autopilot_check: Option<u64>,
     pub queue_cursor: usize,
     pub devices_cursor: usize,
     pub settings_cursor: usize,
@@ -420,6 +435,7 @@ impl AppUI {
         let metadata_cache = crate::library::MetadataCache::from(crate::library::LibraryManager::load_cache_map());
         let tag_reads = SharedTagReads::new(metadata_cache.clone(), metadata_tx.clone());
         let (dir_scan_tx, dir_scan_rx) = std::sync::mpsc::channel();
+        let (folder_check_tx, folder_check_rx) = std::sync::mpsc::channel();
         let analysis_db = crate::analysis::AnalysisDatabase::open_default()
             .unwrap_or_else(|_| crate::analysis::AnalysisDatabase::open_in_memory().unwrap());
         let active_mix_profile = settings_mgr.settings.mix_profile();
@@ -447,6 +463,13 @@ impl AppUI {
             dir_reader: std::sync::Arc::new(|dir: &std::path::Path| {
                 std::fs::read_dir(dir).map(|entries| Box::new(entries) as DirEntries)
             }),
+            path_check: std::sync::Arc::new(PathKind::of),
+            folder_check_tx,
+            folder_check_rx,
+            folder_check_id: 0,
+            folder_check_answers: 0,
+            home_check: None,
+            autopilot_check: None,
             queue_cursor: 0,
             devices_cursor: 0,
             settings_cursor: SETTING_DISPLAY_ORDER[0],
@@ -540,6 +563,13 @@ impl AppUI {
     #[doc(hidden)]
     pub fn set_dir_reader(&mut self, reader: DirReader) {
         self.dir_reader = reader;
+    }
+
+    /// Replace how `folder-check` workers look a path up (tests: a check held back like a slow
+    /// share). Public only because integration tests in `tests/` drive `AppUI` directly.
+    #[doc(hidden)]
+    pub fn set_path_check(&mut self, check: PathCheck) {
+        self.path_check = check;
     }
 
     /// Replace how long a folder being opened keeps the previous one on screen before it is

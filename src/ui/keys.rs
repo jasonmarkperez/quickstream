@@ -637,12 +637,8 @@ impl AppUI {
                         } else {
                             std::env::current_dir().unwrap_or_default()
                         };
-                        if home.is_dir() {
-                            self.status_message = format!("Jumped to home: {}", home.display());
-                            self.navigate_browser(home);
-                        } else {
-                            self.status_message = format!("Home directory not found: {}", home.display());
-                        }
+                        // Checked on a worker: the home may be on a slow share (issue #103).
+                        self.jump_to_home(home);
                     }
                     _ => {}
                 }
