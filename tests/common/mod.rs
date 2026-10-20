@@ -7,6 +7,8 @@
 
 #![allow(dead_code)]
 
+#[cfg(unix)]
+pub mod fake_exec;
 pub mod fake_player;
 pub mod tui;
 
