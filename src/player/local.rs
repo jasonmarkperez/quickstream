@@ -25,6 +25,162 @@ struct SharedState {
     load: Mutex<MpvLoadTracker>,
     /// A load mpv couldn't play, for [`AudioPlayer::take_error`].
     last_error: Mutex<Option<String>>,
+    /// What `time-pos` reports wait for after a seek, a load or a stop, so one mpv sent before
+    /// handling it never overwrites the position (issue #92). Locked after `load`, before
+    /// `position`.
+    position_gate: Mutex<PositionGate>,
+}
+
+/// mpv request ids at and above this one are seeks (`PositionGate`); loads count up from 1
+/// (`MpvLoadTracker`), so the two never share one.
+const SEEK_REQUEST_BASE: u64 = 1 << 32;
+/// How long `time-pos` waits for mpv to confirm a seek, a load or a stop before it is taken again
+/// anyway. mpv handles each within milliseconds, so the bound only matters for an mpv that never
+/// answers request ids or sends the events.
+const SEEK_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Holds back mpv's `time-pos` reports while they may still predate the newest seek, load or
+/// stop (issue #92).
+///
+/// - **Seek:** `seek_to` writes the target as the position and sends the seek with a request id.
+///   `time-pos` is ignored until mpv has answered that request with success, then sent a `seek`
+///   event and then `playback-restart` (mpv 0.41, playing or paused: the answer, `seek`,
+///   `time-pos` at the target, `playback-restart`; two seeks sent together: both answers, then
+///   `seek` and `time-pos` for each, one `playback-restart`). `playback-restart` carries no
+///   request id, so one before the `seek` event can be left over from an earlier seek or the
+///   load. An error answer (no file loaded) or an `end-file` for the playing entry
+///   ([`MpvLoadTracker`]'s, so a replaced load's late end doesn't count) ends the wait. Answers
+///   for an older seek don't count: only the newest target is kept.
+/// - **Load:** after `loadfile`, the old track's reports are ignored until mpv has loaded the new
+///   entry (`file-loaded` once the tracker knows it), ended it, or refused the load.
+/// - **Stop:** after `stop`, until the playing entry's `end-file`.
+///
+/// A new load or stop replaces the wait, and each one ends after [`SEEK_CONFIRM_TIMEOUT`]
+/// anyway, so it never sticks.
+#[derive(Debug)]
+struct PositionGate {
+    /// Request id of the newest seek sent (`SEEK_REQUEST_BASE` before the first).
+    seek_generation: u64,
+    /// The newest seek, while mpv hasn't confirmed it.
+    seek: Option<SeekWait>,
+    /// A load or stop mpv hasn't carried out yet.
+    entry: Option<EntryWait>,
+    timeout: Duration,
+}
+
+/// A seek mpv hasn't confirmed: its answer, then a `seek` event, then `playback-restart`.
+#[derive(Debug, Clone, Copy)]
+struct SeekWait {
+    request_id: u64,
+    since: Instant,
+    /// mpv answered it with success.
+    answered: bool,
+    /// A `seek` event came after the answer: the next `playback-restart` is this seek's.
+    seek_event: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EntryWait {
+    since: Instant,
+    /// `true` after a load (until the new entry is loaded), `false` after a stop (until the
+    /// playing entry ends).
+    load: bool,
+}
+
+impl Default for PositionGate {
+    fn default() -> Self {
+        Self {
+            seek_generation: SEEK_REQUEST_BASE,
+            seek: None,
+            entry: None,
+            timeout: SEEK_CONFIRM_TIMEOUT,
+        }
+    }
+}
+
+impl PositionGate {
+    /// A seek is about to be sent: returns the request id it must carry and the wait it
+    /// replaces, for [`PositionGate::cancel_seek`].
+    fn begin_seek(&mut self) -> (u64, Option<SeekWait>) {
+        self.seek_generation += 1;
+        let previous = self.seek.replace(SeekWait {
+            request_id: self.seek_generation,
+            since: Instant::now(),
+            answered: false,
+            seek_event: false,
+        });
+        (self.seek_generation, previous)
+    }
+
+    /// The seek `request_id` couldn't be sent: put back the wait it replaced. Returns whether it
+    /// was still waiting.
+    fn cancel_seek(&mut self, request_id: u64, previous: Option<SeekWait>) -> bool {
+        if self.seek.is_some_and(|w| w.request_id == request_id) {
+            self.seek = previous;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A load or stop (`load` false) is about to be sent; it replaces any seek.
+    fn hold_entry(&mut self, load: bool) {
+        self.seek = None;
+        self.entry = Some(EntryWait {
+            since: Instant::now(),
+            load,
+        });
+    }
+
+    /// Read one message from mpv, after `load` has read it.
+    fn on_message(&mut self, msg: &serde_json::Value, load: &MpvLoadTracker) {
+        let request_id = msg.get("request_id").and_then(|r| r.as_u64());
+        let success = msg.get("error").and_then(|e| e.as_str()) == Some("success");
+        let event = msg.get("event").and_then(|e| e.as_str());
+        let playing_entry_ended = event == Some("end-file") && load.is_current_entry(msg);
+
+        if let Some(wait) = self.entry {
+            let done = if wait.load {
+                let refused = load.generation > 0 && request_id == Some(load.generation) && !success;
+                (load.is_current() && load.file_loaded) || playing_entry_ended || refused
+            } else {
+                playing_entry_ended
+            };
+            if done {
+                self.entry = None;
+            }
+        }
+
+        let Some(wait) = self.seek.as_mut() else {
+            return;
+        };
+        if request_id == Some(wait.request_id) {
+            if success {
+                wait.answered = true;
+            } else {
+                self.seek = None;
+            }
+            return;
+        }
+        match event {
+            Some("seek") if wait.answered => wait.seek_event = true,
+            Some("playback-restart") if wait.seek_event => self.seek = None,
+            _ if playing_entry_ended => self.seek = None,
+            _ => {}
+        }
+    }
+
+    /// Whether a `time-pos` report may be taken now.
+    fn accepts_position(&mut self) -> bool {
+        let timeout = self.timeout;
+        if self.seek.is_some_and(|w| w.since.elapsed() >= timeout) {
+            self.seek = None;
+        }
+        if self.entry.is_some_and(|w| w.since.elapsed() >= timeout) {
+            self.entry = None;
+        }
+        self.seek.is_none() && self.entry.is_none()
+    }
 }
 
 /// The `file_error` mpv reports for a load started at or past the file's real end (mpv 0.41).
@@ -96,6 +252,11 @@ impl MpvLoadTracker {
     /// entries and the load has started).
     pub fn is_current(&self) -> bool {
         self.answered && (self.entry.is_some() || self.unnamed_entries)
+    }
+
+    /// Whether `msg` (an event) is about the newest load's playlist entry.
+    fn is_current_entry(&self, msg: &serde_json::Value) -> bool {
+        self.is_current() && msg.get("playlist_entry_id").and_then(|i| i.as_i64()) == self.entry
     }
 
     /// Read one message from mpv. Returns how the newest load ended when this message says so.
@@ -341,6 +502,26 @@ impl LocalPlayer {
         }
     }
 
+    /// How long a seek mpv never confirms holds back its position reports (default 2 s). Test
+    /// seam (issue #92).
+    #[doc(hidden)]
+    pub fn set_seek_confirm_timeout(&mut self, timeout: Duration) {
+        self.shared_state.position_gate.lock().unwrap().timeout = timeout;
+    }
+
+    /// A new load of `file` from `start_seconds`: the position is the start, and mpv's reports
+    /// wait until it has loaded the new entry. Returns the `request_id` the `loadfile` must
+    /// carry. The tracker and the gate change under one lock, so the listener never reads the
+    /// new wait against the old load.
+    fn begin_load(&self, file: &Path, start_seconds: f64) -> u64 {
+        let mut load = self.shared_state.load.lock().unwrap();
+        let request_id = load.begin(file, start_seconds > 0.0);
+        let mut gate = self.shared_state.position_gate.lock().unwrap();
+        gate.hold_entry(true);
+        *self.shared_state.position.lock().unwrap() = start_seconds;
+        request_id
+    }
+
     fn ensure_mpv_daemon(&mut self) -> anyhow::Result<()> {
         let is_running = self
             .mpv_child
@@ -421,9 +602,23 @@ impl LocalPlayer {
                         }
 
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                            let time_pos = (val.get("event").and_then(|e| e.as_str()) == Some("property-change")
+                                && val.get("name").and_then(|n| n.as_str()) == Some("time-pos"))
+                            .then(|| val.get("data").and_then(|d| d.as_f64()))
+                            .flatten();
                             let (end, current) = {
                                 let mut load = shared.load.lock().unwrap();
-                                (load.on_message(&val), load.is_current())
+                                let end = load.on_message(&val);
+                                // One guard for the message and its time-pos, so a seek_to,
+                                // load or stop in between can't be undone (issue #92).
+                                let mut gate = shared.position_gate.lock().unwrap();
+                                gate.on_message(&val, &load);
+                                if let Some(pos) = time_pos {
+                                    if gate.accepts_position() {
+                                        *shared.position.lock().unwrap() = pos;
+                                    }
+                                }
+                                (end, load.is_current())
                             };
                             match end {
                                 Some(MpvLoadEnd::Finished) => {
@@ -443,11 +638,6 @@ impl LocalPlayer {
                                     "property-change" => {
                                         if let Some(name) = val.get("name").and_then(|n| n.as_str()) {
                                             match name {
-                                                "time-pos" => {
-                                                    if let Some(pos) = val.get("data").and_then(|d| d.as_f64()) {
-                                                        *shared.position.lock().unwrap() = pos;
-                                                    }
-                                                }
                                                 "duration" => {
                                                     if let Some(dur) = val.get("data").and_then(|d| d.as_f64()) {
                                                         *shared.duration.lock().unwrap() = dur;
@@ -653,7 +843,7 @@ impl LocalPlayer {
 
         // Duration is streamed asynchronously via IPC ("observe_property", "duration") for mpv
         // and read from metadata for ffplay; clear the previous track's until then.
-        *self.shared_state.position.lock().unwrap() = start_seconds;
+        let request_id = self.begin_load(&abs_path, start_seconds);
         *self.shared_state.duration.lock().unwrap() = 0.0;
         self.accumulated_offset = start_seconds;
         self.start_time = None;
@@ -677,12 +867,6 @@ impl LocalPlayer {
                 .to_string();
                 self.send_command(&start_cmd)?;
                 // The request id ties mpv's answer, and so the new playlist entry, to this load.
-                let request_id = self
-                    .shared_state
-                    .load
-                    .lock()
-                    .unwrap()
-                    .begin(&abs_path, start_seconds > 0.0);
                 let json_cmd = serde_json::json!({
                     "command": ["loadfile", file_str, "replace"],
                     "request_id": request_id
@@ -779,7 +963,12 @@ impl AudioPlayer for LocalPlayer {
         self.shared_state.is_playing.store(false, Ordering::SeqCst);
         self.shared_state.is_paused.store(false, Ordering::SeqCst);
         self.shared_state.is_finished.store(false, Ordering::SeqCst);
-        *self.shared_state.position.lock().unwrap() = 0.0;
+        {
+            // mpv's reports wait for the playing entry's end (issue #92).
+            let mut gate = self.shared_state.position_gate.lock().unwrap();
+            gate.hold_entry(false);
+            *self.shared_state.position.lock().unwrap() = 0.0;
+        }
         self.accumulated_offset = 0.0;
         self.start_time = None;
 
@@ -846,12 +1035,30 @@ impl AudioPlayer for LocalPlayer {
             }
             Ok(())
         } else if self.backend == "mpv" {
+            // The target shows at once, and mpv's reports from before it handles the seek are
+            // held back until it confirms (issue #92). Set before sending, so the answer can't
+            // arrive first.
+            let (request_id, previous_wait, previous_position) = {
+                let mut gate = self.shared_state.position_gate.lock().unwrap();
+                let mut position = self.shared_state.position.lock().unwrap();
+                let previous_position = std::mem::replace(&mut *position, target);
+                let (request_id, previous_wait) = gate.begin_seek();
+                (request_id, previous_wait, previous_position)
+            };
             let json_cmd = serde_json::json!({
-                "command": ["seek", target, "absolute"]
+                "command": ["seek", target, "absolute"],
+                "request_id": request_id
             })
             .to_string();
-            self.send_command(&json_cmd)?;
-            *self.shared_state.position.lock().unwrap() = target;
+            if let Err(e) = self.send_command(&json_cmd) {
+                // mpv never got it: the position and the wait go back to what they were.
+                let mut gate = self.shared_state.position_gate.lock().unwrap();
+                let mut position = self.shared_state.position.lock().unwrap();
+                if gate.cancel_seek(request_id, previous_wait) || *position == target {
+                    *position = previous_position;
+                }
+                return Err(e);
+            }
             Ok(())
         } else {
             Ok(())
