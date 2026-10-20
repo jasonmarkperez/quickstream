@@ -383,7 +383,10 @@ impl AppUI {
         // only construct the app should not do (macOS firewall prompts).
         let device_manager = DeviceManager::new();
 
-        let web_state = std::sync::Arc::new(std::sync::RwLock::new(crate::web::NowPlayingState::default()));
+        let web_state = std::sync::Arc::new(std::sync::RwLock::new(crate::web::NowPlayingState {
+            remote_access: settings_mgr.settings.web_remote_access(),
+            ..Default::default()
+        }));
         let (web_server, web_cmd_rx) = if settings_mgr.settings.web_server_enabled {
             let (tx, rx) = std::sync::mpsc::channel();
             let bind = if settings_mgr.settings.web_server_lan {
@@ -2808,6 +2811,8 @@ impl AppUI {
             }
         } else if setting::WEB.contains(&self.settings_cursor) {
             self.sync_web_server();
+            // Remote access off takes effect now, also on a server a renderer keeps on the LAN.
+            self.update_web_state();
         } else if self.settings_cursor == setting::HOME_DIR {
             self.update_web_state();
         }
@@ -3194,7 +3199,9 @@ impl AppUI {
     }
 
     /// Interfaces the web server must listen on right now: the LAN while a DLNA renderer is
-    /// active or the user enabled LAN access, otherwise loopback only.
+    /// active or the user enabled LAN access, otherwise loopback only. Unless Web Remote Access
+    /// and the web server are both on (`Settings::web_remote_access`), network peers get only
+    /// `/stream/*` (`NowPlayingState::remote_access`).
     pub fn required_web_bind(&self) -> crate::web::WebBind {
         let device = self.device_manager.get_active_device();
         self.web_bind_for_renderer(device.as_ref())
@@ -3235,6 +3242,10 @@ impl AppUI {
             }
             None => self.settings_mgr.settings.web_server_port,
         };
+        // Before the first request: the setting may have changed since the last publish.
+        if let Ok(mut state) = self.web_state.write() {
+            state.remote_access = self.settings_mgr.settings.web_remote_access();
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         match crate::web::WebServer::start_with_bind(bind, port, self.web_state.clone(), tx) {
             Ok(handle) => {
@@ -3774,6 +3785,11 @@ impl AppUI {
     }
 
     pub fn update_web_state(&mut self) {
+        // Published even while no server runs, so a server started later never begins with an
+        // old value.
+        if let Ok(mut state) = self.web_state.write() {
+            state.remote_access = self.settings_mgr.settings.web_remote_access();
+        }
         if self.web_server.is_none() {
             return;
         }

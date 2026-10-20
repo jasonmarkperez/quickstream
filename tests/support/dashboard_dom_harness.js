@@ -158,8 +158,11 @@ const document = {
 };
 
 const fetchCalls = [];
+// Set to answer fetches (the status poll checks); otherwise they never resolve.
+let fetchResponder = null;
 function fakeFetch(url, opts) {
   fetchCalls.push({ url: String(url), opts: opts || {} });
+  if (fetchResponder) return fetchResponder(String(url));
   return new Promise(() => {}); // never resolves; keeps renders deterministic
 }
 
@@ -526,4 +529,22 @@ sandbox.renderPlaylists({ state: 'failed', message: H.scriptTag, revision: 0, la
 assert.strictEqual(playlistsList.textContent, H.scriptTag);
 assertNoMarkupFromData();
 
-console.log('dashboard DOM harness: all checks passed');
+// Status poll: remote access turned off reads as that, not as OFFLINE; a lost connection is OFFLINE.
+(async () => {
+  const label = document.getElementById('statusLabel');
+  fetchResponder = () => Promise.resolve({
+    ok: false,
+    status: 403,
+    json: async () => ({ ok: false, error: 'remote access is off' }),
+  });
+  await sandbox.pollStatus();
+  assert.strictEqual(label.textContent, 'REMOTE ACCESS OFF');
+  fetchResponder = () => Promise.reject(new Error('connection refused'));
+  await sandbox.pollStatus();
+  assert.strictEqual(label.textContent, 'OFFLINE');
+  fetchResponder = null;
+  console.log('dashboard DOM harness: all checks passed');
+})().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

@@ -177,6 +177,12 @@ pub struct NowPlayingState {
     /// bookmarks.json. Never sent with `/api/status`.
     #[serde(skip)]
     pub bookmarks: Vec<String>,
+    /// `Settings::web_remote_access` (Web Remote Access and the web server both on). While it is
+    /// off, network peers get only `/stream/*` (`web_access::authorize`), even when a renderer has
+    /// the server on the LAN.
+    /// Off until the UI publishes it. Never sent to clients.
+    #[serde(skip)]
+    pub remote_access: bool,
     /// The playlists snapshot the UI thread publishes for `GET /api/playlists` (issue #50). Not
     /// part of `/api/status`, which is polled several times a second.
     #[serde(skip)]
@@ -221,6 +227,7 @@ impl Default for NowPlayingState {
             key: None,
             allowed_roots: Vec::new(),
             bookmarks: Vec::new(),
+            remote_access: false,
             playlists: Arc::new(WebPlaylists::default()),
             playlists_version: 0,
         }
@@ -1461,7 +1468,9 @@ fn handle_client(
         permit
     };
 
-    if !crate::web_access::check_request(&mut stream, method, path, &auth_headers)? {
+    // Read from memory per request, so toggling the setting applies to the next request.
+    let remote_access = state.read().is_ok_and(|s| s.remote_access);
+    if !crate::web_access::check_request(&mut stream, method, path, &auth_headers, remote_access)? {
         return Ok(());
     }
 
@@ -4181,6 +4190,14 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     async function pollStatus() {
       try {
         const res = await fetch('/api/status?t=' + Date.now());
+        if (res.status === 403) {
+          const body = await res.json().catch(() => ({}));
+          if (body.error === "remote access is off") {
+            document.getElementById('statusDot').className = "status-dot";
+            document.getElementById('statusLabel').textContent = "REMOTE ACCESS OFF";
+            return;
+          }
+        }
         if (!res.ok) throw new Error("Status failed");
         const data = await res.json();
         renderStatus(data);
