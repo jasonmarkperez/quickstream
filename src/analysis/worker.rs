@@ -13,6 +13,7 @@
 //!   a queued track by at most the one candidate being analysed.
 //! - Read-only towards the music library: the only writes go to the analysis database.
 //! - Stops promptly: the stop flag is checked between tracks and while ffmpeg runs.
+//! - A panic while a track is analysed costs that track only (counted as failed).
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -32,8 +33,8 @@ pub struct AnalysisProgress {
     pub analyzed: usize,
     /// Tracks skipped because the database already had an up-to-date row.
     pub skipped: usize,
-    /// Tracks whose acoustic analysis failed (ffmpeg missing / error / timeout / no audio).
-    /// Nothing is stored for them, so they are retried in a later session.
+    /// Tracks whose acoustic analysis failed (ffmpeg missing / error / timeout / no audio) or
+    /// panicked. Nothing is stored for them, so they are retried in a later session.
     pub failed: usize,
     /// Tracks queued but not yet processed.
     pub pending: usize,
@@ -97,6 +98,22 @@ impl AnalysisQueue {
         true
     }
 
+    /// Add one autopilot run's candidates, as [`Self::push_candidate`] does each, up to the bound:
+    /// older runs' candidates give way, but once the run has filled the bound its later paths are
+    /// left out, so it never pushes out its own first ones. Returns whether any was added.
+    pub fn push_candidates<I: IntoIterator<Item = PathBuf>>(&mut self, paths: I) -> bool {
+        let mut added = 0;
+        for path in paths {
+            if added == self.candidate_limit {
+                break;
+            }
+            if self.push_candidate(path) {
+                added += 1;
+            }
+        }
+        added > 0
+    }
+
     /// The next track to analyse: the oldest queued track, else the oldest candidate.
     pub fn pop(&mut self) -> Option<PathBuf> {
         self.queued.pop_front().or_else(|| self.candidates.pop_front())
@@ -118,11 +135,11 @@ struct Work {
     queue: AnalysisQueue,
     /// Tracks being analysed right now.
     in_flight: usize,
-    /// Set on shutdown: nothing more is queued.
-    closed: bool,
 }
 
 struct Shared {
+    /// Raised on shutdown, with the `work` lock held so a thread about to wait sees it or is
+    /// woken: nothing more is queued or taken, and a running ffmpeg call is aborted.
     stop: AtomicBool,
     analyzed: AtomicUsize,
     skipped: AtomicUsize,
@@ -130,9 +147,9 @@ struct Shared {
     /// Waiting plus in flight: written under the `work` lock, read without it.
     pending: AtomicUsize,
     work: Mutex<Work>,
-    /// Signalled when work is queued and on shutdown.
+    /// Signalled when work is queued and on shutdown (after the change, made under `work`).
     ready: Condvar,
-    ffmpeg: FfmpegConfig,
+    analyse: Analyser,
 }
 
 impl Shared {
@@ -145,6 +162,10 @@ impl Shared {
         self.pending.store(work.queue.len() + work.in_flight, Ordering::SeqCst);
     }
 }
+
+/// What the worker runs on each track that needs analysing: [`analyze_track`] with the worker's
+/// ffmpeg settings, or a stand-in (test seam). The flag is raised on shutdown.
+pub type Analyser = Arc<dyn Fn(&Path, &AtomicBool) -> Result<TrackFeatures, AnalysisError> + Send + Sync>;
 
 /// Handle to the background analysis thread pool. Dropping it stops and joins the threads.
 pub struct AnalysisWorker {
@@ -160,6 +181,12 @@ impl AnalysisWorker {
 
     /// Like [`Self::spawn`], but with an explicit ffmpeg binary / timeout for acoustic analysis.
     pub fn spawn_with_ffmpeg(db: AnalysisDatabase, threads: usize, ffmpeg: FfmpegConfig) -> Self {
+        let analyse: Analyser = Arc::new(move |path, stop| analyze_track_with(&ffmpeg, path, Some(stop)));
+        Self::spawn_with_analyser(db, threads, analyse)
+    }
+
+    /// Like [`Self::spawn`], but running `analyse` on each track that needs analysing (test seam).
+    pub fn spawn_with_analyser(db: AnalysisDatabase, threads: usize, analyse: Analyser) -> Self {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             analyzed: AtomicUsize::new(0),
@@ -169,10 +196,9 @@ impl AnalysisWorker {
             work: Mutex::new(Work {
                 queue: AnalysisQueue::new(MAX_PENDING_CANDIDATES),
                 in_flight: 0,
-                closed: false,
             }),
             ready: Condvar::new(),
-            ffmpeg,
+            analyse,
         });
 
         let handles = (0..threads.clamp(1, 2))
@@ -192,25 +218,30 @@ impl AnalysisWorker {
     /// Queue tracks that reached the playback queue: they are analysed before any candidate.
     /// Paths already queued this session are ignored (a waiting candidate moves ahead).
     pub fn enqueue<I: IntoIterator<Item = PathBuf>>(&self, paths: I) {
-        self.push(paths, AnalysisQueue::push_queued);
+        self.push(|queue| {
+            let mut added = false;
+            for path in paths {
+                added |= queue.push_queued(path);
+            }
+            added
+        });
     }
 
     /// Queue an autopilot run's candidate pool behind the queued tracks, at most
-    /// [`MAX_PENDING_CANDIDATES`] waiting (the oldest give way). Paths already queued this
-    /// session are ignored.
+    /// [`MAX_PENDING_CANDIDATES`] waiting: older runs' candidates give way, and past the bound the
+    /// pool's later paths are left out (see [`AnalysisQueue::push_candidates`]). Paths already
+    /// queued this session are ignored.
     pub fn enqueue_candidates<I: IntoIterator<Item = PathBuf>>(&self, paths: I) {
-        self.push(paths, AnalysisQueue::push_candidate);
+        self.push(|queue| queue.push_candidates(paths));
     }
 
-    fn push<I: IntoIterator<Item = PathBuf>>(&self, paths: I, add: fn(&mut AnalysisQueue, PathBuf) -> bool) {
+    /// Run `add` on the queue (it returns whether anything was added) and wake a thread for it.
+    fn push(&self, add: impl FnOnce(&mut AnalysisQueue) -> bool) {
         let mut work = self.shared.work();
-        if work.closed {
+        if self.shared.stop.load(Ordering::SeqCst) {
             return;
         }
-        let mut added = false;
-        for path in paths {
-            added |= add(&mut work.queue, path);
-        }
+        let added = add(&mut work.queue);
         self.shared.publish_pending(&work);
         drop(work);
         if added {
@@ -243,8 +274,10 @@ impl AnalysisWorker {
 
     /// Signal all threads to stop, abort any running ffmpeg call and join the threads.
     pub fn shutdown(&mut self) {
-        self.shared.stop.store(true, Ordering::SeqCst);
-        self.shared.work().closed = true;
+        {
+            let _work = self.shared.work();
+            self.shared.stop.store(true, Ordering::SeqCst);
+        }
         self.shared.ready.notify_all();
         for handle in self.handles.drain(..) {
             let _ = handle.join();
@@ -263,21 +296,25 @@ fn worker_loop(shared: Arc<Shared>, db: AnalysisDatabase) {
         let path = {
             let mut work = shared.work();
             loop {
-                if shared.stop.load(Ordering::SeqCst) || work.closed {
+                if shared.stop.load(Ordering::SeqCst) {
                     return;
                 }
                 if let Some(path) = work.queue.pop() {
                     work.in_flight += 1;
                     break path;
                 }
-                work = match shared.ready.wait_timeout(work, Duration::from_millis(100)) {
-                    Ok((work, _)) => work,
-                    Err(e) => e.into_inner().0,
-                };
+                // Queued work and the stop flag change under this lock before `ready` is
+                // signalled, so no wakeup is missed between the checks above and this wait.
+                work = shared.ready.wait(work).unwrap_or_else(|e| e.into_inner());
             }
         };
 
-        process_track(&path, &shared, &db);
+        // A panic costs this track only: the thread goes on, and the pending count comes down.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process_track(&path, &shared, &db)));
+        if outcome.is_err() {
+            shared.failed.fetch_add(1, Ordering::SeqCst);
+            crate::log_info!("analysis", "Analysis panicked for '{}'; skipped", path.display());
+        }
         let mut work = shared.work();
         work.in_flight -= 1;
         shared.publish_pending(&work);
@@ -290,13 +327,13 @@ fn process_track(path: &Path, shared: &Shared, db: &AnalysisDatabase) {
     };
 
     if let Some(existing) = db.get_track(path) {
-        if existing.mtime == mtime && existing.file_size == file_size {
+        if row_is_current(&existing, (mtime, file_size)) {
             shared.skipped.fetch_add(1, Ordering::SeqCst);
             return;
         }
     }
 
-    let result = analyze_track_with(&shared.ffmpeg, path, Some(&shared.stop));
+    let result = (shared.analyse)(path, &shared.stop);
     // Never persist (or count) a half-finished analysis interrupted by shutdown.
     if shared.stop.load(Ordering::SeqCst) {
         return;
@@ -328,16 +365,24 @@ fn process_track(path: &Path, shared: &Shared, db: &AnalysisDatabase) {
 /// (mtime seconds, size bytes) used to detect stale rows.
 fn file_stamp(path: &Path) -> Option<(u64, u64)> {
     let md = std::fs::metadata(path).ok()?;
-    if !md.is_file() {
-        return None;
-    }
+    md.is_file().then(|| stamp_of(&md))
+}
+
+/// The (mtime seconds, size bytes) a row is current for, from a file's metadata: a row whose
+/// `mtime` and `file_size` match it is skipped by the worker.
+pub fn stamp_of(md: &std::fs::Metadata) -> (u64, u64) {
     let mtime = md
         .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    Some((mtime, md.len()))
+    (mtime, md.len())
+}
+
+/// Whether `row` is current for a file stamped `stamp` ([`stamp_of`]), as the worker checks.
+pub fn row_is_current(row: &TrackFeatures, stamp: (u64, u64)) -> bool {
+    (row.mtime, row.file_size) == stamp
 }
 
 /// Why [`analyze_track`] produced no features. None of these may be persisted.

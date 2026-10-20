@@ -392,57 +392,37 @@ fn test_autopilot_progressive_streaming_events() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
-/// A BPM Flow mix sends its candidate pool for analysis (issue #30): the candidates it gathered
-/// but did not queue, without those already analysed, once, before `Finished`.
-#[test]
-fn test_profile_mix_sends_its_unqueued_candidates_for_analysis() {
-    common::isolate();
-    use quickstream::analysis::{AnalysisDatabase, MixProfile, TrackFeatures};
-    use quickstream::library::{AutopilotEvent, LibraryManager, MetadataCache};
-    use std::collections::HashSet;
-    use std::sync::atomic::AtomicBool;
-
-    let temp_dir = std::env::temp_dir().join(format!("quickstream_pool_test_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&temp_dir);
-    fs::create_dir_all(&temp_dir).unwrap();
-    let db = AnalysisDatabase::open_in_memory().unwrap();
-    let row = |path: &Path, bpm: f64| {
-        let md = fs::metadata(path).unwrap();
-        let mtime = md
-            .modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        TrackFeatures {
-            filepath: path.to_path_buf(),
-            mtime,
-            file_size: md.len(),
-            title: path.file_stem().unwrap().to_string_lossy().to_string(),
-            artist: path.file_stem().unwrap().to_string_lossy().to_string(),
-            bpm: Some(bpm),
-            ..Default::default()
-        }
-    };
-
-    // A small flat folder: three tracks in the BPM range (the mix), one analysed out of range
-    // (up to date: not sent again) and four never analysed (the pool to analyse).
-    let mut unanalysed = HashSet::new();
-    for i in 1..=8 {
-        let path = temp_dir.join(format!("{i:02} Song.wav"));
-        create_dummy_audio(&path);
-        match i {
-            1..=3 => db.upsert_track(&row(&path, 120.0)).unwrap(),
-            4 => db.upsert_track(&row(&path, 90.0)).unwrap(),
-            _ => {
-                unanalysed.insert(path);
-            }
-        }
+/// An analysis row for `path` as the file is now (mtime and size), by `artist`, at `bpm`.
+fn analysis_row(path: &Path, artist: &str, bpm: f64) -> quickstream::analysis::TrackFeatures {
+    let md = fs::metadata(path).unwrap();
+    let mtime = md
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    quickstream::analysis::TrackFeatures {
+        filepath: path.to_path_buf(),
+        mtime,
+        file_size: md.len(),
+        title: path.file_stem().unwrap().to_string_lossy().to_string(),
+        artist: artist.to_string(),
+        bpm: Some(bpm),
+        ..Default::default()
     }
+}
+
+/// Run a BPM Flow mix at 120 BPM over `dir` and collect what it sends: the queued tracks, and
+/// the candidates for analysis in the order sent. Asserts the candidates come after the mix's
+/// tracks and before `Finished`.
+fn run_bpm_flow_mix(dir: &Path, db: &quickstream::analysis::AnalysisDatabase) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    use quickstream::analysis::MixProfile;
+    use quickstream::library::{AutopilotEvent, LibraryManager, MetadataCache};
+    use std::sync::atomic::AtomicBool;
 
     let (tx, rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
-    let (dir, scan_db) = (temp_dir.clone(), db.clone());
+    let (dir, scan_db) = (dir.to_path_buf(), db.clone());
     let handle = std::thread::spawn(move || {
         LibraryManager::scan_directory_autopilot_with_profile(
             dir,
@@ -458,14 +438,14 @@ fn test_profile_mix_sends_its_unqueued_candidates_for_analysis() {
         );
     });
 
-    let mut queued = HashSet::new();
+    let mut queued = Vec::new();
     let mut candidates = Vec::new();
     let mut finished = false;
-    while let Ok(event) = rx.recv_timeout(Duration::from_secs(5)) {
+    while let Ok(event) = rx.recv_timeout(Duration::from_secs(30)) {
         match event {
             AutopilotEvent::Track(t) => {
                 assert!(candidates.is_empty(), "candidates come after the mix");
-                queued.insert(t.filepath);
+                queued.push(t.filepath);
             }
             AutopilotEvent::Candidates(paths) => candidates.extend(paths),
             AutopilotEvent::Finished(_) => {
@@ -476,12 +456,118 @@ fn test_profile_mix_sends_its_unqueued_candidates_for_analysis() {
     }
     handle.join().unwrap();
     assert!(finished);
+    (queued, candidates)
+}
+
+/// A BPM Flow mix sends its candidate pool for analysis (issue #30): the candidates it gathered
+/// but did not queue, without those already analysed, once, before `Finished`.
+#[test]
+fn test_profile_mix_sends_its_unqueued_candidates_for_analysis() {
+    common::isolate();
+    use quickstream::analysis::AnalysisDatabase;
+    use std::collections::HashSet;
+
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_pool_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let db = AnalysisDatabase::open_in_memory().unwrap();
+
+    // A small flat folder: three tracks in the BPM range (the mix), one analysed out of range
+    // (up to date: not sent again) and four never analysed (the pool to analyse).
+    let mut unanalysed = HashSet::new();
+    for i in 1..=8 {
+        let path = temp_dir.join(format!("{i:02} Song.wav"));
+        create_dummy_audio(&path);
+        let artist = format!("Artist {i}");
+        match i {
+            1..=3 => db.upsert_track(&analysis_row(&path, &artist, 120.0)).unwrap(),
+            4 => db.upsert_track(&analysis_row(&path, &artist, 90.0)).unwrap(),
+            _ => {
+                unanalysed.insert(path);
+            }
+        }
+    }
+
+    let (queued, candidates) = run_bpm_flow_mix(&temp_dir, &db);
     assert_eq!(queued.len(), 3, "the three tracks in range make the mix");
     let sent: HashSet<PathBuf> = candidates.iter().cloned().collect();
     assert_eq!(sent.len(), candidates.len(), "each candidate is sent once");
     assert_eq!(sent, unanalysed, "the pool minus queued and up-to-date tracks");
 
     let _ = fs::remove_dir_all(&temp_dir);
+}
+
+/// A row for the file's size but an older mtime (a retag that kept the size) is stale: the
+/// worker would analyse the file again, so the mix sends it, as the worker's own check would.
+#[test]
+fn test_profile_mix_sends_a_candidate_whose_row_has_a_stale_mtime() {
+    common::isolate();
+    use quickstream::analysis::AnalysisDatabase;
+
+    let temp_dir = std::env::temp_dir().join(format!("quickstream_pool_stale_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let db = AnalysisDatabase::open_in_memory().unwrap();
+
+    for i in 1..=3 {
+        let path = temp_dir.join(format!("{i:02} Song.wav"));
+        create_dummy_audio(&path);
+        db.upsert_track(&analysis_row(&path, &format!("Artist {i}"), 120.0))
+            .unwrap();
+    }
+    let current = temp_dir.join("04 Current.wav");
+    let stale = temp_dir.join("05 Retagged.wav");
+    create_dummy_audio(&current);
+    create_dummy_audio(&stale);
+    db.upsert_track(&analysis_row(&current, "Current", 90.0)).unwrap();
+    let mut row = analysis_row(&stale, "Retagged", 90.0);
+    row.mtime -= 3600;
+    db.upsert_track(&row).unwrap();
+
+    let (queued, candidates) = run_bpm_flow_mix(&temp_dir, &db);
+    assert_eq!(queued.len(), 3, "the three tracks in range make the mix");
+    assert_eq!(
+        candidates,
+        vec![stale],
+        "the stale row is sent again, the current one is not"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+/// A large library's pool can hold more than the analysis worker keeps waiting (up to 120
+/// matched candidates and 200 others): at most `MAX_PENDING_CANDIDATES` are sent, the
+/// profile-matched ones first, so none of those is pushed out by the run's own others.
+#[test]
+fn test_analysis_candidates_are_bounded_matched_first() {
+    common::isolate();
+    use quickstream::analysis::worker::MAX_PENDING_CANDIDATES;
+    use quickstream::library::analysis_candidates;
+
+    let track = |name: String| PathBuf::from(format!("/music/{name}.flac"));
+    let matched: Vec<PathBuf> = (0..120).map(|i| track(format!("match-{i}"))).collect();
+    // The others list holds the matched candidates too (gathering adds them to both).
+    let others: Vec<PathBuf> = matched
+        .iter()
+        .cloned()
+        .chain((0..200).map(|i| track(format!("other-{i}"))))
+        .collect();
+    let queued = matched[0].clone();
+    let analysed = track("other-0".to_string());
+
+    let sent = analysis_candidates(&matched, &others, |p| *p == queued || *p == analysed);
+    assert_eq!(sent.len(), MAX_PENDING_CANDIDATES, "never more than the worker keeps");
+    assert_eq!(sent[..119], matched[1..], "the matched candidates first, each once");
+    assert_eq!(
+        sent[119],
+        track("other-1".to_string()),
+        "then the others, less the skipped"
+    );
+    assert_eq!(
+        sent[199],
+        track("other-81".to_string()),
+        "the rest of the others give way"
+    );
 }
 
 #[test]

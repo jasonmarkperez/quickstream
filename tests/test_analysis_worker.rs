@@ -765,6 +765,18 @@ fn candidates_are_bounded_and_the_oldest_give_way() {
 }
 
 #[test]
+fn one_run_with_more_candidates_than_the_bound_keeps_its_first() {
+    common::isolate();
+    let mut queue = AnalysisQueue::new(3);
+    queue.push_candidate(path("older-run"));
+    // An earlier run's candidate gives way; the run's own first candidates are kept.
+    assert!(queue.push_candidates(paths(&["c1", "c2", "c3", "c4", "c5"])));
+    assert_eq!(drain(&mut queue), paths(&["c1", "c2", "c3"]));
+    // The ones left out were never taken, so a later run may offer them again.
+    assert!(queue.push_candidate(path("c4")));
+}
+
+#[test]
 fn a_burst_of_candidates_keeps_the_worker_queue_bounded() {
     common::isolate();
     let cache = scratch_dir("worker_burst_db");
@@ -834,8 +846,14 @@ fn a_track_queued_during_a_candidate_burst_is_analysed_next() {
     }
     let log = cache.join("calls.log");
     let args = cache.join("args.log");
-    // Each call takes a moment, so the queued track arrives while a candidate is analysed.
-    let body = format!("printf '%s\\n' \"$*\" >> '{}'\nsleep 0.2\nexit 0", args.display());
+    let gate = cache.join("gate");
+    // Every call waits for the gate, so the first candidate is still being analysed when the
+    // queued track arrives.
+    let body = format!(
+        "printf '%s\\n' \"$*\" >> '{}'\nwhile [ ! -e '{}' ]; do sleep 0.01; done\nexit 0",
+        args.display(),
+        gate.display()
+    );
     let cfg = FfmpegConfig {
         binary: fake_ffmpeg(&cache, &log, &body),
         ..FfmpegConfig::default()
@@ -847,7 +865,9 @@ fn a_track_queued_during_a_candidate_burst_is_analysed_next() {
     while invocations(&log) == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
+    assert_eq!(invocations(&log), 1, "the first candidate waits at the gate");
     worker.enqueue(vec![queued.clone()]);
+    fs::write(&gate, b"").unwrap();
     assert!(worker.wait_until_idle(Duration::from_secs(30)));
     worker.shutdown();
 
@@ -859,6 +879,47 @@ fn a_track_queued_during_a_candidate_burst_is_analysed_next() {
         order[1], queued,
         "the queued track goes before the other candidates: {order:?}"
     );
+    let _ = fs::remove_dir_all(&music);
+    let _ = fs::remove_dir_all(&cache);
+}
+
+/// A panic while a track is analysed costs that track only: it is counted as failed, the
+/// pending count comes back to zero and the thread goes on with the next track.
+#[test]
+fn a_panicking_analysis_is_counted_failed_and_the_worker_goes_on() {
+    common::isolate();
+    use quickstream::analysis::worker::Analyser;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let music = scratch_dir("worker_panic");
+    let cache = scratch_dir("worker_panic_db");
+    let (boom, fine) = (music.join("boom.wav"), music.join("fine.wav"));
+    write_wav(&boom, &[0i16; 16]);
+    write_wav(&fine, &[0i16; 16]);
+    let analyser: Analyser = Arc::new(|path: &Path, _stop: &AtomicBool| {
+        if path.ends_with("boom.wav") {
+            panic!("analysis blew up");
+        }
+        Ok(TrackFeatures {
+            filepath: path.to_path_buf(),
+            bpm: Some(100.0),
+            ..Default::default()
+        })
+    });
+    let db = AnalysisDatabase::open_at(&cache.join("track_analysis.db")).unwrap();
+    let mut worker = AnalysisWorker::spawn_with_analyser(db.clone(), 1, analyser);
+    worker.enqueue(vec![boom.clone(), fine.clone()]);
+    assert!(
+        worker.wait_until_idle(Duration::from_secs(5)),
+        "pending stuck at {}",
+        worker.progress().pending
+    );
+    let progress = worker.progress();
+    assert_eq!((progress.failed, progress.analyzed, progress.pending), (1, 1, 0));
+    assert_eq!(db.get_track(&fine).and_then(|f| f.bpm), Some(100.0));
+    assert!(db.get_track(&boom).is_none());
+    worker.shutdown();
     let _ = fs::remove_dir_all(&music);
     let _ = fs::remove_dir_all(&cache);
 }
