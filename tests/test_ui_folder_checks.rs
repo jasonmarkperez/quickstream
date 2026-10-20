@@ -228,6 +228,49 @@ fn test_tilde_reports_a_missing_home() {
     }
 }
 
+/// `~` to a missing home while the shown folder is itself still being read (so the home was
+/// shown at once): the browser goes back to that folder and reads it again.
+#[test]
+fn test_tilde_to_a_missing_home_from_a_folder_still_being_read_goes_back() {
+    common::isolate();
+    let (mut app, root) = setup("tilde_back", Some("Gone"));
+    let sub = root.join("Music").join("Sub");
+    fs::create_dir_all(&sub).unwrap();
+    write_wav(&sub.join("track.wav"));
+    app.set_folder_open_deadline(Duration::ZERO);
+    let listing = Gate::listing(&mut app, &sub);
+
+    app.navigate_browser(sub.clone());
+    listing.wait_entered();
+    pump(&mut app);
+    assert_eq!(app.browser_dir, sub);
+    assert!(app.browser_loading);
+
+    press(&mut app, KeyCode::Char('~'));
+    let missing = format!("Home directory not found: {}", root.join("Gone").display());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.status_message != missing && Instant::now() < deadline {
+        pump(&mut app);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(app.status_message, missing);
+    assert_eq!(
+        app.browser_dir, sub,
+        "the browser goes back to the folder it was reading"
+    );
+    assert!(app.browser_loading, "and reads it again");
+
+    listing.open();
+    common::wait_for_dir_scan(&mut app);
+    assert_eq!(app.browser_dir, sub);
+    assert!(
+        app.browser_entries.iter().any(|(_, p, _)| p == &sub.join("track.wav")),
+        "{:?}",
+        app.browser_entries
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// A home that is there but can't be listed reads like any folder that can't be listed.
 #[test]
 fn test_tilde_reports_a_home_that_cannot_be_read() {
@@ -411,6 +454,67 @@ fn test_mix_picker_falls_back_when_the_browsed_folder_is_gone() {
     press(&mut app, KeyCode::Char('2'));
     assert_eq!(app.active_mix_profile, MixProfile::picker_profiles()[1]);
     assert!(app.is_autopilot_scanning);
+    app.wait_for_autopilot_scan(Duration::from_secs(5));
+    assert_eq!(app.autopilot_dir, Some(other.clone()));
+    assert_eq!(
+        app.status_message,
+        format!("No audio files found in '{}'", other.display())
+    );
+    app.reset_playback_session();
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The mix picker pressed again while the first start still checks a folder that turns out to
+/// be gone falls back where the first start does (the last mix's folder), not to the folder
+/// still being checked.
+#[test]
+fn test_mix_picker_pressed_again_during_a_check_keeps_the_fallback() {
+    common::isolate();
+    let (mut app, root) = setup("mix_again", None);
+    let music = root.join("Music");
+    let other = root.join("Other");
+    app.autopilot_dir = Some(other.clone());
+    fs::remove_dir_all(&music).unwrap();
+    let check = Gate::check(&mut app, &music);
+
+    press(&mut app, KeyCode::Char('M'));
+    press(&mut app, KeyCode::Enter);
+    check.wait_entered();
+    press(&mut app, KeyCode::Char('M'));
+    press(&mut app, KeyCode::Enter);
+    check.open();
+    app.wait_for_autopilot_scan(Duration::from_secs(5));
+    assert_eq!(app.autopilot_dir, Some(other.clone()));
+    assert_eq!(
+        app.status_message,
+        format!("No audio files found in '{}'", other.display())
+    );
+    app.reset_playback_session();
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Esc on a start still checking its folder puts back the folder the last mix named, so the
+/// next start falls back there as before.
+#[test]
+fn test_esc_during_a_check_keeps_the_fallback_for_the_next_start() {
+    common::isolate();
+    let (mut app, root) = setup("mix_esc_again", None);
+    let music = root.join("Music");
+    let other = root.join("Other");
+    app.autopilot_dir = Some(other.clone());
+    fs::remove_dir_all(&music).unwrap();
+    let check = Gate::check(&mut app, &music);
+
+    press(&mut app, KeyCode::Char('M'));
+    press(&mut app, KeyCode::Enter);
+    check.wait_entered();
+    assert!(!press(&mut app, KeyCode::Esc));
+    assert_eq!(app.status_message, "Stopped starting Autopilot in 'Music'");
+    assert_eq!(app.autopilot_dir, Some(other.clone()));
+
+    check.open();
+    press(&mut app, KeyCode::Char('M'));
+    press(&mut app, KeyCode::Enter);
     app.wait_for_autopilot_scan(Duration::from_secs(5));
     assert_eq!(app.autopilot_dir, Some(other.clone()));
     assert_eq!(

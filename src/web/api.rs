@@ -51,11 +51,11 @@ struct ActionPayload {
     direction: Option<String>,
 }
 
-/// A JSON response for `/api/action`: status line and body.
 /// `autopilot` / `autopilot_reshuffle` without a path before the terminal has published its
 /// folder.
 pub const NO_TERMINAL_FOLDER: &str = "The terminal hasn't opened a folder yet";
 
+/// A JSON response for `/api/action`: status line and body.
 struct ActionResponse {
     status: &'static str,
     body: serde_json::Value,

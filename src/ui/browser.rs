@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use ratatui::widgets::*;
 
 use super::tag_reads::TagRead;
-use super::{is_subfolder_entry, AppUI, CursorTarget, DirScanEvent, PendingFolder, SPOTLIGHT_HINT};
+use super::{is_subfolder_entry, AppUI, CursorTarget, DirScanEvent, HomeJump, PendingFolder, SPOTLIGHT_HINT};
 use crate::metadata::is_supported_audio_file;
 
 impl AppUI {
@@ -535,9 +535,11 @@ impl AppUI {
                 }
             }
             DirScanEvent::Error { message, kind, .. } => {
-                // `~` to a home that isn't there, or isn't a folder: the shown folder stays.
-                let home_missing = self.home_jump.take().is_some_and(|home| home == dir)
-                    && matches!(kind, std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory);
+                // `~` to a home that isn't there, or isn't a folder: the shown folder stays, and
+                // one the home was shown in place of (still being read) is read again.
+                let jump = self.home_jump.take().filter(|jump| jump.home == dir);
+                let home_missing =
+                    jump.is_some() && matches!(kind, std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory);
                 if opening && home_missing {
                     self.pending_folder = None;
                 } else if opening {
@@ -564,6 +566,12 @@ impl AppUI {
                 } else {
                     format!("Error reading directory '{}': {}", dir.display(), message)
                 };
+                if let Some((left, cursor)) = jump.and_then(|jump| jump.left).filter(|_| home_missing) {
+                    self.browser_dir_cache.remove(&left);
+                    self.spawn_dir_scan(left.clone());
+                    self.show_folder(left, cursor, Some(Instant::now()));
+                    self.update_web_state();
+                }
             }
         }
     }
@@ -672,17 +680,25 @@ impl AppUI {
 
     /// `~`: open the startup home like any folder, so a slow share never stalls the key (issue
     /// #103). A home that isn't there is reported when its scan fails (`Home directory not
-    /// found`), and the shown folder stays. Pressed again while the home is still being read,
+    /// found`), and the shown folder stays; a folder still being read, which the home was shown
+    /// in place of at once, is read again. Pressed again while the home is still being read,
     /// that read goes on.
     pub(super) fn jump_to_home(&mut self, home: PathBuf) {
         self.status_message = format!("Jumped to home: {}", home.display());
         let reading = self.opening_folder() == Some(home.as_path())
             || (self.browser_loading && !self.in_bookmarks_view && self.browser_dir == home);
         if !reading {
+            let left = (self.browser_loading && !self.in_bookmarks_view).then(|| {
+                let cursor = (self.browser_cursor >= self.browser_header_rows())
+                    .then(|| self.browser_entries.get(self.browser_cursor))
+                    .flatten()
+                    .map_or(CursorTarget::Top, |(_, path, _)| CursorTarget::Entry(path.clone()));
+                (self.browser_dir.clone(), cursor)
+            });
             self.navigate_browser(home.clone());
-        }
-        if self.dir_scan_stop.is_some() {
-            self.home_jump = Some(home);
+            self.home_jump = self.dir_scan_stop.is_some().then_some(HomeJump { home, left });
+        } else if self.home_jump.is_none() && self.dir_scan_stop.is_some() {
+            self.home_jump = Some(HomeJump { home, left: None });
         }
     }
 

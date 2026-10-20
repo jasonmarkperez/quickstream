@@ -126,6 +126,14 @@ struct PendingFolder {
     opened: Instant,
 }
 
+/// `~` opening the startup home, while its scan runs (`home_jump`).
+struct HomeJump {
+    home: PathBuf,
+    /// The folder the browser was still reading when the home was shown in its place, and the
+    /// entry its cursor was on: opened again if the home isn't there.
+    left: Option<(PathBuf, CursorTarget)>,
+}
+
 /// Builds the player an output switch moves to, in place of mpv or a renderer client (tests).
 pub type OutputPlayerFactory = Box<dyn FnMut() -> Box<dyn AudioPlayer> + Send>;
 
@@ -258,8 +266,8 @@ pub struct AppUI {
     /// Lists folders on the `dir-scan` worker (`set_dir_reader`).
     dir_reader: DirReader,
     /// The startup home `~` is opening, while its scan runs: a home that isn't there reads
-    /// `Home directory not found` and the shown folder stays.
-    home_jump: Option<PathBuf>,
+    /// `Home directory not found` and the folder shown before stays (or is read again).
+    home_jump: Option<HomeJump>,
     /// Checks on the Autopilot workers whether the folder a start prefers is there
     /// (`set_path_check`).
     folder_checks: folder_checks::FolderChecks,
@@ -325,6 +333,9 @@ pub struct AppUI {
     pub autopilot_scan_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// The folder a start's worker chose (the preferred one, else the fallback), while it checks.
     autopilot_folder_rx: Option<std::sync::mpsc::Receiver<PathBuf>>,
+    /// While `autopilot_folder_rx` waits, the folder `autopilot_dir` named before that start:
+    /// the next mix's fallback meanwhile, and what Esc puts back (`cancel_autopilot_start`).
+    autopilot_settled_dir: Option<PathBuf>,
     pub is_autopilot_scanning: bool,
     pub autopilot_run_mode: AutopilotRunMode,
     pub autopilot_added_count: usize,
@@ -507,6 +518,7 @@ impl AppUI {
             autopilot_rx: None,
             autopilot_scan_stop: None,
             autopilot_folder_rx: None,
+            autopilot_settled_dir: None,
             is_autopilot_scanning: false,
             autopilot_run_mode: AutopilotRunMode::Fresh,
             autopilot_added_count: 0,

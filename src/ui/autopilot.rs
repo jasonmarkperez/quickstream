@@ -7,15 +7,7 @@ use super::{AppUI, AutopilotRunMode};
 
 impl AppUI {
     pub fn poll_background_autopilot(&mut self) {
-        // The folder a start's worker chose: the fallback, when the preferred one is gone.
-        match self.autopilot_folder_rx.as_ref().map(|rx| rx.try_recv()) {
-            Some(Ok(dir)) => {
-                self.autopilot_folder_rx = None;
-                self.take_autopilot_folder(dir);
-            }
-            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => self.autopilot_folder_rx = None,
-            Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => {}
-        }
+        self.poll_autopilot_folder();
 
         let mut new_tracks = Vec::new();
         let mut candidates = Vec::new();
@@ -181,6 +173,29 @@ impl AppUI {
         }
     }
 
+    /// Take in the folder a start's worker chose: the fallback, when the preferred one is gone.
+    fn poll_autopilot_folder(&mut self) {
+        match self.autopilot_folder_rx.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(dir)) => {
+                self.autopilot_folder_rx = None;
+                self.autopilot_settled_dir = None;
+                self.take_autopilot_folder(dir);
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => self.autopilot_folder_rx = None,
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    /// The folder the last mix scans: `autopilot_dir`, or while a start still checks the folder
+    /// it named there, the one named before it.
+    fn last_autopilot_dir(&self) -> Option<PathBuf> {
+        if self.autopilot_folder_rx.is_some() {
+            self.autopilot_settled_dir.clone()
+        } else {
+            self.autopilot_dir.clone()
+        }
+    }
+
     /// The scan's worker chose `dir` over the folder the start named: name it from now on.
     fn take_autopilot_folder(&mut self, dir: PathBuf) {
         if self.autopilot_dir.as_ref() == Some(&dir) {
@@ -236,16 +251,18 @@ impl AppUI {
         }
         self.autopilot_rx = None;
         self.autopilot_folder_rx = None;
+        self.autopilot_settled_dir = None;
         self.is_autopilot_scanning = false;
     }
 
-    /// Esc while a start's worker still checks its folder (a slow share): stop the start.
-    /// Returns the folder it named.
+    /// Esc while a start's worker still checks its folder (a slow share): stop the start and
+    /// name the folder named before it again. Returns the folder the stopped start named.
     pub(super) fn cancel_autopilot_start(&mut self) -> Option<PathBuf> {
         self.autopilot_folder_rx.as_ref()?;
+        let named = std::mem::replace(&mut self.autopilot_dir, self.autopilot_settled_dir.take());
         self.stop_autopilot_scan();
         self.update_web_state();
-        self.autopilot_dir.clone()
+        named
     }
 
     /// The status line a start shows (`mode`, in `dir`) until its first tracks come in.
@@ -295,6 +312,8 @@ impl AppUI {
     /// `poll_background_autopilot` names the fallback if it took it.
     fn start_autopilot_scan(&mut self, preferred: Option<PathBuf>, fallback: PathBuf, mode: AutopilotRunMode) {
         self.supersede_playlist_queue();
+        // What `autopilot_dir` names until the worker answers, not a folder still unchecked.
+        let settled = self.last_autopilot_dir();
         // 1. Cancel any active autopilot scanner (its channel is replaced below)
         self.stop_autopilot_scan();
         let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -338,6 +357,7 @@ impl AppUI {
         let folder_tx = preferred.is_some().then(|| {
             let (folder_tx, folder_rx) = std::sync::mpsc::channel();
             self.autopilot_folder_rx = Some(folder_rx);
+            self.autopilot_settled_dir = settled;
             folder_tx
         });
 
@@ -382,11 +402,12 @@ impl AppUI {
         self.active_mix_profile = profiles.get(index).unwrap_or(&profiles[0]).clone();
         let profile_name = self.active_mix_profile.name();
         // The browsed folder if it is still there (checked on the scan's worker), else the last
-        // mix's folder, else the current directory.
+        // mix's folder (a start still checking its folder isn't one yet), else the current
+        // directory.
+        self.poll_autopilot_folder();
         let preferred = (!self.in_bookmarks_view).then(|| self.browser_dir.clone());
         let fallback = self
-            .autopilot_dir
-            .clone()
+            .last_autopilot_dir()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         self.status_message = format!("⚡ Mix Profile: '{}' - Starting Autopilot...", profile_name);
         let mode = self.run_mode_or(AutopilotRunMode::Append);
