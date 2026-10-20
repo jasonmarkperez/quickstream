@@ -25,6 +25,94 @@ struct SharedState {
     load: Mutex<MpvLoadTracker>,
     /// A load mpv couldn't play, for [`AudioPlayer::take_error`].
     last_error: Mutex<Option<String>>,
+    /// The newest seek mpv hasn't confirmed yet, so a `time-pos` it sent before handling the
+    /// seek never overwrites the target (issue #92). Locked before `position`.
+    seek: Mutex<SeekGate>,
+}
+
+/// mpv request ids at and above this one are seeks (`SeekGate`); loads count up from 1
+/// (`MpvLoadTracker`), so the two never share one.
+const SEEK_REQUEST_BASE: u64 = 1 << 32;
+/// How long `time-pos` waits for mpv to confirm a seek before it is taken again anyway. mpv
+/// handles a seek command within milliseconds (and reports the target as `time-pos` until it
+/// restarts), so the bound only matters for an mpv that never answers request ids.
+const SEEK_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Holds back mpv's `time-pos` reports while the newest seek is unconfirmed (issue #92).
+///
+/// `seek_to` writes the target as the position and sends the seek with a request id. Reports
+/// mpv sent before handling it would put the old position back, so `time-pos` is ignored until
+/// mpv has answered that request (mpv 0.41: the answer, `seek`, `time-pos` at the target, then
+/// `playback-restart`, playing or paused) and then restarted playback. An error answer (no file
+/// loaded, or the file not loaded yet), an `end-file` after the answer, a new load, `stop`, or
+/// [`SEEK_CONFIRM_TIMEOUT`] without either also ends the wait, so it never sticks. Answers and
+/// restarts for an older seek don't count: only the newest target is kept.
+#[derive(Debug)]
+struct SeekGate {
+    /// Request id of the newest seek sent (`SEEK_REQUEST_BASE` before the first).
+    generation: u64,
+    /// The newest seek is still unconfirmed, since this instant.
+    pending_since: Option<Instant>,
+    /// mpv answered the newest seek with success; its `playback-restart` is next.
+    answered: bool,
+    timeout: Duration,
+}
+
+impl Default for SeekGate {
+    fn default() -> Self {
+        Self {
+            generation: SEEK_REQUEST_BASE,
+            pending_since: None,
+            answered: false,
+            timeout: SEEK_CONFIRM_TIMEOUT,
+        }
+    }
+}
+
+impl SeekGate {
+    /// A seek is about to be sent: returns the request id it must carry.
+    fn begin(&mut self) -> u64 {
+        self.generation += 1;
+        self.pending_since = Some(Instant::now());
+        self.answered = false;
+        self.generation
+    }
+
+    fn clear(&mut self) {
+        self.pending_since = None;
+        self.answered = false;
+    }
+
+    /// Read one message from mpv.
+    fn on_message(&mut self, msg: &serde_json::Value) {
+        if self.pending_since.is_none() {
+            return;
+        }
+        if msg.get("request_id").and_then(|r| r.as_u64()) == Some(self.generation) {
+            if msg.get("error").and_then(|e| e.as_str()) == Some("success") {
+                self.answered = true;
+            } else {
+                self.clear();
+            }
+            return;
+        }
+        match msg.get("event").and_then(|e| e.as_str()) {
+            Some("playback-restart" | "end-file") if self.answered => self.clear(),
+            _ => {}
+        }
+    }
+
+    /// Whether a `time-pos` report may be taken now.
+    fn accepts_position(&mut self) -> bool {
+        match self.pending_since {
+            None => true,
+            Some(since) if since.elapsed() >= self.timeout => {
+                self.clear();
+                true
+            }
+            Some(_) => false,
+        }
+    }
 }
 
 /// The `file_error` mpv reports for a load started at or past the file's real end (mpv 0.41).
@@ -341,6 +429,20 @@ impl LocalPlayer {
         }
     }
 
+    /// How long a seek mpv never confirms holds back its position reports (default 2 s). Test
+    /// seam (issue #92).
+    #[doc(hidden)]
+    pub fn set_seek_confirm_timeout(&mut self, timeout: Duration) {
+        self.shared_state.seek.lock().unwrap().timeout = timeout;
+    }
+
+    /// Set the position to `seconds`, ending the wait for any seek (a new load or a stop).
+    fn reset_position(&self, seconds: f64) {
+        let mut seek = self.shared_state.seek.lock().unwrap();
+        seek.clear();
+        *self.shared_state.position.lock().unwrap() = seconds;
+    }
+
     fn ensure_mpv_daemon(&mut self) -> anyhow::Result<()> {
         let is_running = self
             .mpv_child
@@ -425,6 +527,7 @@ impl LocalPlayer {
                                 let mut load = shared.load.lock().unwrap();
                                 (load.on_message(&val), load.is_current())
                             };
+                            shared.seek.lock().unwrap().on_message(&val);
                             match end {
                                 Some(MpvLoadEnd::Finished) => {
                                     shared.is_finished.store(true, Ordering::SeqCst);
@@ -445,7 +548,12 @@ impl LocalPlayer {
                                             match name {
                                                 "time-pos" => {
                                                     if let Some(pos) = val.get("data").and_then(|d| d.as_f64()) {
-                                                        *shared.position.lock().unwrap() = pos;
+                                                        // Under the seek lock, so a seek_to between
+                                                        // the check and the write can't be undone.
+                                                        let mut seek = shared.seek.lock().unwrap();
+                                                        if seek.accepts_position() {
+                                                            *shared.position.lock().unwrap() = pos;
+                                                        }
                                                     }
                                                 }
                                                 "duration" => {
@@ -653,7 +761,7 @@ impl LocalPlayer {
 
         // Duration is streamed asynchronously via IPC ("observe_property", "duration") for mpv
         // and read from metadata for ffplay; clear the previous track's until then.
-        *self.shared_state.position.lock().unwrap() = start_seconds;
+        self.reset_position(start_seconds);
         *self.shared_state.duration.lock().unwrap() = 0.0;
         self.accumulated_offset = start_seconds;
         self.start_time = None;
@@ -779,7 +887,7 @@ impl AudioPlayer for LocalPlayer {
         self.shared_state.is_playing.store(false, Ordering::SeqCst);
         self.shared_state.is_paused.store(false, Ordering::SeqCst);
         self.shared_state.is_finished.store(false, Ordering::SeqCst);
-        *self.shared_state.position.lock().unwrap() = 0.0;
+        self.reset_position(0.0);
         self.accumulated_offset = 0.0;
         self.start_time = None;
 
@@ -846,12 +954,23 @@ impl AudioPlayer for LocalPlayer {
             }
             Ok(())
         } else if self.backend == "mpv" {
+            // The target shows at once, and mpv's reports from before it handles the seek are
+            // held back until it confirms (issue #92). Set before sending, so the answer can't
+            // arrive first.
+            let request_id = {
+                let mut seek = self.shared_state.seek.lock().unwrap();
+                *self.shared_state.position.lock().unwrap() = target;
+                seek.begin()
+            };
             let json_cmd = serde_json::json!({
-                "command": ["seek", target, "absolute"]
+                "command": ["seek", target, "absolute"],
+                "request_id": request_id
             })
             .to_string();
-            self.send_command(&json_cmd)?;
-            *self.shared_state.position.lock().unwrap() = target;
+            if let Err(e) = self.send_command(&json_cmd) {
+                self.shared_state.seek.lock().unwrap().clear();
+                return Err(e);
+            }
             Ok(())
         } else {
             Ok(())
