@@ -514,7 +514,7 @@ impl AppUI {
                         error: None,
                     });
                 }
-                KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+                KeyCode::Char(c) if key.modifiers.is_empty() => {
                     input.push(c);
                     self.playlists.modal = Some(PlaylistModal::NamePrompt {
                         purpose,
@@ -566,7 +566,7 @@ impl AppUI {
                 self.playlists.move_cursor(true);
             }
             (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => self.playlists.jump_cursor(false),
-            (KeyCode::End, _) | (KeyCode::Char('G'), _) => self.playlists.jump_cursor(true),
+            (KeyCode::End, _) | (KeyCode::Char('G'), KeyModifiers::NONE) => self.playlists.jump_cursor(true),
             (KeyCode::PageUp, _) => self.playlists.page_cursor(false),
             (KeyCode::PageDown, _) => self.playlists.page_cursor(true),
             _ => {}
@@ -979,10 +979,14 @@ impl AppUI {
         let tracks_focus = self.playlists.tracks_focus;
         match (code, modifiers) {
             (KeyCode::Char('c'), KeyModifiers::NONE) if !tracks_focus => self.open_create_prompt(),
-            (KeyCode::Char('R'), _) if !tracks_focus => self.open_rename_prompt(),
-            (KeyCode::Char('D'), _) if !tracks_focus => self.open_delete_confirm(),
-            (KeyCode::Char('K'), _) if tracks_focus => self.move_selected_track(crate::playlist_store::MoveDir::Up),
-            (KeyCode::Char('J'), _) if tracks_focus => self.move_selected_track(crate::playlist_store::MoveDir::Down),
+            (KeyCode::Char('R'), KeyModifiers::NONE) if !tracks_focus => self.open_rename_prompt(),
+            (KeyCode::Char('D'), KeyModifiers::NONE) if !tracks_focus => self.open_delete_confirm(),
+            (KeyCode::Char('K'), KeyModifiers::NONE) if tracks_focus => {
+                self.move_selected_track(crate::playlist_store::MoveDir::Up)
+            }
+            (KeyCode::Char('J'), KeyModifiers::NONE) if tracks_focus => {
+                self.move_selected_track(crate::playlist_store::MoveDir::Down)
+            }
             (KeyCode::Char('d') | KeyCode::Char('x'), KeyModifiers::NONE) | (KeyCode::Delete, _) if tracks_focus => {
                 self.remove_selected_track()
             }
@@ -1604,11 +1608,11 @@ impl super::AppUI {
 
     /// Keys while the add picker is open: j/k/arrows move (wrapping), Enter adds, Esc/q cancel.
     fn handle_add_picker_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.playlists.modal = None,
-            KeyCode::Up | KeyCode::Char('k') => self.move_add_picker_cursor(false),
-            KeyCode::Down | KeyCode::Char('j') => self.move_add_picker_cursor(true),
-            KeyCode::Enter => self.confirm_add_picker(),
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) | (KeyCode::Char('q'), KeyModifiers::NONE) => self.playlists.modal = None,
+            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => self.move_add_picker_cursor(false),
+            (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => self.move_add_picker_cursor(true),
+            (KeyCode::Enter, _) => self.confirm_add_picker(),
             _ => {}
         }
     }

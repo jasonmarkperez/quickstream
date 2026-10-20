@@ -1,17 +1,71 @@
-//! Key routing: `handle_input_key` (modals and typed text, then the global hotkeys) and the tab
-//! and pane keys (`handle_tab_key_with_modifiers`), and opening the fuzzy search and the startup
-//! home editor.
+//! Key routing: `normalize_key`, `handle_input_key` (modals and typed text, then the global
+//! hotkeys) and the tab and pane keys (`handle_tab_key_with_modifiers`), and opening the fuzzy
+//! search and the startup home editor.
 
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::*;
 
 use super::{search, AppUI};
 use crate::settings::{setting, SettingsContext, SETTING_DISPLAY_ORDER};
 
+/// A character key as every handler matches it. Terminals report an uppercase letter or a
+/// shifted symbol with SHIFT (Shift held, Caps Lock on, a CSI-u or modifyOtherKeys terminal), and
+/// some report Shift+N as `n` with SHIFT. The character carries the Shift, so it is dropped: a
+/// plain key is its character with no modifiers (`N`, `?`, `+`). A Ctrl / Alt chord of a letter
+/// is the lowercase letter with only its chord modifiers, as terminals that can't tell
+/// Ctrl+Shift+C from Ctrl+C send it. Other keys keep their modifiers.
+pub fn normalize_key(mut key: KeyEvent) -> KeyEvent {
+    let KeyCode::Char(c) = key.code else {
+        return key;
+    };
+    let chord = !key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+    if chord {
+        key.code = KeyCode::Char(one_char(c.to_lowercase(), c));
+    } else if key.modifiers.contains(KeyModifiers::SHIFT) {
+        key.code = KeyCode::Char(one_char(c.to_uppercase(), c));
+    }
+    key.modifiers.remove(KeyModifiers::SHIFT);
+    key
+}
+
+/// `c`'s case mapping when it is one character, else `c` itself (`ß` stays `ß`).
+fn one_char(mut mapped: impl Iterator<Item = char>, c: char) -> char {
+    match (mapped.next(), mapped.next()) {
+        (Some(m), None) => m,
+        _ => c,
+    }
+}
+
 impl AppUI {
-    pub fn handle_input_key(&mut self, key: crossterm::event::KeyEvent) -> anyhow::Result<bool> {
+    /// Every key the terminal sends comes here (`run`), normalised first (`normalize_key`), so
+    /// each handler below matches a character with `NONE` (or its chord, e.g. `CONTROL`) only.
+    /// Returns true when the app should quit.
+    pub fn handle_input_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let key = normalize_key(key);
+
+        // Help, search and spotlight take every key before a pending seek or skip is applied.
+        if self.show_help_modal {
+            if (key.code, key.modifiers) == (KeyCode::Char('c'), KeyModifiers::CONTROL) {
+                self.player.stop()?;
+                return Ok(true);
+            }
+            if matches!(
+                (key.code, key.modifiers),
+                (KeyCode::Esc, _) | (KeyCode::Char('q' | '?'), KeyModifiers::NONE)
+            ) {
+                self.show_help_modal = false;
+            }
+            return Ok(false);
+        }
+        if self.search_modal.is_some() {
+            return self.handle_search_key(key);
+        }
+        if self.browser_spotlight.is_some() {
+            return self.handle_spotlight_key(key);
+        }
+
         // If user presses any non-seek key, immediately flush any pending debounced seek
         let is_seek_key = matches!(
             (key.code, key.modifiers),
@@ -19,12 +73,12 @@ impl AppUI {
                 | (KeyCode::Right, KeyModifiers::CONTROL)
                 | (KeyCode::Right, KeyModifiers::ALT)
                 | (KeyCode::Char(']'), KeyModifiers::NONE)
-                | (KeyCode::Char('>'), _)
+                | (KeyCode::Char('>'), KeyModifiers::NONE)
                 | (KeyCode::Left, KeyModifiers::SHIFT)
                 | (KeyCode::Left, KeyModifiers::CONTROL)
                 | (KeyCode::Left, KeyModifiers::ALT)
                 | (KeyCode::Char('['), KeyModifiers::NONE)
-                | (KeyCode::Char('<'), _)
+                | (KeyCode::Char('<'), KeyModifiers::NONE)
         );
         if !is_seek_key && self.pending_seek_target.is_some() {
             self.flush_pending_seek();
@@ -39,19 +93,6 @@ impl AppUI {
             self.flush_pending_track_skip();
         }
 
-        // If help modal is open, let Esc, q, or ? dismiss it
-        if self.show_help_modal {
-            if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
-                self.player.stop()?;
-                return Ok(true);
-            }
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')) {
-                self.show_help_modal = false;
-                return Ok(false);
-            }
-            return Ok(false);
-        }
-
         // If mix picker modal is open, intercept input
         if self.show_mix_picker_modal {
             if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
@@ -60,27 +101,27 @@ impl AppUI {
             }
             // One row per profile the picker lists; digits 1 to that count pick a profile.
             let count = crate::analysis::MixProfile::picker_profiles().len();
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('M') => {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) | (KeyCode::Char('q' | 'M'), KeyModifiers::NONE) => {
                     self.show_mix_picker_modal = false;
                     return Ok(false);
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
                     self.mix_picker_cursor = (self.mix_picker_cursor + count - 1) % count;
                     return Ok(false);
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
                     self.mix_picker_cursor = (self.mix_picker_cursor + 1) % count;
                     return Ok(false);
                 }
-                KeyCode::Char(c) => {
+                (KeyCode::Char(c), KeyModifiers::NONE) => {
                     match c.to_digit(10).map(|d| d as usize) {
                         Some(d) if (1..=count).contains(&d) => self.apply_mix_picker_selection(d - 1),
                         _ => {}
                     }
                     return Ok(false);
                 }
-                KeyCode::Enter => {
+                (KeyCode::Enter, _) => {
                     self.apply_mix_picker_selection(self.mix_picker_cursor);
                     return Ok(false);
                 }
@@ -131,7 +172,7 @@ impl AppUI {
                 KeyCode::Backspace => {
                     input.pop();
                 }
-                KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+                KeyCode::Char(c) if key.modifiers.is_empty() => {
                     input.push(c);
                 }
                 _ => {}
@@ -208,8 +249,7 @@ impl AppUI {
             (KeyCode::Char('5'), KeyModifiers::NONE) => {
                 self.active_tab = 4;
             }
-            // Terminals send an uppercase letter with SHIFT (Shift held or Caps Lock on).
-            (KeyCode::Char('n' | 'N'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            (KeyCode::Char('n' | 'N'), KeyModifiers::NONE) => {
                 if self.active_tab == 0 {
                     self.active_tab = 1;
                 } else {
@@ -263,7 +303,7 @@ impl AppUI {
             | (KeyCode::Right, KeyModifiers::CONTROL)
             | (KeyCode::Right, KeyModifiers::ALT)
             | (KeyCode::Char(']'), KeyModifiers::NONE)
-            | (KeyCode::Char('>'), _) => {
+            | (KeyCode::Char('>'), KeyModifiers::NONE) => {
                 let step = self.settings_mgr.settings.seek_step_seconds;
                 self.accumulate_seek(step);
                 self.update_web_state();
@@ -272,7 +312,7 @@ impl AppUI {
             | (KeyCode::Left, KeyModifiers::CONTROL)
             | (KeyCode::Left, KeyModifiers::ALT)
             | (KeyCode::Char('['), KeyModifiers::NONE)
-            | (KeyCode::Char('<'), _) => {
+            | (KeyCode::Char('<'), KeyModifiers::NONE) => {
                 let step = self.settings_mgr.settings.seek_step_seconds;
                 self.accumulate_seek(-step);
                 self.update_web_state();
@@ -318,7 +358,7 @@ impl AppUI {
                     self.open_fuzzy_search();
                 }
             }
-            (KeyCode::Char('z' | 'Z'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            (KeyCode::Char('z' | 'Z'), KeyModifiers::NONE) => {
                 if !self.queue.is_empty() {
                     self.queue.shuffle();
                     self.status_message = "🔀 Queue shuffled".to_string();
@@ -337,7 +377,7 @@ impl AppUI {
                 };
                 self.start_autopilot(target_dir);
             }
-            (KeyCode::Char('P'), _) | (KeyCode::Char('p'), KeyModifiers::SHIFT) => {
+            (KeyCode::Char('P'), KeyModifiers::NONE) => {
                 let target_dir = if self.in_bookmarks_view {
                     if self.browser_cursor > 0 && self.browser_cursor < self.browser_entries.len() {
                         self.browser_entries[self.browser_cursor].1.clone()
@@ -349,18 +389,150 @@ impl AppUI {
                 };
                 self.reshuffle_autopilot(target_dir);
             }
-            (KeyCode::Char('M'), _) | (KeyCode::Char('m'), KeyModifiers::SHIFT) => {
+            (KeyCode::Char('M'), KeyModifiers::NONE) => {
                 self.show_mix_picker_modal = !self.show_mix_picker_modal;
                 self.mix_picker_cursor = self.active_mix_profile.picker_index();
                 self.mix_picker_list = ListState::default();
             }
-            (KeyCode::Char('L'), _) | (KeyCode::Char('l'), KeyModifiers::SHIFT) => {
+            (KeyCode::Char('L'), KeyModifiers::NONE) => {
                 self.open_add_picker();
             }
             _ => {
                 // Tab specific key handling
                 self.handle_tab_key_with_modifiers(key.code, key.modifiers);
             }
+        }
+        Ok(false)
+    }
+
+    /// Keys while the fuzzy search is open: letters (`q` included) are query text. Returns true
+    /// when the app should quit.
+    fn handle_search_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Some(ref mut modal) = self.search_modal else {
+            return Ok(false);
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                if let Some(mut m) = self.search_modal.take() {
+                    m.close();
+                }
+                self.player.stop()?;
+                return Ok(true);
+            }
+            (KeyCode::Esc, _) => {
+                if let Some(mut m) = self.search_modal.take() {
+                    m.close();
+                }
+            }
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                let track_opt = modal.selected_track().cloned();
+                if let Some(mut m) = self.search_modal.take() {
+                    m.close();
+                }
+                if let Some(track) = track_opt {
+                    let title = track.display_title().to_string();
+                    self.register_stream_file(&track.filepath);
+                    self.queue.add_track(track);
+                    self.status_message = format!("Added to queue: {}", title);
+                }
+            }
+            (KeyCode::Tab, KeyModifiers::NONE) => {
+                if let Some(track) = modal.selected_track().cloned() {
+                    self.register_stream_file(&track.filepath);
+                    self.queue.add_track(track.clone());
+                    self.status_message = format!("Added to queue: {}", track.display_title());
+                }
+            }
+            (KeyCode::BackTab, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+                let tracks = modal.all_filtered_tracks();
+                let count = tracks.len();
+                if let Some(mut m) = self.search_modal.take() {
+                    m.close();
+                }
+                for t in tracks {
+                    self.register_stream_file(&t.filepath);
+                    self.queue.add_track(t);
+                }
+                self.status_message = format!("Added {} tracks to queue", count);
+            }
+            (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                modal.move_selection_up();
+            }
+            (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                modal.move_selection_down();
+            }
+            (KeyCode::PageUp, _)
+            | (KeyCode::Char('u'), KeyModifiers::CONTROL)
+            | (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+                modal.page_up(15);
+            }
+            (KeyCode::PageDown, _)
+            | (KeyCode::Char('d'), KeyModifiers::CONTROL)
+            | (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+                modal.page_down(15);
+            }
+            (KeyCode::Home, _) => {
+                modal.home();
+            }
+            (KeyCode::End, _) => {
+                modal.end();
+            }
+            (KeyCode::Backspace, _) => {
+                modal.backspace();
+            }
+            (KeyCode::Char(c), KeyModifiers::NONE) => {
+                modal.append_char(c);
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    /// Keys while the library spotlight is open: characters are its query. Returns true when the
+    /// app should quit.
+    fn handle_spotlight_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                self.close_spotlight();
+                self.player.stop()?;
+                return Ok(true);
+            }
+            (KeyCode::Esc, _) => {
+                self.close_spotlight();
+            }
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                self.close_spotlight();
+                if self.browser_cursor < self.browser_entries.len() {
+                    let (_, path, is_dir) = self.browser_entries[self.browser_cursor].clone();
+                    if is_dir {
+                        self.navigate_browser(path);
+                    } else {
+                        let meta = self.quick_metadata(&path);
+                        let title = meta.display_title().to_string();
+                        self.enqueue_tracks(vec![meta]);
+                        self.status_message = format!("Added to queue: {}", title);
+                    }
+                }
+            }
+            (KeyCode::Down, _) | (KeyCode::Tab, KeyModifiers::NONE) => {
+                self.spotlight_next_match();
+            }
+            (KeyCode::Up, _) | (KeyCode::BackTab, _) => {
+                self.spotlight_prev_match();
+            }
+            (KeyCode::Backspace, _) => {
+                if let Some(ref mut q) = self.browser_spotlight {
+                    q.pop();
+                }
+                self.jump_spotlight_to_first_match();
+            }
+            (KeyCode::Char(c), KeyModifiers::NONE) => {
+                if let Some(ref mut q) = self.browser_spotlight {
+                    q.push(c);
+                }
+                self.jump_spotlight_to_first_match();
+            }
+            _ => {}
         }
         Ok(false)
     }
@@ -416,6 +588,8 @@ impl AppUI {
         self.handle_tab_key_with_modifiers(code, KeyModifiers::NONE);
     }
 
+    /// The active tab's and pane's keys, for a key `handle_input_key` has normalised
+    /// (`normalize_key`): an uppercase letter comes with `NONE`, not `SHIFT`.
     pub fn handle_tab_key_with_modifiers(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         match self.active_tab {
             // Now Playing Tab: `r` is its only tab key
@@ -470,7 +644,7 @@ impl AppUI {
                     (KeyCode::PageUp, _)
                     | (KeyCode::Char('u'), KeyModifiers::CONTROL)
                     | (KeyCode::Char('b'), KeyModifiers::CONTROL)
-                    | (KeyCode::Char('K'), _)
+                    | (KeyCode::Char('K'), KeyModifiers::NONE)
                     | (KeyCode::Up, KeyModifiers::SHIFT) => {
                         if self.queue_focus {
                             self.page_up_queue();
@@ -481,7 +655,7 @@ impl AppUI {
                     (KeyCode::PageDown, _)
                     | (KeyCode::Char('d'), KeyModifiers::CONTROL)
                     | (KeyCode::Char('f'), KeyModifiers::CONTROL)
-                    | (KeyCode::Char('J'), _)
+                    | (KeyCode::Char('J'), KeyModifiers::NONE)
                     | (KeyCode::Down, KeyModifiers::SHIFT) => {
                         if self.queue_focus {
                             self.page_down_queue();
@@ -496,7 +670,7 @@ impl AppUI {
                             self.home_browser();
                         }
                     }
-                    (KeyCode::End, _) | (KeyCode::Char('G'), _) => {
+                    (KeyCode::End, _) | (KeyCode::Char('G'), KeyModifiers::NONE) => {
                         if self.queue_focus {
                             self.end_queue();
                         } else {
@@ -606,7 +780,7 @@ impl AppUI {
                             self.status_message = "No track in queue to start Seed Radio".to_string();
                         }
                     }
-                    (KeyCode::Char('H'), _) => {
+                    (KeyCode::Char('H'), KeyModifiers::NONE) => {
                         let target = if self.in_bookmarks_view
                             && self.browser_cursor > 0
                             && self.browser_cursor <= self.bookmarks.len()
@@ -626,7 +800,7 @@ impl AppUI {
                         }
                         self.update_web_state();
                     }
-                    (KeyCode::Char('~'), _) => {
+                    (KeyCode::Char('~'), KeyModifiers::NONE) => {
                         let home = if let Some(ref h) = self.settings_mgr.settings.home_dir {
                             PathBuf::from(h)
                         } else if let Some(base) = directories::BaseDirs::new() {
@@ -665,7 +839,7 @@ impl AppUI {
                     }
                     (KeyCode::PageUp, _)
                     | (KeyCode::Char('u'), KeyModifiers::CONTROL)
-                    | (KeyCode::Char('K'), _)
+                    | (KeyCode::Char('K'), KeyModifiers::NONE)
                     | (KeyCode::Up, KeyModifiers::SHIFT) => {
                         let step = 10;
                         if self.devices_cursor >= step {
@@ -678,7 +852,7 @@ impl AppUI {
                     }
                     (KeyCode::PageDown, _)
                     | (KeyCode::Char('d'), KeyModifiers::CONTROL)
-                    | (KeyCode::Char('J'), _)
+                    | (KeyCode::Char('J'), KeyModifiers::NONE)
                     | (KeyCode::Down, KeyModifiers::SHIFT) => {
                         let step = 10;
                         if self.devices_cursor + step < total_devices {
@@ -692,7 +866,7 @@ impl AppUI {
                     (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => {
                         self.devices_cursor = 0;
                     }
-                    (KeyCode::End, _) | (KeyCode::Char('G'), _) => {
+                    (KeyCode::End, _) | (KeyCode::Char('G'), KeyModifiers::NONE) => {
                         self.devices_cursor = total_devices.saturating_sub(1);
                     }
                     (KeyCode::Enter, KeyModifiers::NONE) => {
@@ -723,14 +897,14 @@ impl AppUI {
                     (KeyCode::PageUp, _)
                     | (KeyCode::Home, _)
                     | (KeyCode::Char('g'), KeyModifiers::NONE)
-                    | (KeyCode::Char('K'), _)
+                    | (KeyCode::Char('K'), KeyModifiers::NONE)
                     | (KeyCode::Up, KeyModifiers::SHIFT) => {
                         self.settings_cursor = SETTING_DISPLAY_ORDER[0];
                     }
                     (KeyCode::PageDown, _)
                     | (KeyCode::End, _)
-                    | (KeyCode::Char('G'), _)
-                    | (KeyCode::Char('J'), _)
+                    | (KeyCode::Char('G'), KeyModifiers::NONE)
+                    | (KeyCode::Char('J'), KeyModifiers::NONE)
                     | (KeyCode::Down, KeyModifiers::SHIFT) => {
                         self.settings_cursor = SETTING_DISPLAY_ORDER[SETTING_DISPLAY_ORDER.len() - 1];
                     }

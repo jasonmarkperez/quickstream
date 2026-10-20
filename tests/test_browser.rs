@@ -271,11 +271,11 @@ fn test_browser_paging_and_jump_shortcuts() {
     );
     assert_eq!(app.browser_cursor, 20);
 
-    // 3. Shift+J (uppercase J) jumps by page height (20 -> 30)
-    app.handle_tab_key_with_modifiers(
+    // 3. Shift+J (uppercase J, as the terminal sends it) jumps by page height (20 -> 30)
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Char('J'),
         crossterm::event::KeyModifiers::SHIFT,
-    );
+    ));
     assert_eq!(app.browser_cursor, 30);
 
     // 4. Ctrl+F jumps by page height (30 -> 40)
@@ -286,10 +286,10 @@ fn test_browser_paging_and_jump_shortcuts() {
     assert_eq!(app.browser_cursor, 40);
 
     // 5. End / G jumps directly to last item
-    app.handle_tab_key_with_modifiers(
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Char('G'),
         crossterm::event::KeyModifiers::SHIFT,
-    );
+    ));
     assert_eq!(app.browser_cursor, last_idx);
 
     // 6. PageDown at last item wraps to 0
@@ -308,10 +308,10 @@ fn test_browser_paging_and_jump_shortcuts() {
     assert_eq!(app.browser_cursor, last_idx - 10);
 
     // 9. Shift+K jumps up by page height
-    app.handle_tab_key_with_modifiers(
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Char('K'),
         crossterm::event::KeyModifiers::SHIFT,
-    );
+    ));
     assert_eq!(app.browser_cursor, last_idx - 20);
 
     // 10. Home / g jumps directly to index 0
