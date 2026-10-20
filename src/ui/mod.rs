@@ -84,6 +84,20 @@ pub enum DirScanEvent {
     },
 }
 
+/// Builds the player an output switch moves to, in place of mpv or a renderer client (tests).
+pub type OutputPlayerFactory = Box<dyn FnMut() -> Box<dyn AudioPlayer> + Send>;
+
+/// What the new output picks up when playback moves to it (issue #48), worked out from the old
+/// player before it stops.
+enum HandOff {
+    /// Nothing was playing or paused: the new output starts idle.
+    Idle,
+    /// Start the queue's current track at `position`, paused when `paused`.
+    Resume { position: f64, paused: bool },
+    /// The current track is over: move on as at its natural end, paused when `paused`.
+    NextTrack { paused: bool },
+}
+
 /// Create a local (mpv/ffplay) player that runs on its own worker thread.
 fn spawn_local_player(backend: &str, initial_volume: u8) -> Box<dyn AudioPlayer> {
     let backend = backend.to_string();
@@ -244,6 +258,13 @@ pub struct AppUI {
     pub status_message: String,
     pub queue: PlaybackQueue,
     pub player: Box<dyn AudioPlayer>,
+    /// The file the player was last told to play, so an output switch can tell whether it still
+    /// holds the queue's current track (issue #48). `None` before anything played and while the
+    /// continuous stream plays (it follows the queue itself).
+    player_track: Option<PathBuf>,
+    /// Builds the player an output switch moves to instead of mpv / a renderer client
+    /// (`set_output_player_factory`, for tests).
+    output_player_factory: Option<OutputPlayerFactory>,
     pub device_manager: DeviceManager,
     pub settings_mgr: SettingsManager,
     /// Shared with background scanners; clone the handle, never the map (issue #4).
@@ -443,6 +464,8 @@ impl AppUI {
             web_server,
             web_state,
             web_cmd_rx,
+            player_track: None,
+            output_player_factory: None,
             pending_seek_delta: 0.0,
             pending_seek_target: None,
             last_seek_key_time: None,
@@ -1289,6 +1312,8 @@ impl AppUI {
                     s.is_playing = true;
                     s.is_paused = false;
                 }
+                // The stream follows the queue itself: no single file is the player's.
+                self.player_track = None;
                 let _ = self.player.play(Path::new("__continuous__.wav"));
             } else {
                 if let Ok(mut s) = self.web_state.write() {
@@ -1573,6 +1598,14 @@ impl AppUI {
     /// renderer) never blocks the UI. Shutdown waits for it, so mpv is gone before the process exits.
     fn retire_player(&mut self, player: Box<dyn AudioPlayer>) {
         self.workers.spawn("retire-player", move || drop(player));
+    }
+
+    /// Build the player every later output switch moves to with `factory`, instead of starting
+    /// mpv or a renderer client (tests use a stand-in player). Public only because integration
+    /// tests in `tests/` drive `AppUI` directly.
+    #[doc(hidden)]
+    pub fn set_output_player_factory(&mut self, factory: OutputPlayerFactory) {
+        self.output_player_factory = Some(factory);
     }
 
     /// Replace the tag reader used by workers started from now on (tests use a counting or
@@ -2871,6 +2904,7 @@ impl AppUI {
             if let Ok(mut s) = self.web_state.write() {
                 s.filepath = Some(path.clone());
             }
+            self.player_track = Some(path.clone());
             match self.player.play(&path) {
                 Ok(_) => {
                     self.status_message.clear();
@@ -2930,6 +2964,7 @@ impl AppUI {
             if let Ok(mut s) = self.web_state.write() {
                 s.filepath = Some(path.clone());
             }
+            self.player_track = Some(path.clone());
             match self.player.play(&path) {
                 Ok(_) => {
                     self.status_message.clear();
@@ -2977,6 +3012,7 @@ impl AppUI {
             if let Ok(mut s) = self.web_state.write() {
                 s.filepath = Some(path.clone());
             }
+            self.player_track = Some(path.clone());
             match self.player.play(&path) {
                 Ok(_) => {
                     self.status_message.clear();
@@ -3223,46 +3259,139 @@ impl AppUI {
         }
     }
 
-    /// Length of the track the current output plays, for [`resume_position`]: the player's when
-    /// it knows it, else the track's own (0 when neither is known). Read before the old player
-    /// stops; the new one's `play_at` returns before it has loaded the file.
+    /// Whether the player holds the queue's current track. Not while a debounced skip is
+    /// pending (the queue moved, the player not yet), nor once the queue moved on without it
+    /// (the track it played removed, or the queue cleared and refilled while it played on).
+    /// Trusted while the app hasn't told it to play anything (`player_track` is `None`).
+    fn player_holds_current_track(&self) -> bool {
+        if self.pending_track_skip {
+            return false;
+        }
+        match &self.player_track {
+            None => true,
+            Some(path) => self.queue.current_track().is_some_and(|t| t.filepath == *path),
+        }
+    }
+
+    /// Length of the current track for [`resume_position`], as [`Self::playback_times`] takes
+    /// it: the player's while it is playing or paused and holds the current track (a tag length
+    /// can be an estimate), else the track's own (0 when neither is known). Read before the old
+    /// player stops; the new one's `play_at` returns before it has loaded the file.
     fn resume_duration(&self) -> f64 {
+        let loaded = self.player.is_playing() || self.player.is_paused();
         let reported = self.player.duration_seconds();
-        if reported.is_finite() && reported > 0.0 {
+        if loaded && self.player_holds_current_track() && reported.is_finite() && reported > 0.0 {
             return reported;
         }
         self.queue.current_track().map(|t| t.duration_seconds).unwrap_or(0.0)
     }
 
-    /// Where the new output picks up the current track, read from the old player before it
-    /// stops, and whether the old player had already reported the track finished. Such a report
-    /// the event loop has not handled yet would be lost with the retired player and leave the
-    /// queue stuck, so the track is over then too, though the player no longer reads as playing.
-    fn resume_on_new_output(&mut self) -> (Resume, bool) {
-        if self.player.is_track_finished() {
-            return (Resume::NextTrack, true);
+    /// What the new output picks up, worked out from the old player before it stops (issue
+    /// #48). A pending debounced skip or seek is applied here, as any other key applies it, but
+    /// on the new output only:
+    /// - a pending skip: its target (already the current track) plays from its start;
+    /// - a pending seek: its target is the position, so a seek back out of the last second
+    ///   resumes there and a seek into it moves on.
+    ///
+    /// A track end the old player reported but the event loop has not handled would be lost with
+    /// the retired player and leave the queue stuck, so the track is over then too. When the
+    /// player no longer holds the current track, its position and end say nothing about it: the
+    /// current track starts from 0:00.
+    fn take_hand_off(&mut self) -> HandOff {
+        let holds = self.player_holds_current_track();
+        let skip_pending = std::mem::take(&mut self.pending_track_skip);
+        self.last_track_skip_time = None;
+        let seek_target = self.pending_seek_target.take();
+        self.pending_seek_delta = 0.0;
+        self.last_seek_key_time = None;
+        if self.queue.current_track().is_none() {
+            return HandOff::Idle;
         }
-        (
-            resume_position(self.player.position_seconds(), self.resume_duration()),
-            false,
-        )
+        if skip_pending {
+            return HandOff::Resume {
+                position: 0.0,
+                paused: false,
+            };
+        }
+        let paused = self.player.is_paused();
+        if self.player.is_track_finished() {
+            return if holds {
+                HandOff::NextTrack { paused }
+            } else {
+                HandOff::Resume { position: 0.0, paused }
+            };
+        }
+        if !self.player.is_playing() && !paused {
+            return HandOff::Idle;
+        }
+        if !holds {
+            return HandOff::Resume { position: 0.0, paused };
+        }
+        let position = seek_target.unwrap_or_else(|| self.player.position_seconds());
+        match resume_position(position, self.resume_duration()) {
+            Resume::At(position) => HandOff::Resume { position, paused },
+            Resume::NextTrack => HandOff::NextTrack { paused },
+        }
     }
 
-    /// An output switch found the track over (issue #48): move on as at its natural end, so
-    /// stop-at-end and repeat-one behave as usual. A paused track's successor loads paused.
-    fn finish_track_after_switch(&mut self, was_paused: bool) {
-        self.handle_track_finished();
-        if was_paused && self.player.is_playing() {
-            let _ = self.player.pause();
+    /// The player the switch moves to: the test seam's, else `build`'s.
+    fn output_player(&mut self, build: impl FnOnce() -> Box<dyn AudioPlayer>) -> Box<dyn AudioPlayer> {
+        match self.output_player_factory.as_mut() {
+            Some(factory) => factory(),
+            None => build(),
+        }
+    }
+
+    /// Put `new_player` in place of the old output (retired on a worker) and pick up `hand_off`
+    /// on it, then show `status`. A track found over moves on as at its natural end
+    /// (`handle_track_finished`: stop-at-end and repeat-one as usual, a held skip while a
+    /// playlist is still being checked); a paused track's successor loads paused. When that
+    /// left a status of its own (`Playback error: …`, `Waiting for the rest of …`), it stays.
+    fn hand_off_to(&mut self, new_player: Box<dyn AudioPlayer>, hand_off: HandOff, status: String) {
+        let old = std::mem::replace(&mut self.player, new_player);
+        self.retire_player(old);
+        match hand_off {
+            HandOff::Idle => self.status_message = status,
+            HandOff::Resume { position, paused } => {
+                if let Some(path) = self.queue.current_track().map(|t| t.filepath.clone()) {
+                    if let Some(ref ws) = self.web_server {
+                        ws.register_stream_file(&path);
+                    }
+                    if let Ok(mut s) = self.web_state.write() {
+                        s.filepath = Some(path.clone());
+                    }
+                    self.player_track = Some(path.clone());
+                    if self.player.play_at(&path, position).is_ok() && paused {
+                        let _ = self.player.pause();
+                    }
+                }
+                self.status_message = status;
+            }
+            HandOff::NextTrack { paused } => {
+                self.status_message.clear();
+                self.handle_track_finished();
+                if paused {
+                    if self.player.is_playing() {
+                        let _ = self.player.pause();
+                    } else {
+                        self.pause_after_held_skip();
+                    }
+                }
+                if self.status_message.is_empty() {
+                    self.status_message = status;
+                }
+            }
         }
     }
 
     pub fn switch_to_local_player(&mut self) {
-        let was_playing = self.player.is_playing();
-        let was_paused = self.player.is_paused();
-        let (resume, finished) = self.resume_on_new_output();
+        self.switch_output_to_local("Active output: Local Audio".to_string());
+    }
+
+    /// Move playback to Local Audio, showing `status` once there.
+    fn switch_output_to_local(&mut self, status: String) {
+        let hand_off = self.take_hand_off();
         let vol = self.player.volume();
-        let current_track = self.queue.current_track().cloned();
 
         self.player.detach_stream_state();
         let _ = self.player.stop();
@@ -3272,37 +3401,21 @@ impl AppUI {
         self.device_manager.set_active_device(None);
 
         let backend = self.settings_mgr.settings.player_backend.clone();
-        let mut new_player = spawn_local_player(&backend, vol);
+        let mut new_player = self.output_player(|| spawn_local_player(&backend, vol));
         let _ = new_player.set_volume(vol);
 
-        let mut track_over = false;
-        if let Some(track) = current_track {
-            if was_playing || was_paused || finished {
-                match resume {
-                    Resume::At(pos) => {
-                        if let Ok(mut s) = self.web_state.write() {
-                            s.filepath = Some(track.filepath.clone());
-                        }
-                        if new_player.play_at(&track.filepath, pos).is_ok() && was_paused {
-                            let _ = new_player.pause();
-                        }
-                    }
-                    Resume::NextTrack => track_over = true,
-                }
-            }
-        }
-
-        let old = std::mem::replace(&mut self.player, new_player);
-        self.retire_player(old);
-        if track_over {
-            self.finish_track_after_switch(was_paused);
-        }
-        self.status_message = "Active output: Local Audio".to_string();
+        self.hand_off_to(new_player, hand_off, status);
         self.sync_web_server();
         self.update_web_state();
     }
 
     pub fn switch_to_upnp_player(&mut self, dev: crate::discovery::DLNADevice) {
+        let status = format!("Active output: {}", dev.friendly_name);
+        self.switch_output_to_upnp(dev, status);
+    }
+
+    /// Move playback to the renderer `dev`, showing `status` once there.
+    fn switch_output_to_upnp(&mut self, dev: crate::discovery::DLNADevice, status: String) {
         // Re-selecting the active renderer is a no-op: a new player would queue Play while the
         // old player's delayed Stop could still reach the same device.
         if self
@@ -3310,17 +3423,14 @@ impl AppUI {
             .get_active_device()
             .is_some_and(|d| d.udn == dev.udn)
         {
-            self.status_message = format!("Active output: {}", dev.friendly_name);
+            self.status_message = status;
             return;
         }
         let bind = self.web_bind_for_renderer(Some(&dev));
         let port = self
             .ensure_web_server_bound(bind)
             .unwrap_or(self.settings_mgr.settings.web_server_port);
-        let was_playing = self.player.is_playing();
-        let was_paused = self.player.is_paused();
-        let (resume, finished) = self.resume_on_new_output();
-        let current_track = self.queue.current_track().cloned();
+        let hand_off = self.take_hand_off();
 
         self.player.detach_stream_state();
         let _ = self.player.stop();
@@ -3337,40 +3447,18 @@ impl AppUI {
         // Built on the worker thread: UPnPPlayer::new queries the renderer's volume over the network.
         // Do NOT overwrite the remote hardware volume with local software volume!
         // The UPnP device preserves its own hardware volume setting.
-        let mut upnp_player: Box<dyn AudioPlayer> = Box::new(AsyncPlayer::spawn(
-            move || Box::new(crate::player::upnp::UPnPPlayer::new(worker_dev, port).with_stream_state(stream_state)),
-            // The renderer's volume is unknown until UPnPPlayer::new has queried it. Report 0 rather
-            // than the local volume so a volume key in that window cannot jump the speaker.
-            0,
-        ));
+        let upnp_player = self.output_player(|| {
+            Box::new(AsyncPlayer::spawn(
+                move || {
+                    Box::new(crate::player::upnp::UPnPPlayer::new(worker_dev, port).with_stream_state(stream_state))
+                },
+                // The renderer's volume is unknown until UPnPPlayer::new has queried it. Report 0 rather
+                // than the local volume so a volume key in that window cannot jump the speaker.
+                0,
+            ))
+        });
 
-        let status = format!("Active output: {}", dev.friendly_name);
-        let mut track_over = false;
-        if let Some(track) = current_track {
-            if was_playing || was_paused || finished {
-                match resume {
-                    Resume::At(pos) => {
-                        if let Some(ref ws) = self.web_server {
-                            ws.register_stream_file(&track.filepath);
-                        }
-                        if let Ok(mut s) = self.web_state.write() {
-                            s.filepath = Some(track.filepath.clone());
-                        }
-                        if upnp_player.play_at(&track.filepath, pos).is_ok() && was_paused {
-                            let _ = upnp_player.pause();
-                        }
-                    }
-                    Resume::NextTrack => track_over = true,
-                }
-            }
-        }
-
-        let old = std::mem::replace(&mut self.player, upnp_player);
-        self.retire_player(old);
-        if track_over {
-            self.finish_track_after_switch(was_paused);
-        }
-        self.status_message = status;
+        self.hand_off_to(upnp_player, hand_off, status);
         self.update_web_state();
     }
 
@@ -3510,12 +3598,10 @@ impl AppUI {
                 crate::web::WebCommand::SelectDevice(id) => {
                     let devices = self.device_manager.get_devices();
                     if id == 0 {
-                        self.switch_to_local_player();
-                        self.status_message = "Switched to Local Audio (web)".to_string();
+                        self.switch_output_to_local("Switched to Local Audio (web)".to_string());
                     } else if let Some(dev) = devices.get(id.saturating_sub(1)) {
-                        let name = dev.friendly_name.clone();
-                        self.switch_to_upnp_player(dev.clone());
-                        self.status_message = format!("Switched to {} (web)", name);
+                        let status = format!("Switched to {} (web)", dev.friendly_name);
+                        self.switch_output_to_upnp(dev.clone(), status);
                     }
                     self.update_web_state();
                 }

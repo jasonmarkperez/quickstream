@@ -1,12 +1,17 @@
-//! An `AudioPlayer` that only holds the state a test gives it, for rendering tests that need a
-//! player playing at a known position or reporting a given backend.
+//! An `AudioPlayer` that only holds the state a test gives it, for tests that need a player
+//! playing at a known position or reporting a given backend, or need to see what it was asked
+//! to play (`calls`).
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use quickstream::player::AudioPlayer;
 
 #[derive(Clone, Debug)]
 pub struct FakePlayer {
+    /// Every `play` / `play_at` / `pause` it was asked for (`play_at <file name> <seconds>`),
+    /// shared with the test.
+    pub calls: Arc<Mutex<Vec<String>>>,
     pub playing: bool,
     pub paused: bool,
     pub position: f64,
@@ -21,6 +26,7 @@ pub struct FakePlayer {
 impl Default for FakePlayer {
     fn default() -> Self {
         Self {
+            calls: Arc::default(),
             playing: false,
             paused: false,
             position: 0.0,
@@ -44,14 +50,36 @@ impl FakePlayer {
     }
 }
 
+/// The file name of `path`, as [`FakePlayer::calls`] records it.
+fn name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+impl FakePlayer {
+    fn record(&self, call: String) {
+        self.calls.lock().unwrap().push(call);
+    }
+}
+
 impl AudioPlayer for FakePlayer {
-    fn play(&mut self, _filepath: &Path) -> anyhow::Result<()> {
+    fn play(&mut self, filepath: &Path) -> anyhow::Result<()> {
+        self.record(format!("play {}", name(filepath)));
         self.playing = true;
         self.paused = false;
         self.position = 0.0;
         Ok(())
     }
+    fn play_at(&mut self, filepath: &Path, position_seconds: f64) -> anyhow::Result<()> {
+        self.record(format!("play_at {} {}", name(filepath), position_seconds));
+        self.playing = true;
+        self.paused = false;
+        self.position = position_seconds.max(0.0);
+        Ok(())
+    }
     fn pause(&mut self) -> anyhow::Result<()> {
+        self.record("pause".to_string());
         self.playing = false;
         self.paused = true;
         Ok(())
