@@ -56,7 +56,10 @@ mod autopilot;
 mod browser;
 mod event_loop;
 pub use event_loop::TickClock;
+mod folder_checks;
+pub use folder_checks::{folder_exists, PathCheck};
 mod keys;
+pub use keys::normalize_key;
 mod output;
 mod playback;
 mod queue_ops;
@@ -90,6 +93,8 @@ pub enum DirScanEvent {
         scan_id: u64,
         dir: PathBuf,
         message: String,
+        /// The failed read's kind: `~` reports a home that isn't there in its own words.
+        kind: io::ErrorKind,
     },
 }
 
@@ -120,6 +125,14 @@ struct PendingFolder {
     dir: PathBuf,
     cursor: CursorTarget,
     opened: Instant,
+}
+
+/// `~` opening the startup home, while its scan runs (`home_jump`).
+struct HomeJump {
+    home: PathBuf,
+    /// The folder the browser was still reading when the home was shown in its place, and the
+    /// entry its cursor was on: opened again if the home isn't there.
+    left: Option<(PathBuf, CursorTarget)>,
 }
 
 /// Builds the player an output switch moves to, in place of mpv or a renderer client (tests).
@@ -253,6 +266,12 @@ pub struct AppUI {
     folder_open_deadline: Duration,
     /// Lists folders on the `dir-scan` worker (`set_dir_reader`).
     dir_reader: DirReader,
+    /// The startup home `~` is opening, while its scan runs: a home that isn't there reads
+    /// `Home directory not found` and the folder shown before stays (or is read again).
+    home_jump: Option<HomeJump>,
+    /// Checks on the Autopilot workers whether the folder a start prefers is there
+    /// (`set_path_check`).
+    folder_checks: folder_checks::FolderChecks,
     pub queue_cursor: usize,
     pub devices_cursor: usize,
     pub settings_cursor: usize,
@@ -313,6 +332,11 @@ pub struct AppUI {
     pub autopilot_dir: Option<PathBuf>,
     pub autopilot_rx: Option<std::sync::mpsc::Receiver<crate::library::AutopilotEvent>>,
     pub autopilot_scan_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The folder a start's worker chose (the preferred one, else the fallback), while it checks.
+    autopilot_folder_rx: Option<std::sync::mpsc::Receiver<PathBuf>>,
+    /// While `autopilot_folder_rx` waits, the folder `autopilot_dir` named before that start:
+    /// the next mix's fallback meanwhile, and what Esc puts back (`cancel_autopilot_start`).
+    autopilot_settled_dir: Option<PathBuf>,
     pub is_autopilot_scanning: bool,
     pub autopilot_run_mode: AutopilotRunMode,
     pub autopilot_added_count: usize,
@@ -447,6 +471,8 @@ impl AppUI {
             dir_reader: std::sync::Arc::new(|dir: &std::path::Path| {
                 std::fs::read_dir(dir).map(|entries| Box::new(entries) as DirEntries)
             }),
+            home_jump: None,
+            folder_checks: folder_checks::FolderChecks::new(std::sync::Arc::new(folder_exists)),
             queue_cursor: 0,
             devices_cursor: 0,
             settings_cursor: SETTING_DISPLAY_ORDER[0],
@@ -492,6 +518,8 @@ impl AppUI {
             autopilot_dir: None,
             autopilot_rx: None,
             autopilot_scan_stop: None,
+            autopilot_folder_rx: None,
+            autopilot_settled_dir: None,
             is_autopilot_scanning: false,
             autopilot_run_mode: AutopilotRunMode::Fresh,
             autopilot_added_count: 0,
@@ -540,6 +568,14 @@ impl AppUI {
     #[doc(hidden)]
     pub fn set_dir_reader(&mut self, reader: DirReader) {
         self.dir_reader = reader;
+    }
+
+    /// Replace how Autopilot workers check that the folder a start prefers is there (tests: a
+    /// check held back like a slow share). Public only because integration tests in `tests/`
+    /// drive `AppUI` directly.
+    #[doc(hidden)]
+    pub fn set_path_check(&mut self, check: PathCheck) {
+        self.folder_checks = folder_checks::FolderChecks::new(check);
     }
 
     /// Replace how long a folder being opened keeps the previous one on screen before it is

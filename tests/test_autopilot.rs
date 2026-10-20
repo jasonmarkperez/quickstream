@@ -151,7 +151,7 @@ fn test_web_autopilot_and_shuffle_actions() {
         assert!(resp.starts_with("HTTP/1.1 200 OK"));
 
         let cmd = rx.recv_timeout(Duration::from_secs(2)).expect("Command not received");
-        assert_eq!(cmd, WebCommand::Autopilot(Some(jazz.clone())));
+        assert_eq!(cmd, WebCommand::Autopilot(jazz.clone()));
     }
 
     // 2. Send POST /api/action with action: "shuffle"
@@ -705,7 +705,7 @@ fn test_web_autopilot_reshuffle_action() {
     app.queue.set_current_index(0);
 
     // Send WebCommand::AutopilotReshuffle
-    tx.send(WebCommand::AutopilotReshuffle(Some(temp_dir.clone()))).unwrap();
+    tx.send(WebCommand::AutopilotReshuffle(temp_dir.clone())).unwrap();
 
     app.handle_web_commands();
     assert_eq!(app.autopilot_run_mode, quickstream::ui::AutopilotRunMode::Reshuffle);

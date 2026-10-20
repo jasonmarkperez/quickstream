@@ -138,16 +138,9 @@ impl AppUI {
                     }
                     self.update_web_state();
                 }
-                crate::web::WebCommand::Autopilot(path_opt) => {
-                    if let Some(target) = path_opt.or_else(|| self.web_terminal_folder()) {
-                        self.start_autopilot(target);
-                    }
-                }
-                crate::web::WebCommand::AutopilotReshuffle(path_opt) => {
-                    if let Some(target) = path_opt.or_else(|| self.web_terminal_folder()) {
-                        self.reshuffle_autopilot(target);
-                    }
-                }
+                // The web thread resolved the folder inside the allowed ones (issue #102).
+                crate::web::WebCommand::Autopilot(target) => self.start_autopilot(target),
+                crate::web::WebCommand::AutopilotReshuffle(target) => self.reshuffle_autopilot(target),
                 crate::web::WebCommand::ShuffleQueue => {
                     // The shuffle keeps the current track in front: for the continuous stream's
                     // wrap that is the track it plays next, which it may have named since this
@@ -204,19 +197,6 @@ impl AppUI {
                 }
             }
         }
-    }
-
-    /// The folder the terminal is browsing, for web commands that name no folder. `None` (with a
-    /// status message) when it lies outside the folders the web dashboard may act on.
-    fn web_terminal_folder(&mut self) -> Option<PathBuf> {
-        let resolved = crate::web_access::resolve_allowed_path(&self.browser_dir, &self.web_allowed_roots());
-        if resolved.is_none() {
-            self.status_message = format!(
-                "Ignored web request: {} is outside your home, bookmarks and launch folder",
-                self.browser_dir.display()
-            );
-        }
-        resolved
     }
 
     /// Folders the web dashboard may browse and act on: the startup home, the bookmarks and the
@@ -279,6 +259,7 @@ impl AppUI {
             state.is_scanning = self.device_manager.is_scanning();
             state.home_dir = self.settings_mgr.settings.home_dir.clone();
             state.current_browser_dir = self.browser_dir.to_string_lossy().to_string();
+            state.terminal_dir = Some(self.browser_dir.clone());
             state.allowed_roots = self.web_allowed_roots();
             state.bookmarks = self.bookmarks.clone();
             state.is_autopilot = self.autopilot_dir.is_some();
