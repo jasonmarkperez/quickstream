@@ -2483,12 +2483,15 @@ pub fn serve_continuous_stream(
         "Connection: close\r\n",
         "\r\n"
     );
-    stream.write_all(headers.as_bytes())?;
     if is_head {
+        stream.write_all(headers.as_bytes())?;
         stream.flush()?;
         return Ok(());
     }
 
+    // Mark the session active before the client can read anything, the response head included,
+    // so a client that has the 200 always sees `is_active` (#79); the guard clears it if a write
+    // fails.
     let cid = conn_id.unwrap_or(0);
     let controller = stream_state.continuous.clone();
     controller.active_conn_id.store(cid, Ordering::SeqCst);
@@ -2523,8 +2526,7 @@ pub fn serve_continuous_stream(
         conn_id: cid,
     };
 
-    // Mark the session active before the client can read any body bytes, so a client that has
-    // the WAV header always sees `is_active`; the guard clears it if this write fails.
+    stream.write_all(headers.as_bytes())?;
     let wav_hdr = make_continuous_wav_header();
     stream.write_all(&wav_hdr)?;
     stream.flush()?;
