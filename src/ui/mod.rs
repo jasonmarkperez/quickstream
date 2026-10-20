@@ -3199,8 +3199,9 @@ impl AppUI {
     }
 
     /// Interfaces the web server must listen on right now: the LAN while a DLNA renderer is
-    /// active or the user enabled LAN access, otherwise loopback only. With LAN access off,
-    /// network peers get only `/stream/*` (`NowPlayingState::remote_access`).
+    /// active or the user enabled LAN access, otherwise loopback only. Unless Web Remote Access
+    /// and the web server are both on (`Settings::web_remote_access`), network peers get only
+    /// `/stream/*` (`NowPlayingState::remote_access`).
     pub fn required_web_bind(&self) -> crate::web::WebBind {
         let device = self.device_manager.get_active_device();
         self.web_bind_for_renderer(device.as_ref())
@@ -3241,7 +3242,7 @@ impl AppUI {
             }
             None => self.settings_mgr.settings.web_server_port,
         };
-        // update_web_state skips its publish while no server runs: the setting may have changed.
+        // Before the first request: the setting may have changed since the last publish.
         if let Ok(mut state) = self.web_state.write() {
             state.remote_access = self.settings_mgr.settings.web_remote_access();
         }
@@ -3784,6 +3785,11 @@ impl AppUI {
     }
 
     pub fn update_web_state(&mut self) {
+        // Published even while no server runs, so a server started later never begins with an
+        // old value.
+        if let Ok(mut state) = self.web_state.write() {
+            state.remote_access = self.settings_mgr.settings.web_remote_access();
+        }
         if self.web_server.is_none() {
             return;
         }
@@ -3806,7 +3812,6 @@ impl AppUI {
             state.current_browser_dir = self.browser_dir.to_string_lossy().to_string();
             state.allowed_roots = self.web_allowed_roots();
             state.bookmarks = self.bookmarks.clone();
-            state.remote_access = self.settings_mgr.settings.web_remote_access();
             state.is_autopilot = self.autopilot_dir.is_some();
             state.autopilot_dir = self.autopilot_dir.as_ref().map(|d| d.to_string_lossy().to_string());
             state.active_mix_profile = self.active_mix_profile.name();

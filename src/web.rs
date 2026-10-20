@@ -4190,6 +4190,14 @@ const NOW_PLAYING_HTML: &str = r##"<!DOCTYPE html>
     async function pollStatus() {
       try {
         const res = await fetch('/api/status?t=' + Date.now());
+        if (res.status === 403) {
+          const body = await res.json().catch(() => ({}));
+          if (body.error === "remote access is off") {
+            document.getElementById('statusDot').className = "status-dot";
+            document.getElementById('statusLabel').textContent = "REMOTE ACCESS OFF";
+            return;
+          }
+        }
         if (!res.ok) throw new Error("Status failed");
         const data = await res.json();
         renderStatus(data);

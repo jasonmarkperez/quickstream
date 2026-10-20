@@ -11,14 +11,17 @@ use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use quickstream::settings::setting;
 use quickstream::web::{NowPlayingState, WebBrowserResponse, WebCommand, WebServer};
 use quickstream::web_access::{
-    authorize, is_acceptable_root, load_or_create_token, resolve_allowed_path, AllowedRoots, AuthDecision, AuthHeaders,
+    authorize, is_acceptable_root, load_or_create_token, resolve_allowed_path, write_decision_response, AllowedRoots,
+    AuthDecision, AuthHeaders, REMOTE_ACCESS_OFF,
 };
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const PORT: u16 = 8080;
-/// The Web Remote Access setting (`web_server_lan`), passed to `authorize`.
+/// `Settings::web_remote_access` (Web Remote Access and the web server both on), passed to
+/// `authorize`.
 const REMOTE_ON: bool = true;
 const REMOTE_OFF: bool = false;
 
@@ -1129,6 +1132,8 @@ fn web_app(start_dir: PathBuf, home: Option<String>) -> quickstream::ui::AppUI {
     settings_mgr.settings.web_server_lan = false;
     settings_mgr.settings.web_server_port = 0;
     settings_mgr.settings.home_dir = home;
+    // Tests that turn Web Remote Access on must not look the LAN address up for real.
+    settings_mgr.set_lan_ip_resolver(|| "192.0.2.10".to_string());
     quickstream::ui::AppUI::new(Some(start_dir), settings_mgr)
 }
 
@@ -1205,6 +1210,8 @@ fn test_app_publishes_remote_access_setting_to_web_state() {
     let mut settings_mgr = quickstream::settings::SettingsManager::new();
     settings_mgr.settings.web_server_enabled = false;
     settings_mgr.settings.web_server_lan = true;
+    // AppUI::new looks the LAN address up early while remote access is on: not for real here.
+    settings_mgr.set_lan_ip_resolver(|| "192.0.2.10".to_string());
     let idle = quickstream::ui::AppUI::new(Some(dir.clone()), settings_mgr);
     assert!(idle.web_server.is_none());
     assert!(!idle.web_state.read().unwrap().remote_access);
@@ -1224,6 +1231,92 @@ fn test_app_publishes_remote_access_setting_to_web_state() {
     app.update_web_state();
     assert!(!app.web_state.read().unwrap().remote_access);
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_turning_web_remote_access_off_closes_the_gate_at_once() {
+    common::isolate();
+    let dir = temp_dir("remote_access_cycle");
+    fs::create_dir_all(&dir).unwrap();
+    let mut app = web_app(dir.clone(), None);
+    // On in memory only, so the server stays on loopback (no firewall prompt).
+    app.settings_mgr.settings.web_server_lan = true;
+    app.update_web_state();
+    assert!(app.web_state.read().unwrap().remote_access);
+
+    // Changed on the Settings tab: refused from the next request, not from the next tick.
+    app.settings_cursor = setting::WEB_SERVER_LAN;
+    app.cycle_and_apply_setting(true);
+    assert!(!app.settings_mgr.settings.web_server_lan);
+    assert!(app.web_server.is_some());
+    assert!(!app.web_state.read().unwrap().remote_access);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_turning_the_web_server_off_closes_the_gate_while_no_server_runs() {
+    common::isolate();
+    let dir = temp_dir("remote_access_server_off");
+    fs::create_dir_all(&dir).unwrap();
+    let mut app = web_app(dir.clone(), None);
+    app.settings_mgr.settings.web_server_lan = true;
+    app.update_web_state();
+    assert!(app.web_state.read().unwrap().remote_access);
+
+    // The server stops (no renderer), and the state the next server starts with says off.
+    app.settings_cursor = setting::WEB_SERVER_ENABLED;
+    app.cycle_and_apply_setting(true);
+    assert!(!app.settings_mgr.settings.web_server_enabled);
+    assert!(app.web_server.is_none());
+    assert!(!app.web_state.read().unwrap().remote_access);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_server_start_publishes_remote_access_before_serving() {
+    common::isolate();
+    let dir = temp_dir("remote_access_start");
+    fs::create_dir_all(&dir).unwrap();
+    let mut app = web_app(dir.clone(), None);
+    app.settings_mgr.settings.web_server_enabled = false;
+    app.sync_web_server();
+    assert!(app.web_server.is_none());
+
+    // A value left from before: the start replaces it before the first request is served.
+    app.web_state.write().unwrap().remote_access = true;
+    app.settings_mgr.settings.web_server_enabled = true;
+    app.ensure_web_server_started();
+    assert!(app.web_server.is_some());
+    assert!(!app.web_state.read().unwrap().remote_access);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_remote_access_off_pages_name_the_setting() {
+    common::isolate();
+    let decision = AuthDecision::Forbidden(REMOTE_ACCESS_OFF);
+    assert_eq!(
+        authorize(lan_peer(), PORT, "GET", "/", &AuthHeaders::default(), TOKEN, REMOTE_OFF),
+        decision
+    );
+
+    let mut page = Vec::new();
+    write_decision_response(&mut page, &decision, "/", TOKEN, PORT).unwrap();
+    let page = String::from_utf8(page).unwrap();
+    assert!(page.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{}", page);
+    assert!(page.contains("Content-Type: text/html"), "{}", page);
+    assert!(page.contains("Web Remote Access"), "{}", page);
+
+    // The API keeps its JSON error, which the dashboard shows instead of OFFLINE.
+    let mut api = Vec::new();
+    write_decision_response(&mut api, &decision, "/api/status", TOKEN, PORT).unwrap();
+    let api = String::from_utf8(api).unwrap();
+    assert!(api.contains("Content-Type: application/json"), "{}", api);
+    assert!(
+        api.ends_with(r#"{"error":"remote access is off","ok":false}"#),
+        "{}",
+        api
+    );
 }
 
 #[test]

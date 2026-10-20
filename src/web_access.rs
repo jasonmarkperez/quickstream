@@ -136,6 +136,9 @@ fn is_loopback_host(host: &str, port: u16) -> bool {
         .any(|name| host == format!("{}:{}", name, port) || (port == 80 && host == *name))
 }
 
+/// Why a network peer is refused while remote access is off (the dashboard shows it).
+pub const REMOTE_ACCESS_OFF: &str = "remote access is off";
+
 /// Decide whether a request may proceed. `server_port` is the port the request arrived on;
 /// `remote_access` is `Settings::web_remote_access` (Web Remote Access and the web server both
 /// on), which network peers need for every route but `/stream/*`.
@@ -165,7 +168,7 @@ pub fn authorize(
         return AuthDecision::Allow;
     } else if !remote_access {
         // The server may listen on the LAN only for a renderer's streams.
-        return AuthDecision::Forbidden("remote access is off");
+        return AuthDecision::Forbidden(REMOTE_ACCESS_OFF);
     } else {
         let is_dashboard = route == "/" || route == "/index.html";
         if read_only && is_dashboard {
@@ -228,6 +231,15 @@ max-width:32rem;margin:15vh auto;padding:0 1.25rem;line-height:1.5}a{color:#7aa2
 (it ends in <code>/?token=&hellip;</code>). After that, this page opens normally.</p>\
 <p><a href=\"/\">Retry</a></p></body></html>";
 
+const REMOTE_ACCESS_OFF_HTML: &str = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Quickstream</title>\
+<style>body{font-family:-apple-system,system-ui,sans-serif;background:#0b0b10;color:#e8e8ef;\
+max-width:32rem;margin:15vh auto;padding:0 1.25rem;line-height:1.5}a{color:#7aa2ff}</style></head>\
+<body><h1>Quickstream</h1><p>Remote access is off.</p>\
+<p>To use this page from another device, turn on <b>Web Remote Access</b> and \
+<b>Now Playing Web Server</b> in Quickstream under <b>[4] Settings</b>.</p>\
+<p><a href=\"/\">Retry</a></p></body></html>";
+
 /// Write the response for a non-`Allow` decision. `server_port` names the session cookie.
 pub fn write_decision_response(
     out: &mut impl Write,
@@ -266,6 +278,12 @@ pub fn write_decision_response(
             "application/json",
             serde_json::json!({ "ok": false, "error": reason }).to_string(),
             "Cache-Control: no-store\r\n".to_string(),
+        ),
+        AuthDecision::Forbidden(reason) if *reason == REMOTE_ACCESS_OFF => (
+            "403 Forbidden",
+            "text/html; charset=utf-8",
+            REMOTE_ACCESS_OFF_HTML.to_string(),
+            "Cache-Control: no-store\r\nX-Frame-Options: DENY\r\n".to_string(),
         ),
         AuthDecision::Forbidden(reason) => (
             "403 Forbidden",
