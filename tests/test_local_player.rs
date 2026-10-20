@@ -2,7 +2,7 @@ mod common;
 
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use quickstream::player::local::LocalPlayer;
 use quickstream::player::AudioPlayer;
@@ -29,6 +29,20 @@ fn ensure_test_file() -> PathBuf {
     path
 }
 
+/// Poll `cond` every 20 ms until it holds or `timeout` has passed. Returns whether it held.
+fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cond() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The mpv lifecycle test needs mpv itself: without it LocalPlayer falls back to ffplay, which
 /// exits at once on machines without an audio device (CI runners).
 fn mpv_available() -> bool {
@@ -49,15 +63,15 @@ fn test_local_playback_lifecycle() {
     let res = player.play(&test_file);
     assert!(res.is_ok(), "play failed: {:?}", res);
 
-    // Give mpv a brief moment to decode audio and report position
-    thread::sleep(Duration::from_millis(400));
+    // mpv reports a position once it has decoded some audio; on a loaded machine that can take
+    // well over the 400 ms this test used to sleep (#89).
+    let started = wait_until(Duration::from_secs(10), || player.position_seconds() > 0.0);
+    let pos = player.position_seconds();
+    println!("Reported position: {:.3}s", pos);
+    assert!(started, "mpv never reported a position");
     assert!(player.is_playing(), "player should be playing");
     assert!(!player.is_paused(), "player should not be paused");
     assert!(!player.is_track_finished(), "track should not be finished yet");
-
-    let pos = player.position_seconds();
-    println!("Reported position: {:.3}s", pos);
-    assert!(pos > 0.0, "Position should be > 0.0s after 400ms of playback");
 
     // Test pause
     assert!(player.pause().is_ok());
@@ -71,7 +85,9 @@ fn test_local_playback_lifecycle() {
 
     // Test seek forward
     assert!(player.seek_to(4.0).is_ok());
-    thread::sleep(Duration::from_millis(250));
+    wait_until(Duration::from_secs(5), || {
+        (3.8..=4.5).contains(&player.position_seconds())
+    });
     let pos_after_seek = player.position_seconds();
     assert!(
         (3.8..=4.5).contains(&pos_after_seek),
@@ -81,7 +97,9 @@ fn test_local_playback_lifecycle() {
 
     // Test relative seek backward
     assert!(player.seek(-1.5).is_ok());
-    thread::sleep(Duration::from_millis(250));
+    wait_until(Duration::from_secs(5), || {
+        (2.0..=3.3).contains(&player.position_seconds())
+    });
     let pos_after_rel = player.position_seconds();
     assert!(
         (2.0..=3.3).contains(&pos_after_rel),
