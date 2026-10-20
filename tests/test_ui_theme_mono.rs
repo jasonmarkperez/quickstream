@@ -224,6 +224,79 @@ fn cursor_chips_and_keycaps_show_in_reverse_video() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The cells of row `y` that show (text, or reverse video) and are faint.
+fn faint_cells(buffer: &Buffer, y: u16) -> Vec<(u16, String)> {
+    (0..buffer.area.width)
+        .filter(|&x| {
+            let cell = &buffer[(x, y)];
+            (cell.symbol() != " " || cell.modifier.contains(Modifier::REVERSED))
+                && cell.modifier.contains(Modifier::DIM)
+        })
+        .map(|x| (x, buffer[(x, y)].symbol().to_string()))
+        .collect()
+}
+
+#[test]
+fn key_row_under_a_modal_is_not_faint() {
+    common::isolate();
+    mono();
+    let (mut app, dir) = mono_app("keyrow");
+    // The key row is drawn after the screen under the modal is made faint: its keycaps, labels
+    // and status read as they do without a modal.
+    for modal in ["help", "search"] {
+        app.status_message = "Added to queue: Tidewater".to_string();
+        if modal == "help" {
+            press(&mut app, KeyCode::Char('?'));
+            assert!(app.show_help_modal);
+        } else {
+            search(&mut app, &dir);
+        }
+        let buffer = tui::render(&mut app, 120, 40);
+        let y = buffer.area.height - 2;
+        let row = tui::row(&buffer, y);
+        assert!(row.contains("Added to queue: Tidewater"), "{modal}: {row:?}");
+        assert!(row.contains("ESC"), "{modal}: {row:?}");
+        assert_eq!(faint_cells(&buffer, y), vec![], "{modal}: {row:?}");
+        // The keycaps are still in reverse video.
+        assert!(reversed_cells(&buffer, y) >= 5, "{modal}: no keycaps");
+        // While the screen above it is faint.
+        let header = tui::text_styles(&buffer, "QUICKSTREAM").expect("header");
+        assert!(header.iter().all(|s| s.add_modifier.contains(Modifier::DIM)), "{modal}");
+        app.show_help_modal = false;
+        if let Some(mut search) = app.search_modal.take() {
+            search.close();
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn spotlight_footnote_keycap_and_query_are_not_faint() {
+    common::isolate();
+    mono();
+    let (mut app, dir) = mono_app("spotlight");
+    app.queue_focus = false;
+    app.open_spotlight();
+    app.browser_spotlight = Some("zq".to_string());
+    let buffer = tui::render(&mut app, 120, 40);
+    // The footnote is drawn over DIM; its keycap, query, block cursor and count are not faint.
+    let (x, y) = tui::find_text(&buffer, " /   zq ").expect("spotlight footnote");
+    let styles = tui::text_styles(&buffer, " /   zq ").unwrap();
+    for (i, s) in styles.iter().enumerate() {
+        let blank = i == 3 || i == 4;
+        assert!(blank || !s.add_modifier.contains(Modifier::DIM), "cell {i}: {s:?}");
+    }
+    assert!((x..x + 3).all(|x| reversed(&buffer, x, y)), "keycap ` / `");
+    assert!(styles[5].add_modifier.contains(Modifier::BOLD), "query in bold");
+    assert!(reversed(&buffer, x + 7, y), "block cursor");
+    let count = tui::text_styles(&buffer, "NO MATCHING SUBFOLDERS").expect("count");
+    assert!(
+        count.iter().all(|s| !s.add_modifier.contains(Modifier::DIM)),
+        "{count:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn no_color_output_keeps_the_attributes() {
     common::isolate();

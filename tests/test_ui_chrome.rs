@@ -174,27 +174,53 @@ fn colorterm_truecolor_wins_over_a_basic_term() {
 #[test]
 fn basic_terms_select_the_named_colours() {
     common::isolate();
+    // crossterm writes a named colour as a 256-colour index (`ESC[38;5;Nm`), so Basic is only for
+    // terminals that read those with 16 colours: the Linux console and the `*-16color` entries.
     for term in [
         "linux",
         "linux-16color",
         "xterm-16color",
         "rxvt-16color",
-        "xterm-8color",
         "screen-16color",
         "screen.linux",
-        "xterm-color",
-        "vt100",
-        "vt102",
-        "vt220",
-        "ansi",
-        "dumb",
-        "cons25",
         "LINUX",
     ] {
         for colorterm in [None, Some(""), Some("256color")] {
             assert_eq!(
                 ColorDepth::from_env(colorterm, Some(term), false),
                 ColorDepth::Basic,
+                "TERM={term} COLORTERM={colorterm:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn eight_colour_and_monochrome_terms_select_mono() {
+    common::isolate();
+    // These cannot show the 256-colour indexes crossterm writes for named colours (and with 8
+    // colours DIM, index 8, can fall back to black on the black ground): no colour at all.
+    for term in [
+        "xterm-8color",
+        "screen-8color",
+        "xterm-color",
+        "ansi",
+        "ansi-m",
+        "vt52",
+        "vt100",
+        "vt100-am",
+        "vt102",
+        "vt220",
+        "vt320",
+        "dumb",
+        "cons25",
+        "linux-m",
+        "VT100",
+    ] {
+        for colorterm in [None, Some(""), Some("256color")] {
+            assert_eq!(
+                ColorDepth::from_env(colorterm, Some(term), false),
+                ColorDepth::Mono,
                 "TERM={term} COLORTERM={colorterm:?}"
             );
         }
@@ -269,8 +295,8 @@ fn basic_palette_keeps_the_tokens_apart() {
     ] {
         assert!(NAMED_ANSI.contains(&c), "{name} is {c:?}, not a named ANSI colour");
     }
-    // Text in INK, MID, DIM, RULE (the dimmed screen under a modal) and ERROR reads differently,
-    // and none of it vanishes into GROUND.
+    // Text in INK, MID, DIM, RULE and ERROR reads differently, and none of it vanishes into
+    // GROUND.
     let fgs = [p.ink, p.mid, p.dim, p.rule, p.error];
     for (i, a) in fgs.iter().enumerate() {
         assert_ne!(*a, p.ground, "{a:?} on GROUND");
@@ -352,6 +378,78 @@ fn mono_palette_draws_no_colour_and_marks_with_attributes() {
 }
 
 #[test]
+fn basic_dims_the_screen_under_a_modal_to_dim() {
+    common::isolate();
+    // RULE is blue in Basic, which would make the screen under a modal stand out more than the
+    // modal's own DIM text; it is drawn in DIM there, still apart from GROUND.
+    let p = Palette::BASIC;
+    assert_eq!(p.dimmed(), Style::new().fg(p.dim).bg(p.ground));
+    assert_ne!(p.dim, p.ground);
+    assert_ne!(p.dim, p.rule);
+    // RULE stays the rules' colour and the keycaps' background.
+    assert_eq!(p.rule(), Style::new().fg(p.rule));
+    assert_eq!(p.keycap(), Style::new().fg(p.ink).bg(p.rule));
+}
+
+#[test]
+fn mono_styles_drawn_over_faint_cells_are_not_faint() {
+    common::isolate();
+    let p = Palette::MONO;
+    // Faint (DIM) stands in for a colour, so a style drawn over a faint cell (the key row over
+    // the screen dimmed under a modal, a footnote's spans over DIM) clears it, as a new colour
+    // would replace the old one.
+    for (name, s) in [
+        ("ink", p.ink()),
+        ("mid", p.mid()),
+        ("bold", p.bold()),
+        ("label(true)", p.label(true)),
+        ("label(false)", p.label(false)),
+        ("keycap", p.keycap()),
+        ("chip", p.chip(false)),
+        ("error chip", p.chip(true)),
+        ("error", p.error()),
+        ("cursor", p.cursor()),
+    ] {
+        assert!(s.sub_modifier.contains(Modifier::DIM), "{name}: {s:?}");
+        for under in [p.dim(), p.rule(), p.dimmed()] {
+            let drawn = under.patch(s);
+            assert!(
+                !drawn.add_modifier.contains(Modifier::DIM),
+                "{name} over {under:?}: {drawn:?}"
+            );
+        }
+    }
+    // And the faint styles clear reverse video and bold, which stand in for a background and
+    // for INK, so faint text drawn over them is plainly faint.
+    for (name, s) in [("dim", p.dim()), ("rule", p.rule()), ("dimmed", p.dimmed())] {
+        assert!(
+            s.sub_modifier.contains(Modifier::REVERSED | Modifier::BOLD),
+            "{name}: {s:?}"
+        );
+        for over in [p.bold(), p.error(), p.keycap(), p.cursor()] {
+            let drawn = over.patch(s);
+            assert_eq!(drawn.add_modifier, Modifier::DIM, "{name} over {over:?}: {drawn:?}");
+        }
+    }
+}
+
+#[test]
+fn mono_error_chip_differs_from_the_other_chips() {
+    common::isolate();
+    let p = Palette::MONO;
+    // The delete confirmation's chip and its `Y` keycap must read as the error ones without
+    // colour: underlined as well as bold reverse video.
+    let error = p.chip(true);
+    assert!(error
+        .add_modifier
+        .contains(Modifier::REVERSED | Modifier::BOLD | Modifier::UNDERLINED));
+    for (name, other) in [("chip", p.chip(false)), ("cursor", p.cursor()), ("keycap", p.keycap())] {
+        assert!(!other.add_modifier.contains(Modifier::UNDERLINED), "{name}: {other:?}");
+        assert_ne!(error, other, "{name}");
+    }
+}
+
+#[test]
 fn coloured_palettes_never_use_reverse_video() {
     common::isolate();
     for p in [Palette::TRUECOLOR, Palette::INDEXED, Palette::BASIC] {
@@ -359,8 +457,10 @@ fn coloured_palettes_never_use_reverse_video() {
             assert!(!s.add_modifier.contains(Modifier::REVERSED), "{s:?}");
             assert!(!s.add_modifier.contains(Modifier::DIM), "{s:?}");
         }
-        assert_eq!(p.dimmed(), Style::new().fg(p.rule).bg(p.ground));
         assert_eq!(p.error(), Style::new().fg(p.error));
+    }
+    for p in [Palette::TRUECOLOR, Palette::INDEXED] {
+        assert_eq!(p.dimmed(), Style::new().fg(p.rule).bg(p.ground));
     }
     // The free functions are the chosen palette's.
     assert_eq!(theme::cursor(), Palette::TRUECOLOR.cursor());
