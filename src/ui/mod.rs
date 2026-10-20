@@ -57,7 +57,7 @@ mod browser;
 mod event_loop;
 pub use event_loop::TickClock;
 mod folder_checks;
-pub use folder_checks::{PathCheck, PathKind};
+pub use folder_checks::{folder_exists, PathCheck};
 mod keys;
 mod output;
 mod playback;
@@ -92,6 +92,8 @@ pub enum DirScanEvent {
         scan_id: u64,
         dir: PathBuf,
         message: String,
+        /// The failed read's kind: `~` reports a home that isn't there in its own words.
+        kind: io::ErrorKind,
     },
 }
 
@@ -255,23 +257,12 @@ pub struct AppUI {
     folder_open_deadline: Duration,
     /// Lists folders on the `dir-scan` worker (`set_dir_reader`).
     dir_reader: DirReader,
-    /// Looks paths up on `folder-check` workers (`set_path_check`).
-    path_check: PathCheck,
-    folder_check_tx: std::sync::mpsc::Sender<folder_checks::FolderCheckAnswer>,
-    folder_check_rx: std::sync::mpsc::Receiver<folder_checks::FolderCheckAnswer>,
-    /// The id of the last folder check started; answers to older ones are dropped.
-    folder_check_id: u64,
-    /// How many folder check answers `poll_folder_checks` has taken in (`folder_check_answers`).
-    folder_check_answers: u64,
-    /// The `~` key's check of the startup home, while it runs.
-    home_check: Option<folder_checks::HomeCheck>,
-    /// How many times `navigate_browser` has sent the browser somewhere; a `~` answer is
-    /// dropped if it changed after the key.
-    browser_navigations: u64,
-    /// The id of the mix picker's or Seed Radio's check of the folder Autopilot is to scan, and
-    /// the profile the scan is to use, while it runs; any other Autopilot start or the end of
-    /// the session drops it.
-    autopilot_check: Option<(u64, crate::analysis::MixProfile)>,
+    /// The startup home `~` is opening, while its scan runs: a home that isn't there reads
+    /// `Home directory not found` and the shown folder stays.
+    home_jump: Option<PathBuf>,
+    /// Checks on the Autopilot workers whether the folder a start prefers is there
+    /// (`set_path_check`).
+    folder_checks: folder_checks::FolderChecks,
     pub queue_cursor: usize,
     pub devices_cursor: usize,
     pub settings_cursor: usize,
@@ -332,6 +323,8 @@ pub struct AppUI {
     pub autopilot_dir: Option<PathBuf>,
     pub autopilot_rx: Option<std::sync::mpsc::Receiver<crate::library::AutopilotEvent>>,
     pub autopilot_scan_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The folder a start's worker chose (the preferred one, else the fallback), while it checks.
+    autopilot_folder_rx: Option<std::sync::mpsc::Receiver<PathBuf>>,
     pub is_autopilot_scanning: bool,
     pub autopilot_run_mode: AutopilotRunMode,
     pub autopilot_added_count: usize,
@@ -341,8 +334,6 @@ pub struct AppUI {
     /// Reads the current track's analysis features off the UI thread.
     track_features: features::TrackFeaturesWorker,
     pub active_mix_profile: crate::analysis::MixProfile,
-    /// The profile the latest Autopilot scan was started with (`autopilot_scan_profile`).
-    autopilot_scan_profile: Option<crate::analysis::MixProfile>,
     pub show_mix_picker_modal: bool,
     pub mix_picker_cursor: usize,
     /// The mix picker's scroll position on screens too short for every profile (reset on open).
@@ -441,7 +432,6 @@ impl AppUI {
         let metadata_cache = crate::library::MetadataCache::from(crate::library::LibraryManager::load_cache_map());
         let tag_reads = SharedTagReads::new(metadata_cache.clone(), metadata_tx.clone());
         let (dir_scan_tx, dir_scan_rx) = std::sync::mpsc::channel();
-        let (folder_check_tx, folder_check_rx) = std::sync::mpsc::channel();
         let analysis_db = crate::analysis::AnalysisDatabase::open_default()
             .unwrap_or_else(|_| crate::analysis::AnalysisDatabase::open_in_memory().unwrap());
         let active_mix_profile = settings_mgr.settings.mix_profile();
@@ -469,14 +459,8 @@ impl AppUI {
             dir_reader: std::sync::Arc::new(|dir: &std::path::Path| {
                 std::fs::read_dir(dir).map(|entries| Box::new(entries) as DirEntries)
             }),
-            path_check: std::sync::Arc::new(PathKind::of),
-            folder_check_tx,
-            folder_check_rx,
-            folder_check_id: 0,
-            folder_check_answers: 0,
-            home_check: None,
-            browser_navigations: 0,
-            autopilot_check: None,
+            home_jump: None,
+            folder_checks: folder_checks::FolderChecks::new(std::sync::Arc::new(folder_exists)),
             queue_cursor: 0,
             devices_cursor: 0,
             settings_cursor: SETTING_DISPLAY_ORDER[0],
@@ -522,6 +506,7 @@ impl AppUI {
             autopilot_dir: None,
             autopilot_rx: None,
             autopilot_scan_stop: None,
+            autopilot_folder_rx: None,
             is_autopilot_scanning: false,
             autopilot_run_mode: AutopilotRunMode::Fresh,
             autopilot_added_count: 0,
@@ -529,7 +514,6 @@ impl AppUI {
             track_features,
             analysis_db,
             active_mix_profile,
-            autopilot_scan_profile: None,
             show_mix_picker_modal: false,
             mix_picker_cursor: 0,
             mix_picker_list: ListState::default(),
@@ -573,11 +557,12 @@ impl AppUI {
         self.dir_reader = reader;
     }
 
-    /// Replace how `folder-check` workers look a path up (tests: a check held back like a slow
-    /// share). Public only because integration tests in `tests/` drive `AppUI` directly.
+    /// Replace how Autopilot workers check that the folder a start prefers is there (tests: a
+    /// check held back like a slow share). Public only because integration tests in `tests/`
+    /// drive `AppUI` directly.
     #[doc(hidden)]
     pub fn set_path_check(&mut self, check: PathCheck) {
-        self.path_check = check;
+        self.folder_checks = folder_checks::FolderChecks::new(check);
     }
 
     /// Replace how long a folder being opened keeps the previous one on screen before it is

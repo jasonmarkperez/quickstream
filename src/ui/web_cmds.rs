@@ -259,6 +259,7 @@ impl AppUI {
             state.is_scanning = self.device_manager.is_scanning();
             state.home_dir = self.settings_mgr.settings.home_dir.clone();
             state.current_browser_dir = self.browser_dir.to_string_lossy().to_string();
+            state.terminal_dir = Some(self.browser_dir.clone());
             state.allowed_roots = self.web_allowed_roots();
             state.bookmarks = self.bookmarks.clone();
             state.is_autopilot = self.autopilot_dir.is_some();

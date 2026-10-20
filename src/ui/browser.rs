@@ -165,6 +165,7 @@ impl AppUI {
     /// scan already sent is dropped too, also when no scan follows (Music Homes, a cache hit):
     /// the poll ignores another scan's events.
     fn stop_dir_scan(&mut self) {
+        self.home_jump = None;
         if let Some(stop) = self.dir_scan_stop.take() {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
             self.dir_scan_id += 1;
@@ -412,6 +413,7 @@ impl AppUI {
                             scan_id,
                             dir: scan_dir,
                             message: err.to_string(),
+                            kind: err.kind(),
                         });
                     }
                 }
@@ -507,6 +509,7 @@ impl AppUI {
                 self.browser_loading = false;
                 self.pending_parent_restore = None;
                 self.dir_scan_stop = None;
+                self.home_jump = None;
                 let load_duration = self.browser_load_start.take().map(|s| s.elapsed());
 
                 let item_count = self.browser_entries.len().saturating_sub(self.browser_header_rows());
@@ -531,8 +534,13 @@ impl AppUI {
                     }
                 }
             }
-            DirScanEvent::Error { message, .. } => {
-                if opening {
+            DirScanEvent::Error { message, kind, .. } => {
+                // `~` to a home that isn't there, or isn't a folder: the shown folder stays.
+                let home_missing = self.home_jump.take().is_some_and(|home| home == dir)
+                    && matches!(kind, std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory);
+                if opening && home_missing {
+                    self.pending_folder = None;
+                } else if opening {
                     self.show_pending_folder(false);
                 }
                 self.browser_loading = false;
@@ -551,7 +559,11 @@ impl AppUI {
                         ),
                     );
                 }
-                self.status_message = format!("Error reading directory '{}': {}", dir.display(), message);
+                self.status_message = if home_missing {
+                    format!("Home directory not found: {}", dir.display())
+                } else {
+                    format!("Error reading directory '{}': {}", dir.display(), message)
+                };
             }
         }
     }
@@ -658,8 +670,23 @@ impl AppUI {
         });
     }
 
+    /// `~`: open the startup home like any folder, so a slow share never stalls the key (issue
+    /// #103). A home that isn't there is reported when its scan fails (`Home directory not
+    /// found`), and the shown folder stays. Pressed again while the home is still being read,
+    /// that read goes on.
+    pub(super) fn jump_to_home(&mut self, home: PathBuf) {
+        self.status_message = format!("Jumped to home: {}", home.display());
+        let reading = self.opening_folder() == Some(home.as_path())
+            || (self.browser_loading && !self.in_bookmarks_view && self.browser_dir == home);
+        if !reading {
+            self.navigate_browser(home.clone());
+        }
+        if self.dir_scan_stop.is_some() {
+            self.home_jump = Some(home);
+        }
+    }
+
     pub fn navigate_browser(&mut self, path: PathBuf) {
-        self.browser_navigations += 1;
         self.close_spotlight();
 
         if path.to_string_lossy() == "___MUSIC_HOMES___" {

@@ -52,6 +52,10 @@ struct ActionPayload {
 }
 
 /// A JSON response for `/api/action`: status line and body.
+/// `autopilot` / `autopilot_reshuffle` without a path before the terminal has published its
+/// folder.
+pub const NO_TERMINAL_FOLDER: &str = "The terminal hasn't opened a folder yet";
+
 struct ActionResponse {
     status: &'static str,
     body: serde_json::Value,
@@ -87,7 +91,7 @@ impl ActionResponse {
 fn edit_playlist_action(
     payload: &ActionPayload,
     cmd_tx: &mpsc::Sender<WebCommand>,
-    allow: &mut dyn FnMut(String) -> Option<PathBuf>,
+    allow: &mut dyn FnMut(PathBuf) -> Option<PathBuf>,
 ) -> ActionResponse {
     let bad = |error: &str| ActionResponse::refused("400 Bad Request", error);
     let Some(name) = payload.name.clone() else {
@@ -107,7 +111,7 @@ fn edit_playlist_action(
             let Some(requested) = payload.path.clone() else {
                 return bad("Missing path");
             };
-            let Some(canonical) = allow(requested.clone()) else {
+            let Some(canonical) = allow(PathBuf::from(&requested)) else {
                 // Refused with 403 by the caller.
                 return ActionResponse::ok();
             };
@@ -614,17 +618,17 @@ pub(super) fn handle_client(
         // Paths must resolve inside the allowed folders; commands carry the resolved path.
         let (roots, terminal_dir) = {
             let current = state.read().unwrap();
-            (current.allowed_roots.clone(), current.current_browser_dir.clone())
+            (current.allowed_roots.clone(), current.terminal_dir.clone())
         };
         let mut rejected: Option<PathBuf> = None;
         // Canonicalized on first use, at most once per request.
         let mut allowed: Option<crate::web_access::AllowedRoots> = None;
-        let mut allow = |p: String| -> Option<PathBuf> {
+        let mut allow = |p: PathBuf| -> Option<PathBuf> {
             let resolved = allowed
                 .get_or_insert_with(|| crate::web_access::AllowedRoots::new(&roots))
-                .resolve(Path::new(&p));
+                .resolve(&p);
             if resolved.is_none() {
-                rejected = Some(PathBuf::from(p));
+                rejected = Some(p);
             }
             resolved
         };
@@ -675,12 +679,12 @@ pub(super) fn handle_client(
                     let _ = cmd_tx.send(WebCommand::ClearQueue);
                 }
                 "add_file" | "add_track" => {
-                    if let Some(p) = payload.path.and_then(&mut allow) {
+                    if let Some(p) = payload.path.map(PathBuf::from).and_then(&mut allow) {
                         let _ = cmd_tx.send(WebCommand::AddFile(p));
                     }
                 }
                 "add_folder" => {
-                    if let Some(p) = payload.path.and_then(&mut allow) {
+                    if let Some(p) = payload.path.map(PathBuf::from).and_then(&mut allow) {
                         let _ = cmd_tx.send(WebCommand::AddFolder(p));
                     }
                 }
@@ -702,21 +706,25 @@ pub(super) fn handle_client(
                         let _ = cmd_tx.send(WebCommand::SetHome(None));
                     }
                     Some(p) => {
-                        if let Some(dir) = allow(p) {
+                        if let Some(dir) = allow(p.into()) {
                             let _ = cmd_tx.send(WebCommand::SetHome(Some(dir.to_string_lossy().to_string())));
                         }
                     }
                 },
-                // Without a path, the folder the terminal is browsing: resolved here, never on
-                // the UI thread (issue #102).
-                "autopilot" => {
-                    if let Some(dir) = allow(payload.path.unwrap_or(terminal_dir)) {
-                        let _ = cmd_tx.send(WebCommand::Autopilot(dir));
-                    }
-                }
-                "autopilot_reshuffle" | "reshuffle" => {
-                    if let Some(dir) = allow(payload.path.unwrap_or(terminal_dir)) {
-                        let _ = cmd_tx.send(WebCommand::AutopilotReshuffle(dir));
+                // Without a path, the folder the terminal is browsing (as a path, so a non-UTF-8
+                // name stays intact): resolved here, never on the UI thread (issue #102).
+                "autopilot" | "autopilot_reshuffle" | "reshuffle" => {
+                    match payload.path.map(PathBuf::from).or(terminal_dir) {
+                        None => response = ActionResponse::refused("409 Conflict", NO_TERMINAL_FOLDER),
+                        Some(dir) => {
+                            if let Some(dir) = allow(dir) {
+                                let _ = cmd_tx.send(if payload.action == "autopilot" {
+                                    WebCommand::Autopilot(dir)
+                                } else {
+                                    WebCommand::AutopilotReshuffle(dir)
+                                });
+                            }
+                        }
                     }
                 }
                 "shuffle" => {
@@ -728,7 +736,7 @@ pub(super) fn handle_client(
                     }
                 }
                 "seed_radio" => {
-                    if let Some(p) = payload.path.and_then(&mut allow) {
+                    if let Some(p) = payload.path.map(PathBuf::from).and_then(&mut allow) {
                         let _ = cmd_tx.send(WebCommand::SeedRadio(p));
                     }
                 }

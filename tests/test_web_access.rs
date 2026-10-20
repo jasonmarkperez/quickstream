@@ -1358,7 +1358,7 @@ fn test_pathless_web_autopilot_resolves_terminal_folder_on_web_thread() {
     for action in ["autopilot", "autopilot_reshuffle", "reshuffle"] {
         let body = format!(r#"{{"action":"{}"}}"#, action);
         // The terminal is browsing outside the allowed folders: refused.
-        state.write().unwrap().current_browser_dir = elsewhere.to_string_lossy().to_string();
+        state.write().unwrap().terminal_dir = Some(elsewhere.clone());
         let (status, _, _) = post_json(port, &body);
         assert_eq!(status, 403, "{}", action);
         assert_eq!(
@@ -1371,7 +1371,12 @@ fn test_pathless_web_autopilot_resolves_terminal_folder_on_web_thread() {
 
         // Inside them (spelled with `..`), the command carries the folder resolved.
         let spelled = music.join("Jazz").join("..").join("Jazz");
-        state.write().unwrap().current_browser_dir = spelled.to_string_lossy().to_string();
+        {
+            let mut s = state.write().unwrap();
+            s.terminal_dir = Some(spelled.clone());
+            // The display string is not what is resolved.
+            s.current_browser_dir = elsewhere.to_string_lossy().to_string();
+        }
         let (status, _, _) = post_json(port, &body);
         assert_eq!(status, 200, "{}", action);
         let expected = if action == "autopilot" {
@@ -1382,6 +1387,78 @@ fn test_pathless_web_autopilot_resolves_terminal_folder_on_web_thread() {
         assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), expected);
     }
 
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Before the terminal has published its folder, a path-less Autopilot request is refused
+/// cleanly (409 with a message), not as a path outside the allowed folders.
+#[test]
+fn test_pathless_web_autopilot_is_refused_until_the_terminal_folder_is_known() {
+    common::isolate();
+    let dir = temp_dir("pathless_ap_unknown");
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    state.write().unwrap().allowed_roots = vec![dir.clone()];
+    let (handle, rx) = start(state);
+    let port = handle.port;
+
+    for action in ["autopilot", "autopilot_reshuffle", "reshuffle"] {
+        let (status, _, body) = post_json(port, &format!(r#"{{"action":"{}"}}"#, action));
+        assert_eq!(status, 409, "{}", action);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["ok"], false, "{}", action);
+        assert_eq!(body["error"], "The terminal hasn't opened a folder yet", "{}", action);
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "{}: nothing is sent",
+            action
+        );
+    }
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The app publishes the folder it browses as a path, the form a path-less Autopilot request
+/// resolves (the display string is lossy for non-UTF-8 names).
+#[test]
+fn test_app_publishes_the_terminal_folder_as_a_path() {
+    common::isolate();
+    let dir = temp_dir("terminal_dir");
+    let music = dir.join("Music");
+    fs::create_dir_all(&music).unwrap();
+    let mut app = web_app(music.clone(), None);
+    app.update_web_state();
+    assert_eq!(
+        app.web_state.read().unwrap().terminal_dir,
+        Some(app.browser_dir.clone())
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A folder whose name isn't UTF-8 (Linux allows any bytes) reaches Autopilot unchanged.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_pathless_web_autopilot_keeps_a_non_utf8_folder_name() {
+    common::isolate();
+    use std::os::unix::ffi::OsStrExt;
+    let dir = temp_dir("pathless_ap_bytes");
+    let folder = dir.join(std::ffi::OsStr::from_bytes(b"Caf\xe9"));
+    fs::create_dir_all(&folder).unwrap();
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    {
+        let mut s = state.write().unwrap();
+        s.allowed_roots = vec![dir.clone()];
+        s.terminal_dir = Some(folder.clone());
+        s.current_browser_dir = folder.to_string_lossy().to_string();
+    }
+    let (handle, rx) = start(state);
+    let (status, _, _) = post_json(handle.port, r#"{"action":"autopilot"}"#);
+    assert_eq!(status, 200);
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        WebCommand::Autopilot(folder)
+    );
     handle.stop();
     let _ = fs::remove_dir_all(&dir);
 }

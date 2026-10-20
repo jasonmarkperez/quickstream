@@ -170,6 +170,11 @@ pub struct NowPlayingState {
     /// bookmarks.json. Never sent with `/api/status`.
     #[serde(skip)]
     pub bookmarks: Vec<String>,
+    /// The folder the terminal is browsing, as a path (non-UTF-8 names intact), for
+    /// `autopilot` / `autopilot_reshuffle` without a path. `None` until the UI publishes it.
+    /// Never sent to clients.
+    #[serde(skip)]
+    pub terminal_dir: Option<PathBuf>,
     /// `Settings::web_remote_access` (Web Remote Access and the web server both on). While it is
     /// off, network peers get only `/stream/*` (`web_access::authorize`), even when a renderer has
     /// the server on the LAN.
@@ -220,6 +225,7 @@ impl Default for NowPlayingState {
             key: None,
             allowed_roots: Vec::new(),
             bookmarks: Vec::new(),
+            terminal_dir: None,
             remote_access: false,
             playlists: Arc::new(WebPlaylists::default()),
             playlists_version: 0,
@@ -248,7 +254,7 @@ pub enum WebCommand {
     SetQueueMode(String),
     SetHome(Option<String>),
     /// Start (or reshuffle) Autopilot in this folder: the one the request named, else the
-    /// terminal's (`current_browser_dir`), resolved inside the allowed folders by the web thread
+    /// terminal's (`terminal_dir`), resolved inside the allowed folders by the web thread
     /// (issue #102).
     Autopilot(PathBuf),
     AutopilotReshuffle(PathBuf),
