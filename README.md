@@ -108,7 +108,13 @@ quickstream/
 │   ├── library.rs        # walkdir directory indexing, jsonl cache persistence, progressive autopilot
 │   ├── metadata.rs       # lofty metadata extraction (tags, duration, audio properties, cover art)
 │   ├── queue.rs          # PlaybackQueue: ordered track list, cursors, auto-advance, reordering
-│   ├── web.rs            # Embedded web server, byte-range streaming, continuous WAV, REST API, Web UI
+│   ├── web/              # Embedded web server
+│   │   ├── mod.rs        # Module docs and pub re-exports
+│   │   ├── state.rs      # NowPlayingState and shared web types, WebCommand
+│   │   ├── server.rs     # Listener, connection limits, request parsing
+│   │   ├── api.rs        # Route dispatch and REST API
+│   │   ├── stream.rs     # Byte-range streaming, continuous WAV
+│   │   └── assets/index.html # Web UI (HTML/CSS/JS, embedded with include_str!)
 │   ├── web_access.rs     # Web access control: pairing token, Host/Origin checks, allowed folders
 │   ├── settings.rs       # Preferences model, cycle definitions, JSON persistence (~/.config/quickstream/config.json)
 │   ├── paths.rs          # XDG Base Directory resolution and legacy dotfile migration
