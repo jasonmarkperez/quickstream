@@ -59,6 +59,7 @@ pub use event_loop::TickClock;
 mod folder_checks;
 pub use folder_checks::{folder_exists, PathCheck};
 mod keys;
+pub use keys::normalize_key;
 mod output;
 mod playback;
 mod queue_ops;
