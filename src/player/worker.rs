@@ -194,6 +194,10 @@ fn refresh(player: &mut dyn AudioPlayer, shared: &Shared) {
         pending: 0,
         volume_pending: 0,
     };
+    // An error the backend found on its own (mpv couldn't play a file), not from a command.
+    if let Some(err) = player.take_error() {
+        *shared.last_error.lock().unwrap() = Some(err);
+    }
     let mut state = shared.state.lock().unwrap();
     state.backend = fresh.backend;
     if state.pending == 0 {
