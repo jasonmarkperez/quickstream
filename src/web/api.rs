@@ -584,7 +584,7 @@ fn answer_request(
                     .or_else(|| roots.iter().find_map(|r| allowed_dir(r))),
             };
             let Some(target_dir) = target_opt else {
-                crate::web_access::write_path_forbidden(&mut stream)?;
+                crate::web_access::write_path_forbidden(&mut stream, is_head)?;
                 return Ok(());
             };
 
@@ -814,9 +814,19 @@ fn answer_request(
                             let _ = cmd_tx.send(WebCommand::SetMixProfile(profile_str));
                         }
                     }
+                    // The terminal's folder only when the web may reach it, else the seed's
+                    // (issue #126); a terminal folder outside them is not the request's, so it is
+                    // passed over without a `PathRejected`.
                     "seed_radio" => {
-                        if let Some(p) = payload.path.map(PathBuf::from).and_then(&mut allow) {
-                            let _ = cmd_tx.send(WebCommand::SeedRadio(p));
+                        if let Some(seed) = payload.path.map(PathBuf::from).and_then(&mut allow) {
+                            let reachable = allowed.get_or_insert_with(|| crate::web_access::AllowedRoots::new(&roots));
+                            let dir = terminal_dir
+                                .and_then(|t| reachable.resolve(&t))
+                                .filter(|d| d.is_dir())
+                                .or_else(|| seed.parent().map(Path::to_path_buf));
+                            if let Some(dir) = dir {
+                                let _ = cmd_tx.send(WebCommand::SeedRadio { seed, dir });
+                            }
                         }
                     }
                     "playlist_play" | "playlist_append" => {
@@ -833,7 +843,7 @@ fn answer_request(
 
             if let Some(path) = rejected {
                 let _ = cmd_tx.send(WebCommand::PathRejected(path));
-                crate::web_access::write_path_forbidden(&mut stream)?;
+                crate::web_access::write_path_forbidden(&mut stream, false)?;
                 return Ok(());
             }
 

@@ -10,6 +10,7 @@ mod server;
 mod state;
 mod stream;
 
+pub(crate) use server::write_response;
 pub use server::{ServerLimits, WebBind, WebServer, WebServerHandle};
 pub use state::{
     NowPlayingState, PlaylistEdit, PlaylistReply, WebBrowserEntry, WebBrowserResponse, WebCommand, WebDeviceItem,

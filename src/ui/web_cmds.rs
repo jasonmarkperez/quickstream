@@ -170,9 +170,8 @@ impl AppUI {
                     self.status_message = format!("⚡ Mix Profile set to: {}", self.active_mix_profile.name());
                     self.update_web_state();
                 }
-                crate::web::WebCommand::SeedRadio(path) => {
-                    self.start_seed_radio(path);
-                }
+                // The web thread resolved the folder inside the allowed ones (issue #126).
+                crate::web::WebCommand::SeedRadio { seed, dir } => self.start_seed_radio_in(seed, dir),
                 crate::web::WebCommand::PathRejected(path) => {
                     self.status_message = format!(
                         "Ignored web request: {} is outside your home, bookmarks and launch folder",

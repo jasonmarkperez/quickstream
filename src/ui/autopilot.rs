@@ -419,6 +419,16 @@ impl AppUI {
         // seed's.
         let preferred = (!self.in_bookmarks_view).then(|| self.browser_dir.clone());
         let fallback = seed_path.parent().unwrap_or(&self.browser_dir).to_path_buf();
+        self.seed_radio_scan(seed_path, preferred, fallback);
+    }
+
+    /// Seed Radio from the web dashboard: scans `dir`, which the web thread resolved inside the
+    /// allowed folders (issue #126), so nothing is checked here.
+    pub fn start_seed_radio_in(&mut self, seed_path: PathBuf, dir: PathBuf) {
+        self.seed_radio_scan(seed_path, None, dir);
+    }
+
+    fn seed_radio_scan(&mut self, seed_path: PathBuf, preferred: Option<PathBuf>, fallback: PathBuf) {
         self.active_mix_profile = crate::analysis::MixProfile::SeedRadio(seed_path.clone());
         let track_name = seed_path.file_stem().unwrap_or_default().to_string_lossy();
         self.status_message = format!("📻 Seed Radio: Initiating station from '{}'...", track_name);

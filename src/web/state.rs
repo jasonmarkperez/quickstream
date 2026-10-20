@@ -171,7 +171,8 @@ pub struct NowPlayingState {
     #[serde(skip)]
     pub bookmarks: Vec<String>,
     /// The folder the terminal is browsing, as a path (non-UTF-8 names intact), for
-    /// `autopilot` / `autopilot_reshuffle` without a path. `None` until the UI publishes it.
+    /// `autopilot` / `autopilot_reshuffle` without a path and the folder `seed_radio` scans.
+    /// `None` until the UI publishes it.
     /// Never sent to clients.
     #[serde(skip)]
     pub terminal_dir: Option<PathBuf>,
@@ -260,7 +261,13 @@ pub enum WebCommand {
     AutopilotReshuffle(PathBuf),
     ShuffleQueue,
     SetMixProfile(String),
-    SeedRadio(PathBuf),
+    /// Start Seed Radio from `seed`, scanning `dir`: the folder the terminal is browsing
+    /// (`terminal_dir`) when it lies inside the allowed folders, else the seed's own folder,
+    /// both resolved by the web thread (issue #126).
+    SeedRadio {
+        seed: PathBuf,
+        dir: PathBuf,
+    },
     /// A web request named a path outside the allowed folders; it was ignored.
     PathRejected(PathBuf),
     /// Queue a playlist (issue #50): replace the queue and play from entry `play_from`, or

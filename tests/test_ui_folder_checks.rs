@@ -644,17 +644,20 @@ fn test_seed_radio_starts_at_the_key_while_its_worker_checks_the_folder() {
     assert_eq!(app.autopilot_dir, Some(music.clone()));
     app.reset_playback_session();
 
-    // The web dashboard's `seed_radio` goes the same way.
+    // The web dashboard's `seed_radio` starts at once too, in the folder the web thread resolved
+    // (issue #126), which the UI checks no further.
     queue_seed(&mut app, &seed);
     let (tx, rx) = mpsc::channel();
     app.web_cmd_rx = Some(rx);
-    let check = Gate::check(&mut app, &music);
-    tx.send(WebCommand::SeedRadio(seed.clone())).unwrap();
+    tx.send(WebCommand::SeedRadio {
+        seed: seed.clone(),
+        dir: music.clone(),
+    })
+    .unwrap();
     app.handle_web_commands();
+    assert_eq!(app.active_mix_profile, MixProfile::SeedRadio(seed.clone()));
     assert_eq!(app.autopilot_dir, Some(music.clone()));
     assert!(app.is_autopilot_scanning);
-    check.wait_entered();
-    check.open();
     app.wait_for_autopilot_scan(Duration::from_secs(5));
     assert_eq!(app.autopilot_dir, Some(music));
     app.reset_playback_session();
