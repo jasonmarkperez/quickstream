@@ -659,6 +659,7 @@ impl AppUI {
     }
 
     pub fn navigate_browser(&mut self, path: PathBuf) {
+        self.browser_navigations += 1;
         self.close_spotlight();
 
         if path.to_string_lossy() == "___MUSIC_HOMES___" {

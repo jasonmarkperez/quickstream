@@ -265,9 +265,13 @@ pub struct AppUI {
     folder_check_answers: u64,
     /// The `~` key's check of the startup home, while it runs.
     home_check: Option<folder_checks::HomeCheck>,
-    /// The id of the mix picker's or Seed Radio's check of the folder Autopilot is to scan,
-    /// while it runs; any other Autopilot start or the end of the session drops it.
-    autopilot_check: Option<u64>,
+    /// How many times `navigate_browser` has sent the browser somewhere; a `~` answer is
+    /// dropped if it changed after the key.
+    browser_navigations: u64,
+    /// The id of the mix picker's or Seed Radio's check of the folder Autopilot is to scan, and
+    /// the profile the scan is to use, while it runs; any other Autopilot start or the end of
+    /// the session drops it.
+    autopilot_check: Option<(u64, crate::analysis::MixProfile)>,
     pub queue_cursor: usize,
     pub devices_cursor: usize,
     pub settings_cursor: usize,
@@ -337,6 +341,8 @@ pub struct AppUI {
     /// Reads the current track's analysis features off the UI thread.
     track_features: features::TrackFeaturesWorker,
     pub active_mix_profile: crate::analysis::MixProfile,
+    /// The profile the latest Autopilot scan was started with (`autopilot_scan_profile`).
+    autopilot_scan_profile: Option<crate::analysis::MixProfile>,
     pub show_mix_picker_modal: bool,
     pub mix_picker_cursor: usize,
     /// The mix picker's scroll position on screens too short for every profile (reset on open).
@@ -469,6 +475,7 @@ impl AppUI {
             folder_check_id: 0,
             folder_check_answers: 0,
             home_check: None,
+            browser_navigations: 0,
             autopilot_check: None,
             queue_cursor: 0,
             devices_cursor: 0,
@@ -522,6 +529,7 @@ impl AppUI {
             track_features,
             analysis_db,
             active_mix_profile,
+            autopilot_scan_profile: None,
             show_mix_picker_modal: false,
             mix_picker_cursor: 0,
             mix_picker_list: ListState::default(),

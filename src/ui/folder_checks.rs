@@ -31,15 +31,10 @@ impl PathKind {
 /// the check back to stand in for a slow share (`AppUI::set_path_check`).
 pub type PathCheck = std::sync::Arc<dyn Fn(&Path) -> PathKind + Send + Sync>;
 
-/// Where the browser is: the shown folder, whether Music Homes is shown, and the folder being
-/// opened.
-#[derive(PartialEq)]
-struct BrowserSpot(PathBuf, bool, Option<PathBuf>);
-
-/// The `~` key's check of the startup home, and where the browser was when `~` was pressed.
+/// The `~` key's check of the startup home, and `browser_navigations` when `~` was pressed.
 pub(super) struct HomeCheck {
     id: u64,
-    from: BrowserSpot,
+    navigations: u64,
 }
 
 /// A `folder-check` worker's answer.
@@ -51,26 +46,19 @@ pub(super) enum FolderCheckAnswer {
 }
 
 impl AppUI {
-    fn browser_spot(&self) -> BrowserSpot {
-        BrowserSpot(
-            self.browser_dir.clone(),
-            self.in_bookmarks_view,
-            self.opening_folder().map(Path::to_path_buf),
-        )
-    }
-
     fn next_folder_check_id(&mut self) -> u64 {
         self.folder_check_id += 1;
         self.folder_check_id
     }
 
     /// `~`: open `home` once a worker has found it is a folder (`Jumped to home: …`), else say
-    /// `Home directory not found: …`. If the browser has moved on by then, it stays where it is.
+    /// `Home directory not found: …`. If the browser was sent elsewhere meanwhile, it stays
+    /// there; a folder that was already being opened when `~` was pressed doesn't count.
     pub(super) fn jump_to_home(&mut self, home: PathBuf) {
         let id = self.next_folder_check_id();
         self.home_check = Some(HomeCheck {
             id,
-            from: self.browser_spot(),
+            navigations: self.browser_navigations,
         });
         let check = self.path_check.clone();
         let tx = self.folder_check_tx.clone();
@@ -81,11 +69,12 @@ impl AppUI {
     }
 
     /// Start Autopilot in `preferred` once a worker has found it exists, else in `fallback` (the
-    /// current directory when `None`). Any other Autopilot start, or the end of the playback
+    /// current directory when `None`), with the mix profile active now (a web profile change
+    /// meanwhile doesn't change it). Any other Autopilot start, or the end of the playback
     /// session, before the answer drops it.
     pub(super) fn start_autopilot_after_check(&mut self, preferred: Option<PathBuf>, fallback: Option<PathBuf>) {
         let id = self.next_folder_check_id();
-        self.autopilot_check = Some(id);
+        self.autopilot_check = Some((id, self.active_mix_profile.clone()));
         let check = self.path_check.clone();
         let tx = self.folder_check_tx.clone();
         self.workers.spawn("folder-check", move || {
@@ -123,7 +112,7 @@ impl AppUI {
                             continue;
                         }
                     };
-                    if check.from != self.browser_spot() {
+                    if check.navigations != self.browser_navigations {
                         continue;
                     }
                     if is_dir {
@@ -133,12 +122,12 @@ impl AppUI {
                         self.status_message = format!("Home directory not found: {}", dir.display());
                     }
                 }
-                FolderCheckAnswer::Autopilot { id, dir } => {
-                    if self.autopilot_check == Some(id) {
-                        self.autopilot_check = None;
-                        self.start_autopilot(dir);
+                FolderCheckAnswer::Autopilot { id, dir } => match self.autopilot_check.take() {
+                    Some((check_id, profile)) if check_id == id => {
+                        self.start_autopilot_with_profile(dir, profile);
                     }
-                }
+                    newer => self.autopilot_check = newer,
+                },
             }
         }
     }

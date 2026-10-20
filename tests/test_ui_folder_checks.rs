@@ -40,6 +40,24 @@ impl GatedCheck {
         GatedCheck { open, entered }
     }
 
+    /// The same gate on the browser's listing of `gated` (a folder being opened on a slow
+    /// share): its read waits until the test opens the gate.
+    fn install_dir_reader(app: &mut AppUI, gated: &Path) -> Self {
+        let open = Arc::new((Mutex::new(false), Condvar::new()));
+        let (entered_tx, entered) = mpsc::channel();
+        let entered_tx = Mutex::new(entered_tx);
+        let (gated, gate) = (gated.to_path_buf(), open.clone());
+        app.set_dir_reader(Arc::new(move |dir: &Path| {
+            if dir == gated {
+                let _ = entered_tx.lock().unwrap().send(dir.to_path_buf());
+                let (lock, cvar) = &*gate;
+                drop(cvar.wait_while(lock.lock().unwrap(), |open| !*open).unwrap());
+            }
+            Ok(Box::new(fs::read_dir(dir)?) as quickstream::ui::DirEntries)
+        }));
+        GatedCheck { open, entered }
+    }
+
     /// Wait (at most 5 s, a deadlock guard) until a check of the gated path has started.
     fn wait_entered(&self) -> PathBuf {
         self.entered
@@ -162,6 +180,39 @@ fn test_tilde_answer_is_dropped_once_the_browser_moved_on() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// A folder that was already being opened when `~` was pressed, and finishes before the home
+/// check answers, is not the browser moving on: `~` still jumps home.
+#[test]
+fn test_tilde_still_jumps_home_when_an_earlier_open_finishes_first() {
+    common::isolate();
+    let (mut app, root) = setup("tilde_open", Some("Home"));
+    let home = root.join("Home");
+    let sub = root.join("Music").join("Sub");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&sub).unwrap();
+    app.set_folder_open_deadline(Duration::from_secs(600));
+    let read = GatedCheck::install_dir_reader(&mut app, &sub);
+    let check = GatedCheck::install(&mut app, &home);
+
+    app.navigate_browser(sub.clone());
+    read.wait_entered();
+    assert_eq!(app.opening_folder(), Some(sub.as_path()));
+    press(&mut app, KeyCode::Char('~'));
+    check.wait_entered();
+
+    // Sub finishes opening while the home check still runs.
+    read.open();
+    common::wait_for_dir_scan(&mut app);
+    assert_eq!(app.browser_dir, sub);
+
+    check.open();
+    wait_for_answers(&mut app, 1);
+    assert_eq!(app.status_message, format!("Jumped to home: {}", home.display()));
+    common::wait_for_dir_scan(&mut app);
+    assert_eq!(app.browser_dir, home, "the last key pressed wins");
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn test_mix_picker_starts_autopilot_only_once_the_check_answers() {
     common::isolate();
@@ -264,6 +315,39 @@ fn test_seed_radio_starts_only_once_the_check_answers() {
     gate.open();
     wait_for_answers(&mut app, 2);
     assert_eq!(app.autopilot_dir, Some(music));
+    app.reset_playback_session();
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The scan uses the profile chosen with the key, even if the web dashboard changes the mix
+/// profile while the folder check runs (as when the scan started at once).
+#[test]
+fn test_seed_radio_scans_with_its_own_profile_after_a_web_profile_change() {
+    common::isolate();
+    let (mut app, root) = setup("seed_profile", None);
+    let music = root.join("Music");
+    let seed = root.join("Other").join("seed.wav");
+    queue_seed(&mut app, &seed);
+    let (tx, rx) = mpsc::channel();
+    app.web_cmd_rx = Some(rx);
+    let gate = GatedCheck::install(&mut app, &music);
+
+    app.active_tab = 0;
+    press(&mut app, KeyCode::Char('r'));
+    gate.wait_entered();
+    tx.send(WebCommand::SetMixProfile("focus".to_string())).unwrap();
+    app.handle_web_commands();
+    let focus = MixProfile::MoodVibe(quickstream::analysis::MoodType::Focus);
+    assert_eq!(app.active_mix_profile, focus);
+
+    gate.open();
+    wait_for_answers(&mut app, 1);
+    assert_eq!(app.autopilot_dir, Some(music));
+    assert_eq!(app.autopilot_scan_profile(), Some(&MixProfile::SeedRadio(seed)));
+    assert_eq!(
+        app.active_mix_profile, focus,
+        "the web change still stands for later mixes"
+    );
     app.reset_playback_session();
     let _ = fs::remove_dir_all(&root);
 }

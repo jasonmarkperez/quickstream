@@ -186,13 +186,26 @@ impl AppUI {
         self.poll_background_autopilot();
     }
 
+    /// The profile the latest Autopilot scan was started with (tests).
+    #[doc(hidden)]
+    pub fn autopilot_scan_profile(&self) -> Option<&crate::analysis::MixProfile> {
+        self.autopilot_scan_profile.as_ref()
+    }
+
     pub fn start_autopilot(&mut self, dir: PathBuf) {
+        let profile = self.active_mix_profile.clone();
+        self.start_autopilot_with_profile(dir, profile);
+    }
+
+    /// `start_autopilot` with `profile` in place of the active mix profile (a start that waited
+    /// for its folder check).
+    pub(super) fn start_autopilot_with_profile(&mut self, dir: PathBuf, profile: crate::analysis::MixProfile) {
         let mode = if self.queue.is_empty() {
             AutopilotRunMode::Fresh
         } else {
             AutopilotRunMode::Append
         };
-        self.start_autopilot_with_mode(dir, mode);
+        self.start_autopilot_scan(dir, mode, profile);
     }
 
     pub fn reshuffle_autopilot(&mut self, dir: PathBuf) {
@@ -243,6 +256,11 @@ impl AppUI {
     }
 
     pub fn start_autopilot_with_mode(&mut self, dir: PathBuf, mode: AutopilotRunMode) {
+        let profile = self.active_mix_profile.clone();
+        self.start_autopilot_scan(dir, mode, profile);
+    }
+
+    fn start_autopilot_scan(&mut self, dir: PathBuf, mode: AutopilotRunMode, profile: crate::analysis::MixProfile) {
         self.supersede_playlist_queue();
         // 1. Cancel any active autopilot scanner (its channel is replaced below)
         self.stop_autopilot_scan();
@@ -295,7 +313,7 @@ impl AppUI {
 
         // 4. Spawn background worker to discover tracks and stream them progressively
         let scan_dir = dir.clone();
-        let profile = self.active_mix_profile.clone();
+        self.autopilot_scan_profile = Some(profile.clone());
         let db = self.analysis_db.clone();
         self.workers.spawn("autopilot", move || {
             crate::library::LibraryManager::scan_directory_autopilot_with_profile(
