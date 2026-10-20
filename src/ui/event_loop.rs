@@ -47,6 +47,17 @@ impl AppUI {
         left
     }
 
+    /// How long each tick waits for a key before polling the workers and drawing again: one
+    /// frame (60 FPS) while a folder is being read, so its listing shows as soon as the scan
+    /// sends it, nothing on the UI thread waiting for it (issue #101); else 100 ms.
+    pub fn key_poll_timeout(&self) -> Duration {
+        if self.browser_loading {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(100)
+        }
+    }
+
     /// Stop playback and return true if a shutdown was requested (e.g. by SIGINT/SIGTERM/SIGHUP).
     pub fn poll_shutdown_request(&mut self) -> bool {
         if !SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
@@ -141,9 +152,7 @@ impl AppUI {
 
             terminal.draw(|f| self.render(f))?;
 
-            let poll_dur = Duration::from_millis(100);
-
-            if event::poll(poll_dur)? {
+            if event::poll(self.key_poll_timeout())? {
                 if let Event::Key(key) = event::read()? {
                     if self.show_help_modal {
                         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {

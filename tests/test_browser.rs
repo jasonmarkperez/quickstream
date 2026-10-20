@@ -48,6 +48,7 @@ fn test_browser_metadata_view_toggle() {
     settings_mgr.settings.metadata_view = true;
 
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
     // Wait for background metadata worker to extract tags and poll
     for _ in 0..50 {
@@ -127,19 +128,21 @@ fn test_browser_non_blocking_navigation_large_directory() {
     settings_mgr.settings.metadata_view = true;
 
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
     let start = std::time::Instant::now();
     app.navigate_browser(music_dir.clone());
     let nav_elapsed = start.elapsed();
 
-    // Navigation must be instantaneous (under 200ms) with zero UI freeze
+    // Navigation must be instantaneous with zero UI freeze: the folder is read on a worker
     assert!(
-        nav_elapsed < std::time::Duration::from_millis(200),
+        nav_elapsed < std::time::Duration::from_millis(20),
         "Navigation took too long: {:?}",
         nav_elapsed
     );
 
-    // All 30 folders and 30 tracks + Homes + Parent must be immediately present
+    // All 30 folders and 30 tracks + Homes + Parent are present once the poll has the scan
+    common::wait_for_dir_scan(&mut app);
     assert_eq!(app.browser_entries.len(), 62);
 
     // Initial labels for uncached tracks should be fast filenames
@@ -191,6 +194,7 @@ fn test_browser_scrolling_beyond_viewport() {
     let config_path = temp_dir.join("config.json");
     let settings_mgr = SettingsManager::with_path(config_path);
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
     let total_entries = app.browser_entries.len();
     assert!(
@@ -251,6 +255,7 @@ fn test_browser_paging_and_jump_shortcuts() {
     let config_path = temp_dir.join("config.json");
     let settings_mgr = SettingsManager::with_path(config_path);
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
     app.browser_page_height = 10;
 
     let total_entries = app.browser_entries.len();
@@ -365,6 +370,7 @@ fn test_browser_navigate_into_folder_resets_cursor_and_offset() {
     let config_path = temp_dir.join("config.json");
     let settings_mgr = SettingsManager::with_path(config_path);
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
     let backend = ratatui::backend::TestBackend::new(80, 20);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -398,6 +404,7 @@ fn test_browser_navigate_into_folder_resets_cursor_and_offset() {
 
     // Press Enter to navigate into folder_35
     app.handle_tab_key(crossterm::event::KeyCode::Enter);
+    common::wait_for_dir_scan(&mut app);
 
     // VERIFY:
     // 1. Current directory changed
@@ -458,6 +465,7 @@ fn test_browser_spotlight_subfolder_jump() {
     let config_path = temp_dir.join("config.json");
     let settings_mgr = SettingsManager::with_path(config_path);
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
     let ambient_idx = app
         .browser_entries
@@ -647,6 +655,7 @@ fn test_browser_cache_instant_back_navigation() {
     let config_path = temp_dir.join("config.json");
     let settings_mgr = SettingsManager::with_path(config_path);
     let mut app = AppUI::new(Some(parent_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
     // Initial load of parent_dir
     assert_eq!(app.browser_dir, parent_dir);
@@ -699,15 +708,14 @@ fn test_browser_small_folder_streaming_and_incremental_sorting() {
     let config_path = temp_dir.join("config.json");
     let settings_mgr = SettingsManager::with_path(config_path);
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
-    let start = std::time::Instant::now();
+    // Opening the folder only starts its scan: the listing comes in through the poll (#101).
     app.navigate_browser(album_dir.clone());
-    let elapsed = start.elapsed();
-
-    // Fast-path should load all items quickly
-    assert!(elapsed < std::time::Duration::from_millis(200));
     assert_eq!(app.browser_dir, album_dir);
-    assert!(!app.browser_loading);
+    assert!(app.browser_loading);
+    assert_eq!(app.browser_entries.len(), 2, "only the header rows until the poll");
+    common::wait_for_dir_scan(&mut app);
 
     // Verify all 3 items + 2 headers are present: Homes, Parent, Bonus_Discs, Track_A, Track_B
     assert_eq!(app.browser_entries.len(), 5);
@@ -731,7 +739,8 @@ fn test_browser_small_folder_streaming_and_incremental_sorting() {
         c.files.clear();
     }
     app.refresh_browser();
-    // After refresh_browser, it should rescan and complete
+    assert!(app.browser_loading, "an incomplete cache entry is scanned again");
+    common::wait_for_dir_scan(&mut app);
     assert_eq!(app.browser_entries.len(), 5);
 
     let _ = fs::remove_dir_all(&temp_dir);
@@ -819,6 +828,7 @@ fn test_browser_add_track_to_queue_does_not_start_playback() {
     let config_path = temp_dir.join("config.json");
     let settings_mgr = SettingsManager::with_path(config_path);
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
     // Initial state: queue is empty, player is not playing
     assert_eq!(app.queue.len(), 0);
@@ -1086,6 +1096,7 @@ fn test_browser_metadata_view_toggle_in_place_and_settings_tab() {
     settings_mgr.settings.metadata_view = false;
 
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
     // Filenames mode initially
     let initial_entry = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song);
@@ -1196,14 +1207,17 @@ fn test_browser_perf_and_scan_lifecycle_tracking() {
     let settings_mgr = SettingsManager::with_path(config_path);
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
 
-    // Initial load: AppUI::new navigates to temp_dir
-    assert!(!app.browser_loading);
+    // Initial load: AppUI::new starts the scan of temp_dir
+    assert!(app.browser_loading);
+    assert!(app.browser_load_start.is_some());
+    common::wait_for_dir_scan(&mut app);
     assert!(app.browser_load_start.is_none());
 
-    // Navigate to folder
+    // Navigate to folder: the scan runs until the poll sees DirScanEvent::Complete
     app.navigate_browser(folder.clone());
-    // Since folder is small, fast path reads it immediately and fires DirScanEvent::Complete
-    assert!(!app.browser_loading);
+    assert!(app.browser_loading);
+    assert!(app.browser_load_start.is_some());
+    common::wait_for_dir_scan(&mut app);
     assert!(app.browser_load_start.is_none());
     assert!(app
         .browser_entries
@@ -1218,7 +1232,9 @@ fn test_browser_perf_and_scan_lifecycle_tracking() {
     // When cache is cleared, refresh_browser triggers a fresh scan
     app.browser_dir_cache.remove(&folder);
     app.refresh_browser();
-    assert!(!app.browser_loading);
+    assert!(app.browser_loading);
+    assert!(app.browser_load_start.is_some());
+    common::wait_for_dir_scan(&mut app);
     assert!(app.browser_load_start.is_none());
 
     let _ = fs::remove_dir_all(&temp_dir);
@@ -1239,6 +1255,7 @@ fn test_queue_rendering_without_file_type_and_file_list_display_swap() {
     settings_mgr.settings.metadata_view = true;
 
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
     let meta = AudioMetadata {
         filepath: song_path.clone(),
@@ -1435,5 +1452,183 @@ fn test_browser_drops_duplicate_directory_entries_from_os() {
 
     let shown = app.browser_entries.iter().filter(|(_, p, _)| p == &sub).count();
     assert_eq!(shown, 1, "Artist/ listed {} times", shown);
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+/// Holds back the browser's reads of one folder until released, like a share that is slow to
+/// answer; other folders are read at once. Dropping it releases the read.
+struct HeldRead {
+    open: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl HeldRead {
+    fn install(app: &mut AppUI, held: &std::path::Path) -> Self {
+        let open = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let gate = open.clone();
+        let held = held.to_path_buf();
+        app.set_dir_reader(std::sync::Arc::new(move |dir: &std::path::Path| {
+            if dir == held {
+                let (lock, cvar) = &*gate;
+                let _open = cvar.wait_while(lock.lock().unwrap(), |open| !*open).unwrap();
+            }
+            fs::read_dir(dir)
+        }));
+        HeldRead { open }
+    }
+
+    fn release(&self) {
+        let (lock, cvar) = &*self.open;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+}
+
+impl Drop for HeldRead {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// How long a key that opens a folder may take: the folder is listed on a worker, never waited
+/// for (the wait this replaces took at least 50 ms whenever the read was slower than that).
+const KEY_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
+
+fn press(app: &mut AppUI, code: crossterm::event::KeyCode) -> std::time::Duration {
+    let start = std::time::Instant::now();
+    let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
+        code,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    start.elapsed()
+}
+
+fn listed_files(app: &AppUI) -> usize {
+    app.browser_entries.iter().filter(|(_, _, is_dir)| !is_dir).count()
+}
+
+#[test]
+fn test_browser_open_folder_does_not_wait_for_a_slow_read() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_slow_open_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let slow = temp_dir.join("Slow");
+    fs::create_dir_all(&slow).unwrap();
+    for name in ["a.wav", "b.wav", "c.wav"] {
+        create_dummy_wav(&slow.join(name));
+    }
+    let mut settings_mgr = SettingsManager::with_path(temp_dir.join("config.json"));
+    settings_mgr.settings.metadata_view = false;
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
+
+    let held = HeldRead::install(&mut app, &slow);
+    app.browser_cursor = app
+        .browser_entries
+        .iter()
+        .position(|(_, p, is_dir)| *is_dir && p == &slow)
+        .expect("Slow/ listed");
+    let elapsed = press(&mut app, crossterm::event::KeyCode::Enter);
+    assert_eq!(app.browser_dir, slow);
+    assert!(elapsed < KEY_BUDGET, "Enter on a folder took {:?}", elapsed);
+
+    // Until the read answers the panel shows READING DIRECTORY, and polling never waits.
+    assert!(app.browser_loading);
+    let start = std::time::Instant::now();
+    app.poll_background_dir_scan();
+    assert!(start.elapsed() < KEY_BUDGET);
+    assert!(app.browser_loading);
+    assert_eq!(listed_files(&app), 0);
+    let screen = common::tui::render_text(&mut app, 120, 40);
+    assert!(screen.contains("READING DIRECTORY"), "{}", screen);
+
+    held.release();
+    common::wait_for_dir_scan(&mut app);
+    assert_eq!(listed_files(&app), 3);
+    let screen = common::tui::render_text(&mut app, 120, 40);
+    assert!(!screen.contains("READING DIRECTORY"), "{}", screen);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_browser_backspace_restores_cursor_once_slow_parent_is_listed() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_slow_parent_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let parent = temp_dir.join("Music");
+    // More folders than the scan's first batch (5), so the one to return to may come later.
+    for name in ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel"] {
+        fs::create_dir_all(parent.join(name)).unwrap();
+    }
+    let golf = parent.join("Golf");
+    let mut settings_mgr = SettingsManager::with_path(temp_dir.join("config.json"));
+    settings_mgr.settings.metadata_view = false;
+    let mut app = AppUI::new(Some(golf.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
+    assert!(!app.browser_dir_cache.contains_key(&parent));
+
+    let held = HeldRead::install(&mut app, &parent);
+    let elapsed = press(&mut app, crossterm::event::KeyCode::Backspace);
+    assert_eq!(app.browser_dir, parent);
+    assert!(elapsed < KEY_BUDGET, "Backspace took {:?}", elapsed);
+    assert!(app.browser_loading);
+    assert_eq!(app.pending_parent_restore.as_ref(), Some(&golf));
+
+    held.release();
+    common::wait_for_dir_scan(&mut app);
+    let golf_row = app
+        .browser_entries
+        .iter()
+        .position(|(_, p, is_dir)| *is_dir && p == &golf)
+        .expect("Golf/ listed");
+    assert_eq!(app.browser_cursor, golf_row, "cursor back on the folder Backspace left");
+    assert_eq!(app.pending_parent_restore, None);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_browser_rescan_does_not_wait_for_a_slow_read() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_slow_rescan_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    create_dummy_wav(&temp_dir.join("a.wav"));
+    let mut settings_mgr = SettingsManager::with_path(temp_dir.join("config.json"));
+    settings_mgr.settings.metadata_view = false;
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
+    assert_eq!(listed_files(&app), 1);
+
+    let held = HeldRead::install(&mut app, &temp_dir);
+    app.browser_cursor = 0; // the Music Homes row: `r` rescans the folder
+    let elapsed = press(&mut app, crossterm::event::KeyCode::Char('r'));
+    assert!(elapsed < KEY_BUDGET, "r took {:?}", elapsed);
+    assert!(app.browser_loading);
+    assert!(app.status_message.contains("Refreshing directory"));
+
+    held.release();
+    common::wait_for_dir_scan(&mut app);
+    assert_eq!(listed_files(&app), 1);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_event_loop_polls_keys_at_frame_rate_while_a_folder_is_read() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_key_poll_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let mut app = AppUI::new(
+        Some(temp_dir.clone()),
+        SettingsManager::with_path(temp_dir.join("config.json")),
+    );
+    common::wait_for_dir_scan(&mut app);
+    assert_eq!(app.key_poll_timeout(), std::time::Duration::from_millis(100));
+    // While a folder is read its batches are picked up within a frame (60 FPS).
+    app.browser_loading = true;
+    assert!(app.key_poll_timeout() <= std::time::Duration::from_millis(16));
+
     let _ = fs::remove_dir_all(&temp_dir);
 }

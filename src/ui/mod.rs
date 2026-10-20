@@ -92,6 +92,10 @@ pub enum DirScanEvent {
     },
 }
 
+/// Lists a folder for the browser's `dir-scan` worker: [`std::fs::read_dir`] except in tests,
+/// which hold the read back to stand in for a slow share (`AppUI::set_dir_reader`).
+pub type DirReader = std::sync::Arc<dyn Fn(&std::path::Path) -> io::Result<std::fs::ReadDir> + Send + Sync>;
+
 /// Builds the player an output switch moves to, in place of mpv or a renderer client (tests).
 pub type OutputPlayerFactory = Box<dyn FnMut() -> Box<dyn AudioPlayer> + Send>;
 
@@ -214,6 +218,8 @@ pub struct AppUI {
     pub dir_scan_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub dir_scan_id: u64,
     pub pending_parent_restore: Option<PathBuf>,
+    /// Lists folders on the `dir-scan` worker (`set_dir_reader`).
+    dir_reader: DirReader,
     pub queue_cursor: usize,
     pub devices_cursor: usize,
     pub settings_cursor: usize,
@@ -403,6 +409,7 @@ impl AppUI {
             dir_scan_stop: None,
             dir_scan_id: 0,
             pending_parent_restore: None,
+            dir_reader: std::sync::Arc::new(|dir: &std::path::Path| std::fs::read_dir(dir)),
             queue_cursor: 0,
             devices_cursor: 0,
             settings_cursor: SETTING_DISPLAY_ORDER[0],
@@ -488,6 +495,14 @@ impl AppUI {
     pub fn set_persistence_worker(&mut self, worker: crate::persist::PersistenceWorker) {
         self.settings_mgr.set_persistence(worker.handle());
         drop(std::mem::replace(&mut self.persistence, worker));
+    }
+
+    /// Replace how the browser lists a folder for scans started from now on (tests: a read held
+    /// back like a slow share). Public only because integration tests in `tests/` drive `AppUI`
+    /// directly.
+    #[doc(hidden)]
+    pub fn set_dir_reader(&mut self, reader: DirReader) {
+        self.dir_reader = reader;
     }
 
     /// Replace the tag reader used by workers started from now on (tests use a counting or

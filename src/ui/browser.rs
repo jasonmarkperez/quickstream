@@ -126,8 +126,6 @@ impl AppUI {
                 .push((".. [Parent Directory]".to_string(), parent.to_path_buf(), true));
         }
 
-        let header_count = if self.browser_dir.parent().is_some() { 2 } else { 1 };
-
         // Cache hit: instantaneous display with zero filesystem overhead!
         if let Some(cached) = self.browser_dir_cache.get(&self.browser_dir).cloned() {
             if cached.is_complete {
@@ -221,10 +219,11 @@ impl AppUI {
         let tx = self.dir_scan_tx.clone();
         let metadata_view = self.settings_mgr.settings.metadata_view;
         let cached_map = self.metadata_cache.clone(); // shared handle, not a copy
+        let read_dir = self.dir_reader.clone();
 
         self.workers.spawn("dir-scan", move || {
             let thread_start = std::time::Instant::now();
-            match std::fs::read_dir(&scan_dir) {
+            match read_dir(&scan_dir) {
                 Ok(entries) => {
                     let mut batch_dirs = Vec::new();
                     let mut batch_files = Vec::new();
@@ -332,30 +331,11 @@ impl AppUI {
                 }
             }
         });
-
-        // Fast path for immediate local reads: process any events available within up to 150ms
-        let fast_path_start = std::time::Instant::now();
-        while let Ok(event) = self.dir_scan_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            let is_complete = matches!(event, DirScanEvent::Complete { .. } | DirScanEvent::Error { .. });
-            self.handle_dir_scan_event(event);
-            if is_complete || fast_path_start.elapsed() >= std::time::Duration::from_millis(150) {
-                break;
-            }
-        }
-
-        if self.browser_loading {
-            let partial_count = self.browser_entries.len().saturating_sub(header_count);
-            crate::logger::log_raw(
-                "DEBUG",
-                "browser",
-                &format!(
-                    "refresh_browser fast-path yielded after {:.2?} ({} items streamed so far), scan continuing in background for '{}'",
-                    refresh_start.elapsed(),
-                    partial_count,
-                    self.browser_dir.display()
-                ),
-            );
-        }
+        // Nothing waits for the scan here (issue #101): its batches come in through
+        // `poll_background_dir_scan`, which the event loop calls at frame rate while
+        // `browser_loading` is set (`key_poll_timeout`), and the LIBRARY panel shows its
+        // READING DIRECTORY row until they do. A Backspace's `pending_parent_restore` waits with
+        // them and puts the cursor back on the folder it left once that folder is listed.
     }
 
     fn handle_dir_scan_event(&mut self, event: DirScanEvent) {
