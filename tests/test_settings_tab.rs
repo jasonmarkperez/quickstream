@@ -528,6 +528,44 @@ fn startup_home_editor_takes_typed_text_inline_including_q() {
     );
 }
 
+#[test]
+fn every_key_that_opens_the_startup_home_editor_leaves_its_own_key_out() {
+    common::isolate();
+    // Issue #100: `/` opened the editor holding `/`, so `/` then Enter set the home to `/`.
+    let mut app = settings_app("editor_open");
+    app.settings_cursor = HOME_DIR;
+    for code in [KeyCode::Char('/'), KeyCode::Char('e'), KeyCode::Enter] {
+        assert!(!press(&mut app, code));
+        assert_eq!(app.editing_home_dir.as_deref(), Some(""), "{code:?} with no home set");
+        press(&mut app, KeyCode::Esc);
+    }
+    // Saved at once, the empty field leaves the startup home unset.
+    press(&mut app, KeyCode::Char('/'));
+    press(&mut app, KeyCode::Enter);
+    assert!(app.editing_home_dir.is_none());
+    assert_eq!(app.settings_mgr.settings.home_dir, None);
+    assert!(
+        app.status_message.starts_with("Cleared startup home"),
+        "{}",
+        app.status_message
+    );
+
+    // With a home set, each key opens the editor on it, and saving keeps it.
+    let home = "/qs-startup-home".to_string();
+    app.settings_mgr.settings.home_dir = Some(home.clone());
+    for code in [KeyCode::Char('/'), KeyCode::Char('e'), KeyCode::Enter] {
+        assert!(!press(&mut app, code));
+        assert_eq!(app.editing_home_dir.as_deref(), Some(home.as_str()), "{code:?}");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.editing_home_dir.is_none());
+        assert_eq!(
+            app.settings_mgr.settings.home_dir.as_deref(),
+            Some(home.as_str()),
+            "{code:?}"
+        );
+    }
+}
+
 // ---------- key row ----------
 
 #[test]

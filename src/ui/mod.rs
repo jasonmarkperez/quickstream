@@ -57,6 +57,7 @@ mod browser;
 mod event_loop;
 pub use event_loop::TickClock;
 mod keys;
+pub use keys::normalize_key;
 mod output;
 mod playback;
 mod queue_ops;
