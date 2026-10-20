@@ -777,6 +777,18 @@ fn one_run_with_more_candidates_than_the_bound_keeps_its_first() {
 }
 
 #[test]
+fn a_run_keeps_its_first_candidate_when_an_earlier_run_offered_it_too() {
+    common::isolate();
+    let mut queue = AnalysisQueue::new(3);
+    queue.push_candidates(paths(&["m1", "o1", "o2"]));
+    // m1 is still waiting from the earlier run: this run's later paths must not push it out.
+    assert!(queue.push_candidates(paths(&["m1", "n1", "n2", "n3"])));
+    let left = drain(&mut queue);
+    assert!(left.contains(&path("m1")), "{:?}", left);
+    assert_eq!(left.len(), 3, "{:?}", left);
+}
+
+#[test]
 fn a_burst_of_candidates_keeps_the_worker_queue_bounded() {
     common::isolate();
     let cache = scratch_dir("worker_burst_db");

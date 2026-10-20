@@ -100,18 +100,26 @@ impl AnalysisQueue {
 
     /// Add one autopilot run's candidates, as [`Self::push_candidate`] does each, up to the bound:
     /// older runs' candidates give way, but once the run has filled the bound its later paths are
-    /// left out, so it never pushes out its own first ones. Returns whether any was added.
+    /// left out, so it never pushes out its own first ones. A path still waiting from an earlier
+    /// run moves to the back and counts as this run's, so it is not pushed out either. Returns
+    /// whether any was added.
     pub fn push_candidates<I: IntoIterator<Item = PathBuf>>(&mut self, paths: I) -> bool {
         let mut added = 0;
+        let mut any_new = false;
         for path in paths {
             if added == self.candidate_limit {
                 break;
             }
-            if self.push_candidate(path) {
+            if let Some(at) = self.candidates.iter().position(|c| *c == path) {
+                self.candidates.remove(at);
+                self.candidates.push_back(path);
                 added += 1;
+            } else if self.push_candidate(path) {
+                added += 1;
+                any_new = true;
             }
         }
-        added > 0
+        any_new
     }
 
     /// The next track to analyse: the oldest queued track, else the oldest candidate.
