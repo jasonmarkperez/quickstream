@@ -10,13 +10,12 @@ mod server;
 mod state;
 mod stream;
 
-pub use api::{MISSING_REVISION, PLAYLISTS_CHANGED};
 pub use server::{ServerLimits, WebBind, WebServer, WebServerHandle};
 pub use state::{
     NowPlayingState, PlaylistEdit, PlaylistReply, WebBrowserEntry, WebBrowserResponse, WebCommand, WebDeviceItem,
-    WebPlaylist, WebPlaylistEntry, WebPlaylists, WebPlaylistsState, WebQueueItem, WebReply,
+    WebPlaylist, WebPlaylistEntry, WebPlaylists, WebPlaylistsState, WebQueueItem, WebReply, PLAYLISTS_CHANGED,
 };
 pub use stream::{
-    calculate_stream_offset, make_continuous_wav_header, parse_byte_range, serve_continuous_stream, wav_header_sizes,
-    ByteRange, ContinuousAdmission, ContinuousStreamController, StreamOffset, StreamRequest, StreamServerState,
+    make_continuous_wav_header, parse_byte_range, wav_header_sizes, ByteRange, ContinuousAdmission,
+    ContinuousStreamController, StreamRequest, StreamServerState,
 };

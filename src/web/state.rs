@@ -326,6 +326,10 @@ pub enum PlaylistEdit {
 /// What the UI answers to a [`PlaylistEdit`]: the status message, or why it was refused.
 pub type PlaylistReply = Result<String, String>;
 
+/// Refusal for a playlist request whose index refers to a list that changed meanwhile. The web
+/// thread and the UI thread both answer with it.
+pub const PLAYLISTS_CHANGED: &str = "Playlists changed; try again";
+
 /// Where the UI thread sends its answer to a web request that waits for one.
 #[derive(Clone, Default)]
 pub struct WebReply(Option<mpsc::Sender<PlaylistReply>>);

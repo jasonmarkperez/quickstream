@@ -281,7 +281,7 @@ fn test_dashboard_and_json_responses_send_nosniff() {
     }
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", handle.port)).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    let body = r#"{"action":"noop"}"#;
+    let body = r#"{"action":"rescan_devices"}"#;
     let req = format!(
         "POST /api/action HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         handle.port,

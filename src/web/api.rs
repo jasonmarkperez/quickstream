@@ -1,6 +1,6 @@
 //! Route dispatch, the REST API (`/api/...`) and the dashboard page.
 
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -11,10 +11,13 @@ use serde::Deserialize;
 
 use crate::metadata::{cover_image_mime, default_cover_svg, extract_cover_art};
 
-use super::server::{read_request_body, read_request_head, reject_request, ConnectionPermit, Rejection, ServerLimits};
+use super::server::{
+    finish_connection, read_request_body, read_request_head, write_json, write_method_not_allowed, write_not_found,
+    write_plain, write_rejection, write_response, BodyError, ConnectionPermit, Rejection, ServerLimits,
+};
 use super::state::{
     NowPlayingState, PlaylistEdit, PlaylistReply, WebBrowserEntry, WebBrowserResponse, WebCommand, WebPlaylistsState,
-    WebReply,
+    WebReply, PLAYLISTS_CHANGED,
 };
 use super::stream::{
     is_continuous_route, serve_audio_stream, serve_continuous_stream, ContinuousAdmission, StreamServerState,
@@ -171,12 +174,19 @@ fn ui_answer(answer: &mpsc::Receiver<PlaylistReply>) -> ActionResponse {
 /// Error when the UI thread did not answer an edit in time (or has gone away).
 const NO_ANSWER: &str = "Quickstream didn't answer; try again";
 
-/// Status for a playlist request whose index refers to a list that changed meanwhile.
-pub const PLAYLISTS_CHANGED: &str = "Playlists changed; try again";
-
 /// Error for a playlist request that names a track by index without the snapshot revision the
 /// index came from.
-pub const MISSING_REVISION: &str = "Missing revision: reload the playlists and try again";
+pub(super) const MISSING_REVISION: &str = "Missing revision: reload the playlists and try again";
+
+/// Error for an `/api/action` body that was cut short.
+const INCOMPLETE_BODY: &str = "Incomplete request body";
+
+/// Error for an `/api/action` body that isn't a JSON action (not JSON, no `action`, a field of
+/// the wrong type).
+const INVALID_REQUEST: &str = "Invalid request";
+
+/// Error for an `/api/action` naming an action the server doesn't know.
+const UNKNOWN_ACTION: &str = "Unknown action";
 
 /// Error for a playlist action that names no playlist.
 const MISSING_NAME: &str = "Missing playlist name";
@@ -295,33 +305,116 @@ fn playlists_response(state: &Arc<RwLock<NowPlayingState>>) -> String {
     serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// The routes the server answers. A route matches the whole path (its query string and fragment
+/// set aside), so `/api/statusXYZ` matches nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Dashboard,
+    Status,
+    Playlists,
+    Cover,
+    Browser,
+    Action,
+    /// `/stream/continuous-<nonce>.wav` and the old fixed continuous names: only the armed
+    /// session's path is served, the others 404.
+    Continuous,
+    /// `/stream/<file name>`: one path segment, resolved by [`serve_audio_stream`].
+    Stream,
+}
+
+impl Route {
+    /// The route `route` (a path without its query string) names, if any.
+    fn find(route: &str) -> Option<Self> {
+        Some(match route {
+            "/" | "/index.html" => Route::Dashboard,
+            "/api/status" => Route::Status,
+            "/api/playlists" => Route::Playlists,
+            "/api/cover" => Route::Cover,
+            "/api/browser" => Route::Browser,
+            "/api/action" => Route::Action,
+            _ if is_continuous_route(route) => Route::Continuous,
+            _ if route
+                .strip_prefix("/stream/")
+                .is_some_and(|name| !name.is_empty() && !name.contains('/')) =>
+            {
+                Route::Stream
+            }
+            _ => return None,
+        })
+    }
+
+    /// The methods the route takes, in the order its `Allow` header lists them.
+    fn methods(self) -> &'static [&'static str] {
+        match self {
+            Route::Action => &["POST"],
+            _ => &["GET", "HEAD"],
+        }
+    }
+
+    fn takes(self, method: &str) -> bool {
+        self.methods().contains(&method)
+    }
+
+    /// The route's `Allow` header value.
+    fn allow(self) -> String {
+        self.methods().join(", ")
+    }
+
+    fn is_stream(self) -> bool {
+        matches!(self, Route::Continuous | Route::Stream)
+    }
+}
+
 pub(super) fn handle_client(
-    mut stream: TcpStream,
-    permit: ConnectionPermit,
+    stream: TcpStream,
+    mut permit: ConnectionPermit,
     limits: &ServerLimits,
     state: &Arc<RwLock<NowPlayingState>>,
     cmd_tx: &mpsc::Sender<WebCommand>,
     stream_state: &Arc<StreamServerState>,
 ) -> std::io::Result<()> {
     stream.set_write_timeout(Some(Duration::from_secs(4)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let answered = answer_request(stream, &mut reader, &mut permit, limits, state, cmd_tx, stream_state);
+    // Every answer, an error or a stream's end too, closes the same way, so a request body no
+    // route read can't reset the connection under the answer. The slot is held until then.
+    finish_connection(&mut reader);
+    answered
+}
 
+/// Read one request from `reader` and answer it on `stream`; the caller closes the connection.
+fn answer_request(
+    mut stream: TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    permit: &mut ConnectionPermit,
+    limits: &ServerLimits,
+    state: &Arc<RwLock<NowPlayingState>>,
+    cmd_tx: &mpsc::Sender<WebCommand>,
+    stream_state: &Arc<StreamServerState>,
+) -> std::io::Result<()> {
     // One deadline for the whole request (line, headers and body), so a client cannot hold the
     // connection open by sending a byte at a time.
     let deadline = Instant::now() + limits.request_timeout;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let head = match read_request_head(&mut reader, deadline, limits) {
+    let head = match read_request_head(reader, deadline, limits) {
         Ok(Some(head)) => head,
         Ok(None) => return Ok(()),
         Err(rejection) => {
-            reject_request(&mut stream, &mut reader, rejection);
+            write_rejection(&mut stream, rejection);
             return Ok(());
         }
     };
 
     let method = head.method.as_str();
     let path = head.path.as_str();
-    // The path without its query string or fragment.
-    let route = path.split(['?', '#']).next().unwrap_or(path);
+    // The path without its fragment, then without its query string: the route and every
+    // handler see the same split.
+    let target = path.split_once('#').map_or(path, |(target, _)| target);
+    let (route, query) = match target.split_once('?') {
+        Some((route, query)) => (route, Some(query)),
+        None => (target, None),
+    };
+    let endpoint = Route::find(route);
+    let is_head = method == "HEAD";
     let content_length = head.content_length;
     let range_header = head.header("range").map(str::to_string);
     let mut auth_headers = crate::web_access::AuthHeaders::default();
@@ -331,23 +424,16 @@ pub(super) fn handle_client(
 
     // Streams can run for hours: move them to their own pool so they do not use up the slots
     // for short requests.
-    let _permit = if (method == "GET" || method == "HEAD") && path.starts_with("/stream") {
-        match permit.into_stream() {
-            Ok(stream_permit) => stream_permit,
-            Err(_request_permit) => {
-                crate::log_warn!(
-                    "web",
-                    "Stream limit ({}) reached; refusing {}",
-                    limits.max_streams,
-                    path
-                );
-                reject_request(&mut stream, &mut reader, Rejection::Busy);
-                return Ok(());
-            }
-        }
-    } else {
-        permit
-    };
+    if endpoint.is_some_and(|e| e.is_stream() && e.takes(method)) && !permit.move_to_stream() {
+        crate::log_warn!(
+            "web",
+            "Stream limit ({}) reached; refusing {}",
+            limits.max_streams,
+            path
+        );
+        write_rejection(&mut stream, Rejection::Busy);
+        return Ok(());
+    }
 
     // Read from memory per request, so toggling the setting applies to the next request.
     let remote_access = state.read().is_ok_and(|s| s.remote_access);
@@ -355,22 +441,33 @@ pub(super) fn handle_client(
         return Ok(());
     }
 
+    // An unknown path, or a method its route doesn't take: answered at once, any declared body
+    // is left to the drain in `handle_client`.
+    let endpoint = match endpoint {
+        Some(endpoint) if endpoint.takes(method) => endpoint,
+        Some(endpoint) => return write_method_not_allowed(&mut stream, route, &endpoint.allow(), is_head),
+        None => return write_not_found(&mut stream, route, is_head),
+    };
+
     // Route dispatch
-    if method == "GET" || method == "HEAD" {
-        let is_head = method == "HEAD";
-        if route == "/" || route == "/index.html" {
+    match endpoint {
+        Route::Dashboard => {
             // Serve single-page dashboard
-            let body = NOW_PLAYING_HTML.as_bytes();
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(header.as_bytes())?;
-            if !is_head {
-                stream.write_all(body)?;
-            }
-            stream.flush()?;
-        } else if path.starts_with("/api/status") {
+            write_response(
+                &mut stream,
+                "200 OK",
+                &[
+                    ("Content-Type", "text/html; charset=utf-8"),
+                    ("X-Frame-Options", "DENY"),
+                    ("Referrer-Policy", "no-referrer"),
+                    ("X-Content-Type-Options", "nosniff"),
+                    ("Cache-Control", "no-store"),
+                ],
+                NOW_PLAYING_HTML.as_bytes(),
+                is_head,
+            )?;
+        }
+        Route::Status => {
             // Serve JSON playback status
             let mut current = {
                 let s = state.read().unwrap();
@@ -407,32 +504,16 @@ pub(super) fn handle_client(
                 current.autopilot_dir = None;
             }
             let json = serde_json::to_string(&current).unwrap_or_else(|_| "{}".to_string());
-            let body = json.as_bytes();
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(header.as_bytes())?;
-            if !is_head {
-                stream.write_all(body)?;
-            }
-            stream.flush()?;
-        } else if route == "/api/playlists" {
+            write_json(&mut stream, "200 OK", "no-cache", &json, is_head)?;
+        }
+        Route::Playlists => {
             // The snapshot the UI thread published; the playlists folder is never read here.
             let json = playlists_response(state);
-            let body = json.as_bytes();
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(header.as_bytes())?;
-            if !is_head {
-                stream.write_all(body)?;
-            }
-            stream.flush()?;
+            write_json(&mut stream, "200 OK", "no-cache", &json, is_head)?;
             // Someone is looking at the playlists: have their files checked on workers.
             let _ = cmd_tx.send(WebCommand::CheckPlaylists);
-        } else if path.starts_with("/api/cover") {
+        }
+        Route::Cover => {
             // Serve cover art (JPEG/PNG/WebP/GIF) or SVG placeholder. `extract_cover_art` only
             // returns allowlisted MIME types; re-check here so a tag string never reaches the
             // response head.
@@ -445,32 +526,24 @@ pub(super) fn handle_client(
                 .as_deref()
                 .and_then(extract_cover_art)
                 .and_then(|(bytes, mime)| cover_image_mime(Some(&mime), &bytes).map(|m| (bytes, m)));
-            if let Some((bytes, mime)) = art_opt {
-                let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: public, max-age=10\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    mime,
-                    bytes.len()
-                );
-                stream.write_all(header.as_bytes())?;
-                if !is_head {
-                    stream.write_all(&bytes)?;
-                }
-                stream.flush()?;
-            } else {
-                let svg = default_cover_svg().as_bytes();
-                let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nX-Content-Type-Options: nosniff\r\nCache-Control: public, max-age=10\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    svg.len()
-                );
-                stream.write_all(header.as_bytes())?;
-                if !is_head {
-                    stream.write_all(svg)?;
-                }
-                stream.flush()?;
-            }
-        } else if path.starts_with("/api/browser") {
-            let requested_path = if let Some(query_idx) = path.find('?') {
-                let query_str = &path[query_idx + 1..];
+            let (mime, bytes) = match &art_opt {
+                Some((bytes, mime)) => (*mime, bytes.as_slice()),
+                None => ("image/svg+xml", default_cover_svg().as_bytes()),
+            };
+            write_response(
+                &mut stream,
+                "200 OK",
+                &[
+                    ("Content-Type", mime),
+                    ("X-Content-Type-Options", "nosniff"),
+                    ("Cache-Control", "public, max-age=10"),
+                ],
+                bytes,
+                is_head,
+            )?;
+        }
+        Route::Browser => {
+            let requested_path = if let Some(query_str) = query {
                 let mut p_val = None;
                 for pair in query_str.split('&') {
                     let mut kv = pair.splitn(2, '=');
@@ -565,17 +638,9 @@ pub(super) fn handle_client(
             };
 
             let json = serde_json::to_string(&resp_data).unwrap_or_else(|_| "{}".to_string());
-            let body = json.as_bytes();
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(header.as_bytes())?;
-            if !is_head {
-                stream.write_all(body)?;
-            }
-            stream.flush()?;
-        } else if is_continuous_route(route) {
+            write_json(&mut stream, "200 OK", "no-cache", &json, is_head)?;
+        }
+        Route::Continuous => {
             // Only the armed UPnP continuous session's path is served, to the first host that
             // connects to it.
             let peer = stream.peer_addr()?.ip();
@@ -583,194 +648,203 @@ pub(super) fn handle_client(
                 ContinuousAdmission::Admitted(nonce) => {
                     serve_continuous_stream(stream, is_head, state, cmd_tx, stream_state, &nonce)?;
                 }
-                ContinuousAdmission::NotFound => {
-                    stream.write_all(
-                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found",
-                    )?;
-                    stream.flush()?;
-                }
+                ContinuousAdmission::NotFound => write_not_found(&mut stream, route, is_head)?,
                 ContinuousAdmission::Conflict => {
                     crate::log_warn!(
                         "web",
                         "Refusing continuous stream request from {}: the session belongs to another host",
                         peer
                     );
-                    stream.write_all(
-                        b"HTTP/1.1 409 Conflict\r\nContent-Length: 8\r\nConnection: close\r\n\r\nConflict",
-                    )?;
-                    stream.flush()?;
+                    write_plain(&mut stream, "409 Conflict", &[], "Conflict", is_head)?;
                 }
             }
-            return Ok(());
-        } else if path.starts_with("/stream") {
-            // Serve DLNA audio streaming with HTTP byte ranges
-            serve_audio_stream(stream, path, range_header.as_deref(), is_head, state, stream_state)?;
-            return Ok(());
-        } else {
-            let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-            stream.write_all(not_found)?;
-            stream.flush()?;
         }
-    } else if method == "POST" && path.starts_with("/api/action") {
-        // content_length was checked against limits.max_body_bytes with the headers.
-        let body_bytes = read_request_body(&mut reader, content_length, deadline).unwrap_or_default();
+        Route::Stream => {
+            // Serve DLNA audio streaming with HTTP byte ranges
+            serve_audio_stream(
+                stream,
+                route,
+                query,
+                range_header.as_deref(),
+                is_head,
+                state,
+                stream_state,
+            )?;
+        }
+        Route::Action => {
+            // content_length was checked against limits.max_body_bytes with the headers. A body
+            // cut short or late is refused: part of a request is never acted on (issue #109).
+            let body_bytes = match read_request_body(reader, content_length, deadline) {
+                Ok(body) => body,
+                // As for a head that runs out of time.
+                Err(BodyError::TimedOut) => {
+                    write_rejection(&mut stream, Rejection::RequestTimeout);
+                    return Ok(());
+                }
+                Err(BodyError::CutShort) => {
+                    let response = ActionResponse::refused("400 Bad Request", INCOMPLETE_BODY);
+                    return write_json(
+                        &mut stream,
+                        response.status,
+                        "no-store",
+                        &response.body.to_string(),
+                        false,
+                    );
+                }
+            };
 
-        // Paths must resolve inside the allowed folders; commands carry the resolved path.
-        let (roots, terminal_dir) = {
-            let current = state.read().unwrap();
-            (current.allowed_roots.clone(), current.terminal_dir.clone())
-        };
-        let mut rejected: Option<PathBuf> = None;
-        // Canonicalized on first use, at most once per request.
-        let mut allowed: Option<crate::web_access::AllowedRoots> = None;
-        let mut allow = |p: PathBuf| -> Option<PathBuf> {
-            let resolved = allowed
-                .get_or_insert_with(|| crate::web_access::AllowedRoots::new(&roots))
-                .resolve(&p);
-            if resolved.is_none() {
-                rejected = Some(p);
-            }
-            resolved
-        };
-        let mut response = ActionResponse::ok();
-        if let Ok(payload) = serde_json::from_slice::<ActionPayload>(&body_bytes) {
-            match payload.action.as_str() {
-                "toggle_pause" => {
-                    let _ = cmd_tx.send(WebCommand::TogglePause);
+            // Paths must resolve inside the allowed folders; commands carry the resolved path.
+            let (roots, terminal_dir) = {
+                let current = state.read().unwrap();
+                (current.allowed_roots.clone(), current.terminal_dir.clone())
+            };
+            let mut rejected: Option<PathBuf> = None;
+            // Canonicalized on first use, at most once per request.
+            let mut allowed: Option<crate::web_access::AllowedRoots> = None;
+            let mut allow = |p: PathBuf| -> Option<PathBuf> {
+                let resolved = allowed
+                    .get_or_insert_with(|| crate::web_access::AllowedRoots::new(&roots))
+                    .resolve(&p);
+                if resolved.is_none() {
+                    rejected = Some(p);
                 }
-                "play" => {
-                    let _ = cmd_tx.send(WebCommand::Play);
-                }
-                "pause" => {
-                    let _ = cmd_tx.send(WebCommand::Pause);
-                }
-                "next" => {
-                    let _ = cmd_tx.send(WebCommand::Next);
-                }
-                "prev" => {
-                    let _ = cmd_tx.send(WebCommand::Prev);
-                }
-                "volume" => {
-                    if let Some(vol) = payload.value {
-                        let _ = cmd_tx.send(WebCommand::SetVolume(vol.clamp(0.0, 100.0) as u8));
+                resolved
+            };
+            let mut response = ActionResponse::ok();
+            match serde_json::from_slice::<ActionPayload>(&body_bytes) {
+                Err(_) => response = ActionResponse::refused("400 Bad Request", INVALID_REQUEST),
+                Ok(payload) => match payload.action.as_str() {
+                    "toggle_pause" => {
+                        let _ = cmd_tx.send(WebCommand::TogglePause);
                     }
-                }
-                "seek" => {
-                    if let Some(target) = payload.value {
-                        let _ = cmd_tx.send(WebCommand::SeekTo(target));
+                    "play" => {
+                        let _ = cmd_tx.send(WebCommand::Play);
                     }
-                }
-                "seek_relative" => {
-                    if let Some(delta) = payload.value {
-                        let _ = cmd_tx.send(WebCommand::SeekRelative(delta));
+                    "pause" => {
+                        let _ = cmd_tx.send(WebCommand::Pause);
                     }
-                }
-                "play_index" => {
-                    if let Some(idx) = payload.index {
-                        let _ = cmd_tx.send(WebCommand::PlayIndex(idx));
+                    "next" => {
+                        let _ = cmd_tx.send(WebCommand::Next);
                     }
-                }
-                "remove_index" => {
-                    if let Some(idx) = payload.index {
-                        let _ = cmd_tx.send(WebCommand::RemoveIndex(idx));
+                    "prev" => {
+                        let _ = cmd_tx.send(WebCommand::Prev);
                     }
-                }
-                "clear_queue" => {
-                    let _ = cmd_tx.send(WebCommand::ClearQueue);
-                }
-                "add_file" | "add_track" => {
-                    if let Some(p) = payload.path.map(PathBuf::from).and_then(&mut allow) {
-                        let _ = cmd_tx.send(WebCommand::AddFile(p));
-                    }
-                }
-                "add_folder" => {
-                    if let Some(p) = payload.path.map(PathBuf::from).and_then(&mut allow) {
-                        let _ = cmd_tx.send(WebCommand::AddFolder(p));
-                    }
-                }
-                "select_device" => {
-                    if let Some(id) = payload.id.or(payload.index) {
-                        let _ = cmd_tx.send(WebCommand::SelectDevice(id));
-                    }
-                }
-                "rescan_devices" => {
-                    let _ = cmd_tx.send(WebCommand::RescanDevices);
-                }
-                "set_queue_mode" => {
-                    if let Some(mode) = payload.mode {
-                        let _ = cmd_tx.send(WebCommand::SetQueueMode(mode));
-                    }
-                }
-                "set_home" => match payload.path {
-                    None => {
-                        let _ = cmd_tx.send(WebCommand::SetHome(None));
-                    }
-                    Some(p) => {
-                        if let Some(dir) = allow(p.into()) {
-                            let _ = cmd_tx.send(WebCommand::SetHome(Some(dir.to_string_lossy().to_string())));
+                    "volume" => {
+                        if let Some(vol) = payload.value {
+                            let _ = cmd_tx.send(WebCommand::SetVolume(vol.clamp(0.0, 100.0) as u8));
                         }
                     }
-                },
-                // Without a path, the folder the terminal is browsing (as a path, so a non-UTF-8
-                // name stays intact): resolved here, never on the UI thread (issue #102).
-                "autopilot" | "autopilot_reshuffle" | "reshuffle" => {
-                    match payload.path.map(PathBuf::from).or(terminal_dir) {
-                        None => response = ActionResponse::refused("409 Conflict", NO_TERMINAL_FOLDER),
-                        Some(dir) => {
-                            if let Some(dir) = allow(dir) {
-                                let _ = cmd_tx.send(if payload.action == "autopilot" {
-                                    WebCommand::Autopilot(dir)
-                                } else {
-                                    WebCommand::AutopilotReshuffle(dir)
-                                });
+                    "seek" => {
+                        if let Some(target) = payload.value {
+                            let _ = cmd_tx.send(WebCommand::SeekTo(target));
+                        }
+                    }
+                    "seek_relative" => {
+                        if let Some(delta) = payload.value {
+                            let _ = cmd_tx.send(WebCommand::SeekRelative(delta));
+                        }
+                    }
+                    "play_index" => {
+                        if let Some(idx) = payload.index {
+                            let _ = cmd_tx.send(WebCommand::PlayIndex(idx));
+                        }
+                    }
+                    "remove_index" => {
+                        if let Some(idx) = payload.index {
+                            let _ = cmd_tx.send(WebCommand::RemoveIndex(idx));
+                        }
+                    }
+                    "clear_queue" => {
+                        let _ = cmd_tx.send(WebCommand::ClearQueue);
+                    }
+                    "add_file" | "add_track" => {
+                        if let Some(p) = payload.path.map(PathBuf::from).and_then(&mut allow) {
+                            let _ = cmd_tx.send(WebCommand::AddFile(p));
+                        }
+                    }
+                    "add_folder" => {
+                        if let Some(p) = payload.path.map(PathBuf::from).and_then(&mut allow) {
+                            let _ = cmd_tx.send(WebCommand::AddFolder(p));
+                        }
+                    }
+                    "select_device" => {
+                        if let Some(id) = payload.id.or(payload.index) {
+                            let _ = cmd_tx.send(WebCommand::SelectDevice(id));
+                        }
+                    }
+                    "rescan_devices" => {
+                        let _ = cmd_tx.send(WebCommand::RescanDevices);
+                    }
+                    "set_queue_mode" => {
+                        if let Some(mode) = payload.mode {
+                            let _ = cmd_tx.send(WebCommand::SetQueueMode(mode));
+                        }
+                    }
+                    "set_home" => match payload.path {
+                        None => {
+                            let _ = cmd_tx.send(WebCommand::SetHome(None));
+                        }
+                        Some(p) => {
+                            if let Some(dir) = allow(p.into()) {
+                                let _ = cmd_tx.send(WebCommand::SetHome(Some(dir.to_string_lossy().to_string())));
+                            }
+                        }
+                    },
+                    // Without a path, the folder the terminal is browsing (as a path, so a non-UTF-8
+                    // name stays intact): resolved here, never on the UI thread (issue #102).
+                    "autopilot" | "autopilot_reshuffle" | "reshuffle" => {
+                        match payload.path.map(PathBuf::from).or(terminal_dir) {
+                            None => response = ActionResponse::refused("409 Conflict", NO_TERMINAL_FOLDER),
+                            Some(dir) => {
+                                if let Some(dir) = allow(dir) {
+                                    let _ = cmd_tx.send(if payload.action == "autopilot" {
+                                        WebCommand::Autopilot(dir)
+                                    } else {
+                                        WebCommand::AutopilotReshuffle(dir)
+                                    });
+                                }
                             }
                         }
                     }
-                }
-                "shuffle" => {
-                    let _ = cmd_tx.send(WebCommand::ShuffleQueue);
-                }
-                "set_mix_profile" | "mix_profile" => {
-                    if let Some(profile_str) = payload.mode.or(payload.path) {
-                        let _ = cmd_tx.send(WebCommand::SetMixProfile(profile_str));
+                    "shuffle" => {
+                        let _ = cmd_tx.send(WebCommand::ShuffleQueue);
                     }
-                }
-                "seed_radio" => {
-                    if let Some(p) = payload.path.map(PathBuf::from).and_then(&mut allow) {
-                        let _ = cmd_tx.send(WebCommand::SeedRadio(p));
+                    "set_mix_profile" | "mix_profile" => {
+                        if let Some(profile_str) = payload.mode.or(payload.path) {
+                            let _ = cmd_tx.send(WebCommand::SetMixProfile(profile_str));
+                        }
                     }
-                }
-                "playlist_play" | "playlist_append" => {
-                    let play = payload.action == "playlist_play";
-                    response = queue_playlist_action(&payload, play, state, cmd_tx, &mut rejected);
-                }
-                "playlist_create" | "playlist_rename" | "playlist_delete" | "playlist_add" | "playlist_remove"
-                | "playlist_move" => {
-                    response = edit_playlist_action(&payload, cmd_tx, &mut allow);
-                }
-                _ => {}
+                    "seed_radio" => {
+                        if let Some(p) = payload.path.map(PathBuf::from).and_then(&mut allow) {
+                            let _ = cmd_tx.send(WebCommand::SeedRadio(p));
+                        }
+                    }
+                    "playlist_play" | "playlist_append" => {
+                        let play = payload.action == "playlist_play";
+                        response = queue_playlist_action(&payload, play, state, cmd_tx, &mut rejected);
+                    }
+                    "playlist_create" | "playlist_rename" | "playlist_delete" | "playlist_add" | "playlist_remove"
+                    | "playlist_move" => {
+                        response = edit_playlist_action(&payload, cmd_tx, &mut allow);
+                    }
+                    _ => response = ActionResponse::refused("400 Bad Request", UNKNOWN_ACTION),
+                },
             }
-        }
 
-        if let Some(path) = rejected {
-            let _ = cmd_tx.send(WebCommand::PathRejected(path));
-            crate::web_access::write_path_forbidden(&mut stream)?;
-            return Ok(());
-        }
+            if let Some(path) = rejected {
+                let _ = cmd_tx.send(WebCommand::PathRejected(path));
+                crate::web_access::write_path_forbidden(&mut stream)?;
+                return Ok(());
+            }
 
-        let body = response.body.to_string();
-        let header = format!(
-            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            response.status,
-            body.len()
-        );
-        stream.write_all(header.as_bytes())?;
-        stream.write_all(body.as_bytes())?;
-        stream.flush()?;
-    } else {
-        let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-        stream.write_all(not_found)?;
-        stream.flush()?;
+            write_json(
+                &mut stream,
+                response.status,
+                "no-store",
+                &response.body.to_string(),
+                false,
+            )?;
+        }
     }
 
     Ok(())

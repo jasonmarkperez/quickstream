@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use super::server::write_not_found;
 use super::state::{NowPlayingState, WebCommand};
 
 /// An armed continuous stream: the renderer must request `/stream/continuous-<nonce>.wav`.
@@ -656,16 +657,16 @@ fn find_wav_pcm_offset(
 
 /// What a `/stream/<name>?pos=` response sends: `header`, then the file's bytes `start..end`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamOffset {
+pub(super) struct StreamOffset {
     /// The first file byte sent.
-    pub start: u64,
+    pub(super) start: u64,
     /// One past the last file byte sent: the file's length, or the end of a WAV's last whole block.
-    pub end: u64,
+    pub(super) end: u64,
     /// A header sent before the file's bytes (a seeked WAV's new RIFF header).
-    pub header: Option<Vec<u8>>,
+    pub(super) header: Option<Vec<u8>>,
 }
 
-pub fn calculate_stream_offset(
+pub(super) fn calculate_stream_offset(
     filepath: &std::path::Path,
     file: &mut std::fs::File,
     offset_seconds: f64,
@@ -820,7 +821,8 @@ pub fn parse_byte_range(header: &str, len: u64) -> ByteRange {
 
 pub(super) fn serve_audio_stream(
     mut stream: TcpStream,
-    path: &str,
+    route: &str,
+    query: Option<&str>,
     range_header: Option<&str>,
     head_only: bool,
     state: &Arc<RwLock<NowPlayingState>>,
@@ -842,13 +844,12 @@ pub(super) fn serve_audio_stream(
     let _ = stream.set_nodelay(true);
 
     // 1. Resolve target file and optional seek offset query parameter
-    let raw_encoded = path.strip_prefix("/stream/").unwrap_or("");
-    let encoded_path = raw_encoded.split('?').next().unwrap_or(raw_encoded);
+    // `route` and `query` are split by the router, so this is the file the route matched.
+    let encoded_path = route.strip_prefix("/stream/").unwrap_or("");
     let decoded_path = crate::player::upnp::url_decode(encoded_path);
 
-    let query_str = path.split_once('?').map(|(_, q)| q);
     let mut offset_seconds: f64 = 0.0;
-    if let Some(query) = query_str {
+    if let Some(query) = query {
         for param in query.split('&') {
             if let Some((k, v)) = param.split_once('=') {
                 if k == "pos" || k == "offset" {
@@ -873,10 +874,7 @@ pub(super) fn serve_audio_stream(
                 "Stream 404: '{}' is not a registered or now-playing file",
                 decoded_path
             );
-            let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-            stream.write_all(not_found)?;
-            stream.flush()?;
-            return Ok(());
+            return write_not_found(&mut stream, route, head_only);
         }
     };
 
@@ -884,10 +882,7 @@ pub(super) fn serve_audio_stream(
         Ok(f) => f,
         Err(e) => {
             crate::log_warn!("web", "Stream 404: Failed to open '{}': {}", filepath.display(), e);
-            let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-            stream.write_all(not_found)?;
-            stream.flush()?;
-            return Ok(());
+            return write_not_found(&mut stream, route, head_only);
         }
     };
 
@@ -1165,7 +1160,7 @@ impl SilencePacer {
 /// Slices tracks sequentially directly into the exact same TCP socket without drops or DAC resets.
 /// `session` is the nonce of the armed session the request was admitted to; the stream ends when
 /// that session ends.
-pub fn serve_continuous_stream(
+pub(super) fn serve_continuous_stream(
     mut stream: TcpStream,
     is_head: bool,
     state: &Arc<RwLock<NowPlayingState>>,

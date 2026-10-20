@@ -1,4 +1,4 @@
-//! The listener, connection limits and request parsing.
+//! The listener, connection limits, request parsing and the response writers.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -149,11 +149,16 @@ pub(super) struct ConnectionPermit {
 }
 
 impl ConnectionPermit {
-    /// Move a request-pool slot to the stream pool; returns `self` unchanged if the stream pool is full.
-    pub(super) fn into_stream(self) -> Result<ConnectionPermit, ConnectionPermit> {
+    /// Move this slot to the stream pool, releasing its request-pool slot. False, and still a
+    /// request slot, when the stream pool is full.
+    pub(super) fn move_to_stream(&mut self) -> bool {
         match self.limiter.try_acquire(PermitKind::Stream) {
-            Some(stream_permit) => Ok(stream_permit),
-            None => Err(self),
+            Some(stream_permit) => {
+                // Dropping the old value releases the request-pool slot.
+                *self = stream_permit;
+                true
+            }
+            None => false,
         }
     }
 }
@@ -208,15 +213,26 @@ fn refuse_busy_connection(mut stream: TcpStream) {
     let _ = stream.flush();
 }
 
-/// Send an error response, then drain unread request bytes for a moment before closing: closing
-/// with unread data makes the kernel send a reset, which can discard the response at the client.
-pub(super) fn reject_request(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, rejection: Rejection) {
-    let _ = stream.write_all(rejection.response().as_bytes());
-    let _ = stream.flush();
-    let _ = stream.shutdown(std::net::Shutdown::Write);
+/// Send an error response that answers before routing (`rejection`).
+pub(super) fn write_rejection(out: &mut impl Write, rejection: Rejection) {
+    let _ = out.write_all(rejection.response().as_bytes());
+    let _ = out.flush();
+}
 
-    const DRAIN_TIME: Duration = Duration::from_millis(500);
-    const DRAIN_BYTES: usize = 256 * 1024;
+/// Longest a closing connection is drained.
+const DRAIN_TIME: Duration = Duration::from_secs(2);
+/// Most bytes a closing connection drains.
+const DRAIN_BYTES: usize = 256 * 1024;
+
+/// Close a connection without losing its answer: shut down the write side (the client sees the
+/// whole response, then end of stream), then read and drop what the client still sends (a body
+/// no route read, or one sent after the answer) until it closes, for at most `DRAIN_TIME` and
+/// `DRAIN_BYTES`. Closing with unread bytes, or with bytes still to come, makes the kernel send
+/// a reset, which can discard the response at the client. A body that arrives after the bound can
+/// still be reset, and a client that keeps a fully read connection open holds its request or
+/// stream slot until the bound.
+pub(super) fn finish_connection(reader: &mut BufReader<TcpStream>) {
+    let _ = reader.get_ref().shutdown(std::net::Shutdown::Write);
     let deadline = Instant::now() + DRAIN_TIME;
     let mut drained = 0usize;
     let mut buf = [0u8; 8192];
@@ -226,10 +242,124 @@ pub(super) fn reject_request(stream: &mut TcpStream, reader: &mut BufReader<TcpS
             break;
         }
         match reader.read(&mut buf) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(n) => drained += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
         }
     }
+}
+
+/// Write a response: the status line, `headers`, `Content-Length` and `Connection: close`, then
+/// `body`; a HEAD request gets the head only (with the same `Content-Length`).
+pub(super) fn write_response(
+    out: &mut impl Write,
+    status: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    is_head: bool,
+) -> std::io::Result<()> {
+    let mut head = format!("HTTP/1.1 {}\r\n", status);
+    for (name, value) in headers {
+        head.push_str(&format!("{}: {}\r\n", name, value));
+    }
+    head.push_str(&format!("Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()));
+    out.write_all(head.as_bytes())?;
+    if !is_head {
+        out.write_all(body)?;
+    }
+    out.flush()
+}
+
+/// Write a JSON response with `Cache-Control: <cache>`; a HEAD request gets the head only.
+pub(super) fn write_json(
+    out: &mut impl Write,
+    status: &str,
+    cache: &str,
+    body: &str,
+    is_head: bool,
+) -> std::io::Result<()> {
+    write_response(
+        out,
+        status,
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Content-Type-Options", "nosniff"),
+            ("Cache-Control", cache),
+        ],
+        body.as_bytes(),
+        is_head,
+    )
+}
+
+/// Write a short plain-text response: `headers` after the content type, then `text` as the
+/// body; a HEAD request gets the head only.
+pub(super) fn write_plain(
+    out: &mut impl Write,
+    status: &str,
+    headers: &[(&str, &str)],
+    text: &str,
+    is_head: bool,
+) -> std::io::Result<()> {
+    let mut all = vec![
+        ("Content-Type", "text/plain; charset=utf-8"),
+        ("X-Content-Type-Options", "nosniff"),
+    ];
+    all.extend_from_slice(headers);
+    write_response(out, status, &all, text.as_bytes(), is_head)
+}
+
+/// Whether `route` (a path without its query string) is one of the API's paths, which answer
+/// errors as JSON: the dashboard reads every `/api/` answer with `res.json()`.
+fn is_api_path(route: &str) -> bool {
+    route == "/api" || route.starts_with("/api/")
+}
+
+/// Write an error answer to `route`: JSON `{"ok":false,"error":<error>}` on the API's paths,
+/// else the status's reason phrase as plain text.
+fn write_route_error(
+    out: &mut impl Write,
+    route: &str,
+    status: &str,
+    headers: &[(&str, &str)],
+    error: &str,
+    is_head: bool,
+) -> std::io::Result<()> {
+    if is_api_path(route) {
+        let body = serde_json::json!({ "ok": false, "error": error }).to_string();
+        let mut all = vec![
+            ("Content-Type", "application/json"),
+            ("X-Content-Type-Options", "nosniff"),
+            ("Cache-Control", "no-store"),
+        ];
+        all.extend_from_slice(headers);
+        write_response(out, status, &all, body.as_bytes(), is_head)
+    } else {
+        let reason = status.split_once(' ').map_or(status, |(_, reason)| reason);
+        write_plain(out, status, headers, reason, is_head)
+    }
+}
+
+/// Write a `404 Not Found` for `route`.
+pub(super) fn write_not_found(out: &mut impl Write, route: &str, is_head: bool) -> std::io::Result<()> {
+    write_route_error(out, route, "404 Not Found", &[], "Not found", is_head)
+}
+
+/// Write a `405 Method Not Allowed` for `route`, naming the methods it takes (`allow`).
+pub(super) fn write_method_not_allowed(
+    out: &mut impl Write,
+    route: &str,
+    allow: &str,
+    is_head: bool,
+) -> std::io::Result<()> {
+    write_route_error(
+        out,
+        route,
+        "405 Method Not Allowed",
+        &[("Allow", allow)],
+        "Method not allowed",
+        is_head,
+    )
 }
 
 /// Request line and headers of an incoming request.
@@ -365,20 +495,37 @@ pub(super) fn read_request_head(
     Ok(Some(head))
 }
 
+/// Why a request body couldn't be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BodyError {
+    /// The client closed its side (or the socket failed) before the whole body came.
+    CutShort,
+    /// The request deadline ran out first.
+    TimedOut,
+}
+
 /// Read a request body of `len` bytes (already checked against the body limit) before `deadline`.
-pub(super) fn read_request_body(reader: &mut BufReader<TcpStream>, len: usize, deadline: Instant) -> Option<Vec<u8>> {
+pub(super) fn read_request_body(
+    reader: &mut BufReader<TcpStream>,
+    len: usize,
+    deadline: Instant,
+) -> Result<Vec<u8>, BodyError> {
     let mut body = vec![0u8; len];
     let mut filled = 0;
     while filled < len {
-        arm_read_deadline(reader.get_ref(), deadline).ok()?;
+        arm_read_deadline(reader.get_ref(), deadline).map_err(|e| match e {
+            LineError::Timeout => BodyError::TimedOut,
+            LineError::Closed | LineError::TooLong => BodyError::CutShort,
+        })?;
         match reader.read(&mut body[filled..]) {
-            Ok(0) => return None,
+            Ok(0) => return Err(BodyError::CutShort),
             Ok(n) => filled += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return None,
+            Err(e) if is_timeout(&e) => return Err(BodyError::TimedOut),
+            Err(_) => return Err(BodyError::CutShort),
         }
     }
-    Some(body)
+    Ok(body)
 }
 
 pub struct WebServer;
