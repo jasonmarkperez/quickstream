@@ -51,23 +51,42 @@ fn test_written_script_starts_while_other_threads_spawn_processes() {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     let dir = scratch_dir("spawn_race");
-    let stop = Arc::new(AtomicBool::new(false));
-    let spawners: Vec<_> = (0..4)
-        .map(|_| {
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let _ = Command::new("/bin/sh").args(["-c", ":"]).status();
-                }
-            })
-        })
-        .collect();
 
-    // About 2 ms a round. With a helper that wrote the script through this process (`fs::write`),
-    // 2 to 5 rounds in 1,000 failed in a Linux container, so 1,000 rounds catch it on almost
-    // every run; the budget only bounds a very slow machine.
+    /// Stops and joins the spawner threads, also when the test panics, so they never keep
+    /// forking while the binary's other tests run.
+    struct Spawners {
+        stop: Arc<AtomicBool>,
+        threads: Vec<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Spawners {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            for thread in self.threads.drain(..) {
+                let _ = thread.join();
+            }
+        }
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawners = Spawners {
+        threads: (0..4)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = Command::new("/bin/sh").args(["-c", ":"]).status();
+                    }
+                })
+            })
+            .collect(),
+        stop,
+    };
+
+    // About 2 to 5 ms a round. With a helper that wrote the script through this process
+    // (`fs::write`), 2 to 5 rounds in 1,000 failed in a Linux container, so 1,000 rounds catch it
+    // on almost every run. The budget is far above the time that takes, so a slow runner still
+    // runs every round; it only bounds a machine that has stalled.
     const ROUNDS: usize = 1000;
-    const BUDGET: Duration = Duration::from_secs(5);
+    const BUDGET: Duration = Duration::from_secs(60);
     let started = Instant::now();
     let mut rounds = 0;
     let mut failures = Vec::new();
@@ -80,10 +99,7 @@ fn test_written_script_starts_while_other_threads_spawn_processes() {
         }
         rounds += 1;
     }
-    stop.store(true, Ordering::Relaxed);
-    for spawner in spawners {
-        spawner.join().unwrap();
-    }
+    drop(spawners);
     eprintln!("{} rounds in {:?}", rounds, started.elapsed());
     assert!(
         failures.is_empty(),

@@ -1,4 +1,6 @@
 //! Switching output to Local Audio resumes at the captured position (issue #44).
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;
