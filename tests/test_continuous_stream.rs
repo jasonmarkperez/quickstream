@@ -869,6 +869,43 @@ fn test_continuous_seek_on_the_last_track_sends_no_shuffle() {
     assert_eq!(*f.controller.current_track_index.lock().unwrap(), 1);
 }
 
+/// The Up Next the stream publishes with each track (`next_track_title`, `up_next`,
+/// `up_next_end`), as JSON so the old fields are read the way clients read them.
+#[cfg(unix)]
+fn published_up_next(f: &DecoderFixture, title: &str) -> serde_json::Value {
+    wait_until(&format!("the stream never published {title}"), || {
+        f.state.read().unwrap().title == title
+    });
+    serde_json::to_value(&*f.state.read().unwrap()).unwrap()
+}
+
+/// The stream publishes Up Next as the UI does while it plays (`PlaybackQueue::upcoming` with
+/// `wrap`): the tracks to the end of the queue, and on the last one no next track, since the
+/// queue is reshuffled before it starts over, never the first track (#104).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_publishes_up_next_to_the_end_then_a_reshuffle() {
+    common::isolate();
+    let names = ["t0_live.wav", "t1_live.wav", "t2_live.wav"];
+    let f = DecoderFixture::start("up_next_first", &names, 0);
+    let status = published_up_next(&f, "Track 0");
+    assert_eq!(status["next_track_title"], "Track 1", "{status}");
+    let listed: Vec<u64> = status["up_next"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|t| t["index"].as_u64()).collect())
+        .unwrap_or_default();
+    assert_eq!(listed, [1, 2], "{status}");
+    assert_eq!(status["up_next_end"], "reshuffles", "{status}");
+    drop(f);
+
+    let f = DecoderFixture::start("up_next_last", &names, 2);
+    let status = published_up_next(&f, "Track 2");
+    assert_eq!(status["next_track_title"], serde_json::Value::Null, "{status}");
+    assert_eq!(status["up_next"], serde_json::json!([]), "{status}");
+    assert_eq!(status["up_next_remaining"], 0, "{status}");
+    assert_eq!(status["up_next_end"], "reshuffles", "{status}");
+}
+
 /// A skip that arrives as a track ends, while the stream waits to pick the next one, is not
 /// lost: the stream plays the track asked for, not the one after the track that ended (#106).
 #[cfg(unix)]

@@ -337,17 +337,14 @@ impl AppUI {
                 state.key = None;
             }
 
-            if self.queue.len() > 1 && self.queue.current_index() + 1 < self.queue.len() {
-                state.next_track_title = self
-                    .queue
-                    .tracks()
-                    .get(self.queue.current_index() + 1)
-                    .map(|t| t.display_title().to_string());
-            } else if !self.queue.is_empty() && self.settings_mgr.settings.queue_mode == "loop" {
-                state.next_track_title = self.queue.tracks().first().map(|t| t.display_title().to_string());
-            } else {
-                state.next_track_title = None;
-            }
+            // What plays next, as tab [1]'s UP NEXT lists it (`now_playing::up_next_summary`):
+            // the same `upcoming` call, so the two never disagree. Only the first few tracks are
+            // built, so this is no per-tick work over the queue.
+            let upcoming = self.queue.current_track().map(|_| {
+                self.queue
+                    .upcoming(&self.settings_mgr.settings.queue_mode, self.continuous_stream_active())
+            });
+            state.publish_up_next(upcoming);
         }
         self.publish_web_playlists();
     }

@@ -313,10 +313,10 @@ impl ContinuousStreamController {
             s.is_playing = true;
             s.is_paused = false;
         }
-        if queue_len > 1 {
-            let next_idx = (index + 1) % queue_len;
-            s.next_track_title = s.queue.get(next_idx).map(|t| t.title.clone());
-        }
+        // Up Next as the UI thread publishes it while the stream plays (`wrap`): the tracks to
+        // the end of the queue, then a reshuffle, never a wrap to the first track.
+        let mode = s.queue_mode.clone();
+        s.publish_up_next(Some(crate::queue::Upcoming::after(index, queue_len, &mode, true)));
     }
 
     /// Run `binary` as the stream's ffmpeg instead of `ffmpeg` on `PATH` (the test seam for a

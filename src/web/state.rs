@@ -18,6 +18,21 @@ pub struct WebQueueItem {
     pub is_current: bool,
 }
 
+/// How many of the tracks after the current one the web state lists in `up_next`; the dashboard
+/// shows them all. `up_next_remaining` counts every one.
+pub const WEB_UP_NEXT_LIMIT: usize = 3;
+
+/// One of the tracks that play after the current one, in `NowPlayingState::up_next`. No path,
+/// so `/api/status` has nothing to clear for a track outside the allowed folders.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WebUpNextItem {
+    /// The track's position in the queue (from 0).
+    pub index: usize,
+    pub title: String,
+    pub artist: String,
+    pub duration_seconds: f64,
+}
+
 /// Output device representation for web rendering.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WebDeviceItem {
@@ -139,7 +154,22 @@ pub struct NowPlayingState {
     pub queue_index: usize,
     pub queue_total: usize,
     pub has_cover: bool,
+    /// The title of the track that plays next: the first of `up_next`, else the current track's
+    /// when it plays again (repeat-one, a single looping track), else `None`. Kept for clients
+    /// that predate `up_next`.
     pub next_track_title: Option<String>,
+    /// The first [`WEB_UP_NEXT_LIMIT`] tracks that play after the current one, in play order,
+    /// from [`crate::queue::PlaybackQueue::upcoming`] as tab [1]'s UP NEXT lists them (`wrap`
+    /// while the continuous stream plays).
+    #[serde(default)]
+    pub up_next: Vec<WebUpNextItem>,
+    /// How many tracks play after the current one before `up_next_end` (tab [1]'s
+    /// `n REMAINING`); `up_next` lists them all when it holds this many.
+    #[serde(default)]
+    pub up_next_remaining: usize,
+    /// What happens once those tracks have played; `None` with nothing loaded.
+    #[serde(default)]
+    pub up_next_end: Option<crate::queue::QueueEnd>,
     #[serde(default)]
     pub queue: Vec<WebQueueItem>,
     #[serde(default)]
@@ -212,6 +242,9 @@ impl Default for NowPlayingState {
             queue_total: 0,
             has_cover: false,
             next_track_title: None,
+            up_next: Vec::new(),
+            up_next_remaining: 0,
+            up_next_end: None,
             queue: Vec::new(),
             devices: Vec::new(),
             queue_mode: "loop".to_string(),
@@ -230,6 +263,44 @@ impl Default for NowPlayingState {
             playlists: Arc::new(WebPlaylists::default()),
             playlists_version: 0,
         }
+    }
+}
+
+impl NowPlayingState {
+    /// Publish what plays after the current track (`up_next`, `up_next_remaining`,
+    /// `up_next_end`, `next_track_title`) from `upcoming` (`None` with nothing loaded) and the
+    /// published `queue`, which its indices name. The UI thread and the continuous stream both
+    /// publish through this, so the two never disagree. At most [`WEB_UP_NEXT_LIMIT`] items are
+    /// built, however long the queue.
+    pub fn publish_up_next(&mut self, upcoming: Option<crate::queue::Upcoming>) {
+        use crate::queue::QueueEnd;
+        let Some(upcoming) = upcoming else {
+            self.up_next.clear();
+            self.up_next_remaining = 0;
+            self.up_next_end = None;
+            self.next_track_title = None;
+            return;
+        };
+        let end = upcoming.end();
+        self.up_next_remaining = upcoming.len();
+        self.up_next = upcoming
+            .take(WEB_UP_NEXT_LIMIT)
+            .filter_map(|index| {
+                self.queue.get(index).map(|t| WebUpNextItem {
+                    index,
+                    title: t.title.clone(),
+                    artist: t.artist.clone(),
+                    duration_seconds: t.duration_seconds,
+                })
+            })
+            .collect();
+        self.up_next_end = Some(end);
+        self.next_track_title = match (self.up_next.first(), end) {
+            (Some(next), _) => Some(next.title.clone()),
+            // Nothing else is listed: the current track plays again, or nothing is known.
+            (None, QueueEnd::RepeatOne | QueueEnd::Loops) => self.queue.get(self.queue_index).map(|t| t.title.clone()),
+            (None, QueueEnd::Stops | QueueEnd::Reshuffles) => None,
+        };
     }
 }
 

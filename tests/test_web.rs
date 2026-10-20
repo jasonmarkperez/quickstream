@@ -1323,3 +1323,146 @@ fn test_web_server_streams_use_separate_pool_and_release_on_disconnect() {
 
     handle.stop();
 }
+
+// ---------------------------------------------------------------------------------------------
+// Up Next (issue #104): /api/status names what plays next as tab [1]'s UP NEXT does
+// ---------------------------------------------------------------------------------------------
+
+/// An app with its web server on (loopback, any port) and four tagged tracks queued.
+fn up_next_app() -> quickstream::ui::AppUI {
+    let mut settings_mgr = quickstream::settings::SettingsManager::new();
+    settings_mgr.settings.web_server_enabled = true;
+    settings_mgr.settings.web_server_lan = false;
+    settings_mgr.settings.web_server_port = 0;
+    let mut app = quickstream::ui::AppUI::new(Some(std::env::temp_dir()), settings_mgr);
+    assert!(app.web_server.is_some(), "web server did not start");
+    for i in 0..4 {
+        app.queue.add_track(quickstream::metadata::AudioMetadata {
+            filepath: PathBuf::from(format!("/music/t{i}.flac")),
+            title: format!("T{i}"),
+            artist: "Mira Lenz".to_string(),
+            duration_seconds: 200.0 + f64::from(i),
+            ..Default::default()
+        });
+    }
+    app
+}
+
+/// Publish the app's state and read `/api/status` back.
+fn up_next_status(app: &mut quickstream::ui::AppUI) -> serde_json::Value {
+    app.update_web_state();
+    let (status, _, body) = http_get(app.web_port().expect("web port"), "/api/status");
+    assert_eq!(status, 200);
+    serde_json::from_slice(&body).expect("status JSON")
+}
+
+/// `/api/status`'s Up Next against `PlaybackQueue::upcoming` with tab [1]'s mode and `wrap`:
+/// the listed indices (the first few; `up_next_remaining` counts every one), the end, and the
+/// older `next_track_title` (the first listed track, else the current one when it plays again).
+fn assert_up_next_matches(app: &mut quickstream::ui::AppUI, wrap: bool, want_end: &str, want_next: Option<&str>) {
+    let mode = app.settings_mgr.settings.queue_mode.clone();
+    let what = format!("{mode}, track {}, wrap {wrap}", app.queue.current_index());
+    let status = up_next_status(app);
+    let upcoming = app.queue.upcoming(&mode, wrap);
+    let remaining = upcoming.len();
+    let want: Vec<serde_json::Value> = upcoming
+        .take(quickstream::web::WEB_UP_NEXT_LIMIT)
+        .map(|i| {
+            let t = &app.queue.tracks()[i];
+            serde_json::json!({
+                "index": i,
+                "title": t.title,
+                "artist": t.artist,
+                "duration_seconds": t.duration_seconds,
+            })
+        })
+        .collect();
+    assert_eq!(status["up_next"], serde_json::Value::Array(want), "{what}: {status}");
+    assert_eq!(status["up_next_remaining"], remaining, "{what}");
+    assert_eq!(status["up_next_end"], want_end, "{what}");
+    assert_eq!(status["next_track_title"].as_str(), want_next, "{what}");
+}
+
+fn stop_up_next_app(mut app: quickstream::ui::AppUI) {
+    if let Some(handle) = app.web_server.take() {
+        handle.stop();
+    }
+}
+
+#[test]
+fn test_status_up_next_in_stop_mode_ends_where_playback_stops() {
+    common::isolate();
+    let mut app = up_next_app();
+    app.settings_mgr.settings.queue_mode = "stop".to_string();
+    app.queue.set_current_index(1);
+    assert_up_next_matches(&mut app, false, "stops", Some("T2"));
+    app.queue.set_current_index(3);
+    assert_up_next_matches(&mut app, false, "stops", None);
+    stop_up_next_app(app);
+}
+
+#[test]
+fn test_status_up_next_in_loop_mode_wraps_to_the_first_track() {
+    common::isolate();
+    let mut app = up_next_app();
+    app.settings_mgr.settings.queue_mode = "loop".to_string();
+    // Three tracks follow track 2: track 3, then past the end tracks 0 and 1.
+    app.queue.set_current_index(2);
+    assert_up_next_matches(&mut app, false, "loops", Some("T3"));
+    app.queue.set_current_index(3);
+    assert_up_next_matches(&mut app, false, "loops", Some("T0"));
+    // A single looping track plays again.
+    while app.queue.len() > 1 {
+        app.queue.remove(1);
+    }
+    app.queue.set_current_index(0);
+    assert_up_next_matches(&mut app, false, "loops", Some("T0"));
+    stop_up_next_app(app);
+}
+
+#[test]
+fn test_status_up_next_in_repeat_one_names_the_current_track() {
+    common::isolate();
+    let mut app = up_next_app();
+    app.settings_mgr.settings.queue_mode = "repeat_one".to_string();
+    app.queue.set_current_index(1);
+    assert_up_next_matches(&mut app, false, "repeat_one", Some("T1"));
+    app.queue.set_current_index(3);
+    assert_up_next_matches(&mut app, false, "repeat_one", Some("T3"));
+    stop_up_next_app(app);
+}
+
+/// While the UPnP continuous stream plays, the queue plays on to its end whatever the mode, then
+/// reshuffles: the last track names no next track, never the first.
+#[test]
+fn test_status_up_next_follows_the_continuous_stream() {
+    common::isolate();
+    let mut app = up_next_app();
+    app.web_server
+        .as_ref()
+        .unwrap()
+        .stream_state()
+        .continuous
+        .is_active
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    for mode in ["stop", "loop", "repeat_one"] {
+        app.settings_mgr.settings.queue_mode = mode.to_string();
+        app.queue.set_current_index(1);
+        assert_up_next_matches(&mut app, true, "reshuffles", Some("T2"));
+        app.queue.set_current_index(3);
+        assert_up_next_matches(&mut app, true, "reshuffles", None);
+    }
+    stop_up_next_app(app);
+}
+
+#[test]
+fn test_status_up_next_is_empty_with_nothing_queued() {
+    common::isolate();
+    let mut app = up_next_app();
+    app.queue.clear();
+    let status = up_next_status(&mut app);
+    assert_eq!(status["up_next"], serde_json::json!([]));
+    assert_eq!(status["up_next_end"], serde_json::Value::Null);
+    assert_eq!(status["next_track_title"], serde_json::Value::Null);
+    stop_up_next_app(app);
+}
