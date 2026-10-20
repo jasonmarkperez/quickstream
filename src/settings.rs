@@ -435,7 +435,7 @@ pub struct SettingsManager {
 
 impl Default for SettingsManager {
     fn default() -> Self {
-        Self::with_path(paths::get_config_path())
+        Self::with_file(paths::config_file())
     }
 }
 
@@ -454,9 +454,15 @@ impl SettingsManager {
     /// parse is copied to `config.json.bak` and logged first (`persist::load_json_or_backup`),
     /// so saving the defaults later doesn't destroy the user's settings.
     pub fn with_path(path: PathBuf) -> Self {
-        let settings = crate::persist::load_json_or_backup(&path, "settings").unwrap_or_default();
+        Self::with_file(paths::ConfigFile::at(path))
+    }
+
+    /// Load settings from `file.read_path` (a legacy file when migrating it failed, #60) and
+    /// save them to `file.write_path`, which `path` holds.
+    pub fn with_file(file: paths::ConfigFile) -> Self {
+        let settings = file.load_json("settings").unwrap_or_default();
         Self {
-            path,
+            path: file.write_path,
             settings,
             persist: None,
             lan_ip: LanIp::new(default_lan_ip_resolver()),

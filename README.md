@@ -76,7 +76,7 @@ It features a native **Ratatui** interactive terminal UI, an in-app recursive **
 
 - **XDG Specification Compliance**:
   - Standard user directories: `~/.config/quickstream/`, `~/.cache/quickstream/`, `~/.local/share/quickstream/`.
-  - Automated backwards-compatible migration for legacy configurations (`~/.quickstream_*.json`, macOS `~/Library/Application Support/quickstream/`) into `~/.config/quickstream/`. Skipped when `XDG_CONFIG_HOME` points elsewhere; legacy files are only read, never written.
+  - Automated backwards-compatible migration for legacy configurations (`~/.quickstream_*.json`, macOS `~/Library/Application Support/quickstream/`) into `~/.config/quickstream/`. Skipped when `XDG_CONFIG_HOME` points elsewhere; legacy files are only read, never written. If the copy fails, Quickstream reads the legacy file and saves to the new location.
 
 ---
 
