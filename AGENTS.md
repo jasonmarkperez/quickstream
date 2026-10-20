@@ -64,7 +64,16 @@ quickstream/
 │   ├── lib.rs            # Library entrypoint and module exports
 │   │
 │   ├── ui/               # Terminal User Interface (Ratatui + Crossterm), see section 3
-│   │   ├── mod.rs        # AppUI state, event loop (`run`: poll workers, draw, wait up to 100 ms for a key), render (chrome, tab body, modal over the dimmed screen), key routing (modals, global hotkeys, tab keys)
+│   │   ├── mod.rs        # AppUI state and `new`, terminal setup/restore and the panic hook, shutdown flags, settings context and status, track features polling; AppUI's methods live in the modules below, by area (issue #26)
+│   │   ├── event_loop.rs # `run` / `event_loop`: poll workers, draw, wait up to 100 ms for a key; shutdown_workers, poll_shutdown_request
+│   │   ├── render.rs     # AppUI::render (chrome, tab body, modal over the dimmed screen), modal_open
+│   │   ├── keys.rs       # Key routing: handle_input_key (modals, global hotkeys), handle_tab_key_with_modifiers (tab and pane keys), open_fuzzy_search
+│   │   ├── browser.rs    # File browser: entry labels, refresh_browser, directory scan and cache, browser metadata fetch, navigate_browser, spotlight, browser paging
+│   │   ├── queue_ops.rs  # Queue edits (enqueue / insert / remove, cursor), queue metadata pool, poll_background_metadata, queue paging
+│   │   ├── playback.rs   # Debounced seeks and track skips, play_current_track / play_next_track / play_prev_track, handle_track_finished
+│   │   ├── autopilot.rs  # Autopilot and Seed Radio: poll_background_autopilot, start / reshuffle / stop, mix picker choice, reset_playback_session
+│   │   ├── output.rs     # Output switching (switch_to_local_player / switch_to_upnp_player, HandOff of the playing track), web server binding (required_web_bind, ensure_web_server_started, sync_web_server)
+│   │   ├── web_cmds.rs   # Web dashboard: handle_web_commands, web_allowed_roots, update_web_state
 │   │   ├── playlists.rs  # Tab 5 Playlists: PlaylistsUi, PLAYLISTS / tracks panels, name prompt (3b/3c) / delete confirm (3d) / add picker (3e, scrolls), L key, play & queue
 │   │   ├── queue_tab.rs  # Tab 2 LIBRARY / QUEUE panels: rows mapped at draw time, IN QUEUE set + totals + column layout from the whole list, cached per revision; split_panes for tabs 2 and 5
 │   │   ├── tag_reads.rs  # SharedTagReads: tag reads shared by browser/queue/folder-add workers, in-flight path set
@@ -160,7 +169,7 @@ The background writer's create, delete and rename tests (used by `PlaylistStore`
 
 ## 3. Terminal UI Architecture & Ratatui Guidelines
 
-The TUI is the Telemetry design: style sheet 2a, screens 2b–2i at 120×40, states, 80×24 screens and width rules in 3a–3h. `AppUI::render` (`src/ui/mod.rs`) draws the chrome (`chrome.rs`), the active tab's body and the open modal; each has its own module (section 2). Tabs are named here by their keys `[1]`–`[5]`; in code `active_tab` is 0–4.
+The TUI is the Telemetry design: style sheet 2a, screens 2b–2i at 120×40, states, 80×24 screens and width rules in 3a–3h. `AppUI::render` (`src/ui/render.rs`) draws the chrome (`chrome.rs`), the active tab's body and the open modal; each has its own module (section 2). Tabs are named here by their keys `[1]`–`[5]`; in code `active_tab` is 0–4.
 
 ### 3.1 Ground rules
 - **No I/O on the render path or the UI thread.** Frames and key handlers read memory only:
@@ -531,7 +540,7 @@ The dashboard's `Playlists` tab uses the same store and code as tab `[5]`.
 1. **List wraparound:** `Up` / `Down` (`k` / `j`) wrap in every interactive list (Queue, file browser, Devices, Settings in display order, search results, mix profiles, Playlists, playlist tracks, add-to-playlist picker): `Up` at the first row goes to the last, `Down` at the last to the first.
    - Page keys on tabs `[2]` and `[3]` stop at the first / last row and wrap only when pressed there; on `[4]` they jump to the ends.
    - On tab `[5]`, `g` / `G` / PageUp / PageDown never wrap, and neither does moving a playlist track with `⇧K` / `⇧J`.
-2. **Precedence** (`AppUI::run`, then `AppUI::handle_input_key`):
+2. **Precedence** (`AppUI::run` in `src/ui/event_loop.rs`, then `AppUI::handle_input_key` in `src/ui/keys.rs`):
    - Resizing needs no handler: each frame is drawn at the terminal's current size, and `run` redraws at least every 100 ms and after every key.
    - Modals and typed text take every key first, in this order: help, search, spotlight (in `run`), then the mix picker, the startup home editor and the playlist modals (in `handle_input_key`). `Ctrl+C` quits from any of them. Dismissal: help `Esc` / `q` / `?`; search `Esc` (letters are query text); mix picker `Esc` / `q` / `M`; add picker `Esc` / `q`; the name prompt and the startup home editor treat `q` as text and close only with `Esc` / `Enter`; the delete confirmation closes on any key.
    - In `handle_input_key`, a key other than a seek key first applies a pending debounced seek, and a key other than `←` / `→` (`s` and `c` aside) applies a pending debounced skip.
