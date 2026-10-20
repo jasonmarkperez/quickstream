@@ -660,6 +660,8 @@ pub struct UPnPPlayer {
     playback_stream_offset: Arc<Mutex<f64>>,
     last_seek_time: Arc<Mutex<Instant>>,
     poll_control: Arc<Mutex<PollControl>>,
+    /// Why the last seek played from the start instead, for [`AudioPlayer::take_error`].
+    seek_error: Mutex<Option<String>>,
 }
 
 impl UPnPPlayer {
@@ -690,6 +692,7 @@ impl UPnPPlayer {
             playback_stream_offset: Arc::new(Mutex::new(0.0)),
             last_seek_time: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(10))),
             poll_control: Arc::new(Mutex::new(PollControl::default())),
+            seek_error: Mutex::new(None),
         }
     }
 
@@ -705,6 +708,32 @@ impl UPnPPlayer {
 
     pub fn set_stream_state(&mut self, stream_state: Option<Arc<crate::web::StreamServerState>>) {
         self.stream_state = stream_state;
+    }
+
+    /// Where a `?pos=` load of `path` at `target` really starts: `target`, or 0 when the web
+    /// server can't seek the file (a WAV or AIFF whose header it can't use, which it serves whole
+    /// from 0:00), so the position stays where the audio is. The reason goes to `take_error`, so
+    /// the status line says why (issue #116). Reads the file's header, as `extract_metadata` does.
+    fn seekable_target(&self, path: &Path, target: f64) -> f64 {
+        if target <= 0.0 {
+            return target;
+        }
+        match crate::web::check_stream_seek(path) {
+            Ok(()) => target,
+            Err(why) => {
+                crate::log_warn!(
+                    "player",
+                    "Can't seek '{}' to {:.2}s ({}); playing it from the start",
+                    path.display(),
+                    target,
+                    why
+                );
+                let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+                *self.seek_error.lock().unwrap() =
+                    Some(format!("Can't seek {} ({}); playing it from the start", name, why));
+                0.0
+            }
+        }
     }
 
     fn start_polling_loop(&mut self) {
@@ -931,6 +960,7 @@ impl UPnPPlayer {
             Some(p) => p,
             None => anyhow::bail!("No track currently loaded"),
         };
+        let target = self.seekable_target(&filepath, target);
 
         if self.poll_stop_flag.load(Ordering::Relaxed) {
             self.start_polling_loop();
@@ -953,10 +983,14 @@ impl UPnPPlayer {
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| "track".to_string());
         let encoded_name = url_encode(&file_name);
-        let stream_url = format!(
-            "http://{}:{}/stream/{}?pos={:.2}",
-            host_ip, self.web_port, encoded_name, target
-        );
+        let stream_url = if target > 0.0 {
+            format!(
+                "http://{}:{}/stream/{}?pos={:.2}",
+                host_ip, self.web_port, encoded_name, target
+            )
+        } else {
+            format!("http://{}:{}/stream/{}", host_ip, self.web_port, encoded_name)
+        };
         crate::log_info!(
             "player",
             "Reloading UPnP transport URI with seek offset: {}",
@@ -1037,6 +1071,11 @@ impl AudioPlayer for UPnPPlayer {
         // command epoch bumped above makes it drop whatever it observes from now on.
         // `__continuous__.wav` is a placeholder that selects the gapless continuous stream.
         let is_continuous = filepath.file_name().is_some_and(|f| f == "__continuous__.wav");
+        let position_seconds = if is_continuous {
+            position_seconds
+        } else {
+            self.seekable_target(filepath, position_seconds)
+        };
         self.poll_stop_flag.store(true, Ordering::SeqCst);
         if let Some(ref ss) = self.stream_state {
             // Also ends any previous continuous session.
@@ -1312,6 +1351,10 @@ impl AudioPlayer for UPnPPlayer {
 
     fn is_track_finished(&mut self) -> bool {
         self.track_finished.load(Ordering::SeqCst)
+    }
+
+    fn take_error(&mut self) -> Option<String> {
+        self.seek_error.lock().unwrap().take()
     }
 
     fn reset_finished(&mut self) {
