@@ -13,8 +13,8 @@ mod stream;
 pub use server::{ServerLimits, WebBind, WebServer, WebServerHandle};
 pub use state::{
     NowPlayingState, PlaylistEdit, PlaylistReply, WebBrowserEntry, WebBrowserResponse, WebCommand, WebDeviceItem,
-    WebPlaylist, WebPlaylistEntry, WebPlaylists, WebPlaylistsState, WebQueueItem, WebReply, WebUpNextItem, PLAYLISTS_CHANGED,
-    WEB_UP_NEXT_LIMIT,
+    WebPlaylist, WebPlaylistEntry, WebPlaylists, WebPlaylistsState, WebQueueItem, WebReply, WebUpNextItem,
+    PLAYLISTS_CHANGED, WEB_UP_NEXT_LIMIT,
 };
 pub use stream::{
     make_continuous_wav_header, parse_byte_range, wav_header_sizes, ByteRange, ContinuousAdmission,
