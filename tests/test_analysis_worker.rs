@@ -386,13 +386,15 @@ const TEN_SECONDS_PCM_BYTES: usize = SAMPLE_RATE as usize * 2 * 10;
 
 /// A [`fake_ffmpeg`] that runs `at_offset` when called with `-ss <offset>` and otherwise
 /// answers at once with [`TEN_SECONDS_PCM_BYTES`] of silence. A call without `-ss` counts as
-/// offset 0; a value that isn't a whole number answers too, so a call at any offset but
-/// `offset` succeeds rather than stalling or failing.
+/// offset 0. Values are compared as numbers (`30`, `30.0` and `030` are all 30 s); a value that
+/// isn't a plain number (`00:00:30`) answers too, so a call at any offset but `offset` succeeds
+/// rather than stalling or failing.
 #[cfg(unix)]
 fn fake_ffmpeg_answering_except_at(dir: &Path, log: &Path, offset: u32, at_offset: &str) -> PathBuf {
     let body = format!(
         "ss=0\nprev=\nfor arg in \"$@\"; do\n  [ \"$prev\" = -ss ] && ss=$arg\n  prev=$arg\ndone\n\
-         if [ \"$ss\" -eq {} ] 2>/dev/null; then\n  {}\nfi\nhead -c {} /dev/zero\nexit 0",
+         if awk -v v=\"$ss\" 'BEGIN {{ exit !(v ~ /^[0-9]+(\\.[0-9]*)?$/ && v + 0 == {}) }}'; then\n  \
+         {}\nfi\nhead -c {} /dev/zero\nexit 0",
         offset, at_offset, TEN_SECONDS_PCM_BYTES
     );
     fake_ffmpeg(dir, log, &body)
@@ -453,8 +455,12 @@ fn test_fake_ffmpeg_starts_while_other_threads_spawn_processes() {
         })
         .collect();
 
+    // About 2 ms a round. With a helper that wrote the script through this process (`fs::write`),
+    // about one round in 250 failed in a Linux container, so 1,000 rounds catch it on almost
+    // every run.
+    const ROUNDS: usize = 1000;
     let mut failures = Vec::new();
-    for i in 0..200 {
+    for i in 0..ROUNDS {
         let sub = dir.join(i.to_string());
         fs::create_dir_all(&sub).unwrap();
         let log = sub.join("calls.log");
@@ -470,8 +476,9 @@ fn test_fake_ffmpeg_starts_while_other_threads_spawn_processes() {
     }
     assert!(
         failures.is_empty(),
-        "fake ffmpeg failed to start {} of 200 times: {:?}",
+        "fake ffmpeg failed to start {} of {} times: {:?}",
         failures.len(),
+        ROUNDS,
         failures
     );
     let _ = fs::remove_dir_all(&dir);
