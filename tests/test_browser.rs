@@ -2,6 +2,7 @@ mod common;
 
 use std::fs::{self, File};
 use std::io::Write;
+use std::path::PathBuf;
 
 use quickstream::metadata::AudioMetadata;
 use quickstream::settings::SettingsManager;
@@ -1626,9 +1627,202 @@ fn test_event_loop_polls_keys_at_frame_rate_while_a_folder_is_read() {
     );
     common::wait_for_dir_scan(&mut app);
     assert_eq!(app.key_poll_timeout(), std::time::Duration::from_millis(100));
-    // While a folder is read its batches are picked up within a frame (60 FPS).
-    app.browser_loading = true;
+    let slow = temp_dir.join("Slow");
+    fs::create_dir_all(&slow).unwrap();
+    let _held = HeldRead::install(&mut app, &slow);
+    app.navigate_browser(slow);
+    // While a folder has just been opened its batches are picked up within a frame (60 FPS)...
     assert!(app.key_poll_timeout() <= std::time::Duration::from_millis(16));
+    // ...but a read that keeps going (a hung share) goes back to the usual tick.
+    std::thread::sleep(AppUI::FAST_TICK_WHILE_READING + std::time::Duration::from_millis(20));
+    app.poll_background_dir_scan();
+    assert!(app.browser_loading);
+    assert_eq!(app.key_poll_timeout(), std::time::Duration::from_millis(100));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_browser_stopped_scan_never_lists_into_music_homes() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_stopped_scan_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let folder = temp_dir.join("X");
+    for name in ["A1", "A2", "A3", "A4", "A5", "A6", "A7"] {
+        fs::create_dir_all(folder.join(name)).unwrap();
+    }
+    let homes: Vec<PathBuf> = ["HomeA", "HomeB", "HomeC"].iter().map(|n| temp_dir.join(n)).collect();
+    for home in &homes {
+        fs::create_dir_all(home).unwrap();
+    }
+    let mut app = AppUI::new(
+        Some(temp_dir.clone()),
+        SettingsManager::with_path(temp_dir.join("config.json")),
+    );
+    common::wait_for_dir_scan(&mut app);
+    app.bookmarks = homes.iter().map(|h| h.to_string_lossy().to_string()).collect();
+
+    // X's batches are queued but not yet polled when Music Homes opens.
+    let held = HeldRead::install(&mut app, &folder);
+    app.navigate_browser(folder.clone());
+    held.release();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    app.navigate_browser(PathBuf::from("___MUSIC_HOMES___"));
+    app.poll_background_dir_scan();
+
+    let listed: Vec<&PathBuf> = app.browser_entries.iter().skip(1).map(|(_, p, _)| p).collect();
+    assert_eq!(
+        listed,
+        homes.iter().collect::<Vec<_>>(),
+        "Music Homes lists only the homes"
+    );
+
+    // `d` on a home removes that home, not one a stray row pushed down.
+    app.browser_cursor = 2;
+    app.handle_tab_key(crossterm::event::KeyCode::Char('d'));
+    assert!(!app.bookmarks.contains(&homes[1].to_string_lossy().to_string()));
+    assert_eq!(app.bookmarks.len(), 2);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_browser_cancelled_scan_never_lists_later() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_cancel_scan_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let folder = temp_dir.join("Slow");
+    fs::create_dir_all(folder.join("Sub")).unwrap();
+    let mut app = AppUI::new(
+        Some(temp_dir.clone()),
+        SettingsManager::with_path(temp_dir.join("config.json")),
+    );
+    common::wait_for_dir_scan(&mut app);
+
+    let held = HeldRead::install(&mut app, &folder);
+    app.navigate_browser(folder.clone());
+    // Once the READING DIRECTORY row is on screen, Esc cancels the scan, even when the read
+    // answered just before (its rows are queued, not yet polled).
+    std::thread::sleep(AppUI::FOLDER_FIRST_FRAME_HOLD + std::time::Duration::from_millis(20));
+    app.poll_background_dir_scan();
+    held.release();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let quit = app
+        .handle_input_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .unwrap();
+    assert!(!quit);
+    assert_eq!(app.status_message, "Cancelled directory scan");
+    app.poll_background_dir_scan();
+    assert_eq!(app.browser_entries.len(), 2, "the cancelled scan's rows are dropped");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_browser_esc_right_after_opening_a_folder_quits() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_esc_quit_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let folder = temp_dir.join("X");
+    fs::create_dir_all(folder.join("S1")).unwrap();
+    fs::create_dir_all(folder.join("S2")).unwrap();
+    let mut app = AppUI::new(
+        Some(temp_dir.clone()),
+        SettingsManager::with_path(temp_dir.join("config.json")),
+    );
+    common::wait_for_dir_scan(&mut app);
+
+    // Nothing of X has been drawn yet (the previous frame is still on screen), so Esc quits
+    // as it would have once a fast folder was listed.
+    app.navigate_browser(folder.clone());
+    let quit = app
+        .handle_input_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .unwrap();
+    assert!(quit, "Esc quits; status {:?}", app.status_message);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+/// One tick of `AppUI::event_loop` without a terminal: poll the scan, then draw unless the loop
+/// keeps the previous frame. Returns the frame drawn, if any.
+fn tick(app: &mut AppUI) -> Option<String> {
+    app.poll_background_dir_scan();
+    if app.holds_frame() {
+        return None;
+    }
+    Some(common::tui::render_text(app, 120, 40))
+}
+
+#[test]
+fn test_event_loop_never_draws_reading_directory_for_a_fast_folder() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_first_frame_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let folders: Vec<PathBuf> = (0..10).map(|i| temp_dir.join(format!("F{i:02}"))).collect();
+    for folder in &folders {
+        fs::create_dir_all(folder.join("Sub")).unwrap();
+        create_dummy_wav(&folder.join("a.wav"));
+    }
+    let mut settings_mgr = SettingsManager::with_path(temp_dir.join("config.json"));
+    settings_mgr.settings.metadata_view = false;
+    let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
+    app.active_tab = 1;
+
+    for folder in &folders {
+        app.navigate_browser(folder.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let first = loop {
+            if let Some(frame) = tick(&mut app) {
+                break frame;
+            }
+            assert!(std::time::Instant::now() < deadline, "no frame drawn");
+            std::thread::sleep(app.key_poll_timeout());
+        };
+        assert!(!first.contains("READING DIRECTORY"), "{}", first);
+        assert!(first.contains("SUB/"), "{}", first);
+        app.navigate_browser(temp_dir.clone());
+        common::wait_for_dir_scan(&mut app);
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_event_loop_draws_reading_directory_once_a_slow_read_passes_the_hold() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_hold_slow_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let slow = temp_dir.join("Slow");
+    fs::create_dir_all(slow.join("Sub")).unwrap();
+    let mut app = AppUI::new(
+        Some(temp_dir.clone()),
+        SettingsManager::with_path(temp_dir.join("config.json")),
+    );
+    common::wait_for_dir_scan(&mut app);
+    app.active_tab = 1;
+
+    let held = HeldRead::install(&mut app, &slow);
+    app.navigate_browser(slow.clone());
+    assert_eq!(
+        tick(&mut app),
+        None,
+        "the previous frame stays while the read may still answer"
+    );
+    std::thread::sleep(AppUI::FOLDER_FIRST_FRAME_HOLD + std::time::Duration::from_millis(20));
+    let frame = tick(&mut app).expect("drawn once the hold is over");
+    assert!(frame.contains("READING DIRECTORY"), "{}", frame);
+
+    held.release();
+    common::wait_for_dir_scan(&mut app);
+    let frame = tick(&mut app).expect("drawn");
+    assert!(frame.contains("SUB/"), "{}", frame);
 
     let _ = fs::remove_dir_all(&temp_dir);
 }

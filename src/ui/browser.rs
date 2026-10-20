@@ -70,6 +70,9 @@ impl AppUI {
 
         if let Some(stop) = self.dir_scan_stop.take() {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Drop what the stopped scan already sent, also when no scan follows (Music Homes,
+            // a cache hit): the poll ignores another scan's events.
+            self.dir_scan_id += 1;
         }
         if self.browser_loading {
             if let Some(prev_start) = self.browser_load_start.take() {
@@ -332,9 +335,10 @@ impl AppUI {
             }
         });
         // Nothing waits for the scan here (issue #101): its batches come in through
-        // `poll_background_dir_scan`, which the event loop calls at frame rate while
-        // `browser_loading` is set (`key_poll_timeout`), and the LIBRARY panel shows its
-        // READING DIRECTORY row until they do. A Backspace's `pending_parent_restore` waits with
+        // `poll_background_dir_scan`, which the event loop calls at frame rate while the folder
+        // has just been opened (`key_poll_timeout`). The loop keeps the previous frame until the
+        // first batch or `FOLDER_FIRST_FRAME_HOLD` (`holds_frame`), then the LIBRARY panel shows
+        // its READING DIRECTORY row until the batches come. A Backspace's `pending_parent_restore` waits with
         // them and puts the cursor back on the folder it left once that folder is listed.
     }
 

@@ -47,11 +47,35 @@ impl AppUI {
         left
     }
 
+    /// How long the event loop keeps the previous frame on screen after a folder is opened,
+    /// while its scan has listed nothing yet (`holds_frame`).
+    pub const FOLDER_FIRST_FRAME_HOLD: Duration = Duration::from_millis(100);
+    /// How long after a folder is opened the event loop ticks every frame to pick its batches
+    /// up (`key_poll_timeout`); a read still going after that (a hung share) ticks at 100 ms.
+    pub const FAST_TICK_WHILE_READING: Duration = Duration::from_millis(500);
+
+    /// True while a folder opened less than `FOLDER_FIRST_FRAME_HOLD` ago has listed nothing
+    /// yet. The event loop doesn't draw meanwhile (the terminal keeps the previous frame, keys
+    /// are still read), so a fast folder's first frame is its listing rather than an empty one
+    /// with READING DIRECTORY, nothing on the UI thread waiting for it (issue #101). Esc quits
+    /// meanwhile rather than cancelling a scan that was never on screen.
+    pub fn holds_frame(&self) -> bool {
+        let header_rows = if self.browser_dir.parent().is_some() { 2 } else { 1 };
+        self.browser_loading
+            && self.browser_entries.len() <= header_rows
+            && self
+                .browser_load_start
+                .is_some_and(|start| start.elapsed() < Self::FOLDER_FIRST_FRAME_HOLD)
+    }
+
     /// How long each tick waits for a key before polling the workers and drawing again: one
-    /// frame (60 FPS) while a folder is being read, so its listing shows as soon as the scan
-    /// sends it, nothing on the UI thread waiting for it (issue #101); else 100 ms.
+    /// frame (60 FPS) for the first `FAST_TICK_WHILE_READING` of a folder's read, so its listing
+    /// shows as soon as the scan sends it (issue #101); else 100 ms.
     pub fn key_poll_timeout(&self) -> Duration {
-        if self.browser_loading {
+        let just_opened = self
+            .browser_load_start
+            .is_some_and(|start| start.elapsed() < Self::FAST_TICK_WHILE_READING);
+        if self.browser_loading && just_opened {
             Duration::from_millis(16)
         } else {
             Duration::from_millis(100)
@@ -150,7 +174,9 @@ impl AppUI {
             // Flush debounced track skip if debounce timer expired
             self.poll_pending_track_skip();
 
-            terminal.draw(|f| self.render(f))?;
+            if !self.holds_frame() {
+                terminal.draw(|f| self.render(f))?;
+            }
 
             if event::poll(self.key_poll_timeout())? {
                 if let Event::Key(key) = event::read()? {

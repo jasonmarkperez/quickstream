@@ -148,10 +148,12 @@ impl AppUI {
             (KeyCode::Char('q'), KeyModifiers::NONE)
             | (KeyCode::Esc, KeyModifiers::NONE)
             | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                if key.code == KeyCode::Esc && self.browser_loading {
+                if key.code == KeyCode::Esc && self.browser_loading && !self.holds_frame() {
                     if let Some(stop) = self.dir_scan_stop.take() {
                         stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
+                    // Drop what the scan already sent: the poll ignores another scan's events.
+                    self.dir_scan_id += 1;
                     self.browser_loading = false;
                     if let Some(start) = self.browser_load_start.take() {
                         crate::logger::log_raw(
