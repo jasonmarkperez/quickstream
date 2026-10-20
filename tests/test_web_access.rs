@@ -829,6 +829,38 @@ fn test_browser_api_rejects_paths_outside_allowed_roots() {
 }
 
 #[test]
+fn test_browser_api_lists_the_bookmarks_the_ui_published_not_the_file() {
+    common::isolate();
+    let dir = temp_dir("browse_bookmarks");
+    let music = dir.join("Music");
+    fs::create_dir_all(&music).unwrap();
+    // The web thread never reads bookmarks.json (#60): no path lookup or file read per request.
+    let file = quickstream::paths::get_bookmarks_path();
+    fs::write(&file, r#"["/qs-web-from-file"]"#).unwrap();
+
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    {
+        let mut s = state.write().unwrap();
+        s.allowed_roots = vec![music.clone()];
+        s.bookmarks = vec![music.to_string_lossy().to_string()];
+    }
+    let (handle, _rx) = start(state.clone());
+    let (status, _, body) = get(handle.port, "/api/browser");
+    assert_eq!(status, 200);
+    let resp: WebBrowserResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(resp.bookmarks, vec![music.to_string_lossy().to_string()]);
+    let (_, _, status_body) = get(handle.port, "/api/status");
+    assert!(
+        !String::from_utf8_lossy(&status_body).contains("\"bookmarks\""),
+        "bookmarks are not part of /api/status"
+    );
+
+    handle.stop();
+    fs::write(&file, "[]").unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_browser_api_without_roots_never_lists_process_directory() {
     common::isolate();
     let (handle, _rx) = start(Arc::new(RwLock::new(NowPlayingState::default())));
@@ -972,6 +1004,9 @@ fn test_app_publishes_allowed_roots_to_web_state() {
     assert!(roots.contains(&home), "{:?}", roots);
     assert!(roots.contains(&bookmark), "{:?}", roots);
     assert!(!roots.contains(&elsewhere), "{:?}", roots);
+    // The bookmarks themselves too, for GET /api/browser (#60).
+    let published = app.web_state.read().unwrap().bookmarks.clone();
+    assert_eq!(published, app.bookmarks);
     let _ = fs::remove_dir_all(&dir);
 }
 

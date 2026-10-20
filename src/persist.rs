@@ -120,6 +120,13 @@ pub fn backup_corrupt_file(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
 /// so falling back to defaults (and saving them later) never loses the user's data. `what`
 /// names the file in the log ("settings", "bookmarks").
 pub fn load_json_or_backup<T: DeserializeOwned>(path: &Path, what: &str) -> Option<T> {
+    load_json_or_backup_beside(path, path, what)
+}
+
+/// [`load_json_or_backup`], but a file that fails to parse is backed up as `backup_as` would
+/// be (`<backup_as>.bak`), not beside `path`: a legacy config file is read in place and nothing
+/// is ever written next to it (#60).
+pub fn load_json_or_backup_beside<T: DeserializeOwned>(path: &Path, backup_as: &Path, what: &str) -> Option<T> {
     let bytes = match fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
@@ -143,7 +150,7 @@ pub fn load_json_or_backup<T: DeserializeOwned>(path: &Path, what: &str) -> Opti
     match serde_json::from_slice(&bytes) {
         Ok(v) => Some(v),
         Err(e) => {
-            let saved = match backup_corrupt_file(path, &bytes) {
+            let saved = match backup_corrupt_file(backup_as, &bytes) {
                 Ok(bak) => format!("copied to '{}'", bak.display()),
                 Err(be) => format!("backup FAILED: {}", be),
             };

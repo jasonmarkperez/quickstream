@@ -239,6 +239,8 @@ pub struct AppUI {
     pub devices_cursor: usize,
     pub settings_cursor: usize,
     pub bookmarks: Vec<String>,
+    /// Where the bookmarks were read from and are saved to, resolved once at startup (#60).
+    bookmarks_file: paths::ConfigFile,
     pub in_bookmarks_view: bool,
     pub show_help_modal: bool,
     pub status_message: String,
@@ -353,7 +355,9 @@ impl AppUI {
         // Browser entries inherit this; relative ones would be saved into playlists as-is.
         let cwd = std::path::absolute(&cwd).unwrap_or(cwd);
         let backend = settings_mgr.settings.player_backend.clone();
-        let bookmarks = Self::load_bookmarks();
+        // A corrupt file is backed up to bookmarks.json.bak before we start from an empty list.
+        let bookmarks_file = paths::bookmarks_file();
+        let bookmarks = bookmarks_file.load_json("bookmarks").unwrap_or_default();
         // Discovery starts in run(): SSDP opens a socket on all interfaces, which tests that
         // only construct the app should not do (macOS firewall prompts).
         let device_manager = DeviceManager::new();
@@ -414,6 +418,7 @@ impl AppUI {
             devices_cursor: 0,
             settings_cursor: SETTING_DISPLAY_ORDER[0],
             bookmarks,
+            bookmarks_file,
             in_bookmarks_view: false,
             show_help_modal: false,
             status_message: "Welcome to Quickstream (Rust)".to_string(),
@@ -479,15 +484,11 @@ impl AppUI {
         app
     }
 
-    fn load_bookmarks() -> Vec<String> {
-        // A corrupt file is backed up to bookmarks.json.bak before we start from an empty list.
-        crate::persist::load_json_or_backup(&paths::get_bookmarks_path(), "bookmarks").unwrap_or_default()
-    }
-
     /// Queue the bookmarks file write on the persistence worker (never blocks the UI).
     fn save_bookmarks(&self) {
         if let Ok(json) = serde_json::to_string_pretty(&self.bookmarks) {
-            self.persistence.save(paths::get_bookmarks_path(), json.into_bytes());
+            self.persistence
+                .save(self.bookmarks_file.write_path.clone(), json.into_bytes());
         }
     }
 
@@ -3656,6 +3657,7 @@ impl AppUI {
             state.home_dir = self.settings_mgr.settings.home_dir.clone();
             state.current_browser_dir = self.browser_dir.to_string_lossy().to_string();
             state.allowed_roots = self.web_allowed_roots();
+            state.bookmarks = self.bookmarks.clone();
             state.is_autopilot = self.autopilot_dir.is_some();
             state.autopilot_dir = self.autopilot_dir.as_ref().map(|d| d.to_string_lossy().to_string());
             state.active_mix_profile = self.active_mix_profile.name();

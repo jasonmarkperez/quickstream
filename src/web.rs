@@ -173,6 +173,10 @@ pub struct NowPlayingState {
     /// Never sent to clients.
     #[serde(skip)]
     pub allowed_roots: Vec<PathBuf>,
+    /// The bookmarks the UI holds, for `GET /api/browser`: the web thread never reads
+    /// bookmarks.json. Never sent with `/api/status`.
+    #[serde(skip)]
+    pub bookmarks: Vec<String>,
     /// The playlists snapshot the UI thread publishes for `GET /api/playlists` (issue #50). Not
     /// part of `/api/status`, which is polled several times a second.
     #[serde(skip)]
@@ -216,6 +220,7 @@ impl Default for NowPlayingState {
             bpm: None,
             key: None,
             allowed_roots: Vec::new(),
+            bookmarks: Vec::new(),
             playlists: Arc::new(WebPlaylists::default()),
             playlists_version: 0,
         }
@@ -1591,12 +1596,13 @@ fn handle_client(
                 None
             };
 
-            let (current_home_dir, current_terminal_dir, roots) = {
+            let (current_home_dir, current_terminal_dir, roots, bookmarks) = {
                 let s = state.read().unwrap();
                 (
                     s.home_dir.clone(),
                     s.current_browser_dir.clone(),
                     s.allowed_roots.clone(),
+                    s.bookmarks.clone(),
                 )
             };
             // Only folders inside the allowed roots (startup home, bookmarks, launch folder).
@@ -1623,16 +1629,6 @@ fn handle_client(
                 .parent()
                 .and_then(allowed_dir)
                 .map(|p| p.to_string_lossy().to_string());
-
-            let bookmarks_file = crate::paths::get_bookmarks_path();
-            let bookmarks: Vec<String> = if bookmarks_file.exists() {
-                std::fs::read_to_string(&bookmarks_file)
-                    .ok()
-                    .and_then(|c| serde_json::from_str(&c).ok())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
 
             let mut dirs = Vec::new();
             let mut files = Vec::new();
