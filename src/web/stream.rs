@@ -1189,10 +1189,11 @@ pub fn serve_continuous_stream(
                 let mut queue_changed = false;
                 if let Some((paths, checked)) = &nothing_playable {
                     let recheck = checked.elapsed() >= MISSING_RECHECK;
-                    // Another length shows at once, other files at the next recheck: an idle
-                    // tick never compares the whole queue.
+                    // Another length shows at once, other files at the next recheck or request
+                    // (the UI publishes a new queue before it skips): an idle tick never compares
+                    // the whole queue.
                     queue_changed = s.queue.len() != paths.len()
-                        || (recheck && !s.queue.iter().map(|t| &t.filepath).eq(paths.iter()));
+                        || ((recheck || pending.is_some()) && !s.queue.iter().map(|t| &t.filepath).eq(paths.iter()));
                     if !queue_changed && !recheck && pending.is_none() {
                         break 'pick None;
                     }
@@ -1417,20 +1418,28 @@ pub fn serve_continuous_stream(
             silent_runs = 0;
         }
         // A skip or seek kills the decoder, which also ends its output: only an end with no
-        // request pending is the end of the track.
-        if ended && !controller.has_request() {
+        // request pending is the end of the track. Decided under the request lock, so a request
+        // that arrives later is for whatever this end decides.
+        let pending = controller.request.lock().unwrap();
+        if ended && pending.is_none() {
             let wraps = track_index + 1 >= queue_len;
             // Reshuffle once per wrap that played something, and only from the current
             // connection of the armed session.
             let owns_session = controller.is_session(session) && controller.owns(cid);
             if wraps && queue_len > 1 && owns_session && streamed_since_wrap {
+                // The UI's shuffle keeps the track `current_track_index` names in front, so it
+                // names the first track before the UI is asked: never the one that just ended,
+                // which would play again. A seek from here on is for that first track, since
+                // after the reshuffle no index names the track that ended.
+                *controller.current_track_index.lock().unwrap() = 0;
                 let _ = cmd_tx.send(WebCommand::ShuffleQueue);
             }
+            drop(pending);
             if wraps {
                 streamed_since_wrap = false;
             }
-            // `current_track_index` moves when the next track starts, so a seek that arrives
-            // before then is still for this one.
+            // Otherwise `current_track_index` moves when the next track starts, so a seek that
+            // arrives before then is still for this one.
             next_index = Some((track_index + 1) % queue_len);
 
             if !streamed {
@@ -1449,6 +1458,7 @@ pub fn serve_continuous_stream(
                 nothing_playable = None;
             }
         } else {
+            drop(pending);
             // The next pass takes the request, or after a read error tries the track again.
             next_index = Some(track_index);
             nothing_playable = None;

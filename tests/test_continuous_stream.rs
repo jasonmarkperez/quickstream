@@ -560,6 +560,15 @@ impl FakeDecoder {
             log = log.display()
         );
         common::fake_exec::write_script(&binary, &text);
+        // The first run of a just-written script can take seconds to start on a loaded machine;
+        // paid here, before any stream waits on it, then forgotten.
+        let warm_up = std::process::Command::new(&binary)
+            .args(["-i", "warm_up_bad"])
+            .status()
+            .expect("run the fake decoder");
+        assert!(!warm_up.success(), "the warm-up run exits at once");
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(&pids);
         Self { binary, log, pids }
     }
 
@@ -646,6 +655,12 @@ impl Renderer {
         assert_eq!(status, 200);
         let mut wav_hdr = [0u8; 44];
         reader.read_exact(&mut wav_hdr).unwrap();
+        // As long as the stream's own write timeout: the stream sends nothing while a decoder
+        // starts, which can take seconds on a loaded machine (or a slow share).
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
         let received = Arc::new(AtomicU64::new(0));
         let reading = Arc::new(AtomicBool::new(true));
         let (received_t, reading_t) = (received.clone(), reading.clone());
@@ -1189,6 +1204,81 @@ fn test_continuous_seek_just_after_a_track_ends_is_not_applied_to_the_next_track
     assert_eq!(f.run(3), (f.tracks[1].clone(), None), "the next track from its start");
 }
 
+/// When the last track ends, the stream's index is on the first track before it asks for the
+/// reshuffle, so the UI (which follows that index, and whose shuffle keeps its current track in
+/// front) never puts the track that just ended first and plays it again (#106).
+#[cfg(unix)]
+#[test]
+fn test_continuous_wrap_reshuffle_keeps_the_next_track_in_front() {
+    common::isolate();
+    let f = DecoderFixture::start("wrap_front", &["t0.wav", "t1_short.wav"], 1);
+    assert_eq!(f.run(1), (f.tracks[1].clone(), None));
+    // Past t1's audio (and the position update it may bring), well before t1 ends.
+    std::thread::sleep(Duration::from_millis(200));
+
+    {
+        // Hold the web state while t1 ends, so the stream waits to pick the next track; then do
+        // what one UI tick does with the reshuffle: follow the stream's index, shuffle with that
+        // track in front, publish.
+        let mut held = f.state.write().unwrap();
+        match f.rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(WebCommand::ShuffleQueue) => {}
+            other => panic!("expected ShuffleQueue after the queue wrapped, got {:?}", other),
+        }
+        let front = *f.controller.current_track_index.lock().unwrap();
+        let kept = held.queue.remove(front);
+        held.queue.insert(0, kept);
+    }
+    assert_eq!(
+        f.run(2),
+        (f.tracks[0].clone(), None),
+        "the track that ended doesn't play again"
+    );
+}
+
+/// The UI follows the continuous stream's index before it reshuffles the queue for a wrap, so
+/// the track the stream plays next stays in front even when the reshuffle arrives in the same
+/// tick as the index moved (#106).
+#[test]
+fn test_continuous_reshuffle_follows_the_stream_index_first() {
+    common::isolate();
+    let dir = temp_dir("reshuffle_sync");
+    let tracks: Vec<PathBuf> = (0..4).map(|i| dir.join(format!("t{}.wav", i))).collect();
+    let settings = SettingsManager::with_path(dir.join("config.json"));
+    let mut app = AppUI::new(Some(dir.clone()), settings);
+    app.queue.add_tracks(
+        tracks
+            .iter()
+            .enumerate()
+            .map(|(i, p)| track_meta(p, &format!("Track {}", i), 60.0))
+            .collect(),
+    );
+    app.queue.set_current_index(3);
+    let (tx, _web_rx) = mpsc::channel();
+    let handle = WebServer::start(0, app.web_state.clone(), tx).expect("start web server");
+    let controller = handle.stream_state().continuous.clone();
+    controller.is_active.store(true, Ordering::SeqCst);
+    *controller.current_track_index.lock().unwrap() = 0;
+    app.web_server = Some(handle);
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    app.web_cmd_rx = Some(cmd_rx);
+
+    cmd_tx.send(WebCommand::ShuffleQueue).unwrap();
+    app.handle_web_commands();
+    assert_eq!(app.queue.current_index(), 0);
+    assert_eq!(
+        app.queue.current_track().map(|t| t.filepath.clone()),
+        Some(tracks[0].clone()),
+        "the stream's next track is kept in front, not the one that ended"
+    );
+
+    if let Some(handle) = app.web_server.take() {
+        handle.stream_state().close_active_streams();
+        handle.stop();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A skip or seek asked while the queue is empty is dropped: the next queue starts at its top,
 /// from its start, not at a stale index or offset (#106).
 #[cfg(unix)]
@@ -1341,6 +1431,17 @@ fn test_continuous_stream_logs_each_missing_queue_once() {
     std::thread::sleep(Duration::from_millis(1500));
     assert_eq!(log_lines_naming(&first_name), 2, "each missing file once");
     assert_eq!(log_lines_naming(&second_name), 2, "each missing file once");
+
+    // A replacement followed at once by a skip (as `play_current_track` sends one) is logged too.
+    let third = dir.join("gone3");
+    state.write().unwrap().queue = queue(&third);
+    handle.stream_state().continuous.skip_to_index(0);
+    let third_name = third.display().to_string();
+    wait_until("the queue replaced before a skip was never logged", || {
+        log_lines_naming(&third_name) > 0
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(log_lines_naming(&third_name), 2, "each missing file once");
     assert!(decoder.calls().is_empty(), "nothing to decode");
 
     handle.stream_state().close_active_streams();
