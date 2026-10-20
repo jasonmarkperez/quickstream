@@ -87,6 +87,9 @@ struct StartedPlay {
     /// The track ended, or Next / Previous was pressed, before the rest was checked: done once
     /// the rest is in the queue.
     pending_skip: Option<PlaylistSkip>,
+    /// The held skip's track loads paused: an output switch found the paused started track
+    /// over while it was held (issue #48).
+    pause_after_skip: bool,
 }
 
 /// What to do once the rest of the playlist `Enter` started is in the queue.
@@ -2081,6 +2084,7 @@ impl AppUI {
             generation: start.generation,
             playback_error,
             pending_skip: None,
+            pause_after_skip: false,
         });
         self.update_web_state();
     }
@@ -2123,6 +2127,16 @@ impl AppUI {
         };
         self.update_web_state();
         true
+    }
+
+    /// The skip [`Self::hold_skip_for_playlist_fill`] holds, if any, loads its track paused once
+    /// the rest of the playlist arrives: an output switch found the paused track over (#48).
+    pub(super) fn pause_after_held_skip(&mut self) {
+        if let Some(started) = self.playlists.checks.started.as_mut() {
+            if started.pending_skip.is_some() {
+                started.pause_after_skip = true;
+            }
+        }
     }
 
     /// Put the rest of a playlist around the track `Enter` already started: the tracks before
@@ -2200,6 +2214,7 @@ impl AppUI {
         // The status keeps that error and puts the queue summary after it, so a failed start is
         // never reported as plain success.
         let mut skip = None;
+        let mut pause_after_skip = false;
         let playback_error = match (result.play_from, start_index, started) {
             (Some(_), Some(_), Some(started)) => {
                 self.fill_playlist_around(&started, tracks, &entry_indices);
@@ -2207,6 +2222,7 @@ impl AppUI {
                 // played something else meanwhile.
                 if self.queue.current_track().is_some_and(|t| t.filepath == started.path) {
                     skip = started.pending_skip;
+                    pause_after_skip = started.pause_after_skip;
                 }
                 started.playback_error
             }
@@ -2243,6 +2259,9 @@ impl AppUI {
                 match skip {
                     PlaylistSkip::Ended | PlaylistSkip::Next => self.play_next_track(),
                     PlaylistSkip::Previous => self.play_prev_track(),
+                }
+                if pause_after_skip && self.player.is_playing() {
+                    let _ = self.player.pause();
                 }
                 self.queue_cursor = self.queue.current_index();
                 (!self.status_message.is_empty()).then(|| self.status_message.clone())

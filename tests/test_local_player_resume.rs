@@ -4,8 +4,9 @@ mod common;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use quickstream::player::local::LocalPlayer;
+use quickstream::player::local::{LocalPlayer, MpvLoadEnd, MpvLoadTracker};
 use quickstream::player::AudioPlayer;
+use serde_json::json;
 
 /// 90s of silence (mp3, like the library), so the test never makes audible noise.
 fn silent_track() -> Option<PathBuf> {
@@ -295,4 +296,301 @@ fn test_mpv_play_at_loads_file_with_start_position() {
 
     drop(player);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Waits up to 5 s for `player` to report that its track finished.
+fn wait_for_finished(player: &mut LocalPlayer) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if player.is_track_finished() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[test]
+fn test_mpv_play_at_past_the_end_finishes_the_track() {
+    common::isolate();
+    if !has("mpv") {
+        eprintln!("SKIPPED: mpv not installed");
+        return;
+    }
+    let Some(track) = silent_track() else {
+        eprintln!("SKIPPED: ffmpeg not installed");
+        return;
+    };
+
+    // A tag length can be an estimate longer than the file, so a hand-off can ask for a start
+    // past the real end. mpv then ends the load with reason "error"; the track must still count
+    // as finished so the queue moves on instead of sitting stopped (issue #48).
+    let mut player = LocalPlayer::new("mpv");
+    player.play_at(&track, 95.0).expect("play_at");
+    assert!(
+        wait_for_finished(&mut player),
+        "play_at past the end never reported the track finished"
+    );
+    assert!(!player.is_playing(), "nothing plays after a start past the end");
+}
+
+/// Waits up to 5 s for `player` to report an error, checking on every poll that it never
+/// reports the track finished meanwhile. Returns the error, if one came.
+fn wait_for_error_never_finishing(player: &mut LocalPlayer) -> Option<String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        assert!(
+            !player.is_track_finished(),
+            "a load that failed must not count as the track finishing"
+        );
+        if let Some(err) = player.take_error() {
+            return Some(err);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
+#[test]
+fn test_mpv_missing_file_started_past_zero_reports_an_error() {
+    common::isolate();
+    if !has("mpv") {
+        eprintln!("SKIPPED: mpv not installed");
+        return;
+    }
+    // A share that went away mid-session: mpv ends the load with reason "error" (file_error
+    // "loading failed"). Only a start past the file's real end counts as finished.
+    let missing = std::env::temp_dir().join(format!("qs_missing_{}/gone.mp3", std::process::id()));
+    let mut player = LocalPlayer::new("mpv");
+    player.play_at(&missing, 42.0).expect("play_at");
+    let err = wait_for_error_never_finishing(&mut player).expect("the failed load reports an error");
+    assert!(
+        err.contains("gone.mp3") && err.contains("loading failed"),
+        "error: {err}"
+    );
+    assert!(!player.is_playing());
+}
+
+#[test]
+fn test_mpv_corrupt_file_started_past_zero_reports_an_error() {
+    common::isolate();
+    if !has("mpv") {
+        eprintln!("SKIPPED: mpv not installed");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("qs_corrupt_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let corrupt = dir.join("corrupt.mp3");
+    std::fs::write(
+        &corrupt,
+        b"not really audio, not really audio, not really audio".repeat(100),
+    )
+    .unwrap();
+
+    let mut player = LocalPlayer::new("mpv");
+    player.play_at(&corrupt, 42.0).expect("play_at");
+    let err = wait_for_error_never_finishing(&mut player).expect("the failed load reports an error");
+    assert!(err.contains("corrupt.mp3"), "error: {err}");
+    drop(player);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stand-in mpv that answers `loadfile` with the new playlist entry's id, as mpv does, and
+/// then reports, before the new entry's `start-file`, that the entry it replaced failed: a late
+/// `end-file` from a load that is no longer current. Writes `loadfile <n>` to `events.log` once
+/// it has sent the events for load `n`.
+fn late_end_file_fake_mpv(dir: &std::path::Path) -> PathBuf {
+    let script = dir.join("fake-mpv");
+    let body = r#"#!/usr/bin/env python3
+import json, os, socket, sys
+sock = next(a.split("=", 1)[1] for a in sys.argv if a.startswith("--input-ipc-server="))
+srv = socket.socket(socket.AF_UNIX)
+srv.bind(sock)
+srv.listen(4)
+log = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "events.log"), "a", buffering=1)
+entry = 0
+def send(conn, msg):
+    conn.sendall((json.dumps(msg) + "\n").encode())
+while True:
+    conn, _ = srv.accept()
+    buf = b""
+    while True:
+        data = conn.recv(65536)
+        if not data:
+            break
+        buf += data
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            if not line.strip():
+                continue
+            req = json.loads(line)
+            reply = {"error": "success"}
+            if "request_id" in req:
+                reply["request_id"] = req["request_id"]
+            if req.get("command", [None])[0] == "loadfile":
+                entry += 1
+                reply["data"] = {"playlist_entry_id": entry}
+                send(conn, reply)
+                if entry > 1:
+                    send(conn, {"event": "end-file", "reason": "error", "playlist_entry_id": entry - 1,
+                                "file_error": "loading failed"})
+                send(conn, {"event": "start-file", "playlist_entry_id": entry})
+                log.write("loadfile %d\n" % entry)
+            else:
+                send(conn, reply)
+"#;
+    std::fs::write(&script, body).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+#[test]
+fn test_mpv_end_of_a_replaced_load_is_not_the_new_loads_end() {
+    common::isolate();
+    if !has("python3") {
+        eprintln!("SKIPPED: python3 not installed");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("qs_fake_mpv_late_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake = late_end_file_fake_mpv(&dir);
+    let track = dir.join("track.mp3");
+    std::fs::write(&track, b"not audio").unwrap();
+    let events = dir.join("events.log");
+    let sent = |n: usize| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if std::fs::read_to_string(&events)
+                .unwrap_or_default()
+                .contains(&format!("loadfile {n}"))
+            {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    };
+
+    let mut player = LocalPlayer::with_mpv_binary("mpv", &fake);
+    player.play(&track).expect("play");
+    assert!(sent(1), "the fake mpv never saw the first load");
+    // The second load starts past 0:00. The first load's late "error" end must neither count
+    // as the second one finishing (a start past the end) nor be reported as its error.
+    player.play_at(&track, 30.0).expect("play_at");
+    assert!(sent(2), "the fake mpv never saw the second load");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !player.is_track_finished(),
+        "a replaced load's end was taken for the new load's"
+    );
+    assert_eq!(player.take_error(), None, "a replaced load's error was reported");
+    drop(player);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------------------------
+// MpvLoadTracker fed mpv's messages directly, as each mpv generation sends them
+// ---------------------------------------------------------------------------------------------
+
+/// Feeds `msgs` to `tracker` and returns the end it reported, if any.
+fn feed(tracker: &mut MpvLoadTracker, msgs: &[serde_json::Value]) -> Option<MpvLoadEnd> {
+    msgs.iter().filter_map(|m| tracker.on_message(m)).last()
+}
+
+#[test]
+fn test_mpv_tracker_with_the_entry_in_the_answer_ignores_the_replaced_entry() {
+    common::isolate();
+    let mut tracker = MpvLoadTracker::default();
+    let id = tracker.begin(std::path::Path::new("/m/a.mp3"), true);
+    let end = feed(
+        &mut tracker,
+        &[
+            json!({"request_id": id, "error": "success", "data": {"playlist_entry_id": 2}}),
+            json!({"event": "end-file", "reason": "error", "playlist_entry_id": 1, "file_error": "loading failed"}),
+            json!({"event": "start-file", "playlist_entry_id": 2}),
+            json!({"event": "file-loaded"}),
+        ],
+    );
+    assert_eq!(end, None, "the replaced entry's end is not the new load's");
+    let end = feed(
+        &mut tracker,
+        &[
+            json!({"event": "end-file", "reason": "error", "playlist_entry_id": 2, "file_error": "no audio or video data played"}),
+        ],
+    );
+    assert_eq!(
+        end,
+        Some(MpvLoadEnd::Finished),
+        "a start past the end finishes the track"
+    );
+}
+
+#[test]
+fn test_mpv_tracker_without_the_entry_in_the_answer_takes_it_from_start_file() {
+    common::isolate();
+    // mpv 0.33 to 0.37: the events carry playlist_entry_id, loadfile's answer doesn't.
+    let mut tracker = MpvLoadTracker::default();
+    let id = tracker.begin(std::path::Path::new("/m/a.mp3"), false);
+    let end = feed(
+        &mut tracker,
+        &[
+            json!({"request_id": id, "error": "success"}),
+            json!({"event": "end-file", "reason": "eof", "playlist_entry_id": 1}),
+            json!({"event": "start-file", "playlist_entry_id": 2}),
+            json!({"event": "file-loaded"}),
+        ],
+    );
+    assert_eq!(end, None, "the replaced entry's end is not the new load's");
+    assert!(tracker.is_current());
+    let end = feed(
+        &mut tracker,
+        &[json!({"event": "end-file", "reason": "eof", "playlist_entry_id": 2})],
+    );
+    assert_eq!(end, Some(MpvLoadEnd::Finished));
+}
+
+#[test]
+fn test_mpv_tracker_without_any_entry_ids_still_sees_the_track_end() {
+    common::isolate();
+    // mpv older than 0.33 names no playlist entries at all: after loadfile's answer and the
+    // next start-file, the events are the newest load's, so a track still ends.
+    let mut tracker = MpvLoadTracker::default();
+    let id = tracker.begin(std::path::Path::new("/m/a.mp3"), false);
+    let end = feed(
+        &mut tracker,
+        &[
+            json!({"request_id": id, "error": "success"}),
+            json!({"event": "end-file", "reason": "eof"}),
+            json!({"event": "start-file"}),
+            json!({"event": "file-loaded"}),
+        ],
+    );
+    assert_eq!(end, None, "the end before the new start-file is the replaced load's");
+    assert!(tracker.is_current(), "eof-reached counts once the new load has started");
+    let end = feed(&mut tracker, &[json!({"event": "end-file", "reason": "eof"})]);
+    assert_eq!(end, Some(MpvLoadEnd::Finished), "the track's own end is seen");
+}
+
+#[test]
+fn test_mpv_tracker_without_any_entry_ids_still_reports_a_failed_load() {
+    common::isolate();
+    let mut tracker = MpvLoadTracker::default();
+    let id = tracker.begin(std::path::Path::new("/m/gone.mp3"), true);
+    let end = feed(
+        &mut tracker,
+        &[
+            json!({"request_id": id, "error": "success"}),
+            json!({"event": "start-file"}),
+            json!({"event": "end-file", "reason": "error", "file_error": "loading failed"}),
+        ],
+    );
+    assert_eq!(
+        end,
+        Some(MpvLoadEnd::Failed(
+            "couldn't play gone.mp3 (loading failed)".to_string()
+        ))
+    );
 }

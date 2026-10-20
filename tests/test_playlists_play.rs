@@ -1314,3 +1314,55 @@ fn test_rest_goes_around_the_playing_copy_when_another_copy_is_queued_ahead_of_i
     assert_eq!(app.queue.tracks()[4].filepath, z);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_output_switch_while_the_rest_is_checked_keeps_a_paused_track_paused() {
+    common::isolate();
+    // Issue #48 / PR #76 review: switching output with the started track paused in its last
+    // second counts it as over. The next track isn't queued yet, so the skip is held; once the
+    // rest arrives the next track must load paused on the new output, not start playing.
+    let SlowShare {
+        mut app,
+        dir,
+        paths,
+        calls,
+        gate_tx,
+    } = slow_share_app("switch_paused", 0);
+    app.queue_selected_playlist(Some(0));
+    assert!(poll_until(&mut app, |_| !play_calls(&calls).is_empty()));
+    app.player = Box::new(common::fake_player::FakePlayer {
+        paused: true,
+        position: 199.6,
+        duration: 200.0,
+        ..Default::default()
+    });
+    let output: Arc<Mutex<Vec<String>>> = Arc::default();
+    let log = output.clone();
+    app.set_output_player_factory(Box::new(move || {
+        Box::new(common::fake_player::FakePlayer {
+            calls: log.clone(),
+            ..Default::default()
+        })
+    }));
+
+    app.switch_to_local_player();
+    assert_eq!(
+        app.status_message, "Waiting for the rest of Road Trip…",
+        "the switch keeps the held skip's status"
+    );
+    assert!(
+        output.lock().unwrap().is_empty(),
+        "nothing to play until the rest is checked"
+    );
+
+    drop(gate_tx);
+    assert!(poll_until(&mut app, |app| !app.playlists.queue_check_pending()));
+    assert_eq!(queue_paths(&app), paths);
+    assert_eq!(app.queue.current_index(), 1, "the held skip went on to the next track");
+    assert_eq!(*output.lock().unwrap(), vec!["play b.mp3", "pause"]);
+    assert!(
+        app.player.is_paused(),
+        "the next track loads paused, as the switched track was"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -20,6 +20,138 @@ struct SharedState {
     is_paused: AtomicBool,
     is_playing: AtomicBool,
     is_finished: AtomicBool,
+    /// Which mpv playlist entry the newest load is, so the end of a load it replaced is never
+    /// taken for its own (issue #48).
+    load: Mutex<MpvLoadTracker>,
+    /// A load mpv couldn't play, for [`AudioPlayer::take_error`].
+    last_error: Mutex<Option<String>>,
+}
+
+/// The `file_error` mpv reports for a load started at or past the file's real end (mpv 0.41).
+const NO_DATA_PLAYED: &str = "no audio or video data played";
+
+/// How the newest mpv load ended, as [`MpvLoadTracker::on_message`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MpvLoadEnd {
+    /// The track played to its end, or was started at or past it.
+    Finished,
+    /// mpv couldn't play the file (missing, unreadable, not audio): the message says which.
+    Failed(String),
+}
+
+/// Follows mpv's events for the newest `loadfile`, so a late `end-file` from a load it replaced
+/// is never taken for its own (issue #48). Each `loadfile` carries a `request_id`; mpv answers
+/// it with the new playlist entry's id (`playlist_entry_id`), and only an `end-file` for that
+/// entry counts. Without an id in the answer (mpv 0.33 to 0.37), the latest `start-file` after
+/// the answer names it. An mpv that names no entries at all (older than 0.33) has its events
+/// taken for the newest load from the first `start-file` after the answer, as before entries had
+/// ids, so a track's end is never missed.
+///
+/// An `end-file` with reason `error` counts as the track finishing only when the load started
+/// past 0:00, mpv got as far as loading the file, and it reports that nothing played
+/// (`file_error` `no audio or video data played`, or none): a start at or past the file's real
+/// end, which a tag length (an estimate) can ask for. Every other error (`loading failed`,
+/// `unrecognized file format`, …) is a failure. Public only so tests can feed it events.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct MpvLoadTracker {
+    /// The newest load's `request_id` (0 before the first load; mpv answers our other commands
+    /// with 0).
+    generation: u64,
+    started_past_zero: bool,
+    file_name: String,
+    /// mpv has answered the newest `loadfile`.
+    answered: bool,
+    /// The newest load's playlist entry, once known.
+    entry: Option<i64>,
+    /// `entry` came from mpv's answer (else from the latest `start-file`).
+    entry_from_answer: bool,
+    /// The entry of the latest `start-file`.
+    started: Option<i64>,
+    /// mpv reported `file-loaded` for the newest load's entry.
+    file_loaded: bool,
+    /// mpv names no playlist entries (older than 0.33), and the newest load's `start-file` came.
+    unnamed_entries: bool,
+}
+
+impl MpvLoadTracker {
+    /// A new load of `file` is about to be sent, starting past 0:00 when `started_past_zero`.
+    /// Returns the `request_id` its `loadfile` must carry.
+    pub fn begin(&mut self, file: &Path, started_past_zero: bool) -> u64 {
+        self.generation += 1;
+        self.started_past_zero = started_past_zero;
+        self.file_name = file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| file.display().to_string());
+        self.answered = false;
+        self.entry = None;
+        self.entry_from_answer = false;
+        self.file_loaded = false;
+        self.unnamed_entries = false;
+        self.generation
+    }
+
+    /// Whether mpv's events now concern the newest load (its entry is known, or mpv names no
+    /// entries and the load has started).
+    pub fn is_current(&self) -> bool {
+        self.answered && (self.entry.is_some() || self.unnamed_entries)
+    }
+
+    /// Read one message from mpv. Returns how the newest load ended when this message says so.
+    pub fn on_message(&mut self, msg: &serde_json::Value) -> Option<MpvLoadEnd> {
+        if self.generation > 0 && msg.get("request_id").and_then(|r| r.as_u64()) == Some(self.generation) {
+            self.answered = true;
+            let id = msg.pointer("/data/playlist_entry_id").and_then(|i| i.as_i64());
+            self.entry_from_answer = id.is_some();
+            self.entry = id;
+            return None;
+        }
+        let event = msg.get("event").and_then(|e| e.as_str())?;
+        let id = msg.get("playlist_entry_id").and_then(|i| i.as_i64());
+        match event {
+            "start-file" => {
+                self.started = id;
+                if self.answered && !self.entry_from_answer {
+                    self.entry = id;
+                    self.unnamed_entries = id.is_none();
+                }
+                if self.is_current() && self.entry == id {
+                    self.file_loaded = false;
+                }
+                None
+            }
+            "file-loaded" => {
+                if self.is_current() && self.started == self.entry {
+                    self.file_loaded = true;
+                }
+                None
+            }
+            "end-file" => {
+                if !self.is_current() || id != self.entry {
+                    return None;
+                }
+                match msg.get("reason").and_then(|r| r.as_str()) {
+                    Some("eof") => Some(MpvLoadEnd::Finished),
+                    Some("error") => {
+                        let file_error = msg.get("file_error").and_then(|e| e.as_str());
+                        if self.started_past_zero && self.file_loaded && file_error.is_none_or(|e| e == NO_DATA_PLAYED)
+                        {
+                            Some(MpvLoadEnd::Finished)
+                        } else {
+                            Some(MpvLoadEnd::Failed(format!(
+                                "couldn't play {} ({})",
+                                self.file_name,
+                                file_error.unwrap_or("error")
+                            )))
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 /// File name of the mpv IPC socket inside the player's private directory.
@@ -289,6 +421,23 @@ impl LocalPlayer {
                         }
 
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                            let (end, current) = {
+                                let mut load = shared.load.lock().unwrap();
+                                (load.on_message(&val), load.is_current())
+                            };
+                            match end {
+                                Some(MpvLoadEnd::Finished) => {
+                                    shared.is_finished.store(true, Ordering::SeqCst);
+                                    shared.is_playing.store(false, Ordering::SeqCst);
+                                }
+                                Some(MpvLoadEnd::Failed(err)) => {
+                                    crate::log_warn!("player", "mpv: {}", err);
+                                    shared.is_finished.store(false, Ordering::SeqCst);
+                                    shared.is_playing.store(false, Ordering::SeqCst);
+                                    *shared.last_error.lock().unwrap() = Some(err);
+                                }
+                                None => {}
+                            }
                             if let Some(event) = val.get("event").and_then(|e| e.as_str()) {
                                 match event {
                                     "property-change" => {
@@ -311,24 +460,13 @@ impl LocalPlayer {
                                                 }
                                                 "eof-reached" => {
                                                     if let Some(eof) = val.get("data").and_then(|d| d.as_bool()) {
-                                                        if eof {
+                                                        if eof && current {
                                                             shared.is_finished.store(true, Ordering::SeqCst);
                                                             shared.is_playing.store(false, Ordering::SeqCst);
                                                         }
                                                     }
                                                 }
                                                 _ => {}
-                                            }
-                                        }
-                                    }
-                                    "end-file" => {
-                                        if let Some(reason) = val.get("reason").and_then(|r| r.as_str()) {
-                                            if reason == "eof" {
-                                                shared.is_finished.store(true, Ordering::SeqCst);
-                                                shared.is_playing.store(false, Ordering::SeqCst);
-                                            } else if reason == "error" {
-                                                shared.is_finished.store(false, Ordering::SeqCst);
-                                                shared.is_playing.store(false, Ordering::SeqCst);
                                             }
                                         }
                                     }
@@ -538,8 +676,16 @@ impl LocalPlayer {
                 })
                 .to_string();
                 self.send_command(&start_cmd)?;
+                // The request id ties mpv's answer, and so the new playlist entry, to this load.
+                let request_id = self
+                    .shared_state
+                    .load
+                    .lock()
+                    .unwrap()
+                    .begin(&abs_path, start_seconds > 0.0);
                 let json_cmd = serde_json::json!({
-                    "command": ["loadfile", file_str, "replace"]
+                    "command": ["loadfile", file_str, "replace"],
+                    "request_id": request_id
                 })
                 .to_string();
                 self.send_command(&json_cmd)?;
@@ -772,5 +918,9 @@ impl AudioPlayer for LocalPlayer {
 
     fn reset_finished(&mut self) {
         LocalPlayer::reset_finished(self);
+    }
+
+    fn take_error(&mut self) -> Option<String> {
+        self.shared_state.last_error.lock().unwrap().take()
     }
 }
