@@ -903,6 +903,19 @@ pub fn duration(seconds: f64) -> String {
     }
 }
 
+/// A count with its thousands grouped, as the TUI shows counts: `4812` as `4,812`.
+pub fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Uppercase with full Unicode case mapping (`ß` becomes `SS`, so the result can be longer).
 pub fn upper(text: &str) -> String {
     text.to_uppercase()

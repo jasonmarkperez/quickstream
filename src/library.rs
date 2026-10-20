@@ -17,6 +17,12 @@ use crate::paths;
 #[derive(Debug, Clone, PartialEq)]
 pub enum AutopilotEvent {
     Track(AudioMetadata),
+    /// A profile mix's candidate pool for the analysis worker (issue #30): the tracks it gathered
+    /// but did not queue and that have no up-to-date analysis row (mtime and size), matched ones
+    /// first and at most `MAX_PENDING_CANDIDATES` ([`analysis_candidates`]), so BPM Flow and the
+    /// moods have more to choose from on the next run. Sent once, after the mix's tracks and
+    /// before `Finished`; never queued.
+    Candidates(Vec<PathBuf>),
     Finished(usize),
 }
 
@@ -197,6 +203,23 @@ impl MixScanStats {
 const MIX_SCAN_THREADS: usize = 4;
 /// Tracks per folder whose tags are read while gathering profile-mix candidates.
 const TAG_READS_PER_FOLDER: usize = 4;
+
+/// The tracks a profile mix sends for analysis (issue #30): its matched candidates first, then
+/// the others (`others` may list matched ones again), each path once, less those `skip` names
+/// (queued by the mix, or with an up-to-date analysis row), and at most
+/// [`MAX_PENDING_CANDIDATES`](crate::analysis::worker::MAX_PENDING_CANDIDATES), what the worker
+/// keeps waiting. A pool can hold 120 matched and 200 other candidates, and the worker would push
+/// out the oldest, so the matched ones are kept and the last others left out.
+pub fn analysis_candidates(matched: &[PathBuf], others: &[PathBuf], skip: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    matched
+        .iter()
+        .chain(others)
+        .filter(|p| !skip(p) && seen.insert(*p))
+        .take(crate::analysis::worker::MAX_PENDING_CANDIDATES)
+        .cloned()
+        .collect()
+}
 
 fn log_autopilot(message: String) {
     crate::logger::log_raw("PERF", "autopilot", &message);
@@ -610,8 +633,7 @@ impl LibraryManager {
         let mut rng = crate::queue::FastRng::new();
 
         let stats = MixScanStats::default();
-        let make_metadata_untimed = |path: &Path| -> AudioMetadata {
-            let file_len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let make_metadata_untimed = |path: &Path, file_len: u64| -> AudioMetadata {
             if let Some(cached) = cache.get(path) {
                 if cached.file_size == file_len && !cached.title.is_empty() {
                     MixScanStats::count(&stats.cache_hits);
@@ -663,11 +685,14 @@ impl LibraryManager {
                 ..Default::default()
             }
         };
-        let make_metadata = |path: &Path| -> AudioMetadata {
+        // A track's tags, and the stamp (mtime, size) of the file they were read for: whether its
+        // analysis row is current is judged against it, so no file is read again for that.
+        let make_metadata = |path: &Path| -> (AudioMetadata, Option<(u64, u64)>) {
             let start = Instant::now();
-            let meta = make_metadata_untimed(path);
+            let stamp = fs::metadata(path).ok().map(|md| crate::analysis::worker::stamp_of(&md));
+            let meta = make_metadata_untimed(path, stamp.map_or(0, |(_, size)| size));
             MixScanStats::time(&stats.metadata, start);
-            meta
+            (meta, stamp)
         };
 
         // 1. Determine subdirectories and immediate files in dir
@@ -736,12 +761,11 @@ impl LibraryManager {
             let mut matched_candidates: Vec<AudioMetadata> = Vec::new();
             let mut all_candidates: Vec<AudioMetadata> = Vec::new();
 
-            let is_match_untimed = |meta: &AudioMetadata| -> bool {
+            let is_match_untimed = |meta: &AudioMetadata, feat: Option<&crate::analysis::TrackFeatures>| -> bool {
                 match &profile {
                     crate::analysis::MixProfile::BpmFlow { target_bpm, tolerance } => {
                         let min_bpm = target_bpm * (1.0 - tolerance);
                         let max_bpm = target_bpm * (1.0 + tolerance);
-                        let feat = db.get_track(&meta.filepath);
                         if let Some(b) = feat.and_then(|f| f.bpm) {
                             (b >= min_bpm && b <= max_bpm)
                                 || (b >= min_bpm / 2.0 && b <= max_bpm / 2.0)
@@ -750,10 +774,7 @@ impl LibraryManager {
                             false
                         }
                     }
-                    crate::analysis::MixProfile::MoodVibe(mood) => {
-                        let feat = db.get_track(&meta.filepath);
-                        mood.matches_track(meta, feat.as_ref())
-                    }
+                    crate::analysis::MixProfile::MoodVibe(mood) => mood.matches_track(meta, feat),
                     crate::analysis::MixProfile::SeedRadio(seed_path) => {
                         if &meta.filepath == seed_path {
                             return false;
@@ -767,22 +788,28 @@ impl LibraryManager {
                         };
                         let seed_genre = seed_feat.genre;
 
-                        let feat = db.get_track(&meta.filepath);
                         let artist_match = !seed_artist.is_empty() && meta.artist.eq_ignore_ascii_case(&seed_artist);
                         let genre_match = !seed_genre.is_empty()
                             && (meta.genre.eq_ignore_ascii_case(&seed_genre)
-                                || feat
-                                    .as_ref()
-                                    .map(|f| f.genre.eq_ignore_ascii_case(&seed_genre))
-                                    .unwrap_or(false));
+                                || feat.map(|f| f.genre.eq_ignore_ascii_case(&seed_genre)).unwrap_or(false));
                         artist_match || genre_match
                     }
                     _ => true,
                 }
             };
-            let is_match = |meta: &AudioMetadata| -> bool {
+            // Gathered tracks whose analysis row is current for the file as gathering read it
+            // (the worker would skip them): left out of the pool sent for analysis.
+            let analysed = std::cell::RefCell::new(std::collections::HashSet::new());
+            // Each gathered track's row is read once, for matching and to tell if it is current.
+            let is_match = |meta: &AudioMetadata, stamp: Option<(u64, u64)>| -> bool {
                 let start = Instant::now();
-                let matched = is_match_untimed(meta);
+                let row = db.get_track(&meta.filepath);
+                if let (Some(row), Some(stamp)) = (&row, stamp) {
+                    if crate::analysis::worker::row_is_current(row, stamp) {
+                        analysed.borrow_mut().insert(meta.filepath.clone());
+                    }
+                }
+                let matched = is_match_untimed(meta, row.as_ref());
                 MixScanStats::time(&stats.matching, start);
                 matched
             };
@@ -807,8 +834,8 @@ impl LibraryManager {
                 if !immediate_files.is_empty() {
                     rng.shuffle(&mut immediate_files);
                     for f in immediate_files.iter().take(per_subdir) {
-                        let meta = make_metadata(f);
-                        if is_match(&meta) {
+                        let (meta, stamp) = make_metadata(f);
+                        if is_match(&meta, stamp) {
                             if first_sent.is_none() && tx.send(AutopilotEvent::Track(meta.clone())).is_ok() {
                                 total_sent += 1;
                                 first_sent = Some(meta);
@@ -831,7 +858,8 @@ impl LibraryManager {
                 let next_folder = AtomicUsize::new(0);
                 let halt = AtomicBool::new(false);
                 std::thread::scope(|scope| {
-                    let (folder_tx, folder_rx) = std::sync::mpsc::channel::<(usize, Vec<AudioMetadata>)>();
+                    let (folder_tx, folder_rx) =
+                        std::sync::mpsc::channel::<(usize, Vec<(AudioMetadata, Option<(u64, u64)>)>)>();
                     for worker in 0..MIX_SCAN_THREADS {
                         let folder_tx = folder_tx.clone();
                         let (next_folder, halt, subdirs, stop_flag, stats) =
@@ -903,8 +931,8 @@ impl LibraryManager {
                         stats.files.fetch_add(files_found, Ordering::Relaxed);
 
                         let mut artist_match_count = 0;
-                        for meta in metas {
-                            if is_match(&meta) {
+                        for (meta, stamp) in metas {
+                            if is_match(&meta, stamp) {
                                 if first_sent.is_none() && tx.send(AutopilotEvent::Track(meta.clone())).is_ok() {
                                     total_sent += 1;
                                     first_sent = Some(meta);
@@ -979,8 +1007,8 @@ impl LibraryManager {
                     if i > 0 && over_budget() {
                         break;
                     }
-                    let meta = make_metadata(&p);
-                    if is_match(&meta) {
+                    let (meta, stamp) = make_metadata(&p);
+                    if is_match(&meta, stamp) {
                         if first_sent.is_none() && tx.send(AutopilotEvent::Track(meta.clone())).is_ok() {
                             total_sent += 1;
                             first_sent = Some(meta);
@@ -1004,6 +1032,11 @@ impl LibraryManager {
                 let _ = tx.send(AutopilotEvent::Finished(total_sent));
                 return;
             }
+
+            // The whole pool, before the mix takes its share: what the mix leaves out goes to the
+            // analysis worker (issue #30).
+            let pool_matched: Vec<PathBuf> = matched_candidates.iter().map(|m| m.filepath.clone()).collect();
+            let pool_others: Vec<PathBuf> = all_candidates.iter().map(|m| m.filepath.clone()).collect();
 
             let remaining_limit = target_limit - total_sent;
             let filtered: Vec<AudioMetadata> = if matched_candidates.len() >= remaining_limit {
@@ -1048,6 +1081,11 @@ impl LibraryManager {
                 sequence_start.elapsed()
             ));
 
+            let queued: std::collections::HashSet<PathBuf> = first_sent
+                .iter()
+                .chain(&sequenced)
+                .map(|t| t.filepath.clone())
+                .collect();
             for track in sequenced {
                 if stop_flag.load(Ordering::Relaxed) {
                     return;
@@ -1055,6 +1093,18 @@ impl LibraryManager {
                 if tx.send(AutopilotEvent::Track(track)).is_ok() {
                     total_sent += 1;
                 }
+            }
+
+            // The candidates the mix didn't queue, less those with an analysis row for the file
+            // as gathering read it (the worker skips those anyway): analysed in the background,
+            // so the next mix has more tracks with a BPM and energy to choose from.
+            let analysed = analysed.into_inner();
+            let unanalysed = analysis_candidates(&pool_matched, &pool_others, |path| {
+                queued.contains(path) || analysed.contains(path)
+            });
+            if !unanalysed.is_empty() && !stop_flag.load(Ordering::Relaxed) {
+                log_autopilot(format!("candidates sent for analysis={}", unanalysed.len()));
+                let _ = tx.send(AutopilotEvent::Candidates(unanalysed));
             }
 
             if !stop_flag.load(Ordering::Relaxed) {
@@ -1077,7 +1127,7 @@ impl LibraryManager {
                     if stop_flag.load(Ordering::Relaxed) {
                         return;
                     }
-                    let meta = make_metadata(&f);
+                    let (meta, _) = make_metadata(&f);
                     if tx.send(AutopilotEvent::Track(meta)).is_ok() {
                         total_sent += 1;
                     }
@@ -1095,7 +1145,7 @@ impl LibraryManager {
                 if stop_flag.load(Ordering::Relaxed) {
                     return;
                 }
-                let meta = make_metadata(f);
+                let (meta, _) = make_metadata(f);
                 if tx.send(AutopilotEvent::Track(meta)).is_ok() {
                     total_sent += 1;
                 }
@@ -1137,7 +1187,7 @@ impl LibraryManager {
 
                 if !folder_tracks.is_empty() {
                     let pick = (rng.next_u64() as usize) % folder_tracks.len();
-                    let meta = make_metadata(&folder_tracks[pick]);
+                    let (meta, _) = make_metadata(&folder_tracks[pick]);
                     if tx.send(AutopilotEvent::Track(meta)).is_ok() {
                         total_sent += 1;
                     }
@@ -1180,7 +1230,7 @@ impl LibraryManager {
                     rng.shuffle(&mut folder_tracks);
                     for (i, p) in folder_tracks.into_iter().enumerate() {
                         if i < per_subdir && total_sent < target_limit {
-                            let meta = make_metadata(&p);
+                            let (meta, _) = make_metadata(&p);
                             if tx.send(AutopilotEvent::Track(meta)).is_ok() {
                                 total_sent += 1;
                             }
@@ -1198,7 +1248,7 @@ impl LibraryManager {
                     if stop_flag.load(Ordering::Relaxed) || total_sent >= target_limit {
                         break;
                     }
-                    let meta = make_metadata(&p);
+                    let (meta, _) = make_metadata(&p);
                     if tx.send(AutopilotEvent::Track(meta)).is_ok() {
                         total_sent += 1;
                     }
