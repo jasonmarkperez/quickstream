@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use quickstream::web::{
     NowPlayingState, ServerLimits, StreamServerState, WebBind, WebCommand, WebServer, WebServerHandle,
@@ -142,26 +142,39 @@ fn test_action_body_cut_short_is_refused_with_400() {
 }
 
 #[test]
-fn test_action_body_that_times_out_is_refused_with_400() {
+fn test_action_body_that_times_out_is_answered_408_like_a_head_timeout() {
     common::isolate();
     let limits = ServerLimits {
         request_timeout: Duration::from_secs(1),
         ..ServerLimits::default()
     };
     let (handle, rx) = start_with_limits(limits);
+    let port = handle.port;
 
-    // Part of the body, then nothing: the request deadline runs out with the socket still open.
-    let mut stream = connect(handle.port);
+    // Part of the head, then nothing: the request deadline runs out with the socket still open.
+    let mut stream = connect(port);
+    stream
+        .write_all(b"POST /api/action HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+        .unwrap();
+    let head_timeout = read_all(stream);
+    assert_eq!(
+        head_timeout,
+        b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+    );
+
+    // Part of the body, then nothing: the same answer.
+    let mut stream = connect(port);
     let head = format!(
-        "POST /api/action HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        handle.port,
+        "POST /api/action HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         PLAYLIST_DELETE.len()
     );
     stream.write_all(head.as_bytes()).unwrap();
     stream.write_all(&PLAYLIST_DELETE.as_bytes()[..10]).unwrap();
-    let (status, headers, body) = parse(&read_all(stream));
-    let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
-    assert_refused(status, &headers, &json, "Incomplete request body", "timed out");
+    assert_eq!(
+        read_all(stream),
+        head_timeout,
+        "a body timeout is answered like a head timeout"
+    );
 
     assert!(rx.try_recv().is_err(), "no command for a body that timed out");
     handle.stop();
@@ -360,14 +373,11 @@ fn test_not_found_and_json_responses_keep_their_bytes() {
             format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").as_bytes(),
         )
     };
-    assert_eq!(
-        get("/nope"),
-        b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found".to_vec()
-    );
-    assert_eq!(
-        get("/stream/unknown.mp3"),
-        b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found".to_vec()
-    );
+    // Outside the API a 404 is plain text, labelled as such (it had no Content-Type before).
+    let plain_404 = b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found".to_vec();
+    assert_eq!(get("/nope"), plain_404);
+    assert_eq!(get("/stream/unknown.mp3"), plain_404);
+    assert_eq!(get("/stream/continuous-unarmed.wav"), plain_404);
 
     for path in ["/api/status", "/api/playlists"] {
         let (status, headers, body) = parse(&get(path));
@@ -419,18 +429,72 @@ fn test_not_found_and_json_responses_keep_their_bytes() {
 }
 
 #[test]
+fn test_api_paths_answer_404_and_405_as_json() {
+    common::isolate();
+    let (handle, rx) = start();
+    let port = handle.port;
+
+    let cases = [
+        ("GET", "/api/nope", 404, "Not found", None),
+        ("GET", "/api", 404, "Not found", None),
+        ("POST", "/api/statusXYZ", 404, "Not found", None),
+        ("GET", "/api/action", 405, "Method not allowed", Some("POST")),
+        ("POST", "/api/status?t=1", 405, "Method not allowed", Some("GET, HEAD")),
+    ];
+    for (method, path, code, error, allow) in cases {
+        let (status, headers, body) = request(port, method, path, r#"{"action":"next"}"#);
+        let case = format!("{method} {path}");
+        assert_eq!(status, code, "{case}: {headers}");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|e| panic!("{case}: JSON body ({e}): {headers}"));
+        assert_eq!(json, serde_json::json!({ "ok": false, "error": error }), "{case}");
+        for (name, value) in [
+            ("content-type", "application/json"),
+            ("x-content-type-options", "nosniff"),
+            ("cache-control", "no-store"),
+            ("connection", "close"),
+        ] {
+            assert_eq!(header_value(&headers, name).as_deref(), Some(value), "{case}: {name}");
+        }
+        assert_eq!(header_value(&headers, "allow").as_deref(), allow, "{case}");
+    }
+
+    // Elsewhere a 405 is plain text, like the 404.
+    let (status, headers, body) = request(port, "POST", "/", "{}");
+    assert_eq!(status, 405);
+    assert_eq!(body, b"Method Not Allowed".to_vec());
+    assert_eq!(
+        header_value(&headers, "content-type").as_deref(),
+        Some("text/plain; charset=utf-8")
+    );
+    assert_eq!(
+        header_value(&headers, "x-content-type-options").as_deref(),
+        Some("nosniff")
+    );
+    assert_eq!(header_value(&headers, "allow").as_deref(), Some("GET, HEAD"));
+
+    assert!(rx.try_recv().is_err(), "no command for a 404 or 405");
+    handle.stop();
+}
+
+#[test]
 fn test_head_error_answers_have_no_body() {
     common::isolate();
     let (handle, rx) = start();
     let port = handle.port;
 
     let cases = [
-        ("/api/action", 405, "18"),
-        ("/nope", 404, "9"),
-        ("/stream/unknown.mp3", 404, "9"),
-        ("/stream/continuous-unarmed.wav", 404, "9"),
+        ("/api/action", 405),
+        ("/api/nope", 404),
+        ("/nope", 404),
+        ("/stream/unknown.mp3", 404),
+        ("/stream/continuous-unarmed.wav", 404),
     ];
-    for (path, code, length) in cases {
+    for (path, code) in cases {
+        // The length a GET of the same path gets.
+        let (_, _, get_body) = request(port, "GET", path, "");
+        assert!(!get_body.is_empty(), "GET {path} has a body");
+        let length = get_body.len().to_string();
         let raw = raw_exchange(
             port,
             format!("HEAD {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").as_bytes(),
@@ -445,7 +509,7 @@ fn test_head_error_answers_have_no_body() {
         // The head still names the length a GET would get.
         assert_eq!(
             header_value(&headers, "content-length").as_deref(),
-            Some(length),
+            Some(length.as_str()),
             "HEAD {path}"
         );
     }
@@ -454,11 +518,69 @@ fn test_head_error_answers_have_no_body() {
     handle.stop();
 }
 
+/// Send `method path` declaring a 5-byte body, send the body `delay` later, then read the answer.
+/// Returns the bytes read and whether the read ended cleanly (no connection reset).
+fn exchange_with_late_body(port: u16, method: &str, path: &str, delay: Duration) -> (Vec<u8>, bool) {
+    let content_type = if method == "GET" || method == "HEAD" {
+        ""
+    } else {
+        "Content-Type: application/json\r\n"
+    };
+    let mut stream = connect(port);
+    let head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{content_type}Content-Length: 5\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).unwrap();
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
+    stream.write_all(b"hello").unwrap();
+    let mut raw = Vec::new();
+    let clean = stream.read_to_end(&mut raw).is_ok();
+    (raw, clean)
+}
+
 #[test]
-fn test_unknown_path_with_an_unsent_body_is_answered_before_the_request_deadline() {
+fn test_answers_survive_a_declared_body_the_route_never_reads() {
     common::isolate();
-    // A long request deadline, so an answer well before it shows the 404 didn't wait for the body.
+    let (handle, rx) = start();
+    let port = handle.port;
+
+    // A body sent with the head (unread when the answer is written) and one sent more than a
+    // second after it (after the answer): either way the client reads the whole answer and a
+    // clean close, never a reset that could throw the answer away.
+    for delay in [Duration::ZERO, Duration::from_millis(1300)] {
+        for (method, path, code) in [
+            ("GET", "/nope", 404),
+            ("GET", "/api/action", 405),
+            ("POST", "/", 405),
+            ("GET", "/api/status", 200),
+            ("HEAD", "/api/status", 200),
+        ] {
+            let case = format!("{method} {path} with the body after {delay:?}");
+            let (raw, clean) = exchange_with_late_body(port, method, path, delay);
+            let (status, headers, body) = parse(&raw);
+            assert!(clean, "{case}: the connection was reset");
+            assert_eq!(status, code, "{case}: {headers}");
+            let length: usize = header_value(&headers, "content-length")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("{case}: no Content-Length: {headers}"));
+            let expected = if method == "HEAD" { 0 } else { length };
+            assert_eq!(body.len(), expected, "{case}: the whole body arrives");
+        }
+    }
+
+    assert!(rx.try_recv().is_err(), "no command for these requests");
+    handle.stop();
+}
+
+#[test]
+fn test_an_unsent_body_neither_delays_the_answer_nor_holds_the_slot() {
+    common::isolate();
+    // One request slot and a long request deadline: the answer must come at once, and the slot
+    // must come back while the client still holds its socket open, body never sent.
     let limits = ServerLimits {
+        max_connections: 1,
         request_timeout: Duration::from_secs(60),
         ..ServerLimits::default()
     };
@@ -469,20 +591,64 @@ fn test_unknown_path_with_an_unsent_body_is_answered_before_the_request_deadline
         ("GET", "/nope", 404),
         ("HEAD", "/nope", 404),
         ("GET", "/api/action", 405),
+        ("GET", "/api/status", 200),
     ] {
+        let case = format!("{method} {path}");
         let mut stream = connect(port);
-        stream.set_read_timeout(Some(Duration::from_secs(90))).unwrap();
-        // Declares a body and never sends it, keeping the socket open.
         let head = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 5\r\n\r\n");
         stream.write_all(head.as_bytes()).unwrap();
-        let started = std::time::Instant::now();
-        let (status, headers, _) = parse(&read_all(stream));
+        let started = Instant::now();
+        let mut raw = Vec::new();
+        // The server shuts down its side once it has answered, so this ends at the answer.
+        let clean = stream.read_to_end(&mut raw).is_ok();
         let waited = started.elapsed();
-        assert_eq!(status, code, "{method} {path}: {headers}");
+        let (status, headers, _) = parse(&raw);
+        assert!(clean, "{case}: the connection was reset");
+        assert_eq!(status, code, "{case}: {headers}");
         assert!(
-            waited < Duration::from_secs(30),
-            "{method} {path} waited {waited:?} for a body that never came"
+            waited < Duration::from_millis(800),
+            "{case}: the answer waited {waited:?} for a body that never came"
         );
+
+        // `stream` stays open: the slot still comes back within the server's drain bound.
+        loop {
+            let (status, _, _) = request(port, "GET", "/api/status", "");
+            if status == 200 {
+                break;
+            }
+            assert_eq!(status, 503, "{case}: only busy until the slot is back");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{case}: the request slot was held past the drain bound"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(stream);
+    }
+    handle.stop();
+}
+
+#[test]
+fn test_stream_paths_with_a_fragment_or_query_are_served() {
+    let dir = common::isolate().join("web_api_stream_fragment");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("song.mp3");
+    let data = vec![0x42u8; 64];
+    std::fs::write(&file, &data).unwrap();
+    let (handle, _rx) = start();
+    handle.register_stream_file(&file);
+
+    // The router and the stream handler split the path the same way, so a path the router sends
+    // to the stream pool is the file it names, not a 404.
+    for path in [
+        "/stream/song.mp3",
+        "/stream/song.mp3#t=10",
+        "/stream/song.mp3?x=1",
+        "/stream/song.mp3?x=1#t=10",
+    ] {
+        let (status, headers, body) = request(handle.port, "GET", path, "");
+        assert_eq!(status, 200, "GET {path}: {headers}");
+        assert_eq!(body, data, "GET {path}");
     }
     handle.stop();
 }

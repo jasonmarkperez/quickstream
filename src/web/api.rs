@@ -1,6 +1,6 @@
 //! Route dispatch, the REST API (`/api/...`) and the dashboard page.
 
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -12,8 +12,8 @@ use serde::Deserialize;
 use crate::metadata::{cover_image_mime, default_cover_svg, extract_cover_art};
 
 use super::server::{
-    read_request_body, read_request_head, reject_request, write_json, write_method_not_allowed, write_not_found,
-    write_plain, ConnectionPermit, Rejection, ServerLimits,
+    finish_connection, read_request_body, read_request_head, write_json, write_method_not_allowed, write_not_found,
+    write_plain, write_rejection, write_response, BodyError, ConnectionPermit, Rejection, ServerLimits,
 };
 use super::state::{
     NowPlayingState, PlaylistEdit, PlaylistReply, WebBrowserEntry, WebBrowserResponse, WebCommand, WebPlaylistsState,
@@ -26,10 +26,6 @@ use super::stream::{
 /// How long a web request waits for the UI thread's answer to a playlist edit or play. The UI handles
 /// web commands every tick, so this only runs out when it is stuck.
 const EDIT_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long a 404 or 405 waits for a declared request body before answering, so a body that is
-/// never sent doesn't hold the answer (and a request slot) until the request deadline.
-const UNANSWERED_BODY_WAIT: Duration = Duration::from_secs(1);
 
 #[derive(Deserialize)]
 struct ActionPayload {
@@ -178,7 +174,7 @@ const NO_ANSWER: &str = "Quickstream didn't answer; try again";
 /// index came from.
 pub(super) const MISSING_REVISION: &str = "Missing revision: reload the playlists and try again";
 
-/// Error for an `/api/action` body that was cut short or didn't arrive in time.
+/// Error for an `/api/action` body that was cut short.
 const INCOMPLETE_BODY: &str = "Incomplete request body";
 
 /// Error for an `/api/action` body that isn't a JSON action (not JSON, no `action`, a field of
@@ -343,19 +339,21 @@ impl Route {
         })
     }
 
-    /// The methods the route takes, as its `Allow` header lists them.
-    fn allow(self) -> &'static str {
+    /// The methods the route takes, in the order its `Allow` header lists them.
+    fn methods(self) -> &'static [&'static str] {
         match self {
-            Route::Action => "POST",
-            _ => "GET, HEAD",
+            Route::Action => &["POST"],
+            _ => &["GET", "HEAD"],
         }
     }
 
     fn takes(self, method: &str) -> bool {
-        match self {
-            Route::Action => method == "POST",
-            _ => method == "GET" || method == "HEAD",
-        }
+        self.methods().contains(&method)
+    }
+
+    /// The route's `Allow` header value.
+    fn allow(self) -> String {
+        self.methods().join(", ")
     }
 
     fn is_stream(self) -> bool {
@@ -364,32 +362,53 @@ impl Route {
 }
 
 pub(super) fn handle_client(
-    mut stream: TcpStream,
-    permit: ConnectionPermit,
+    stream: TcpStream,
+    mut permit: ConnectionPermit,
     limits: &ServerLimits,
     state: &Arc<RwLock<NowPlayingState>>,
     cmd_tx: &mpsc::Sender<WebCommand>,
     stream_state: &Arc<StreamServerState>,
 ) -> std::io::Result<()> {
     stream.set_write_timeout(Some(Duration::from_secs(4)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let answered = answer_request(stream, &mut reader, &mut permit, limits, state, cmd_tx, stream_state);
+    // Every answer, an error or a stream's end too, closes the same way, so a request body no
+    // route read can't reset the connection under the answer. The slot is held until then.
+    finish_connection(&mut reader);
+    answered
+}
 
+/// Read one request from `reader` and answer it on `stream`; the caller closes the connection.
+fn answer_request(
+    mut stream: TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    permit: &mut ConnectionPermit,
+    limits: &ServerLimits,
+    state: &Arc<RwLock<NowPlayingState>>,
+    cmd_tx: &mpsc::Sender<WebCommand>,
+    stream_state: &Arc<StreamServerState>,
+) -> std::io::Result<()> {
     // One deadline for the whole request (line, headers and body), so a client cannot hold the
     // connection open by sending a byte at a time.
     let deadline = Instant::now() + limits.request_timeout;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let head = match read_request_head(&mut reader, deadline, limits) {
+    let head = match read_request_head(reader, deadline, limits) {
         Ok(Some(head)) => head,
         Ok(None) => return Ok(()),
         Err(rejection) => {
-            reject_request(&mut stream, &mut reader, rejection);
+            write_rejection(&mut stream, rejection);
             return Ok(());
         }
     };
 
     let method = head.method.as_str();
     let path = head.path.as_str();
-    // The path without its query string or fragment.
-    let route = path.split(['?', '#']).next().unwrap_or(path);
+    // The path without its fragment, then without its query string: the route and every
+    // handler see the same split.
+    let target = path.split_once('#').map_or(path, |(target, _)| target);
+    let (route, query) = match target.split_once('?') {
+        Some((route, query)) => (route, Some(query)),
+        None => (target, None),
+    };
     let endpoint = Route::find(route);
     let is_head = method == "HEAD";
     let content_length = head.content_length;
@@ -401,23 +420,16 @@ pub(super) fn handle_client(
 
     // Streams can run for hours: move them to their own pool so they do not use up the slots
     // for short requests.
-    let _permit = if (method == "GET" || is_head) && endpoint.is_some_and(Route::is_stream) {
-        match permit.into_stream() {
-            Ok(stream_permit) => stream_permit,
-            Err(_request_permit) => {
-                crate::log_warn!(
-                    "web",
-                    "Stream limit ({}) reached; refusing {}",
-                    limits.max_streams,
-                    path
-                );
-                reject_request(&mut stream, &mut reader, Rejection::Busy);
-                return Ok(());
-            }
-        }
-    } else {
-        permit
-    };
+    if endpoint.is_some_and(|e| e.is_stream() && e.takes(method)) && !permit.move_to_stream() {
+        crate::log_warn!(
+            "web",
+            "Stream limit ({}) reached; refusing {}",
+            limits.max_streams,
+            path
+        );
+        write_rejection(&mut stream, Rejection::Busy);
+        return Ok(());
+    }
 
     // Read from memory per request, so toggling the setting applies to the next request.
     let remote_access = state.read().is_ok_and(|s| s.remote_access);
@@ -425,35 +437,31 @@ pub(super) fn handle_client(
         return Ok(());
     }
 
-    // An unknown path, or a method its route doesn't take. The body is read first (it is within
-    // the body limit), so closing with unread bytes doesn't reset the connection under the answer;
-    // a body that doesn't arrive within `UNANSWERED_BODY_WAIT` isn't waited for.
+    // An unknown path, or a method its route doesn't take: answered at once, any declared body
+    // is left to the drain in `handle_client`.
     let endpoint = match endpoint {
         Some(endpoint) if endpoint.takes(method) => endpoint,
-        unanswered => {
-            let drain_by = deadline.min(Instant::now() + UNANSWERED_BODY_WAIT);
-            let _ = read_request_body(&mut reader, content_length, drain_by);
-            return match unanswered {
-                Some(endpoint) => write_method_not_allowed(&mut stream, endpoint.allow(), is_head),
-                None => write_not_found(&mut stream, is_head),
-            };
-        }
+        Some(endpoint) => return write_method_not_allowed(&mut stream, route, &endpoint.allow(), is_head),
+        None => return write_not_found(&mut stream, route, is_head),
     };
 
     // Route dispatch
     match endpoint {
         Route::Dashboard => {
             // Serve single-page dashboard
-            let body = NOW_PLAYING_HTML.as_bytes();
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(header.as_bytes())?;
-            if !is_head {
-                stream.write_all(body)?;
-            }
-            stream.flush()?;
+            write_response(
+                &mut stream,
+                "200 OK",
+                &[
+                    ("Content-Type", "text/html; charset=utf-8"),
+                    ("X-Frame-Options", "DENY"),
+                    ("Referrer-Policy", "no-referrer"),
+                    ("X-Content-Type-Options", "nosniff"),
+                    ("Cache-Control", "no-store"),
+                ],
+                NOW_PLAYING_HTML.as_bytes(),
+                is_head,
+            )?;
         }
         Route::Status => {
             // Serve JSON playback status
@@ -514,33 +522,24 @@ pub(super) fn handle_client(
                 .as_deref()
                 .and_then(extract_cover_art)
                 .and_then(|(bytes, mime)| cover_image_mime(Some(&mime), &bytes).map(|m| (bytes, m)));
-            if let Some((bytes, mime)) = art_opt {
-                let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: public, max-age=10\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    mime,
-                    bytes.len()
-                );
-                stream.write_all(header.as_bytes())?;
-                if !is_head {
-                    stream.write_all(&bytes)?;
-                }
-                stream.flush()?;
-            } else {
-                let svg = default_cover_svg().as_bytes();
-                let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nX-Content-Type-Options: nosniff\r\nCache-Control: public, max-age=10\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    svg.len()
-                );
-                stream.write_all(header.as_bytes())?;
-                if !is_head {
-                    stream.write_all(svg)?;
-                }
-                stream.flush()?;
-            }
+            let (mime, bytes) = match &art_opt {
+                Some((bytes, mime)) => (*mime, bytes.as_slice()),
+                None => ("image/svg+xml", default_cover_svg().as_bytes()),
+            };
+            write_response(
+                &mut stream,
+                "200 OK",
+                &[
+                    ("Content-Type", mime),
+                    ("X-Content-Type-Options", "nosniff"),
+                    ("Cache-Control", "public, max-age=10"),
+                ],
+                bytes,
+                is_head,
+            )?;
         }
         Route::Browser => {
-            let requested_path = if let Some(query_idx) = path.find('?') {
-                let query_str = &path[query_idx + 1..];
+            let requested_path = if let Some(query_str) = query {
                 let mut p_val = None;
                 for pair in query_str.split('&') {
                     let mut kv = pair.splitn(2, '=');
@@ -645,33 +644,49 @@ pub(super) fn handle_client(
                 ContinuousAdmission::Admitted(nonce) => {
                     serve_continuous_stream(stream, is_head, state, cmd_tx, stream_state, &nonce)?;
                 }
-                ContinuousAdmission::NotFound => write_not_found(&mut stream, is_head)?,
+                ContinuousAdmission::NotFound => write_not_found(&mut stream, route, is_head)?,
                 ContinuousAdmission::Conflict => {
                     crate::log_warn!(
                         "web",
                         "Refusing continuous stream request from {}: the session belongs to another host",
                         peer
                     );
-                    write_plain(&mut stream, "409 Conflict", "", "Conflict", is_head)?;
+                    write_plain(&mut stream, "409 Conflict", &[], "Conflict", is_head)?;
                 }
             }
         }
         Route::Stream => {
             // Serve DLNA audio streaming with HTTP byte ranges
-            serve_audio_stream(stream, path, range_header.as_deref(), is_head, state, stream_state)?;
+            serve_audio_stream(
+                stream,
+                route,
+                query,
+                range_header.as_deref(),
+                is_head,
+                state,
+                stream_state,
+            )?;
         }
         Route::Action => {
             // content_length was checked against limits.max_body_bytes with the headers. A body
             // cut short or late is refused: part of a request is never acted on (issue #109).
-            let Some(body_bytes) = read_request_body(&mut reader, content_length, deadline) else {
-                let response = ActionResponse::refused("400 Bad Request", INCOMPLETE_BODY);
-                return write_json(
-                    &mut stream,
-                    response.status,
-                    "no-store",
-                    &response.body.to_string(),
-                    false,
-                );
+            let body_bytes = match read_request_body(reader, content_length, deadline) {
+                Ok(body) => body,
+                // As for a head that runs out of time.
+                Err(BodyError::TimedOut) => {
+                    write_rejection(&mut stream, Rejection::RequestTimeout);
+                    return Ok(());
+                }
+                Err(BodyError::CutShort) => {
+                    let response = ActionResponse::refused("400 Bad Request", INCOMPLETE_BODY);
+                    return write_json(
+                        &mut stream,
+                        response.status,
+                        "no-store",
+                        &response.body.to_string(),
+                        false,
+                    );
+                }
             };
 
             // Paths must resolve inside the allowed folders; commands carry the resolved path.

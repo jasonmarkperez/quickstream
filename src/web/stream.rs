@@ -821,7 +821,8 @@ pub fn parse_byte_range(header: &str, len: u64) -> ByteRange {
 
 pub(super) fn serve_audio_stream(
     mut stream: TcpStream,
-    path: &str,
+    route: &str,
+    query: Option<&str>,
     range_header: Option<&str>,
     head_only: bool,
     state: &Arc<RwLock<NowPlayingState>>,
@@ -843,13 +844,12 @@ pub(super) fn serve_audio_stream(
     let _ = stream.set_nodelay(true);
 
     // 1. Resolve target file and optional seek offset query parameter
-    let raw_encoded = path.strip_prefix("/stream/").unwrap_or("");
-    let encoded_path = raw_encoded.split('?').next().unwrap_or(raw_encoded);
+    // `route` and `query` are split by the router, so this is the file the route matched.
+    let encoded_path = route.strip_prefix("/stream/").unwrap_or("");
     let decoded_path = crate::player::upnp::url_decode(encoded_path);
 
-    let query_str = path.split_once('?').map(|(_, q)| q);
     let mut offset_seconds: f64 = 0.0;
-    if let Some(query) = query_str {
+    if let Some(query) = query {
         for param in query.split('&') {
             if let Some((k, v)) = param.split_once('=') {
                 if k == "pos" || k == "offset" {
@@ -874,7 +874,7 @@ pub(super) fn serve_audio_stream(
                 "Stream 404: '{}' is not a registered or now-playing file",
                 decoded_path
             );
-            return write_not_found(&mut stream, head_only);
+            return write_not_found(&mut stream, route, head_only);
         }
     };
 
@@ -882,7 +882,7 @@ pub(super) fn serve_audio_stream(
         Ok(f) => f,
         Err(e) => {
             crate::log_warn!("web", "Stream 404: Failed to open '{}': {}", filepath.display(), e);
-            return write_not_found(&mut stream, head_only);
+            return write_not_found(&mut stream, route, head_only);
         }
     };
 
