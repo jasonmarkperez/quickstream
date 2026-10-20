@@ -228,7 +228,9 @@ const DRAIN_BYTES: usize = 256 * 1024;
 /// whole response, then end of stream), then read and drop what the client still sends (a body
 /// no route read, or one sent after the answer) until it closes, for at most `DRAIN_TIME` and
 /// `DRAIN_BYTES`. Closing with unread bytes, or with bytes still to come, makes the kernel send
-/// a reset, which can discard the response at the client.
+/// a reset, which can discard the response at the client. A body that arrives after the bound can
+/// still be reset, and a client that keeps a fully read connection open holds its request or
+/// stream slot until the bound.
 pub(super) fn finish_connection(reader: &mut BufReader<TcpStream>) {
     let _ = reader.get_ref().shutdown(std::net::Shutdown::Write);
     let deadline = Instant::now() + DRAIN_TIME;
