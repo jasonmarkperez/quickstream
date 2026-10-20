@@ -357,73 +357,169 @@ fn find_mp3_stream_offset(file: &mut std::fs::File, offset_seconds: f64, duratio
     find_mp3_frame_sync(file, est_offset, 4096)
 }
 
-fn find_wav_pcm_offset(file: &mut std::fs::File, offset_seconds: f64) -> (u64, Option<Vec<u8>>) {
+/// Largest `fmt ` chunk a WAV seek reads and copies; the extensible form is 40 bytes.
+const MAX_WAV_FMT_CHUNK: u64 = 64 * 1024;
+
+/// A WAV size field that means "unknown length": what ffmpeg writes when it outputs to a pipe.
+const WAV_UNKNOWN_SIZE: u32 = u32::MAX;
+
+/// `fmt ` format tags whose byte rate a seek works out from the sample rate and block align.
+const WAVE_FORMAT_PCM: u16 = 0x0001;
+const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+
+/// The chunks of a WAV file that a seek needs.
+struct WavLayout {
+    /// The `fmt ` chunk's body, as it is in the file.
+    fmt: Vec<u8>,
+    /// Where the `data` chunk's audio starts and ends in the file (clamped to the file).
+    data_start: u64,
+    data_end: u64,
+    /// The `data` size field was 0 or `0xFFFFFFFF`: the audio runs to the end of the file.
+    size_unknown: bool,
+}
+
+/// Walk the RIFF chunks of a WAV file of `file_len` bytes, with every size bounded by the file.
+fn read_wav_layout(file: &mut std::fs::File, file_len: u64) -> Result<WavLayout, &'static str> {
     use std::io::{Read, Seek, SeekFrom};
-    let _ = file.seek(SeekFrom::Start(0));
     let mut riff_hdr = [0u8; 12];
+    file.seek(SeekFrom::Start(0)).map_err(|_| "can't read the file")?;
     if file.read_exact(&mut riff_hdr).is_err() || &riff_hdr[0..4] != b"RIFF" || &riff_hdr[8..12] != b"WAVE" {
-        return (0, None);
+        return Err("not a RIFF/WAVE file");
     }
-    let mut fmt_info = None;
-    let mut data_offset = 0u64;
-    let mut data_size = 0u32;
-
-    while let Ok(chunk_hdr) = (|| -> std::io::Result<[u8; 8]> {
-        let mut h = [0u8; 8];
-        file.read_exact(&mut h)?;
-        Ok(h)
-    })() {
-        let cid = &chunk_hdr[0..4];
-        let csize = u32::from_le_bytes(chunk_hdr[4..8].try_into().unwrap());
-        if cid == b"fmt " {
-            let mut fmt_bytes = vec![0u8; csize as usize];
-            if file.read_exact(&mut fmt_bytes).is_ok() && fmt_bytes.len() >= 16 {
-                let audio_fmt = u16::from_le_bytes(fmt_bytes[0..2].try_into().unwrap());
-                let channels = u16::from_le_bytes(fmt_bytes[2..4].try_into().unwrap());
-                let srate = u32::from_le_bytes(fmt_bytes[4..8].try_into().unwrap());
-                let brate = u32::from_le_bytes(fmt_bytes[8..12].try_into().unwrap());
-                let align = u16::from_le_bytes(fmt_bytes[12..14].try_into().unwrap());
-                let bps = u16::from_le_bytes(fmt_bytes[14..16].try_into().unwrap());
-                fmt_info = Some((audio_fmt, channels, srate, brate, align, bps));
-            }
-        } else if cid == b"data" {
-            data_offset = file.stream_position().unwrap_or(0);
-            data_size = csize;
+    let mut fmt: Option<Vec<u8>> = None;
+    let mut data: Option<(u64, u64, bool)> = None;
+    let mut pos = 12u64;
+    while pos.saturating_add(8) <= file_len {
+        let mut chunk_hdr = [0u8; 8];
+        if file.seek(SeekFrom::Start(pos)).is_err() || file.read_exact(&mut chunk_hdr).is_err() {
             break;
-        } else {
-            let pad = (csize % 2) as i64;
-            let _ = file.seek(SeekFrom::Current(csize as i64 + pad));
         }
+        let size = u32::from_le_bytes(chunk_hdr[4..8].try_into().unwrap());
+        let body = pos + 8;
+        let available = file_len - body;
+        match &chunk_hdr[0..4] {
+            b"fmt " if fmt.is_none() => {
+                if size < 16 {
+                    return Err("fmt chunk shorter than 16 bytes");
+                }
+                if u64::from(size) > MAX_WAV_FMT_CHUNK.min(available) {
+                    return Err("fmt chunk larger than 64 KiB or the file");
+                }
+                let mut bytes = vec![0u8; size as usize];
+                file.read_exact(&mut bytes).map_err(|_| "can't read the fmt chunk")?;
+                fmt = Some(bytes);
+            }
+            b"data" if data.is_none() => {
+                let size_unknown = size == 0 || size == WAV_UNKNOWN_SIZE;
+                let len = if size_unknown {
+                    available
+                } else {
+                    u64::from(size).min(available)
+                };
+                data = Some((body, body + len, size_unknown));
+                // Past audio of unknown length there are no chunk boundaries to follow.
+                if size_unknown {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        if fmt.is_some() && data.is_some() {
+            break;
+        }
+        // Chunks are padded to an even length.
+        pos = body + u64::from(size) + u64::from(size & 1);
+    }
+    let fmt = fmt.ok_or("no fmt chunk before the audio")?;
+    let (data_start, data_end, size_unknown) = data.ok_or("no data chunk")?;
+    Ok(WavLayout {
+        fmt,
+        data_start,
+        data_end,
+        size_unknown,
+    })
+}
+
+/// The RIFF and `data` size fields of a seeked WAV whose `fmt ` chunk body is `fmt_len` bytes and
+/// whose audio is `audio_len` bytes.
+#[doc(hidden)]
+pub fn wav_header_sizes(fmt_len: u64, audio_len: u64, size_unknown: bool) -> (u32, u32) {
+    // "WAVE", the fmt chunk with its pad byte, the data chunk's header and the audio.
+    let riff = 4 + 8 + fmt_len + (fmt_len & 1) + 8 + audio_len;
+    // Both known or both unknown: the RIFF size is the larger, so it decides for both. It must
+    // stay under WAV_UNKNOWN_SIZE, which would read as unknown.
+    match (size_unknown, u32::try_from(riff)) {
+        (false, Ok(riff)) if riff != WAV_UNKNOWN_SIZE => (riff, audio_len as u32),
+        _ => (WAV_UNKNOWN_SIZE, WAV_UNKNOWN_SIZE),
+    }
+}
+
+/// Seek a WAV file of `file_len` bytes to `offset_seconds`: the audio from the block at or before
+/// that time to the last whole block of the `data` chunk, behind a new RIFF header with the file's
+/// own `fmt ` chunk (so WAVE_FORMAT_EXTENSIBLE and 24-bit files stay decodable) and sizes that
+/// match it.
+fn find_wav_pcm_offset(
+    file: &mut std::fs::File,
+    offset_seconds: f64,
+    file_len: u64,
+) -> Result<StreamOffset, &'static str> {
+    let layout = read_wav_layout(file, file_len)?;
+    let fmt = &layout.fmt;
+    let format_tag = u16::from_le_bytes(fmt[0..2].try_into().unwrap());
+    let sample_rate = u64::from(u32::from_le_bytes(fmt[4..8].try_into().unwrap()));
+    let block_align = u64::from(u16::from_le_bytes(fmt[12..14].try_into().unwrap()));
+    // PCM and WAVE_FORMAT_EXTENSIBLE play a block per sample, so their byte rate follows from the
+    // sample rate; some writers leave nAvgBytesPerSec wrong. Other formats only have that field.
+    let byte_rate = match format_tag {
+        WAVE_FORMAT_PCM | WAVE_FORMAT_EXTENSIBLE => sample_rate * block_align,
+        _ => u64::from(u32::from_le_bytes(fmt[8..12].try_into().unwrap())),
+    };
+    if byte_rate == 0 || block_align == 0 {
+        return Err("zero byte rate or block align");
     }
 
-    if let (Some((audio_fmt, channels, srate, brate, align, bps)), true) = (fmt_info, data_offset > 0 && data_size > 0)
-    {
-        let pcm_offset = (offset_seconds * brate as f64) as u64;
-        let aligned_pcm = if align > 0 {
-            (pcm_offset / align as u64) * align as u64
-        } else {
-            pcm_offset
-        };
-        let clamped_pcm = aligned_pcm.min(data_size as u64);
-        let file_seek_pos = data_offset + clamped_pcm;
-        let remaining_pcm = (data_size as u64).saturating_sub(clamped_pcm) as u32;
+    // Whole blocks only, at both ends: a truncated file or an odd data size ends in a partial
+    // frame, which is left out of the audio and the header's size.
+    let whole_blocks = |len: u64| len / block_align * block_align;
+    let data_len = whole_blocks(layout.data_end - layout.data_start);
+    // The cast saturates, so a `pos` past the end lands at the end of the last whole block: no audio.
+    let wanted = (offset_seconds * byte_rate as f64) as u64;
+    let skip = whole_blocks(wanted).min(data_len);
+    let start = layout.data_start + skip;
+    let end = layout.data_start + data_len;
+    let remaining = end - start;
 
-        let mut hdr = Vec::with_capacity(44);
-        hdr.extend_from_slice(b"RIFF");
-        hdr.extend_from_slice(&(36u32 + remaining_pcm).to_le_bytes());
-        hdr.extend_from_slice(b"WAVEfmt ");
-        hdr.extend_from_slice(&16u32.to_le_bytes());
-        hdr.extend_from_slice(&audio_fmt.to_le_bytes());
-        hdr.extend_from_slice(&channels.to_le_bytes());
-        hdr.extend_from_slice(&srate.to_le_bytes());
-        hdr.extend_from_slice(&brate.to_le_bytes());
-        hdr.extend_from_slice(&align.to_le_bytes());
-        hdr.extend_from_slice(&bps.to_le_bytes());
-        hdr.extend_from_slice(b"data");
-        hdr.extend_from_slice(&remaining_pcm.to_le_bytes());
-        return (file_seek_pos, Some(hdr));
+    let fmt_len = fmt.len() as u64;
+    let fmt_pad = fmt_len & 1;
+    let (riff_size, data_size) = wav_header_sizes(fmt_len, remaining, layout.size_unknown);
+
+    let mut hdr = Vec::with_capacity(28 + fmt.len() + 1);
+    hdr.extend_from_slice(b"RIFF");
+    hdr.extend_from_slice(&riff_size.to_le_bytes());
+    hdr.extend_from_slice(b"WAVEfmt ");
+    hdr.extend_from_slice(&(fmt_len as u32).to_le_bytes());
+    hdr.extend_from_slice(fmt);
+    if fmt_pad == 1 {
+        hdr.push(0);
     }
-    (0, None)
+    hdr.extend_from_slice(b"data");
+    hdr.extend_from_slice(&data_size.to_le_bytes());
+    Ok(StreamOffset {
+        start,
+        end,
+        header: Some(hdr),
+    })
+}
+
+/// What a `/stream/<name>?pos=` response sends: `header`, then the file's bytes `start..end`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamOffset {
+    /// The first file byte sent.
+    pub start: u64,
+    /// One past the last file byte sent: the file's length, or the end of a WAV's last whole block.
+    pub end: u64,
+    /// A header sent before the file's bytes (a seeked WAV's new RIFF header).
+    pub header: Option<Vec<u8>>,
 }
 
 pub fn calculate_stream_offset(
@@ -432,15 +528,37 @@ pub fn calculate_stream_offset(
     offset_seconds: f64,
     total_size: u64,
     duration_hint: f64,
-) -> (u64, Option<Vec<u8>>) {
+) -> StreamOffset {
+    let from_start = StreamOffset {
+        start: 0,
+        end: total_size,
+        header: None,
+    };
     if offset_seconds <= 0.0 || total_size == 0 {
-        return (0, None);
+        return from_start;
     }
     let ext = filepath
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
+
+    if ext == "wav" || ext == "wave" {
+        return match find_wav_pcm_offset(file, offset_seconds, total_size) {
+            Ok(offset) => offset,
+            Err(why) => {
+                crate::log_warn!(
+                    "web",
+                    "Can't seek '{}' to {:.2}s ({}); serving it from the start",
+                    filepath.display(),
+                    offset_seconds,
+                    why
+                );
+                from_start
+            }
+        };
+    }
+
     let duration = if duration_hint > 0.0 {
         duration_hint
     } else {
@@ -448,17 +566,17 @@ pub fn calculate_stream_offset(
             .map(|m| m.duration_seconds)
             .unwrap_or(0.0)
     };
-
-    if ext == "wav" || ext == "wave" {
-        find_wav_pcm_offset(file, offset_seconds)
-    } else if ext == "mp3" {
-        let off = find_mp3_stream_offset(file, offset_seconds, duration, total_size);
-        (off, None)
+    let start = if ext == "mp3" {
+        find_mp3_stream_offset(file, offset_seconds, duration, total_size)
     } else {
         let dur = if duration > 0.0 { duration } else { 1.0 };
         let ratio = (offset_seconds / dur).clamp(0.0, 0.995);
-        let seek_pos = (total_size as f64 * ratio) as u64;
-        (seek_pos, None)
+        (total_size as f64 * ratio) as u64
+    };
+    StreamOffset {
+        start,
+        end: total_size,
+        header: None,
     }
 }
 
@@ -634,14 +752,15 @@ pub(super) fn serve_audio_stream(
     let mime = crate::metadata::get_audio_mime_type(&filepath);
 
     // 2. Calculate base byte offset for seek queries (e.g. ?pos=12.5)
-    let (base_offset, synthesized_hdr) =
-        calculate_stream_offset(&filepath, &mut file, offset_seconds, total_size, current_duration);
+    //    A seeked WAV sends a new header, then only its `data` chunk from the seek point.
+    let StreamOffset {
+        start: base_offset,
+        end: body_end,
+        header: synthesized_hdr,
+    } = calculate_stream_offset(&filepath, &mut file, offset_seconds, total_size, current_duration);
 
-    let effective_total = if let Some(ref hdr) = synthesized_hdr {
-        hdr.len() as u64 + total_size.saturating_sub(base_offset)
-    } else {
-        total_size.saturating_sub(base_offset)
-    };
+    let header_len = synthesized_hdr.as_ref().map_or(0, |hdr| hdr.len() as u64);
+    let effective_total = header_len + body_end.saturating_sub(base_offset);
 
     // 3. Parse Range header if present
     let range = range_header.map_or(ByteRange::Full, |h| parse_byte_range(h, effective_total));
