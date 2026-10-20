@@ -27,6 +27,10 @@ use super::stream::{
 /// web commands every tick, so this only runs out when it is stuck.
 const EDIT_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a 404 or 405 waits for a declared request body before answering, so a body that is
+/// never sent doesn't hold the answer (and a request slot) until the request deadline.
+const UNANSWERED_BODY_WAIT: Duration = Duration::from_secs(1);
+
 #[derive(Deserialize)]
 struct ActionPayload {
     action: String,
@@ -422,14 +426,16 @@ pub(super) fn handle_client(
     }
 
     // An unknown path, or a method its route doesn't take. The body is read first (it is within
-    // the body limit), so closing with unread bytes doesn't reset the connection under the answer.
+    // the body limit), so closing with unread bytes doesn't reset the connection under the answer;
+    // a body that doesn't arrive within `UNANSWERED_BODY_WAIT` isn't waited for.
     let endpoint = match endpoint {
         Some(endpoint) if endpoint.takes(method) => endpoint,
         unanswered => {
-            let _ = read_request_body(&mut reader, content_length, deadline);
+            let drain_by = deadline.min(Instant::now() + UNANSWERED_BODY_WAIT);
+            let _ = read_request_body(&mut reader, content_length, drain_by);
             return match unanswered {
-                Some(endpoint) => write_method_not_allowed(&mut stream, endpoint.allow()),
-                None => write_not_found(&mut stream),
+                Some(endpoint) => write_method_not_allowed(&mut stream, endpoint.allow(), is_head),
+                None => write_not_found(&mut stream, is_head),
             };
         }
     };
@@ -639,14 +645,14 @@ pub(super) fn handle_client(
                 ContinuousAdmission::Admitted(nonce) => {
                     serve_continuous_stream(stream, is_head, state, cmd_tx, stream_state, &nonce)?;
                 }
-                ContinuousAdmission::NotFound => write_not_found(&mut stream)?,
+                ContinuousAdmission::NotFound => write_not_found(&mut stream, is_head)?,
                 ContinuousAdmission::Conflict => {
                     crate::log_warn!(
                         "web",
                         "Refusing continuous stream request from {}: the session belongs to another host",
                         peer
                     );
-                    write_plain(&mut stream, "409 Conflict", "", "Conflict")?;
+                    write_plain(&mut stream, "409 Conflict", "", "Conflict", is_head)?;
                 }
             }
         }

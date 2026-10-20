@@ -874,7 +874,7 @@ pub(super) fn serve_audio_stream(
                 "Stream 404: '{}' is not a registered or now-playing file",
                 decoded_path
             );
-            return write_not_found(&mut stream);
+            return write_not_found(&mut stream, head_only);
         }
     };
 
@@ -882,7 +882,7 @@ pub(super) fn serve_audio_stream(
         Ok(f) => f,
         Err(e) => {
             crate::log_warn!("web", "Stream 404: Failed to open '{}': {}", filepath.display(), e);
-            return write_not_found(&mut stream);
+            return write_not_found(&mut stream, head_only);
         }
     };
 

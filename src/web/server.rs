@@ -253,31 +253,39 @@ pub(super) fn write_json(
     out.flush()
 }
 
-/// Write a short plain-text response: the status line, `extra` header lines, then `text` as the body.
-pub(super) fn write_plain(out: &mut impl Write, status: &str, extra: &str, text: &str) -> std::io::Result<()> {
+/// Write a short plain-text response: the status line, `extra` header lines, then `text` as the
+/// body; a HEAD request gets the head only (with the same `Content-Length`).
+pub(super) fn write_plain(
+    out: &mut impl Write,
+    status: &str,
+    extra: &str,
+    text: &str,
+    is_head: bool,
+) -> std::io::Result<()> {
     let response = format!(
         "HTTP/1.1 {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         status,
         extra,
         text.len(),
-        text
+        if is_head { "" } else { text }
     );
     out.write_all(response.as_bytes())?;
     out.flush()
 }
 
 /// Write a `404 Not Found`.
-pub(super) fn write_not_found(out: &mut impl Write) -> std::io::Result<()> {
-    write_plain(out, "404 Not Found", "", "Not Found")
+pub(super) fn write_not_found(out: &mut impl Write, is_head: bool) -> std::io::Result<()> {
+    write_plain(out, "404 Not Found", "", "Not Found", is_head)
 }
 
 /// Write a `405 Method Not Allowed` naming the methods the route takes (`allow`).
-pub(super) fn write_method_not_allowed(out: &mut impl Write, allow: &str) -> std::io::Result<()> {
+pub(super) fn write_method_not_allowed(out: &mut impl Write, allow: &str, is_head: bool) -> std::io::Result<()> {
     write_plain(
         out,
         "405 Method Not Allowed",
         &format!("Allow: {}\r\n", allow),
         "Method Not Allowed",
+        is_head,
     )
 }
 

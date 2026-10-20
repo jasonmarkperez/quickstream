@@ -417,3 +417,72 @@ fn test_not_found_and_json_responses_keep_their_bytes() {
 
     handle.stop();
 }
+
+#[test]
+fn test_head_error_answers_have_no_body() {
+    common::isolate();
+    let (handle, rx) = start();
+    let port = handle.port;
+
+    let cases = [
+        ("/api/action", 405, "18"),
+        ("/nope", 404, "9"),
+        ("/stream/unknown.mp3", 404, "9"),
+        ("/stream/continuous-unarmed.wav", 404, "9"),
+    ];
+    for (path, code, length) in cases {
+        let raw = raw_exchange(
+            port,
+            format!("HEAD {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").as_bytes(),
+        );
+        let (status, headers, body) = parse(&raw);
+        assert_eq!(status, code, "HEAD {path}: {headers}");
+        assert!(
+            body.is_empty(),
+            "HEAD {path} has no body: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        // The head still names the length a GET would get.
+        assert_eq!(
+            header_value(&headers, "content-length").as_deref(),
+            Some(length),
+            "HEAD {path}"
+        );
+    }
+
+    assert!(rx.try_recv().is_err(), "no command for a HEAD error");
+    handle.stop();
+}
+
+#[test]
+fn test_unknown_path_with_an_unsent_body_is_answered_before_the_request_deadline() {
+    common::isolate();
+    // A long request deadline, so an answer well before it shows the 404 didn't wait for the body.
+    let limits = ServerLimits {
+        request_timeout: Duration::from_secs(60),
+        ..ServerLimits::default()
+    };
+    let (handle, _rx) = start_with_limits(limits);
+    let port = handle.port;
+
+    for (method, path, code) in [
+        ("GET", "/nope", 404),
+        ("HEAD", "/nope", 404),
+        ("GET", "/api/action", 405),
+    ] {
+        let mut stream = connect(port);
+        stream.set_read_timeout(Some(Duration::from_secs(90))).unwrap();
+        // Declares a body and never sends it, keeping the socket open.
+        let head = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 5\r\n\r\n");
+        stream.write_all(head.as_bytes()).unwrap();
+        let started = std::time::Instant::now();
+        let (status, headers, _) = parse(&read_all(stream));
+        let waited = started.elapsed();
+        assert_eq!(status, code, "{method} {path}: {headers}");
+        assert!(
+            waited < Duration::from_secs(30),
+            "{method} {path} waited {waited:?} for a body that never came"
+        );
+    }
+    handle.stop();
+}
