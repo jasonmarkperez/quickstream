@@ -1,5 +1,6 @@
 //! Key routing: `handle_input_key` (modals and typed text, then the global hotkeys) and the tab
-//! and pane keys (`handle_tab_key_with_modifiers`), and opening the fuzzy search.
+//! and pane keys (`handle_tab_key_with_modifiers`), and opening the fuzzy search and the startup
+//! home editor.
 
 use std::path::PathBuf;
 
@@ -207,7 +208,8 @@ impl AppUI {
             (KeyCode::Char('5'), KeyModifiers::NONE) => {
                 self.active_tab = 4;
             }
-            (KeyCode::Char('n') | KeyCode::Char('N'), KeyModifiers::NONE) => {
+            // Terminals send an uppercase letter with SHIFT (Shift held or Caps Lock on).
+            (KeyCode::Char('n' | 'N'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                 if self.active_tab == 0 {
                     self.active_tab = 1;
                 } else {
@@ -308,14 +310,7 @@ impl AppUI {
                 } else if self.active_tab == 0 || (self.active_tab == 1 && self.queue_focus) {
                     self.open_fuzzy_search();
                 } else if self.active_tab == 3 && self.settings_cursor == setting::HOME_DIR {
-                    let curr = self
-                        .settings_mgr
-                        .settings
-                        .home_dir
-                        .clone()
-                        .unwrap_or_else(|| "/".to_string());
-                    self.editing_home_dir = Some(curr);
-                    self.status_message = "Editing Startup Home Directory (Enter: Save, Esc: Cancel)".to_string();
+                    self.open_home_dir_editor();
                 }
             }
             (KeyCode::Char('f'), KeyModifiers::NONE) => {
@@ -323,7 +318,7 @@ impl AppUI {
                     self.open_fuzzy_search();
                 }
             }
-            (KeyCode::Char('z') | KeyCode::Char('Z'), KeyModifiers::NONE) => {
+            (KeyCode::Char('z' | 'Z'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                 if !self.queue.is_empty() {
                     self.queue.shuffle();
                     self.status_message = "🔀 Queue shuffled".to_string();
@@ -408,6 +403,13 @@ impl AppUI {
         self.status_message = format!("Fuzzy search in {}", target_name);
         let modal = search::SearchModalState::new_with_scanner(target_dir, Vec::new(), Some(rx), Some(stop_flag));
         self.search_modal = Some(modal);
+    }
+
+    /// Open the startup home editor on tab 4 (`Enter`, `e` and `/` all come here), holding the
+    /// current startup home, or nothing when none is set. The key that opened it is not text.
+    fn open_home_dir_editor(&mut self) {
+        self.editing_home_dir = Some(self.settings_mgr.settings.home_dir.clone().unwrap_or_default());
+        self.status_message = "Editing Startup Home Directory (Enter: Save, Esc: Cancel)".to_string();
     }
 
     pub fn handle_tab_key(&mut self, code: KeyCode) {
@@ -604,11 +606,6 @@ impl AppUI {
                             self.status_message = "No track in queue to start Seed Radio".to_string();
                         }
                     }
-                    (KeyCode::Char('z') | KeyCode::Char('Z'), _) if self.queue_focus && !self.queue.is_empty() => {
-                        self.queue.shuffle();
-                        self.status_message = "🔀 Queue shuffled".to_string();
-                        self.update_web_state();
-                    }
                     (KeyCode::Char('H'), _) => {
                         let target = if self.in_bookmarks_view
                             && self.browser_cursor > 0
@@ -738,9 +735,7 @@ impl AppUI {
                         self.settings_cursor = SETTING_DISPLAY_ORDER[SETTING_DISPLAY_ORDER.len() - 1];
                     }
                     (KeyCode::Char('e'), KeyModifiers::NONE) if self.settings_cursor == setting::HOME_DIR => {
-                        let curr = self.settings_mgr.settings.home_dir.clone().unwrap_or_default();
-                        self.editing_home_dir = Some(curr);
-                        self.status_message = "Editing Startup Home Directory (Enter: Save, Esc: Cancel)".to_string();
+                        self.open_home_dir_editor();
                     }
                     (KeyCode::Char('c'), KeyModifiers::NONE) | (KeyCode::Delete, _)
                         if self.settings_cursor == setting::HOME_DIR =>
@@ -758,10 +753,7 @@ impl AppUI {
                     }
                     (KeyCode::Enter, KeyModifiers::NONE) => {
                         if self.settings_cursor == setting::HOME_DIR {
-                            let curr = self.settings_mgr.settings.home_dir.clone().unwrap_or_default();
-                            self.editing_home_dir = Some(curr);
-                            self.status_message =
-                                "Editing Startup Home Directory (Enter: Save, Esc: Cancel)".to_string();
+                            self.open_home_dir_editor();
                         } else {
                             self.cycle_and_apply_setting(true);
                         }

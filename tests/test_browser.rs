@@ -1399,13 +1399,13 @@ fn test_settings_view_file_actions_disabled_and_home_dir_editing() {
     ));
     assert_eq!(app.settings_mgr.settings.home_dir, None);
 
-    // 4. Pressing '/' directly on row 7 starts editing with '/'
+    // 4. Pressing '/' directly on row 7 starts editing, empty like Enter and 'e' (#100)
     let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Char('/'),
         crossterm::event::KeyModifiers::NONE,
     ));
     assert!(app.editing_home_dir.is_some());
-    assert_eq!(app.editing_home_dir.as_deref(), Some("/"));
+    assert_eq!(app.editing_home_dir.as_deref(), Some(""));
 
     // Press 'Esc' to cancel
     let _ = app.handle_input_key(crossterm::event::KeyEvent::new(
