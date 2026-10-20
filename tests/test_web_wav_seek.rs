@@ -12,7 +12,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use quickstream::web::{NowPlayingState, WebServer, WebServerHandle};
+use quickstream::web::{wav_header_sizes, NowPlayingState, WebServer, WebServerHandle};
 
 const RATE: u32 = 8000;
 
@@ -200,15 +200,18 @@ fn assert_seeked(port: u16, name: &str, pos: &str, fmt: &[u8], audio: &[u8]) -> 
         pos
     );
 
-    let byte_rate = u32::from_le_bytes(fmt[8..12].try_into().unwrap()) as f64;
+    // PCM and extensible: the byte rate is the sample rate times the block, whatever the file says.
+    let rate = u32::from_le_bytes(fmt[4..8].try_into().unwrap()) as usize;
     let align = u16::from_le_bytes(fmt[12..14].try_into().unwrap()) as usize;
-    let wanted = (pos.parse::<f64>().unwrap() * byte_rate) as usize;
-    let offset = (wanted / align * align).min(audio.len() / align * align);
+    let wanted = (pos.parse::<f64>().unwrap() * (rate * align) as f64) as usize;
+    let whole = audio.len() / align * align;
+    let offset = (wanted / align * align).min(whole);
     assert_eq!(offset % align, 0);
     let sent = &body[wav.data_offset..];
-    assert_eq!(sent.len(), audio.len() - offset, "{}?pos={}: audio length", name, pos);
+    assert_eq!(sent.len() % align, 0, "{}?pos={}: whole frames only", name, pos);
+    assert_eq!(sent.len(), whole - offset, "{}?pos={}: audio length", name, pos);
     assert!(
-        sent == &audio[offset..],
+        sent == &audio[offset..whole],
         "{}?pos={}: audio from byte {}",
         name,
         pos,
@@ -333,12 +336,98 @@ fn test_wav_seek_truncated_data_chunk() {
     file.extend_from_slice(&audio);
     let (handle, dir) = serve("truncated", "truncated.wav", &file);
 
-    assert_seeked(handle.port, "truncated.wav", "0.5", &fmt, &audio);
-    // Past what the file holds: from its last whole frame.
-    assert_seeked(handle.port, "truncated.wav", "1.5", &fmt, &audio);
+    // Whole frames only: the stray last byte is left out of the audio and its size.
+    let body = assert_seeked(handle.port, "truncated.wav", "0.5", &fmt, &audio);
+    assert_eq!(parse_wav(&body).data_size, 30000 - 16000);
+    assert_seeked(handle.port, "truncated.wav", "0.0001", &fmt, &audio);
+    // Past what the file holds: from its last whole frame, so no audio.
+    let body = assert_seeked(handle.port, "truncated.wav", "1.5", &fmt, &audio);
+    assert_eq!(parse_wav(&body).data_size, 0);
 
     handle.stop();
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_wav_seek_data_size_not_whole_frames() {
+    common::isolate();
+    let fmt = pcm_fmt(2, 16);
+    // A data chunk of 30001 bytes (odd, so padded) with a LIST chunk after it.
+    let audio = pcm(30001);
+    let file = riff(&[
+        chunk(b"fmt ", 16, &fmt),
+        chunk(b"data", audio.len() as u32, &audio),
+        list_chunk(),
+    ]);
+    let (handle, dir) = serve("partial_frame", "partial.wav", &file);
+
+    let body = assert_seeked(handle.port, "partial.wav", "0.5", &fmt, &audio);
+    assert_eq!(parse_wav(&body).data_size, 30000 - 16000);
+    assert_seeked(handle.port, "partial.wav", "0.9", &fmt, &audio);
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_wav_seek_byte_rate_from_sample_rate_and_block() {
+    common::isolate();
+    // 16-bit stereo at 44.1 kHz whose nAvgBytesPerSec says 88200 (it is 176400): PCM and
+    // WAVE_FORMAT_EXTENSIBLE seek by the sample rate times the block align.
+    let audio = pcm(44_100 * 4 * 2);
+    let mut pcm16 = Vec::new();
+    pcm16.extend_from_slice(&1u16.to_le_bytes());
+    pcm16.extend_from_slice(&2u16.to_le_bytes());
+    pcm16.extend_from_slice(&44_100u32.to_le_bytes());
+    pcm16.extend_from_slice(&88_200u32.to_le_bytes());
+    pcm16.extend_from_slice(&4u16.to_le_bytes());
+    pcm16.extend_from_slice(&16u16.to_le_bytes());
+    let mut ext = extensible_fmt_24();
+    ext[4..8].copy_from_slice(&44_100u32.to_le_bytes());
+    ext[8..12].copy_from_slice(&88_200u32.to_le_bytes());
+    ext[12..14].copy_from_slice(&4u16.to_le_bytes());
+    ext[14..16].copy_from_slice(&16u16.to_le_bytes());
+    ext[18..20].copy_from_slice(&16u16.to_le_bytes());
+    for (name, fmt) in [("rate_pcm.wav", pcm16), ("rate_ext.wav", ext)] {
+        let file = riff(&[
+            chunk(b"fmt ", fmt.len() as u32, &fmt),
+            chunk(b"data", audio.len() as u32, &audio),
+        ]);
+        let (handle, dir) = serve(name, name, &file);
+
+        let body = assert_seeked(handle.port, name, "1", &fmt, &audio);
+        let wav = parse_wav(&body);
+        assert!(
+            body[wav.data_offset..] == audio[176_400..],
+            "{}?pos=1: the audio starts at byte 176400",
+            name
+        );
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn test_wav_seek_header_sizes() {
+    common::isolate();
+    // "WAVE", the fmt chunk's header and body (padded to even), the data chunk's header, the audio.
+    assert_eq!(wav_header_sizes(16, 1000, false), (4 + 8 + 16 + 8 + 1000, 1000));
+    assert_eq!(wav_header_sizes(17, 1000, false), (4 + 8 + 18 + 8 + 1000, 1000));
+    assert_eq!(wav_header_sizes(16, 1000, true), (u32::MAX, u32::MAX));
+    // Audio whose RIFF size only just fits.
+    let fits = u64::from(u32::MAX) - 37;
+    assert_eq!(wav_header_sizes(16, fits, false), (u32::MAX - 1, fits as u32));
+    // The data size fits but the RIFF size doesn't: both unknown, never a mix.
+    assert_eq!(wav_header_sizes(16, fits + 2, false), (u32::MAX, u32::MAX));
+    assert_eq!(
+        wav_header_sizes(40, u64::from(u32::MAX) - 50, false),
+        (u32::MAX, u32::MAX)
+    );
+    assert_eq!(
+        wav_header_sizes(16, u64::from(u32::MAX) + 1, false),
+        (u32::MAX, u32::MAX)
+    );
 }
 
 #[test]
@@ -346,13 +435,17 @@ fn test_wav_seek_corrupt_header_serves_whole_file() {
     common::isolate();
     let audio = pcm(RATE as usize * 4);
     let good = pcm_fmt(2, 16);
+    // A format other than PCM / extensible (IEEE float) seeks by nAvgBytesPerSec, here 0.
     let mut zero_rate = good.clone();
+    zero_rate[0..2].copy_from_slice(&3u16.to_le_bytes());
     zero_rate[8..12].copy_from_slice(&0u32.to_le_bytes());
+    let mut zero_sample_rate = good.clone();
+    zero_sample_rate[4..8].copy_from_slice(&0u32.to_le_bytes());
     let mut zero_align = good.clone();
     zero_align[12..14].copy_from_slice(&0u16.to_le_bytes());
 
     // A huge fmt size (no allocation of it), one that runs past the end, a short one, zero byte
-    // rate / block align, no data chunk, data before fmt with an unknown length, a truncated
+    // rate / sample rate / block align, no data chunk, data before fmt with an unknown length, a truncated
     // RIFF header and a file that isn't RIFF at all.
     let mut huge_fmt = riff(&[]);
     huge_fmt.extend_from_slice(b"fmt ");
@@ -377,6 +470,13 @@ fn test_wav_seek_corrupt_header_serves_whole_file() {
             "zero_rate.wav",
             riff(&[
                 chunk(b"fmt ", 16, &zero_rate),
+                chunk(b"data", audio.len() as u32, &audio),
+            ]),
+        ),
+        (
+            "zero_sample_rate.wav",
+            riff(&[
+                chunk(b"fmt ", 16, &zero_sample_rate),
                 chunk(b"data", audio.len() as u32, &audio),
             ]),
         ),
