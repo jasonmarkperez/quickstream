@@ -128,7 +128,9 @@ fn press(app: &mut AppUI, code: KeyCode) {
 
 /// `L` on the browser row for `folder`, then Enter on `playlist` in the add picker.
 fn add_folder_to(app: &mut AppUI, folder: &Path, playlist: &str) {
-    wait_until(app, "browser listing", |a| !a.browser_loading);
+    wait_until(app, "browser listing", |a| {
+        !a.browser_loading && a.opening_folder().is_none()
+    });
     app.browser_cursor = app
         .browser_entries
         .iter()

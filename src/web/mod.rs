@@ -17,6 +17,6 @@ pub use state::{
     WebPlaylist, WebPlaylistEntry, WebPlaylists, WebPlaylistsState, WebQueueItem, WebReply,
 };
 pub use stream::{
-    calculate_stream_offset, make_continuous_wav_header, parse_byte_range, serve_continuous_stream, ByteRange,
-    ContinuousAdmission, ContinuousStreamController, StreamRequest, StreamServerState,
+    calculate_stream_offset, make_continuous_wav_header, parse_byte_range, serve_continuous_stream, wav_header_sizes,
+    ByteRange, ContinuousAdmission, ContinuousStreamController, StreamOffset, StreamRequest, StreamServerState,
 };

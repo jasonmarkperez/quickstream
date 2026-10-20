@@ -68,6 +68,20 @@ pub fn isolate() -> &'static Path {
     root
 }
 
+/// Poll the browser's directory scan until the folder being opened is shown and listed (at
+/// most 5 s). Opening a folder returns at once and leaves its listing to the event loop's poll
+/// (issue #101).
+pub fn wait_for_dir_scan(app: &mut quickstream::ui::AppUI) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let busy = |app: &quickstream::ui::AppUI| app.browser_loading || app.opening_folder().is_some();
+    while busy(app) && std::time::Instant::now() < deadline {
+        app.poll_background_dir_scan();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    app.poll_background_dir_scan();
+    assert!(!busy(app), "{} was not listed", app.browser_dir.display());
+}
+
 /// The config, cache and data directories `quickstream::paths` currently resolves.
 pub fn app_dirs() -> [PathBuf; 3] {
     [

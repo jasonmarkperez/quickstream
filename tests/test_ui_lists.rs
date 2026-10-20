@@ -79,11 +79,14 @@ fn lists_app(tag: &str, tagged: &[usize]) -> (AppUI, PathBuf) {
 
 fn wait_for_listing(app: &mut AppUI) {
     let start = Instant::now();
-    while app.browser_loading && start.elapsed() < Duration::from_secs(5) {
+    while (app.browser_loading || app.opening_folder().is_some()) && start.elapsed() < Duration::from_secs(5) {
         app.poll_background_dir_scan();
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert!(!app.browser_loading, "folder listing did not finish");
+    assert!(
+        !app.browser_loading && app.opening_folder().is_none(),
+        "folder listing did not finish"
+    );
 }
 
 fn queue_track(dir: &Path, i: usize) -> AudioMetadata {

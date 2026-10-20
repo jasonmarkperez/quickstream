@@ -411,7 +411,7 @@ impl AppUI {
         let match_set: HashSet<usize> = matches.iter().copied().collect();
         let playing = self.queue.current_track().map(|t| t.filepath.clone());
         let first_file = self.browser_entries.partition_point(|(_, _, is_dir)| *is_dir);
-        let header_rows = if self.browser_dir.parent().is_some() { 2 } else { 1 };
+        let header_rows = self.browser_header_rows();
 
         let rows: Vec<(usize, LibraryRow)> = self.metadata_cache.read_with(|map| {
             window

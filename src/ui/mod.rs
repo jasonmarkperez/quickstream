@@ -55,6 +55,7 @@ macro_rules! settings_context {
 mod autopilot;
 mod browser;
 mod event_loop;
+pub use event_loop::TickClock;
 mod keys;
 mod output;
 mod playback;
@@ -90,6 +91,35 @@ pub enum DirScanEvent {
         dir: PathBuf,
         message: String,
     },
+}
+
+/// A folder's entries as the browser's `dir-scan` worker reads them.
+pub type DirEntries = Box<dyn Iterator<Item = io::Result<std::fs::DirEntry>> + Send>;
+
+/// Lists a folder for the browser's `dir-scan` worker: [`std::fs::read_dir`] except in tests,
+/// which hold the read back (all of it, or after some entries) to stand in for a slow share
+/// (`AppUI::set_dir_reader`).
+pub type DirReader = std::sync::Arc<dyn Fn(&std::path::Path) -> io::Result<DirEntries> + Send + Sync>;
+
+/// Where the browser's cursor goes when a folder is shown.
+#[derive(Debug)]
+enum CursorTarget {
+    /// The first row: another folder was opened.
+    Top,
+    /// The row of this entry once it is listed: the folder `Backspace` left.
+    Entry(PathBuf),
+    /// The entry the cursor is on when the listing is shown (else the same row): the shown
+    /// folder was listed again (`r`).
+    Selection,
+}
+
+/// A folder being opened while the previous one stays on screen and keeps the keys (issue
+/// #101). Its scan's batches collect in `browser_dir_cache`; it is shown when the scan
+/// completes or fails, or once `folder_open_deadline` has passed.
+struct PendingFolder {
+    dir: PathBuf,
+    cursor: CursorTarget,
+    opened: Instant,
 }
 
 /// Builds the player an output switch moves to, in place of mpv or a renderer client (tests).
@@ -213,7 +243,16 @@ pub struct AppUI {
     pub dir_scan_rx: std::sync::mpsc::Receiver<DirScanEvent>,
     pub dir_scan_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub dir_scan_id: u64,
+    /// The entry the cursor goes to once the shown folder's scan lists it (the folder
+    /// `Backspace` left); dropped when the user moves the cursor.
     pub pending_parent_restore: Option<PathBuf>,
+    /// The folder being opened while the previous one is still shown (`opening_folder`).
+    pending_folder: Option<PendingFolder>,
+    /// How long `pending_folder` may wait for its scan before it is shown with what has been
+    /// listed so far (`set_folder_open_deadline`).
+    folder_open_deadline: Duration,
+    /// Lists folders on the `dir-scan` worker (`set_dir_reader`).
+    dir_reader: DirReader,
     pub queue_cursor: usize,
     pub devices_cursor: usize,
     pub settings_cursor: usize,
@@ -403,6 +442,11 @@ impl AppUI {
             dir_scan_stop: None,
             dir_scan_id: 0,
             pending_parent_restore: None,
+            pending_folder: None,
+            folder_open_deadline: Self::FOLDER_OPEN_DEADLINE,
+            dir_reader: std::sync::Arc::new(|dir: &std::path::Path| {
+                std::fs::read_dir(dir).map(|entries| Box::new(entries) as DirEntries)
+            }),
             queue_cursor: 0,
             devices_cursor: 0,
             settings_cursor: SETTING_DISPLAY_ORDER[0],
@@ -488,6 +532,23 @@ impl AppUI {
     pub fn set_persistence_worker(&mut self, worker: crate::persist::PersistenceWorker) {
         self.settings_mgr.set_persistence(worker.handle());
         drop(std::mem::replace(&mut self.persistence, worker));
+    }
+
+    /// Replace how the browser lists a folder for scans started from now on (tests: a read held
+    /// back like a slow share). Public only because integration tests in `tests/` drive `AppUI`
+    /// directly.
+    #[doc(hidden)]
+    pub fn set_dir_reader(&mut self, reader: DirReader) {
+        self.dir_reader = reader;
+    }
+
+    /// Replace how long a folder being opened keeps the previous one on screen before it is
+    /// shown with what its scan has listed so far (`FOLDER_OPEN_DEADLINE`; tests: zero, or long
+    /// enough that only the scan's end shows it). Public only because integration tests in
+    /// `tests/` drive `AppUI` directly.
+    #[doc(hidden)]
+    pub fn set_folder_open_deadline(&mut self, deadline: Duration) {
+        self.folder_open_deadline = deadline;
     }
 
     /// Replace the tag reader used by workers started from now on (tests use a counting or
