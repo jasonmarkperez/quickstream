@@ -114,11 +114,18 @@ impl AppUI {
     }
 
     /// List the shown folder again (`r`, startup), or Music Homes. The cursor stays on the
-    /// entry it is on.
+    /// entry it is on. In Music Homes a home being opened keeps opening, unless it is no
+    /// longer a home (`d` removed it).
     pub fn refresh_browser(&mut self) {
         if self.in_bookmarks_view {
             let refresh_start = Instant::now();
-            self.stop_dir_scan();
+            let opening_home = self
+                .pending_folder
+                .as_ref()
+                .is_some_and(|pending| self.bookmarks.iter().any(|b| Path::new(b) == pending.dir));
+            if !opening_home {
+                self.stop_dir_scan();
+            }
             self.browser_loading = false;
             self.browser_load_start = None;
             let old_cursor = self.browser_cursor;
@@ -186,7 +193,12 @@ impl AppUI {
     /// the scan completes or fails or `folder_open_deadline` passes (`poll_background_dir_scan`),
     /// so a fast folder never shows an empty READING DIRECTORY frame. With nothing to keep (at
     /// startup, or while the shown folder is itself still being read) `dir` is shown at once.
+    /// Opening the folder already being opened (a second Backspace) keeps its scan and deadline.
     fn open_folder(&mut self, dir: PathBuf, cursor: CursorTarget) {
+        if let Some(pending) = self.pending_folder.as_mut().filter(|pending| pending.dir == dir) {
+            pending.cursor = cursor;
+            return;
+        }
         let refresh_start = Instant::now();
         self.stop_dir_scan();
 
@@ -407,9 +419,13 @@ impl AppUI {
         });
     }
 
-    /// Show the folder being opened, with what its scan has listed so far.
+    /// Show the folder being opened, with what its scan has listed so far. A spotlight opened
+    /// meanwhile was on the previous folder, so it closes.
     fn show_pending_folder(&mut self, still_reading: bool) {
         if let Some(pending) = self.pending_folder.take() {
+            if self.in_bookmarks_view || pending.dir != self.browser_dir {
+                self.close_spotlight();
+            }
             self.show_folder(pending.dir, pending.cursor, still_reading.then_some(pending.opened));
             // Its scan counts from when the folder was opened (logs, the slow-read status).
             if !still_reading {
@@ -646,6 +662,7 @@ impl AppUI {
         self.close_spotlight();
 
         if path.to_string_lossy() == "___MUSIC_HOMES___" {
+            self.stop_dir_scan();
             self.in_bookmarks_view = true;
             self.browser_cursor = 0;
             self.browser_state = ListState::default();
