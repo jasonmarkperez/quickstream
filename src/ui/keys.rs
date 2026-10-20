@@ -199,6 +199,14 @@ impl AppUI {
                         );
                         return Ok(false);
                     }
+                    // An Autopilot start still checking its folder (a slow share): stop it.
+                    if let Some(dir) = self.cancel_autopilot_start() {
+                        self.status_message = format!(
+                            "Stopped starting Autopilot in '{}'",
+                            dir.file_name().unwrap_or(dir.as_os_str()).to_string_lossy()
+                        );
+                        return Ok(false);
+                    }
                 }
                 if key.code == KeyCode::Esc && self.browser_loading {
                     if let Some(stop) = self.dir_scan_stop.take() {
@@ -808,12 +816,7 @@ impl AppUI {
                         } else {
                             std::env::current_dir().unwrap_or_default()
                         };
-                        if home.is_dir() {
-                            self.status_message = format!("Jumped to home: {}", home.display());
-                            self.navigate_browser(home);
-                        } else {
-                            self.status_message = format!("Home directory not found: {}", home.display());
-                        }
+                        self.jump_to_home(home);
                     }
                     _ => {}
                 }
