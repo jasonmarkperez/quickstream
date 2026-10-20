@@ -304,6 +304,8 @@ pub struct AppUI {
     /// Sizes the queue metadata pool found for files whose tags it couldn't read (issue #124).
     queue_size_tx: std::sync::mpsc::Sender<(PathBuf, u64)>,
     queue_size_rx: std::sync::mpsc::Receiver<(PathBuf, u64)>,
+    /// The sizes received on `queue_size_rx` this session, for files queued again.
+    queue_file_sizes: std::collections::HashMap<PathBuf, u64>,
     /// Tells the queue metadata pool to stop reading tags (set on shutdown).
     pub queue_metadata_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Paths already sent to the queue metadata workers this session.
@@ -498,6 +500,7 @@ impl AppUI {
             queue_metadata_tx: None,
             queue_size_tx,
             queue_size_rx,
+            queue_file_sizes: std::collections::HashMap::new(),
             queue_metadata_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             queue_metadata_attempted: std::collections::HashSet::new(),
             tag_reads,

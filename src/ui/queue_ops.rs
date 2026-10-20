@@ -10,9 +10,10 @@ use super::AppUI;
 
 /// Start 4 threads that read tags for paths sent to the returned inbox through `tag_reads`, which
 /// reports results on `metadata_tx`. A path another worker is reading right now is skipped: that
-/// read reports it. When a file's tags can't be read, its size alone is sent on `sizes`, since the
-/// queue's placeholders don't stat the file (issue #124). The threads exit once the inbox sender
-/// is dropped or `stop` is set (paths still queued in the inbox are then skipped).
+/// read reports it. Since the queue's placeholders don't stat the file (issue #124), a worker that
+/// couldn't read the tags, or skipped them, sends the file's size alone on `sizes`: the other read
+/// may fail and publish nothing. The threads exit once the inbox sender is dropped or `stop` is
+/// set (paths still queued in the inbox are then skipped).
 fn spawn_queue_metadata_workers(
     workers: &mut WorkerRegistry,
     tag_reads: SharedTagReads,
@@ -37,7 +38,7 @@ fn spawn_queue_metadata_workers(
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
-            if tag_reads.read_unless_busy(&path) == TagRead::Failed {
+            if tag_reads.read_unless_busy(&path) != TagRead::Read {
                 if let Ok(md) = std::fs::metadata(&path) {
                     let _ = sizes.send((path, md.len()));
                 }
@@ -91,12 +92,16 @@ impl AppUI {
         }
     }
 
-    /// Cached metadata for `path`, or a placeholder built from the path alone. Never touches the
-    /// disk, not even to stat the file (issue #124): the queue's tag read fills in the size.
+    /// Cached metadata for `path`, or a placeholder built from the path alone, with the size the
+    /// queue's workers found for it earlier this session, if any. Never touches the disk, not
+    /// even to stat the file (issue #124): the queue's tag read fills in the size.
     pub(super) fn quick_metadata(&self, path: &std::path::Path) -> crate::metadata::AudioMetadata {
         self.metadata_cache
             .get(path)
-            .unwrap_or_else(|| crate::metadata::path_metadata(path))
+            .unwrap_or_else(|| crate::metadata::AudioMetadata {
+                file_size: self.queue_file_sizes.get(path).copied().unwrap_or(0),
+                ..crate::metadata::path_metadata(path)
+            })
     }
 
     /// Append tracks to the queue and resolve missing tags on background workers.
@@ -186,10 +191,13 @@ impl AppUI {
         }
 
         // 3. Sizes of queued files whose tags couldn't be read
+        // (kept, since the workers read each path once a session and a file queued again gets
+        // its placeholder from `quick_metadata`)
         while let Ok((path, size)) = self.queue_size_rx.try_recv() {
             if self.queue.set_file_size(&path, size) {
                 queue_updated = true;
             }
+            self.queue_file_sizes.insert(path, size);
         }
 
         if queue_updated {

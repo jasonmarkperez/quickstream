@@ -74,8 +74,14 @@ impl Gate {
 /// App browsing `dir` on tab [2] with the browser's own tag reads off (Filenames mode) and the
 /// queue's tag reads held by `gate`, then done by the real reader.
 fn gated_app(dir: &Path, gate: &Gate) -> AppUI {
+    gated_app_in_mode(dir, gate, false)
+}
+
+/// [`gated_app`], in Tags mode when `tags` is set: the browser then reads the folder's tags
+/// too, through the same gate.
+fn gated_app_in_mode(dir: &Path, gate: &Gate, tags: bool) -> AppUI {
     let mut settings_mgr = SettingsManager::with_path(dir.join("config.json"));
-    settings_mgr.settings.metadata_view = false;
+    settings_mgr.settings.metadata_view = tags;
     settings_mgr.settings.web_server_enabled = false;
     let mut app = AppUI::new(Some(dir.to_path_buf()), settings_mgr);
     let gate = gate.clone();
@@ -191,6 +197,64 @@ fn test_add_all_unreadable_files_get_their_size_from_the_queue_workers() {
         .find(|l| l.contains("SIZE"))
         .unwrap_or_else(|| panic!("SIZE once known:\n{screen}"));
     assert!(size_row.contains("1.4 MB"), "{size_row:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Tags mode: the browser's own tag fetch is reading the file (held at the gate) when `a` queues
+/// it, so the queue's worker skips the read. It still reports the size, without waiting for that
+/// read, which may fail and publish nothing.
+#[test]
+fn test_add_all_while_the_browser_reads_an_unreadable_file_still_gets_its_size() {
+    common::isolate();
+    let dir = scratch_dir("browser_busy");
+    let file = dir.join("garbage.ogg");
+    fs::write(&file, vec![0x55u8; 120_000]).unwrap();
+    assert!(quickstream::metadata::extract_metadata(&file).is_err());
+    let gate = Gate::default();
+    let mut app = gated_app_in_mode(&dir, &gate, true);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.tag_reads_in_flight() == 0 && Instant::now() < deadline {
+        app.poll_background_metadata();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(app.tag_reads_in_flight(), 1, "the browser is reading the file");
+
+    press(&mut app, KeyCode::Char('a'));
+    assert_eq!(app.queue.len(), 1);
+    assert_eq!(app.queue.tracks()[0].file_size, 0, "looked up on the UI thread");
+    wait_until(&mut app, "the size, while the browser's read is held", |a| {
+        a.queue.tracks()[0].file_size > 0
+    });
+    assert_eq!(app.queue.tracks()[0].file_size, 120_000);
+
+    gate.open();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An unreadable file queued again after it left the queue (`a`, `c`, `a`) gets the size found
+/// the first time, from memory: the queue's workers read each path once a session.
+#[test]
+fn test_unreadable_file_queued_again_keeps_its_size() {
+    common::isolate();
+    let dir = scratch_dir("requeue");
+    let file = dir.join("garbage.ogg");
+    fs::write(&file, vec![0x55u8; 300_000]).unwrap();
+    let gate = Gate::default();
+    let mut app = gated_app(&dir, &gate);
+
+    press(&mut app, KeyCode::Char('a'));
+    assert_eq!(app.queue.tracks()[0].file_size, 0, "looked up on the UI thread");
+    gate.open();
+    wait_until(&mut app, "the size", |a| a.queue.tracks()[0].file_size > 0);
+
+    app.queue_focus = true;
+    press(&mut app, KeyCode::Char('c'));
+    assert!(app.queue.is_empty());
+    app.queue_focus = false;
+    let elapsed = press(&mut app, KeyCode::Char('a'));
+    assert!(elapsed < UI_BUDGET, "`a` blocked the UI thread for {:?}", elapsed);
+    assert_eq!(app.queue.len(), 1);
+    assert_eq!(app.queue.tracks()[0].file_size, 300_000, "size after re-adding");
     let _ = fs::remove_dir_all(&dir);
 }
 
