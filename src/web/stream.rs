@@ -1130,8 +1130,10 @@ const SILENCE_MAX_BURST: Duration = Duration::from_secs(1);
 const MISSING_RECHECK: Duration = Duration::from_secs(1);
 /// The longest one pass waits for file checks before it sends silence instead (#117).
 const FILE_CHECK_WAIT: Duration = Duration::from_millis(20);
-// A pass that waits on file checks, then on its tick, still writes before the lead runs out.
-const _: () = assert!(SILENCE_TICK.as_millis() + FILE_CHECK_WAIT.as_millis() < SILENCE_LEAD.as_millis());
+// A pass's wait on file checks comes out of its tick, so silence still goes out every tick, well
+// before the lead runs out.
+const _: () = assert!(FILE_CHECK_WAIT.as_millis() < SILENCE_TICK.as_millis());
+const _: () = assert!(SILENCE_TICK.as_millis() < SILENCE_LEAD.as_millis());
 
 /// The PCM bytes in `duration`, whole 4-byte frames.
 fn pcm_bytes(duration: Duration) -> u64 {
@@ -1154,9 +1156,10 @@ impl SilencePacer {
         }
     }
 
-    /// Write the silence due by now (plus `SILENCE_LEAD`), then wait one tick. Returns the write
-    /// error, which means the renderer has gone.
-    fn send(&mut self, stream: &mut impl Write) -> std::io::Result<()> {
+    /// Write the silence due by now (plus `SILENCE_LEAD`), then wait until one tick after
+    /// `pass_started`, so time the pass spent waiting on file checks doesn't add to the gap
+    /// between writes. Returns the write error, which means the renderer has gone.
+    fn send(&mut self, stream: &mut impl Write, pass_started: Instant) -> std::io::Result<()> {
         let due = pcm_bytes(self.started.elapsed() + SILENCE_LEAD);
         let mut owed = due.saturating_sub(self.sent).min(pcm_bytes(SILENCE_MAX_BURST));
         self.sent = due;
@@ -1166,7 +1169,7 @@ impl SilencePacer {
             stream.write_all(&chunk[..n])?;
             owed -= n as u64;
         }
-        std::thread::sleep(SILENCE_TICK);
+        std::thread::sleep((pass_started + SILENCE_TICK).saturating_duration_since(Instant::now()));
         Ok(())
     }
 }
@@ -1280,6 +1283,7 @@ pub(super) fn serve_continuous_stream(
     let mut look_started: Option<Instant> = None;
 
     'pass: while controller.is_active.load(Ordering::SeqCst) {
+        let pass_started = Instant::now();
         if !controller.is_session(session) {
             crate::log_info!(
                 "web",
@@ -1430,7 +1434,10 @@ pub(super) fn serve_continuous_stream(
             Some((found, path, duration, start_pos, request, tentative, tracks))
         };
         let Some((track_index, track_path, track_duration, start_pos, request, tentative, tracks)) = picked else {
-            if let Err(e) = silence.get_or_insert_with(SilencePacer::new).send(&mut stream) {
+            if let Err(e) = silence
+                .get_or_insert_with(SilencePacer::new)
+                .send(&mut stream, pass_started)
+            {
                 crate::log_info!("web", "Continuous stream socket closed while idle: {}", e);
                 return Ok(());
             }

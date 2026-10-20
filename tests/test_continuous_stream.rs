@@ -1634,3 +1634,53 @@ fn test_continuous_hung_file_checks_run_once_per_path() {
     assert!(f.decoder.calls().is_empty(), "nothing decoded");
     again.hang_up();
 }
+
+/// While the stream idles on a queue whose files are all missing (the share was unmounted), its
+/// rechecks reuse the helper threads that answered before rather than starting one per file per
+/// recheck, and the silence stays at real time (#117).
+#[cfg(unix)]
+#[test]
+fn test_continuous_missing_file_rechecks_reuse_their_threads() {
+    common::isolate();
+    let dir = temp_dir("recheck_threads");
+    let decoder = FakeDecoder::new(&dir);
+    let missing: Vec<PathBuf> = (0..20).map(|i| dir.join(format!("gone/{i:02}.wav"))).collect();
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    state.write().unwrap().queue = missing.iter().enumerate().map(|(i, p)| queue_item(i, p)).collect();
+    let (handle, _rx) = start(state.clone());
+    let controller = handle.stream_state().continuous.clone();
+    controller.set_decoder(&decoder.binary);
+    let threads = Arc::new(Mutex::new(Vec::new()));
+    let threads_c = threads.clone();
+    controller.set_path_check(move |path: &Path| {
+        threads_c.lock().unwrap().push(std::thread::current().id());
+        path.exists()
+    });
+    let path = handle.stream_state().arm_continuous_session();
+
+    let renderer = Renderer::connect(handle.port, &path);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_about_real_time(renderer.rate_over(Duration::from_millis(3500)), "every file missing");
+    let checks = threads.lock().unwrap().clone();
+    let mut distinct = checks.clone();
+    distinct.sort_by_key(|id| format!("{id:?}"));
+    distinct.dedup();
+    assert!(
+        checks.len() >= 3 * missing.len(),
+        "a few rechecks: {} checks",
+        checks.len()
+    );
+    assert!(
+        distinct.len() <= 4,
+        "{} checks ran on {} threads, not on the few that answered before",
+        checks.len(),
+        distinct.len()
+    );
+    assert!(decoder.calls().is_empty(), "nothing to decode");
+
+    handle.stream_state().close_active_streams();
+    renderer.hang_up();
+    handle.stop();
+    drop(decoder);
+    let _ = std::fs::remove_dir_all(&dir);
+}
