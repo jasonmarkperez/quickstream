@@ -446,9 +446,10 @@ fn read_wav_layout(file: &mut std::fs::File, file_len: u64) -> Result<WavLayout,
 pub fn wav_header_sizes(fmt_len: u64, audio_len: u64, size_unknown: bool) -> (u32, u32) {
     // "WAVE", the fmt chunk with its pad byte, the data chunk's header and the audio.
     let riff = 4 + 8 + fmt_len + (fmt_len & 1) + 8 + audio_len;
-    // Both known or both unknown: the RIFF size is the larger, so it decides for both.
+    // Both known or both unknown: the RIFF size is the larger, so it decides for both. It must
+    // stay under WAV_UNKNOWN_SIZE, which would read as unknown.
     match (size_unknown, u32::try_from(riff)) {
-        (false, Ok(riff)) => (riff, audio_len as u32),
+        (false, Ok(riff)) if riff != WAV_UNKNOWN_SIZE => (riff, audio_len as u32),
         _ => (WAV_UNKNOWN_SIZE, WAV_UNKNOWN_SIZE),
     }
 }

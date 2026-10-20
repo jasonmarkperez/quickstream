@@ -295,8 +295,15 @@ fn test_wav_seek_stops_at_data_chunk_end() {
 fn test_wav_seek_unknown_data_size_runs_to_end_of_file() {
     common::isolate();
     let fmt = pcm_fmt(2, 16);
-    let audio = pcm(RATE as usize * 4 * 2);
-    for (name, size_field) in [("unknown_ff.wav", u32::MAX), ("unknown_zero.wav", 0)] {
+    // 2 s of audio, then the same with a trailing partial frame, which is never sent.
+    let whole = RATE as usize * 4 * 2;
+    for (name, size_field, audio_len) in [
+        ("unknown_ff.wav", u32::MAX, whole),
+        ("unknown_zero.wav", 0, whole),
+        ("unknown_ff_partial.wav", u32::MAX, whole + 1),
+        ("unknown_zero_partial.wav", 0, whole + 2),
+    ] {
+        let audio = pcm(audio_len);
         let file = riff(&[chunk(b"fmt ", 16, &fmt), chunk(b"data", size_field, &audio)]);
         let (handle, dir) = serve(name, name, &file);
 
@@ -309,9 +316,16 @@ fn test_wav_seek_unknown_data_size_runs_to_end_of_file() {
             assert_eq!(wav.riff_size, u32::MAX, "{}?pos={}: length still unknown", name, pos);
             assert_eq!(wav.data_size, u32::MAX, "{}?pos={}: length still unknown", name, pos);
             let wanted = (pos.parse::<f64>().unwrap() * (RATE * 4) as f64) as usize;
-            let offset = (wanted / 4 * 4).min(audio.len());
+            let offset = (wanted / 4 * 4).min(whole);
+            assert_eq!(
+                (body.len() - wav.data_offset) % 4,
+                0,
+                "{}?pos={}: whole frames only",
+                name,
+                pos
+            );
             assert!(
-                body[wav.data_offset..] == audio[offset..],
+                body[wav.data_offset..] == audio[offset..whole],
                 "{}?pos={}: audio from {}",
                 name,
                 pos,
@@ -420,6 +434,8 @@ fn test_wav_seek_header_sizes() {
     assert_eq!(wav_header_sizes(16, fits, false), (u32::MAX - 1, fits as u32));
     // The data size fits but the RIFF size doesn't: both unknown, never a mix.
     assert_eq!(wav_header_sizes(16, fits + 2, false), (u32::MAX, u32::MAX));
+    // A RIFF size of exactly u32::MAX would read as unknown next to a known data size.
+    assert_eq!(wav_header_sizes(16, fits + 1, false), (u32::MAX, u32::MAX));
     assert_eq!(
         wav_header_sizes(40, u64::from(u32::MAX) - 50, false),
         (u32::MAX, u32::MAX)
