@@ -54,7 +54,7 @@ fn wait_loaded(app: &mut AppUI) {
 fn wait_browser_listed(app: &mut AppUI) {
     for _ in 0..200 {
         app.poll_background_dir_scan();
-        if !app.browser_loading {
+        if !app.browser_loading && app.opening_folder().is_none() {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));

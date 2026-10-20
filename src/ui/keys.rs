@@ -148,7 +148,17 @@ impl AppUI {
             (KeyCode::Char('q'), KeyModifiers::NONE)
             | (KeyCode::Esc, KeyModifiers::NONE)
             | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                if key.code == KeyCode::Esc && self.browser_loading && !self.holds_frame() {
+                if key.code == KeyCode::Esc {
+                    // A folder still being opened (the previous one is on screen): stay there.
+                    if let Some(dir) = self.cancel_folder_open() {
+                        self.status_message = format!(
+                            "Stopped opening '{}'",
+                            dir.file_name().unwrap_or(dir.as_os_str()).to_string_lossy()
+                        );
+                        return Ok(false);
+                    }
+                }
+                if key.code == KeyCode::Esc && self.browser_loading {
                     if let Some(stop) = self.dir_scan_stop.take() {
                         stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -434,6 +444,7 @@ impl AppUI {
                             } else {
                                 self.browser_cursor = self.browser_entries.len() - 1;
                             }
+                            self.browser_cursor_moved();
                         }
                     }
                     (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
@@ -451,6 +462,7 @@ impl AppUI {
                             } else {
                                 self.browser_cursor = 0;
                             }
+                            self.browser_cursor_moved();
                         }
                     }
                     (KeyCode::PageUp, _)
@@ -508,12 +520,21 @@ impl AppUI {
                     }
                     (KeyCode::Backspace, _) if !self.queue_focus => {
                         if self.in_bookmarks_view {
-                            self.in_bookmarks_view = false;
-                            self.refresh_browser();
+                            self.navigate_browser(self.browser_dir.clone());
                         } else if let Some(parent) = self.browser_dir.parent() {
                             let parent_path = parent.to_path_buf();
                             self.navigate_browser(parent_path);
                         }
+                    }
+                    (KeyCode::Char('a'), KeyModifiers::NONE) if !self.in_bookmarks_view && self.browser_loading => {
+                        // Part of the folder is listed: adding that would leave the rest out.
+                        self.status_message = format!(
+                            "Still reading {}, try again when it's listed",
+                            self.browser_dir
+                                .file_name()
+                                .unwrap_or(self.browser_dir.as_os_str())
+                                .to_string_lossy()
+                        );
                     }
                     (KeyCode::Char('a'), KeyModifiers::NONE) if !self.in_bookmarks_view => {
                         let tracks: Vec<_> = self

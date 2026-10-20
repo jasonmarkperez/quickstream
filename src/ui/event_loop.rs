@@ -47,38 +47,22 @@ impl AppUI {
         left
     }
 
-    /// How long the event loop keeps the previous frame on screen after a folder is opened,
-    /// while its scan has listed nothing yet (`holds_frame`).
-    pub const FOLDER_FIRST_FRAME_HOLD: Duration = Duration::from_millis(100);
     /// How long after a folder is opened the event loop ticks every frame to pick its batches
     /// up (`key_poll_timeout`); a read still going after that (a hung share) ticks at 100 ms.
     pub const FAST_TICK_WHILE_READING: Duration = Duration::from_millis(500);
 
-    /// True while a folder opened less than `FOLDER_FIRST_FRAME_HOLD` ago has listed nothing
-    /// yet. The event loop doesn't draw meanwhile (the terminal keeps the previous frame, keys
-    /// are still read), so a fast folder's first frame is its listing rather than an empty one
-    /// with READING DIRECTORY, nothing on the UI thread waiting for it (issue #101). Esc quits
-    /// meanwhile rather than cancelling a scan that was never on screen.
-    pub fn holds_frame(&self) -> bool {
-        let header_rows = if self.browser_dir.parent().is_some() { 2 } else { 1 };
-        self.browser_loading
-            && self.browser_entries.len() <= header_rows
-            && self
-                .browser_load_start
-                .is_some_and(|start| start.elapsed() < Self::FOLDER_FIRST_FRAME_HOLD)
-    }
-
-    /// How long each tick waits for a key before polling the workers and drawing again: one
-    /// frame (60 FPS) for the first `FAST_TICK_WHILE_READING` of a folder's read, so its listing
-    /// shows as soon as the scan sends it (issue #101); else 100 ms.
+    /// How long each tick waits for a key: one frame (60 FPS) while a folder is being opened and
+    /// for the first `FAST_TICK_WHILE_READING` of a shown folder's read, so its listing shows as
+    /// soon as the scan sends it (issue #101); else 100 ms. The extra ticks poll only the
+    /// directory scan (`TickClock`).
     pub fn key_poll_timeout(&self) -> Duration {
         let just_opened = self
             .browser_load_start
             .is_some_and(|start| start.elapsed() < Self::FAST_TICK_WHILE_READING);
-        if self.browser_loading && just_opened {
+        if self.opening_folder().is_some() || (self.browser_loading && just_opened) {
             Duration::from_millis(16)
         } else {
-            Duration::from_millis(100)
+            TickClock::FULL_TICK
         }
     }
 
@@ -112,73 +96,82 @@ impl AppUI {
         res
     }
 
+    /// Everything a full tick of the event loop polls before it draws.
+    fn poll_workers(&mut self) {
+        if let Some(err) = self.player.take_error() {
+            self.status_message = format!("Playback error: {}", err);
+        }
+
+        // Check if active track finished and auto-advance queue
+        if self.player.is_track_finished() {
+            self.player.reset_finished();
+            self.handle_track_finished();
+        }
+
+        // Synchronize continuous gapless stream track index
+        if let Some(ref ws) = self.web_server {
+            if ws
+                .stream_state()
+                .continuous
+                .is_active
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                let cur_idx = *ws.stream_state().continuous.current_track_index.lock().unwrap();
+                if cur_idx != self.queue.current_index() && cur_idx < self.queue.len() {
+                    self.queue.set_current_index(cur_idx);
+                    self.queue_cursor = cur_idx;
+                }
+            }
+        }
+
+        // Process remote web commands
+        self.handle_web_commands();
+
+        self.poll_track_features();
+
+        // Synchronize web server live state
+        self.update_web_state();
+
+        // Poll background directory scan
+        self.poll_background_dir_scan();
+
+        // Poll background metadata extraction
+        self.poll_background_metadata();
+        self.poll_pending_queue_adds();
+        self.poll_playlists();
+        self.poll_settings_status();
+
+        // Poll progressive background autopilot discovery
+        self.poll_background_autopilot();
+
+        if let Some(ref mut modal) = self.search_modal {
+            modal.poll_background_scan();
+        }
+
+        // Flush debounced seek if debounce timer expired
+        self.poll_pending_seek();
+
+        // Flush debounced track skip if debounce timer expired
+        self.poll_pending_track_skip();
+    }
+
     fn event_loop<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> anyhow::Result<()> {
+        let mut clock = TickClock::new(Instant::now());
         loop {
             if self.poll_shutdown_request() {
                 return Ok(());
             }
 
-            if let Some(err) = self.player.take_error() {
-                self.status_message = format!("Playback error: {}", err);
-            }
-
-            // Check if active track finished and auto-advance queue
-            if self.player.is_track_finished() {
-                self.player.reset_finished();
-                self.handle_track_finished();
-            }
-
-            // Synchronize continuous gapless stream track index
-            if let Some(ref ws) = self.web_server {
-                if ws
-                    .stream_state()
-                    .continuous
-                    .is_active
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    let cur_idx = *ws.stream_state().continuous.current_track_index.lock().unwrap();
-                    if cur_idx != self.queue.current_index() && cur_idx < self.queue.len() {
-                        self.queue.set_current_index(cur_idx);
-                        self.queue_cursor = cur_idx;
-                    }
-                }
-            }
-
-            // Process remote web commands
-            self.handle_web_commands();
-
-            self.poll_track_features();
-
-            // Synchronize web server live state
-            self.update_web_state();
-
-            // Poll background directory scan
-            self.poll_background_dir_scan();
-
-            // Poll background metadata extraction
-            self.poll_background_metadata();
-            self.poll_pending_queue_adds();
-            self.poll_playlists();
-            self.poll_settings_status();
-
-            // Poll progressive background autopilot discovery
-            self.poll_background_autopilot();
-
-            if let Some(ref mut modal) = self.search_modal {
-                modal.poll_background_scan();
-            }
-
-            // Flush debounced seek if debounce timer expired
-            self.poll_pending_seek();
-
-            // Flush debounced track skip if debounce timer expired
-            self.poll_pending_track_skip();
-
-            if !self.holds_frame() {
+            if clock.full_tick(Instant::now()) {
+                self.poll_workers();
+                terminal.draw(|f| self.render(f))?;
+            } else if self.poll_background_dir_scan() {
+                // A tick between full ones (`key_poll_timeout`): only the directory scan.
                 terminal.draw(|f| self.render(f))?;
             }
 
-            if event::poll(self.key_poll_timeout())? {
+            if event::poll(clock.wait(Instant::now(), self.key_poll_timeout()))? {
+                clock.input(Instant::now());
                 if let Event::Key(key) = event::read()? {
                     if self.show_help_modal {
                         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
@@ -322,5 +315,42 @@ impl AppUI {
                 }
             }
         }
+    }
+}
+
+/// When the event loop's ticks are full ones, polling every worker before drawing: every
+/// `FULL_TICK`, and right after a key (or another terminal event). The shorter ticks of
+/// `AppUI::key_poll_timeout` in between poll only the directory scan, so the other pollers
+/// (web state, playlists, features, …) keep their rate.
+pub struct TickClock {
+    next_full: Instant,
+}
+
+impl TickClock {
+    /// The time between full ticks with no key pressed.
+    pub const FULL_TICK: Duration = Duration::from_millis(100);
+
+    /// A clock whose first tick, at `now`, is a full one.
+    pub fn new(now: Instant) -> Self {
+        TickClock { next_full: now }
+    }
+
+    /// Whether the tick at `now` is a full one; if it is, the next one is due `FULL_TICK` later.
+    pub fn full_tick(&mut self, now: Instant) -> bool {
+        if now < self.next_full {
+            return false;
+        }
+        self.next_full = now + Self::FULL_TICK;
+        true
+    }
+
+    /// How long the tick at `now` waits for a key: `key_poll`, but never past the next full tick.
+    pub fn wait(&self, now: Instant, key_poll: Duration) -> Duration {
+        key_poll.min(self.next_full.saturating_duration_since(now))
+    }
+
+    /// A key or another terminal event came in: the next tick is a full one.
+    pub fn input(&mut self, now: Instant) {
+        self.next_full = now;
     }
 }

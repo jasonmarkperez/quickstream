@@ -2,11 +2,12 @@
 //! cache, the browser's metadata fetch, navigation, the spotlight and the browser's paging keys.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use ratatui::widgets::*;
 
 use super::tag_reads::TagRead;
-use super::{is_subfolder_entry, AppUI, DirScanEvent, SPOTLIGHT_HINT};
+use super::{is_subfolder_entry, AppUI, CursorTarget, DirScanEvent, PendingFolder, SPOTLIGHT_HINT};
 use crate::metadata::is_supported_audio_file;
 
 impl AppUI {
@@ -19,6 +20,64 @@ impl AppUI {
         path.file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_default()
+    }
+
+    /// How long a folder being opened keeps the previous one on screen while its scan runs:
+    /// a folder listed within it is shown whole, a slower one with its first rows and READING
+    /// DIRECTORY (issue #101).
+    pub const FOLDER_OPEN_DEADLINE: Duration = Duration::from_millis(150);
+
+    /// The navigation rows at the top of the browser list, before the folder's entries:
+    /// `★ Music Homes` and `..` (no `..` at the file system's root); in Music Homes, `..` alone.
+    pub fn browser_header_rows(&self) -> usize {
+        if self.in_bookmarks_view {
+            1
+        } else {
+            1 + usize::from(self.browser_dir.parent().is_some())
+        }
+    }
+
+    /// The folder being opened while the previous one is still shown, if any: keys act on the
+    /// shown one until it is swapped in (`poll_background_dir_scan`).
+    pub fn opening_folder(&self) -> Option<&Path> {
+        self.pending_folder.as_ref().map(|pending| pending.dir.as_path())
+    }
+
+    /// Sort the folder's entries (subfolders first, then by name, ignoring case) under the
+    /// header rows, keeping the cursor on the entry it was on.
+    fn sort_browser_entries(&mut self) {
+        let header = self.browser_header_rows();
+        if self.browser_entries.len() <= header {
+            return;
+        }
+        let selected = (self.browser_cursor >= header)
+            .then(|| self.browser_entries.get(self.browser_cursor).map(|(_, p, _)| p.clone()))
+            .flatten();
+        self.browser_entries[header..].sort_by(|a, b| match (a.2, b.2) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+        });
+        if let Some(path) = selected {
+            if let Some(row) = self.browser_entry_row(&path) {
+                self.browser_cursor = row;
+            }
+        }
+    }
+
+    /// The row of the folder's entry for `path` (never a header row).
+    fn browser_entry_row(&self, path: &Path) -> Option<usize> {
+        let header = self.browser_header_rows();
+        self.browser_entries
+            .iter()
+            .skip(header)
+            .position(|(_, p, _)| p == path)
+            .map(|pos| header + pos)
+    }
+
+    /// The user moved the browser's cursor: a Backspace's restore no longer applies.
+    pub(super) fn browser_cursor_moved(&mut self) {
+        self.pending_parent_restore = None;
     }
 
     pub fn update_browser_entry_labels(&mut self) {
@@ -35,17 +94,7 @@ impl AppUI {
                     }
                 }
             }
-
-            let header_count = if self.browser_dir.parent().is_some() { 2 } else { 1 };
-            if self.browser_entries.len() > header_count {
-                let mut content_entries = self.browser_entries.split_off(header_count);
-                content_entries.sort_by(|a, b| match (a.2, b.2) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-                });
-                self.browser_entries.extend(content_entries);
-            }
+            self.sort_browser_entries();
         }
 
         // 2. Update cached entries across all cached directories
@@ -64,35 +113,16 @@ impl AppUI {
         }
     }
 
+    /// List the shown folder again (`r`, startup), or Music Homes. The cursor stays on the
+    /// entry it is on.
     pub fn refresh_browser(&mut self) {
-        let refresh_start = std::time::Instant::now();
-        let old_cursor = self.browser_cursor;
-
-        if let Some(stop) = self.dir_scan_stop.take() {
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            // Drop what the stopped scan already sent, also when no scan follows (Music Homes,
-            // a cache hit): the poll ignores another scan's events.
-            self.dir_scan_id += 1;
-        }
-        if self.browser_loading {
-            if let Some(prev_start) = self.browser_load_start.take() {
-                crate::logger::log_raw(
-                    "PERF",
-                    "browser",
-                    &format!(
-                        "previous directory scan cancelled for '{}' after {:.2?}",
-                        self.browser_dir.display(),
-                        prev_start.elapsed()
-                    ),
-                );
-            }
-        }
-
-        self.browser_entries.clear();
-
         if self.in_bookmarks_view {
+            let refresh_start = Instant::now();
+            self.stop_dir_scan();
             self.browser_loading = false;
             self.browser_load_start = None;
+            let old_cursor = self.browser_cursor;
+            self.browser_entries.clear();
             self.browser_entries
                 .push((".. [Back to File System]".to_string(), self.browser_dir.clone(), true));
             for b in &self.bookmarks {
@@ -120,103 +150,144 @@ impl AppUI {
             );
             return;
         }
+        let dir = self.browser_dir.clone();
+        self.open_folder(dir, CursorTarget::Selection);
+    }
 
+    /// Stop the running directory scan, if any, and drop a folder still being opened. What the
+    /// scan already sent is dropped too, also when no scan follows (Music Homes, a cache hit):
+    /// the poll ignores another scan's events.
+    fn stop_dir_scan(&mut self) {
+        if let Some(stop) = self.dir_scan_stop.take() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.dir_scan_id += 1;
+        }
+        let (dir, start) = match self.pending_folder.take() {
+            Some(pending) => (pending.dir, Some(pending.opened)),
+            None if self.browser_loading => (self.browser_dir.clone(), self.browser_load_start),
+            None => return,
+        };
+        if let Some(start) = start {
+            crate::logger::log_raw(
+                "PERF",
+                "browser",
+                &format!(
+                    "previous directory scan cancelled for '{}' after {:.2?}",
+                    dir.display(),
+                    start.elapsed()
+                ),
+            );
+        }
+    }
+
+    /// Open `dir` (another folder, or the shown one again). A complete cached listing is shown
+    /// at once. Otherwise its scan starts on a worker and nothing here waits for it (issue
+    /// #101): while a complete listing is on screen it stays there, and keeps the keys, until
+    /// the scan completes or fails or `folder_open_deadline` passes (`poll_background_dir_scan`),
+    /// so a fast folder never shows an empty READING DIRECTORY frame. With nothing to keep (at
+    /// startup, or while the shown folder is itself still being read) `dir` is shown at once.
+    fn open_folder(&mut self, dir: PathBuf, cursor: CursorTarget) {
+        let refresh_start = Instant::now();
+        self.stop_dir_scan();
+
+        // Cache hit: instantaneous display with zero filesystem overhead!
+        if self
+            .browser_dir_cache
+            .get(&dir)
+            .is_some_and(|cached| cached.is_complete)
+        {
+            self.show_folder(dir, cursor, None);
+            let unfetched = self
+                .browser_dir_cache
+                .get(&self.browser_dir)
+                .map(|cached| cached.unfetched_tracks.clone())
+                .unwrap_or_default();
+            if !unfetched.is_empty() && self.settings_mgr.settings.metadata_view {
+                self.start_background_metadata_fetch(unfetched);
+            }
+            crate::logger::log_raw(
+                "PERF",
+                "browser",
+                &format!(
+                    "directory loaded from cache ({} items) for '{}' -> elapsed: {:.2?}",
+                    self.browser_entries.len().saturating_sub(self.browser_header_rows()),
+                    self.browser_dir.display(),
+                    refresh_start.elapsed()
+                ),
+            );
+            return;
+        }
+
+        // Incomplete or uncached directory: clear any partial cache entry so fresh scan is clean
+        self.browser_dir_cache.remove(&dir);
+        self.spawn_dir_scan(dir.clone());
+        if !self.browser_entries.is_empty() && !self.browser_loading {
+            self.pending_folder = Some(PendingFolder {
+                dir,
+                cursor,
+                opened: refresh_start,
+            });
+        } else {
+            self.show_folder(dir, cursor, Some(refresh_start));
+        }
+    }
+
+    /// Show `dir` with what `browser_dir_cache` holds of it (all of it, part, or nothing yet),
+    /// as still being read when `load_start` is given. The cursor goes to `cursor`'s row; an
+    /// entry not listed yet becomes `pending_parent_restore` while the scan runs.
+    fn show_folder(&mut self, dir: PathBuf, cursor: CursorTarget, load_start: Option<Instant>) {
+        let same = !self.in_bookmarks_view && self.browser_dir == dir;
+        let (target, fallback) = match cursor {
+            CursorTarget::Top => (None, 0),
+            CursorTarget::Entry(path) => (Some(path), 0),
+            CursorTarget::Selection => {
+                let selected = (self.browser_cursor >= self.browser_header_rows())
+                    .then(|| self.browser_entries.get(self.browser_cursor).map(|(_, p, _)| p.clone()))
+                    .flatten();
+                (selected, self.browser_cursor)
+            }
+        };
+
+        self.in_bookmarks_view = false;
+        self.browser_dir = dir;
+        self.browser_loading = load_start.is_some();
+        self.browser_load_start = load_start;
+        self.browser_entries.clear();
         self.browser_entries
             .push(("★ Music Homes".to_string(), PathBuf::from("___MUSIC_HOMES___"), true));
-
         if let Some(parent) = self.browser_dir.parent() {
             self.browser_entries
                 .push((".. [Parent Directory]".to_string(), parent.to_path_buf(), true));
         }
-
-        // Cache hit: instantaneous display with zero filesystem overhead!
-        if let Some(cached) = self.browser_dir_cache.get(&self.browser_dir).cloned() {
-            if cached.is_complete {
-                self.browser_loading = false;
-                self.browser_load_start = None;
-                self.browser_entries.extend(cached.dirs);
-                let metadata_view = self.settings_mgr.settings.metadata_view;
-                for (mut label, path, is_dir) in cached.files {
-                    if !is_dir {
-                        label = Self::format_file_label(&path, metadata_view, &self.metadata_cache);
-                    }
-                    self.browser_entries.push((label, path, is_dir));
-                }
-
-                let header_count = if self.browser_dir.parent().is_some() { 2 } else { 1 };
-                if self.browser_entries.len() > header_count {
-                    let mut content_entries = self.browser_entries.split_off(header_count);
-                    content_entries.sort_by(|a, b| match (a.2, b.2) {
-                        (true, false) => std::cmp::Ordering::Less,
-                        (false, true) => std::cmp::Ordering::Greater,
-                        _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-                    });
-                    self.browser_entries.extend(content_entries);
-                }
-
-                if let Some(target_sub) = self.pending_parent_restore.take() {
-                    if let Some(pos) = self
-                        .browser_entries
-                        .iter()
-                        .position(|(name, p, is_dir)| *is_dir && p == &target_sub && name.starts_with("📁 "))
-                    {
-                        self.browser_cursor = pos;
-                        self.browser_state = ListState::default();
-                        self.browser_state.select(Some(pos));
-                        let item_count = self.browser_entries.len().saturating_sub(header_count);
-                        crate::logger::log_raw(
-                            "PERF",
-                            "browser",
-                            &format!(
-                                "directory loaded from cache ({} items) for '{}' -> elapsed: {:.2?}",
-                                item_count,
-                                self.browser_dir.display(),
-                                refresh_start.elapsed()
-                            ),
-                        );
-                        return;
-                    }
-                }
-
-                self.browser_cursor = old_cursor.min(self.browser_entries.len().saturating_sub(1));
-                if self.browser_cursor == 0 {
-                    self.browser_state = ListState::default();
-                    self.browser_state.select(Some(0));
-                }
-
-                if !cached.unfetched_tracks.is_empty() && self.settings_mgr.settings.metadata_view {
-                    self.start_background_metadata_fetch(cached.unfetched_tracks);
-                }
-                let item_count = self.browser_entries.len().saturating_sub(header_count);
-                crate::logger::log_raw(
-                    "PERF",
-                    "browser",
-                    &format!(
-                        "directory loaded from cache ({} items) for '{}' -> elapsed: {:.2?}",
-                        item_count,
-                        self.browser_dir.display(),
-                        refresh_start.elapsed()
-                    ),
-                );
-                return;
+        if let Some(cached) = self.browser_dir_cache.get(&self.browser_dir) {
+            self.browser_entries.extend(cached.dirs.iter().cloned());
+            let metadata_view = self.settings_mgr.settings.metadata_view;
+            for (_, path, is_dir) in &cached.files {
+                let label = Self::format_file_label(path, metadata_view, &self.metadata_cache);
+                self.browser_entries.push((label, path.clone(), *is_dir));
             }
         }
+        self.browser_cursor = 0;
+        self.sort_browser_entries();
 
-        // Incomplete or uncached directory: clear any partial cache entry so fresh scan is clean
-        self.browser_dir_cache.remove(&self.browser_dir);
-
-        self.browser_cursor = old_cursor.min(self.browser_entries.len().saturating_sub(1));
-        if self.browser_cursor == 0 {
+        let row = target.as_deref().and_then(|path| self.browser_entry_row(path));
+        self.browser_cursor = row.unwrap_or(fallback).min(self.browser_entries.len() - 1);
+        self.pending_parent_restore = if row.is_none() && self.browser_loading {
+            target
+        } else {
+            None
+        };
+        if !same {
             self.browser_state = ListState::default();
-            self.browser_state.select(Some(0));
         }
+        self.browser_state.select(Some(self.browser_cursor));
+    }
 
-        self.browser_loading = true;
-        self.browser_load_start = Some(refresh_start);
-
+    /// Start listing `dir` on a `dir-scan` worker; its batches come in through
+    /// `poll_background_dir_scan`.
+    fn spawn_dir_scan(&mut self, scan_dir: PathBuf) {
         self.dir_scan_id += 1;
         let scan_id = self.dir_scan_id;
-        let scan_dir = self.browser_dir.clone();
         let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.dir_scan_stop = Some(stop_flag.clone());
         let tx = self.dir_scan_tx.clone();
@@ -334,27 +405,41 @@ impl AppUI {
                 }
             }
         });
-        // Nothing waits for the scan here (issue #101): its batches come in through
-        // `poll_background_dir_scan`, which the event loop calls at frame rate while the folder
-        // has just been opened (`key_poll_timeout`). The loop keeps the previous frame until the
-        // first batch or `FOLDER_FIRST_FRAME_HOLD` (`holds_frame`), then the LIBRARY panel shows
-        // its READING DIRECTORY row until the batches come. A Backspace's `pending_parent_restore` waits with
-        // them and puts the cursor back on the folder it left once that folder is listed.
+    }
+
+    /// Show the folder being opened, with what its scan has listed so far.
+    fn show_pending_folder(&mut self, still_reading: bool) {
+        if let Some(pending) = self.pending_folder.take() {
+            self.show_folder(pending.dir, pending.cursor, still_reading.then_some(pending.opened));
+            // Its scan counts from when the folder was opened (logs, the slow-read status).
+            if !still_reading {
+                self.browser_load_start = Some(pending.opened);
+            }
+        }
     }
 
     fn handle_dir_scan_event(&mut self, event: DirScanEvent) {
+        let (scan_id, dir) = match &event {
+            DirScanEvent::Batch { scan_id, dir, .. }
+            | DirScanEvent::Complete { scan_id, dir }
+            | DirScanEvent::Error { scan_id, dir, .. } => (*scan_id, dir.clone()),
+        };
+        // The scan of the folder being opened, else of the shown folder.
+        let opening = match &self.pending_folder {
+            Some(pending) => pending.dir == dir,
+            None if dir == self.browser_dir && !self.in_bookmarks_view => false,
+            None => return,
+        };
+        if scan_id != self.dir_scan_id || (self.pending_folder.is_some() && !opening) {
+            return;
+        }
         match event {
             DirScanEvent::Batch {
-                scan_id,
-                dir,
                 mut dirs,
                 mut files,
                 mut unfetched_tracks,
+                ..
             } => {
-                if scan_id != self.dir_scan_id || dir != self.browser_dir {
-                    return;
-                }
-
                 {
                     let seen = &mut self.browser_dir_cache.entry(dir.clone()).or_default().seen;
                     dirs.retain(|(_, path, _)| seen.insert(path.clone()));
@@ -376,61 +461,39 @@ impl AppUI {
                 let cached = self.browser_dir_cache.entry(dir).or_default();
                 cached.dirs.extend(dirs.clone());
                 cached.files.extend(files.clone());
-                cached.unfetched_tracks.extend(unfetched_tracks.clone());
+                cached.unfetched_tracks.extend(unfetched_tracks);
                 cached.is_complete = false;
 
-                self.browser_entries.extend(dirs);
-                self.browser_entries.extend(files);
-
-                // Incremental sort so streamed entries are always alphabetical
-                let header_count = if self.browser_dir.parent().is_some() { 2 } else { 1 };
-                if self.browser_entries.len() > header_count {
-                    let mut content_entries = self.browser_entries.split_off(header_count);
-                    content_entries.sort_by(|a, b| match (a.2, b.2) {
-                        (true, false) => std::cmp::Ordering::Less,
-                        (false, true) => std::cmp::Ordering::Greater,
-                        _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-                    });
-                    self.browser_entries.extend(content_entries);
-                }
-
-                if let Some(ref target_sub) = self.pending_parent_restore {
-                    if let Some(pos) = self
-                        .browser_entries
-                        .iter()
-                        .position(|(name, p, is_dir)| *is_dir && p == target_sub && name.starts_with("📁 "))
-                    {
-                        self.browser_cursor = pos;
-                        self.browser_state = ListState::default();
-                        self.browser_state.select(Some(pos));
-                    }
-                }
-            }
-            DirScanEvent::Complete { scan_id, dir } => {
-                if scan_id != self.dir_scan_id || dir != self.browser_dir {
+                // A folder being opened is shown from the cache once its scan ends or the
+                // deadline passes, never at its first batch.
+                if opening {
                     return;
                 }
-                self.browser_loading = false;
-                let load_duration = self.browser_load_start.take().map(|s| s.elapsed());
-
-                let header_count = if self.browser_dir.parent().is_some() { 2 } else { 1 };
-                if self.browser_entries.len() > header_count {
-                    let mut content_entries = self.browser_entries.split_off(header_count);
-                    content_entries.sort_by(|a, b| match (a.2, b.2) {
-                        (true, false) => std::cmp::Ordering::Less,
-                        (false, true) => std::cmp::Ordering::Greater,
-                        _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-                    });
-                    self.browser_entries.extend(content_entries);
-                }
-
+                self.browser_entries.extend(dirs);
+                self.browser_entries.extend(files);
+                // Incremental sort so streamed entries are always alphabetical; the cursor
+                // stays on its entry.
+                self.sort_browser_entries();
+                self.restore_browser_cursor();
+            }
+            DirScanEvent::Complete { .. } => {
                 if let Some(cached) = self.browser_dir_cache.get_mut(&dir) {
                     cached.dirs.sort_by_key(|a| a.0.to_lowercase());
                     cached.files.sort_by_key(|a| a.0.to_lowercase());
                     cached.is_complete = true;
                 }
+                if opening {
+                    self.show_pending_folder(false);
+                } else {
+                    self.sort_browser_entries();
+                    self.restore_browser_cursor();
+                }
+                self.browser_loading = false;
+                self.pending_parent_restore = None;
+                self.dir_scan_stop = None;
+                let load_duration = self.browser_load_start.take().map(|s| s.elapsed());
 
-                let item_count = self.browser_entries.len().saturating_sub(header_count);
+                let item_count = self.browser_entries.len().saturating_sub(self.browser_header_rows());
                 if let Some(dur) = load_duration {
                     crate::logger::log_raw(
                         "PERF",
@@ -444,18 +507,6 @@ impl AppUI {
                     );
                 }
 
-                if let Some(target_sub) = self.pending_parent_restore.take() {
-                    if let Some(pos) = self
-                        .browser_entries
-                        .iter()
-                        .position(|(name, p, is_dir)| *is_dir && p == &target_sub && name.starts_with("📁 "))
-                    {
-                        self.browser_cursor = pos;
-                        self.browser_state = ListState::default();
-                        self.browser_state.select(Some(pos));
-                    }
-                }
-
                 if self.settings_mgr.settings.metadata_view {
                     if let Some(cached) = self.browser_dir_cache.get(&dir) {
                         if !cached.unfetched_tracks.is_empty() {
@@ -464,11 +515,13 @@ impl AppUI {
                     }
                 }
             }
-            DirScanEvent::Error { scan_id, dir, message } => {
-                if scan_id != self.dir_scan_id || dir != self.browser_dir {
-                    return;
+            DirScanEvent::Error { message, .. } => {
+                if opening {
+                    self.show_pending_folder(false);
                 }
                 self.browser_loading = false;
+                self.pending_parent_restore = None;
+                self.dir_scan_stop = None;
                 let dur = self.browser_load_start.take().map(|s| s.elapsed());
                 if let Some(d) = dur {
                     crate::logger::log_raw(
@@ -487,15 +540,41 @@ impl AppUI {
         }
     }
 
-    pub fn poll_background_dir_scan(&mut self) {
+    /// Put the cursor on the folder `Backspace` left once the shown folder's scan lists it.
+    fn restore_browser_cursor(&mut self) {
+        let Some(target) = self.pending_parent_restore.as_deref() else {
+            return;
+        };
+        if let Some(row) = self.browser_entry_row(target) {
+            self.browser_cursor = row;
+            self.browser_state = ListState::default();
+            self.browser_state.select(Some(row));
+            self.pending_parent_restore = None;
+        }
+    }
+
+    /// Take in what the directory scan has sent, without waiting, and show a folder being
+    /// opened once its deadline has passed (with its rows so far and READING DIRECTORY).
+    /// Returns whether anything came in or changed, so the event loop knows to draw.
+    pub fn poll_background_dir_scan(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(event) = self.dir_scan_rx.try_recv() {
             self.handle_dir_scan_event(event);
+            changed = true;
+        }
+        if self
+            .pending_folder
+            .as_ref()
+            .is_some_and(|pending| pending.opened.elapsed() >= self.folder_open_deadline)
+        {
+            self.show_pending_folder(true);
+            changed = true;
         }
 
         if self.browser_loading {
             if let Some(start) = self.browser_load_start {
                 if start.elapsed() > std::time::Duration::from_secs(3) {
-                    let count = self.browser_entries.len().saturating_sub(2);
+                    let count = self.browser_entries.len().saturating_sub(self.browser_header_rows());
                     self.status_message = format!(
                         "Loaded {} items from '{}'... Esc or '..' to go back",
                         count,
@@ -504,6 +583,16 @@ impl AppUI {
                 }
             }
         }
+        changed
+    }
+
+    /// Esc while a folder is being opened: stop opening it and stay in the shown folder.
+    /// Returns the folder that was being opened.
+    pub(super) fn cancel_folder_open(&mut self) -> Option<PathBuf> {
+        let dir = self.pending_folder.as_ref()?.dir.clone();
+        self.stop_dir_scan();
+        self.browser_dir_cache.remove(&dir);
+        Some(dir)
     }
 
     pub fn start_background_metadata_fetch(&mut self, paths: Vec<PathBuf>) {
@@ -566,31 +655,13 @@ impl AppUI {
             return;
         }
 
-        if self.in_bookmarks_view {
-            self.in_bookmarks_view = false;
-            self.browser_dir = path;
-            self.browser_cursor = 0;
-            self.browser_state = ListState::default();
-            self.browser_state.select(Some(0));
-            self.refresh_browser();
-            self.update_web_state();
-            return;
-        }
-
-        let prev_dir = self.browser_dir.clone();
-        let is_parent = prev_dir.parent().map(|p| p == path).unwrap_or(false);
-
-        if is_parent {
-            self.pending_parent_restore = Some(prev_dir);
+        // To the parent (Backspace, `..`): the cursor goes back to the folder it left.
+        let cursor = if !self.in_bookmarks_view && self.browser_dir.parent() == Some(path.as_path()) {
+            CursorTarget::Entry(self.browser_dir.clone())
         } else {
-            self.pending_parent_restore = None;
-        }
-
-        self.browser_dir = path;
-        self.browser_cursor = 0;
-        self.browser_state = ListState::default();
-        self.browser_state.select(Some(0));
-        self.refresh_browser();
+            CursorTarget::Top
+        };
+        self.open_folder(path, cursor);
         self.update_web_state();
     }
 
@@ -646,6 +717,7 @@ impl AppUI {
         let matches = self.spotlight_matches();
         if let Some(&first_idx) = matches.first() {
             self.browser_cursor = first_idx;
+            self.browser_cursor_moved();
         }
     }
 
@@ -654,6 +726,7 @@ impl AppUI {
         if matches.is_empty() {
             return;
         }
+        self.browser_cursor_moved();
         if let Some(&next_idx) = matches.iter().find(|&&i| i > self.browser_cursor) {
             self.browser_cursor = next_idx;
         } else if let Some(&first_idx) = matches.first() {
@@ -666,6 +739,7 @@ impl AppUI {
         if matches.is_empty() {
             return;
         }
+        self.browser_cursor_moved();
         if let Some(&prev_idx) = matches.iter().rev().find(|&&i| i < self.browser_cursor) {
             self.browser_cursor = prev_idx;
         } else if let Some(&last_idx) = matches.last() {
@@ -677,6 +751,7 @@ impl AppUI {
         if self.browser_entries.is_empty() {
             return;
         }
+        self.browser_cursor_moved();
         let len = self.browser_entries.len();
         let step = self.browser_page_height.max(1);
         if self.browser_cursor + step < len {
@@ -692,6 +767,7 @@ impl AppUI {
         if self.browser_entries.is_empty() {
             return;
         }
+        self.browser_cursor_moved();
         let len = self.browser_entries.len();
         let step = self.browser_page_height.max(1);
         if self.browser_cursor >= step {
@@ -705,6 +781,7 @@ impl AppUI {
 
     pub fn home_browser(&mut self) {
         if !self.browser_entries.is_empty() {
+            self.browser_cursor_moved();
             self.browser_cursor = 0;
             self.browser_state = ListState::default();
             self.browser_state.select(Some(0));
@@ -713,6 +790,7 @@ impl AppUI {
 
     pub fn end_browser(&mut self) {
         if !self.browser_entries.is_empty() {
+            self.browser_cursor_moved();
             self.browser_cursor = self.browser_entries.len() - 1;
         }
     }
