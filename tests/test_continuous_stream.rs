@@ -744,6 +744,16 @@ struct DecoderFixture {
 #[cfg(unix)]
 impl DecoderFixture {
     fn start(name: &str, names: &[&str], first: usize) -> Self {
+        Self::start_with(name, names, first, |_, _| {})
+    }
+
+    /// As [`Self::start`], with `setup` run on the controller before the renderer connects.
+    fn start_with(
+        name: &str,
+        names: &[&str],
+        first: usize,
+        setup: impl FnOnce(&ContinuousStreamController, &[PathBuf]),
+    ) -> Self {
         let dir = temp_dir(name);
         let decoder = FakeDecoder::new(&dir);
         let tracks: Vec<PathBuf> = names.iter().map(|n| dir.join(n)).collect();
@@ -755,6 +765,7 @@ impl DecoderFixture {
         let (handle, rx) = start(state.clone());
         let controller = handle.stream_state().continuous.clone();
         controller.set_decoder(&decoder.binary);
+        setup(&controller, &tracks);
         *controller.current_track_index.lock().unwrap() = first;
         let path = handle.stream_state().arm_continuous_session();
         let renderer = Renderer::connect(handle.port, &path);
@@ -1449,4 +1460,177 @@ fn test_continuous_stream_logs_each_missing_queue_once() {
     handle.stop();
     drop(decoder);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A file check standing in for a network share that hangs rather than unmounting: checks of the
+/// paths it holds block until it is released, the others answer from the disk. Every check is
+/// counted per path.
+#[derive(Clone, Default)]
+struct HeldPathCheck {
+    released: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    calls: Arc<Mutex<std::collections::HashMap<PathBuf, usize>>>,
+}
+
+/// Releases a [`HeldPathCheck`] when dropped, so no check (nor, without the fix, the stream
+/// blocked in one) outlives the test, even one that fails.
+struct ReleaseOnDrop(HeldPathCheck);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+impl HeldPathCheck {
+    /// Check files on `controller` through this, holding `held`.
+    fn install(&self, controller: &ContinuousStreamController, held: &[PathBuf]) {
+        let (released, calls, held) = (self.released.clone(), self.calls.clone(), held.to_vec());
+        controller.set_path_check(move |path: &Path| {
+            *calls.lock().unwrap().entry(path.to_path_buf()).or_default() += 1;
+            if held.iter().any(|h| h == path) {
+                let (lock, cvar) = &*released;
+                let mut done = lock.lock().unwrap();
+                while !*done {
+                    done = cvar.wait(done).unwrap();
+                }
+            }
+            path.exists()
+        });
+    }
+
+    fn release(&self) {
+        let (lock, cvar) = &*self.released;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+
+    fn release_on_drop(&self) -> ReleaseOnDrop {
+        ReleaseOnDrop(self.clone())
+    }
+
+    fn calls(&self, path: &Path) -> usize {
+        self.calls.lock().unwrap().get(path).copied().unwrap_or(0)
+    }
+}
+
+/// While the check of the next file hangs (a network share that hangs), the renderer still gets
+/// silence at real time, no more than the lead ahead; once the check answers, the file plays
+/// (#117).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_sends_silence_while_a_file_check_hangs() {
+    common::isolate();
+    let hang = HeldPathCheck::default();
+    let f = DecoderFixture::start_with("hung_check", &["t0_live.wav", "t1_live.wav"], 0, |c, tracks| {
+        hang.install(c, &tracks[..1])
+    });
+    let _release = hang.release_on_drop();
+    let connected = Instant::now();
+    std::thread::sleep(Duration::from_millis(300));
+    let renderer = f.renderer.as_ref().unwrap();
+    assert_about_real_time(
+        renderer.rate_over(Duration::from_millis(1200)),
+        "while the file check hangs",
+    );
+    let received = renderer.received.load(Ordering::SeqCst) as f64;
+    let lead = 0.1 * REAL_TIME_BYTES_PER_SEC;
+    assert!(
+        received <= (connected.elapsed().as_secs_f64() + 0.1) * REAL_TIME_BYTES_PER_SEC + lead,
+        "silence runs at most the lead ahead of real time: {:.0} bytes after {:?}",
+        received,
+        connected.elapsed()
+    );
+    assert!(f.decoder.calls().is_empty(), "nothing decoded while the check hangs");
+    assert_eq!(hang.calls(&f.tracks[0]), 1, "one check of the file, not one per pass");
+
+    hang.release();
+    assert_eq!(f.run(1), (f.tracks[0].clone(), None));
+    wait_until("the file was never shown as playing", || {
+        f.state.read().unwrap().title == "Track 0"
+    });
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 0);
+}
+
+/// A seek asked while the stream waits on a file check stays pending, and is applied to that
+/// file once its check answers; a skip asked then plays the track skipped to (#117).
+#[cfg(unix)]
+#[test]
+fn test_continuous_requests_made_while_a_file_check_hangs_are_kept() {
+    common::isolate();
+    let hang = HeldPathCheck::default();
+    let f = DecoderFixture::start_with("hung_request", &["t0_live.wav", "t1.wav", "t2.wav"], 0, |c, tracks| {
+        hang.install(c, &tracks[..1])
+    });
+    let _release = hang.release_on_drop();
+    wait_until("the file was never checked", || hang.calls(&f.tracks[0]) == 1);
+    f.controller.seek_to(12.0);
+    std::thread::sleep(Duration::from_millis(300));
+    let seek = StreamRequest {
+        index: 0,
+        position: 12.0,
+    };
+    assert_eq!(f.controller.pending_request(), Some(seek), "kept while the check hangs");
+    hang.release();
+    assert_eq!(f.run(1), (f.tracks[0].clone(), Some("12.000".to_string())));
+    wait_until("the seek was never taken", || f.controller.pending_request().is_none());
+
+    f.controller.skip_to_index(2);
+    assert_eq!(f.run(2), (f.tracks[2].clone(), None));
+    assert_eq!(hang.calls(&f.tracks[0]), 1, "a file checked since is not checked again");
+}
+
+/// A file whose check doesn't answer in time is passed over for the next one, which plays
+/// (#117).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_plays_the_next_file_while_a_check_hangs() {
+    common::isolate();
+    let hang = HeldPathCheck::default();
+    let f = DecoderFixture::start_with("hung_first", &["t0_live.wav", "t1_live.wav"], 0, |c, tracks| {
+        hang.install(c, &tracks[..1])
+    });
+    let _release = hang.release_on_drop();
+    assert_eq!(f.run(1), (f.tracks[1].clone(), None));
+    wait_until("the next file was never shown as playing", || {
+        *f.controller.current_track_index.lock().unwrap() == 1
+    });
+    assert_eq!(hang.calls(&f.tracks[0]), 1);
+}
+
+/// Checks that never answer (the share stays hung) don't pile up: one is in flight per path,
+/// however often the stream looks through the queue, also after the renderer reconnects; the
+/// stream sends silence at real time all along (#117).
+#[cfg(unix)]
+#[test]
+fn test_continuous_hung_file_checks_run_once_per_path() {
+    common::isolate();
+    let hang = HeldPathCheck::default();
+    let f = DecoderFixture::start_with("hung_all", &["t0_live.wav", "t1_live.wav"], 0, |c, tracks| {
+        hang.install(c, tracks)
+    });
+    let _release = hang.release_on_drop();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_about_real_time(
+        f.renderer.as_ref().unwrap().rate_over(Duration::from_millis(1200)),
+        "every check hangs",
+    );
+    // Past both checks' deadlines and a few rechecks of the queue.
+    std::thread::sleep(Duration::from_millis(5500));
+    for track in &f.tracks {
+        assert_eq!(hang.calls(track), 1, "one check in flight for {}", track.display());
+    }
+
+    let again = Renderer::connect(f.port, &f.path);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_about_real_time(again.rate_over(Duration::from_millis(1500)), "after a reconnect");
+    for track in &f.tracks {
+        assert_eq!(
+            hang.calls(track),
+            1,
+            "no new check for {} after a reconnect",
+            track.display()
+        );
+    }
+    assert!(f.decoder.calls().is_empty(), "nothing decoded");
+    again.hang_up();
 }

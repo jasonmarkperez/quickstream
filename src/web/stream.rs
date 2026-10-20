@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use super::file_checks::{FileChecks, FileStatus};
 use super::server::write_not_found;
 use super::state::{NowPlayingState, WebCommand};
 
@@ -78,6 +79,9 @@ pub struct ContinuousStreamController {
     /// the two always name the same track (lock order: the web state, then `current_duration`,
     /// then this).
     decoding: Mutex<Option<(usize, PathBuf)>>,
+    /// Whether the queue's files are there, checked off the stream's write path (#117); see
+    /// [`Self::set_path_check`].
+    file_checks: FileChecks,
 }
 
 impl ContinuousStreamController {
@@ -323,6 +327,12 @@ impl ContinuousStreamController {
     /// fake decoder).
     pub fn set_decoder(&self, binary: impl Into<PathBuf>) {
         *self.decoder.lock().unwrap() = Some(binary.into());
+    }
+
+    /// Tell whether a queued file is there with `check` instead of `Path::exists` (the test seam
+    /// for a share that hangs). It runs on a helper thread, at most once at a time per path.
+    pub fn set_path_check(&self, check: impl Fn(&Path) -> bool + Send + Sync + 'static) {
+        self.file_checks.set_check(Arc::new(check));
     }
 
     fn decoder(&self) -> PathBuf {
@@ -1118,6 +1128,10 @@ const SILENCE_LEAD: Duration = Duration::from_millis(100);
 const SILENCE_MAX_BURST: Duration = Duration::from_secs(1);
 /// How often a queue whose files are all missing is looked through again.
 const MISSING_RECHECK: Duration = Duration::from_secs(1);
+/// The longest one pass waits for file checks before it sends silence instead (#117).
+const FILE_CHECK_WAIT: Duration = Duration::from_millis(20);
+// A pass that waits on file checks, then on its tick, still writes before the lead runs out.
+const _: () = assert!(SILENCE_TICK.as_millis() + FILE_CHECK_WAIT.as_millis() < SILENCE_LEAD.as_millis());
 
 /// The PCM bytes in `duration`, whole 4-byte frames.
 fn pcm_bytes(duration: Duration) -> u64 {
@@ -1125,7 +1139,8 @@ fn pcm_bytes(duration: Duration) -> u64 {
 }
 
 /// Sends silence at the stream's real-time byte rate while there is nothing to decode (empty
-/// queue, every file missing). Measured from when it started, so sleep overshoot doesn't add up.
+/// queue, every file missing, a file check not answered yet). Measured from when it started, so
+/// sleep overshoot doesn't add up.
 struct SilencePacer {
     started: Instant,
     sent: u64,
@@ -1260,8 +1275,11 @@ pub(super) fn serve_continuous_stream(
     let mut streamed_since_wrap = false;
     // Whether a decoder that couldn't start (no ffmpeg) was logged since audio last went out.
     let mut spawn_failure_logged = false;
+    // When the look through the queue still waiting on a file check began: answers given since
+    // then are used as the stream looks again on the next passes. `None`: no look is waiting.
+    let mut look_started: Option<Instant> = None;
 
-    while controller.is_active.load(Ordering::SeqCst) {
+    'pass: while controller.is_active.load(Ordering::SeqCst) {
         if !controller.is_session(session) {
             crate::log_info!(
                 "web",
@@ -1285,8 +1303,8 @@ pub(super) fn serve_continuous_stream(
         let picked = 'pick: {
             let (index, request, tracks, tentative, queue_changed) = {
                 let s = state.read().unwrap();
-                // The connection is checked under the lock the request is taken with, so one a
-                // reconnect has superseded never takes the request meant for the new one.
+                // A connection a reconnect has superseded stops here (and is checked again as the
+                // request is taken below), so it never takes the request meant for the new one.
                 let mut pending = controller.request.lock().unwrap();
                 if !controller.owns(cid) {
                     crate::log_info!("web", "Continuous stream connection {} superseded, closing", cid);
@@ -1298,6 +1316,7 @@ pub(super) fn serve_continuous_stream(
                     *pending = None;
                     *controller.current_track_index.lock().unwrap() = 0;
                     next_index = None;
+                    look_started = None;
                     break 'pick None;
                 }
                 let mut queue_changed = false;
@@ -1308,13 +1327,14 @@ pub(super) fn serve_continuous_stream(
                     // the whole queue.
                     queue_changed = s.queue.len() != paths.len()
                         || ((recheck || pending.is_some()) && !s.queue.iter().map(|t| &t.filepath).eq(paths.iter()));
-                    if !queue_changed && !recheck && pending.is_none() {
+                    if !queue_changed && !recheck && pending.is_none() && look_started.is_none() {
                         break 'pick None;
                     }
                 }
-                // Taken in one step with the decision it drives, so a request that arrives later
-                // stays pending for the next pass.
-                let request = pending.take();
+                // Read here and taken once the look through the queue below has decided (the
+                // look can take several passes while file checks answer), so it shows as pending
+                // until then.
+                let request = *pending;
                 // A changed queue or a request gets every file tried again.
                 if queue_changed || request.is_some() {
                     silent_runs = 0;
@@ -1339,13 +1359,53 @@ pub(super) fn serve_continuous_stream(
             let queue_len = tracks.len();
             // Logged once per queue, not again while the stream idles on it.
             let quiet = nothing_playable.is_some() && !queue_changed;
-            let found = (0..queue_len).map(|step| (index + step) % queue_len).find(|&i| {
-                let exists = Path::new(&tracks[i].0).exists();
-                if !exists && !quiet {
-                    crate::log_warn!("web", "Continuous stream track missing: {}", tracks[i].0);
+            // Files are checked on helper threads (a share that hangs can take seconds to stat),
+            // waited for `FILE_CHECK_WAIT` at most per pass so the silence stays paced. A check
+            // still unanswered then leaves the look to the next pass, the request (if any) still
+            // pending; the answers given meanwhile carry over.
+            let since = *look_started.get_or_insert_with(Instant::now);
+            let wait_until = Instant::now() + FILE_CHECK_WAIT;
+            let mut passed_over = Vec::new();
+            let mut found = None;
+            for i in (0..queue_len).map(|step| (index + step) % queue_len) {
+                match controller
+                    .file_checks
+                    .status(Path::new(&tracks[i].0), since, wait_until)
+                {
+                    FileStatus::Exists => {
+                        found = Some(i);
+                        break;
+                    }
+                    FileStatus::Missing => passed_over.push((i, false)),
+                    FileStatus::Unanswered => passed_over.push((i, true)),
+                    FileStatus::Pending => break 'pick None,
                 }
-                exists
-            });
+            }
+            {
+                // Taken in one step with the decision it drives, so a request that arrives later
+                // stays pending for the next pass. One that replaced it during the look is looked
+                // for afresh, with the answers given so far. The connection is checked under the
+                // same lock, so one a reconnect has superseded never takes the new one's request.
+                let mut pending = controller.request.lock().unwrap();
+                if !controller.owns(cid) {
+                    crate::log_info!("web", "Continuous stream connection {} superseded, closing", cid);
+                    return Ok(());
+                }
+                if *pending != request {
+                    continue 'pass;
+                }
+                *pending = None;
+            }
+            look_started = None;
+            if !quiet {
+                for (i, unanswered) in passed_over {
+                    if unanswered {
+                        crate::log_warn!("web", "Continuous stream track not answering: {}", tracks[i].0);
+                    } else {
+                        crate::log_warn!("web", "Continuous stream track missing: {}", tracks[i].0);
+                    }
+                }
+            }
             let Some(found) = found else {
                 if !quiet {
                     crate::log_warn!(
