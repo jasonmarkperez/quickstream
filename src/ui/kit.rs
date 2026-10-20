@@ -244,15 +244,15 @@ pub fn clear(buf: &mut Buffer, area: Rect) {
 }
 
 /// Dim `area` (clipped to the buffer) under a modal: every cell keeps its text but is drawn in RULE
-/// on GROUND, with no bold, underline or other modifier.
+/// on GROUND, with no bold, underline or other modifier (faint in Mono, `theme::dimmed`).
 pub fn dim_buffer(buf: &mut Buffer, area: Rect) {
     let area = area.intersection(buf.area);
-    let p = theme::palette();
+    let dimmed = theme::dimmed();
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
             let cell = &mut buf[(x, y)];
-            cell.set_fg(p.rule).set_bg(p.ground);
             cell.modifier = Modifier::empty();
+            cell.set_style(dimmed);
         }
     }
 }

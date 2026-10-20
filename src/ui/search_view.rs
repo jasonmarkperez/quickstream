@@ -7,7 +7,6 @@
 use std::path::Path;
 
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
@@ -145,11 +144,10 @@ fn draw_query_row(f: &mut Frame, area: Rect, modal: &SearchModalState) {
             .saturating_sub(label.len() + 1)
             .saturating_sub(if show_counts { counts_width + 2 } else { 0 });
     let query = kit::visible_tail(&modal.query, query_room);
-    let cursor = Style::new().bg(theme::palette().ink);
     let line = Line::from(vec![
         Span::styled(label, theme::dim()),
         Span::styled(query, theme::bold()),
-        Span::styled(" ", cursor),
+        Span::styled(" ", theme::cursor()),
     ]);
     let buf = f.buffer_mut();
     buf.set_line(area.x, area.y, &line, area.width);
