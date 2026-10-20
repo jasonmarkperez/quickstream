@@ -361,17 +361,41 @@ fn write_undecodable_mp3(path: &Path) {
 
 /// Fake `ffmpeg` executable: appends its arguments to `log` (one line per invocation), then
 /// runs `body`.
+///
+/// The script is written by a short-lived `sh`, never through a descriptor of this process. On
+/// Linux exec fails with ETXTBSY while any process holds the file open for writing, and a child
+/// another test thread forks while this process has it open keeps that descriptor until the
+/// child's own exec. Writing to a temporary name and renaming it into place would not help: the
+/// inherited descriptor is on the same file.
 #[cfg(unix)]
 fn fake_ffmpeg(dir: &Path, log: &Path, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let script = dir.join("fake-ffmpeg");
-    fs::write(
-        &script,
-        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{}\n", log.display(), body),
-    )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let text = format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{}\n", log.display(), body);
+    let status = std::process::Command::new("/bin/sh")
+        .args(["-c", "printf '%s' \"$1\" > \"$2\" && chmod 755 \"$2\"", "sh"])
+        .arg(&text)
+        .arg(&script)
+        .status()
+        .unwrap();
+    assert!(status.success(), "could not write {}", script.display());
     script
+}
+
+/// Bytes in 10 s of mono s16le PCM at [`SAMPLE_RATE`]: enough audio for a decode to count.
+const TEN_SECONDS_PCM_BYTES: usize = SAMPLE_RATE as usize * 2 * 10;
+
+/// A [`fake_ffmpeg`] that runs `at_offset` when called with `-ss <offset>` and otherwise
+/// answers at once with [`TEN_SECONDS_PCM_BYTES`] of silence. A call without `-ss` counts as
+/// offset 0; a value that isn't a whole number answers too, so a call at any offset but
+/// `offset` succeeds rather than stalling or failing.
+#[cfg(unix)]
+fn fake_ffmpeg_answering_except_at(dir: &Path, log: &Path, offset: u32, at_offset: &str) -> PathBuf {
+    let body = format!(
+        "ss=0\nprev=\nfor arg in \"$@\"; do\n  [ \"$prev\" = -ss ] && ss=$arg\n  prev=$arg\ndone\n\
+         if [ \"$ss\" -eq {} ] 2>/dev/null; then\n  {}\nfi\nhead -c {} /dev/zero\nexit 0",
+        offset, at_offset, TEN_SECONDS_PCM_BYTES
+    );
+    fake_ffmpeg(dir, log, &body)
 }
 
 /// The arguments of each logged invocation of a [`fake_ffmpeg`].
@@ -382,9 +406,75 @@ fn calls(log: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The `-ss` offset of each logged invocation, in seconds: 0 when it has none, `None` when its
+/// value isn't a number.
+#[cfg(unix)]
+fn seek_offsets(log: &Path) -> Vec<Option<f64>> {
+    calls(log)
+        .iter()
+        .map(|call| {
+            let mut args = call.split_whitespace();
+            match args.position(|a| a == "-ss") {
+                Some(_) => args.next().and_then(|v| v.parse().ok()),
+                None => Some(0.0),
+            }
+        })
+        .collect()
+}
+
 #[cfg(unix)]
 fn invocations(log: &Path) -> usize {
     calls(log).len()
+}
+
+/// Issue #71: a [`fake_ffmpeg`] must start even while other threads of the test process start
+/// processes. On Linux exec fails with ETXTBSY while any process holds the script open for
+/// writing, and a child forked by another thread inherits this process's descriptors until its
+/// own exec, so a script this process had just written could fail to start (0 calls logged).
+/// Linux only: macOS runs a script that is open for writing, and spawning is slow enough there
+/// that this test would take most of a minute.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_fake_ffmpeg_starts_while_other_threads_spawn_processes() {
+    common::isolate();
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let dir = scratch_dir("fake_ffmpeg_spawn_race");
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawners: Vec<_> = (0..4)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = Command::new("/bin/sh").args(["-c", ":"]).status();
+                }
+            })
+        })
+        .collect();
+
+    let mut failures = Vec::new();
+    for i in 0..200 {
+        let sub = dir.join(i.to_string());
+        fs::create_dir_all(&sub).unwrap();
+        let log = sub.join("calls.log");
+        let script = fake_ffmpeg(&sub, &log, "exit 0");
+        match Command::new(&script).status() {
+            Ok(status) if status.success() => {}
+            other => failures.push(format!("script {}: {:?}", i, other)),
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for spawner in spawners {
+        spawner.join().unwrap();
+    }
+    assert!(
+        failures.is_empty(),
+        "fake ffmpeg failed to start {} of 200 times: {:?}",
+        failures.len(),
+        failures
+    );
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -579,32 +669,38 @@ fn test_decode_does_not_retry_from_zero_after_timeout() {
     let track = dir.join("track.wav");
     write_wav(&track, &click_track(120.0, 12.0));
     let log = dir.join("calls.log");
-    // Stalls at the seek offset; from offset 0 it answers at once with 10s of audio, so a retry
-    // from 0 would make the decode succeed, whether or not the stalled call got to log before
-    // it was killed (under load it may not have).
-    let body = "case \" $* \" in *\" -ss 0 \"*) head -c 220500 /dev/zero; exit 0 ;; esac\nexec sleep 30";
+    // Stalls at the 30 s seek and answers at once at any other offset, so a retry from 0 (or
+    // from anywhere else) would make the decode succeed.
     let cfg = FfmpegConfig {
-        binary: fake_ffmpeg(&dir, &log, body),
-        // Long enough for the fake script to start even on a loaded machine, short enough to
-        // keep the test fast.
-        timeout: Duration::from_secs(3),
+        binary: fake_ffmpeg_answering_except_at(&dir, &log, 30, "exec sleep 30"),
+        // Nothing waits on the fake making progress (its log line may be missing: under load it
+        // can be killed before writing it). The timeout only has to exceed what the kill, reap
+        // and stdout join add on top of it, so that `elapsed < 2 * timeout` holds under load.
+        timeout: Duration::from_millis(1500),
     };
 
     let start = Instant::now();
     let out = BpmAnalyzer::decode_pcm_slice_with(&cfg, &track, 30, 20, SAMPLE_RATE, None);
     let elapsed = start.elapsed();
-    let calls = calls(&log);
+    let logged = calls(&log);
+    // Proof the timeout path ran: a fake that failed to start, or exited, returns at once.
+    assert!(
+        elapsed >= cfg.timeout,
+        "the stalled decode must run until its timeout, returned after {:?} (calls: {:?})",
+        elapsed,
+        logged
+    );
     assert!(
         out.is_none(),
-        "a timed-out decode must not be retried from offset 0 (calls: {:?})",
-        calls
+        "a timed-out decode must give no audio; a retry would have (calls: {:?})",
+        logged
     );
     assert!(
-        calls.iter().all(|c| !format!(" {} ", c).contains(" -ss 0 ")),
-        "a timed-out decode must not be retried from offset 0 (calls: {:?})",
-        calls
+        seek_offsets(&log).iter().all(|o| *o == Some(30.0)),
+        "every decode must seek to 30 s, none retried from another offset (calls: {:?})",
+        logged
     );
-    assert!(calls.len() <= 1, "expected at most one decode, got {:?}", calls);
+    assert!(logged.len() <= 1, "expected one decode at most, got {:?}", logged);
     // A second decode that also stalled would cost a second timeout.
     assert!(
         elapsed < 2 * cfg.timeout,
@@ -623,15 +719,14 @@ fn test_decode_retries_from_zero_when_first_decode_is_too_short() {
     write_wav(&track, &click_track(120.0, 12.0));
     let log = dir.join("calls.log");
     // Succeeds with no audio at the seek offset (track shorter than offset); 10s of audio from 0.
-    let body = "case \" $* \" in *\" -ss 0 \"*) head -c 220500 /dev/zero ;; esac\nexit 0";
     let cfg = FfmpegConfig {
-        binary: fake_ffmpeg(&dir, &log, body),
+        binary: fake_ffmpeg_answering_except_at(&dir, &log, 30, "exit 0"),
         ..FfmpegConfig::default()
     };
 
     let out = BpmAnalyzer::decode_pcm_slice_with(&cfg, &track, 30, 20, SAMPLE_RATE, None)
         .expect("a short first decode must be retried from offset 0");
-    assert_eq!(out.len(), 110_250);
-    assert_eq!(invocations(&log), 2);
+    assert_eq!(out.len(), TEN_SECONDS_PCM_BYTES / 2);
+    assert_eq!(seek_offsets(&log), vec![Some(30.0), Some(0.0)]);
     let _ = fs::remove_dir_all(&dir);
 }
