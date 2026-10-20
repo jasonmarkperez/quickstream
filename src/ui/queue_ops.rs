@@ -121,6 +121,48 @@ impl AppUI {
         self.start_queue_metadata_fetch();
     }
 
+    /// Insert tracks at random positions after the current track, keeping the current track, the
+    /// order of the queued tracks and the cursor on the entry it was on, and resolve missing tags
+    /// on background workers: the rest of a playlist arriving after a shuffle (issue #122).
+    pub(super) fn shuffle_queue_tracks_in(&mut self, tracks: Vec<crate::metadata::AudioMetadata>) {
+        if tracks.is_empty() {
+            return;
+        }
+        for meta in &tracks {
+            self.register_stream_file(&meta.filepath);
+        }
+        let moved = self.queue.shuffle_in(tracks);
+        self.follow_queue_cursor(&moved);
+        self.start_queue_metadata_fetch();
+    }
+
+    /// Shuffle the queue (`z` / `Z`, the web dashboard's Shuffle, the continuous stream's
+    /// reshuffle on a wrap): the current track goes in front and the cursor stays on the entry it
+    /// was on (issue #123). While the rest of a playlist `Enter` started is still being checked,
+    /// that rest is shuffled in when it arrives (issue #122). `source` ends the status
+    /// (`" (web)"`).
+    pub(super) fn shuffle_queue(&mut self, source: &str) {
+        if self.queue.is_empty() {
+            return;
+        }
+        let moved = self.queue.shuffle();
+        self.follow_queue_cursor(&moved);
+        self.status_message = match self.shuffle_in_playlist_fill() {
+            Some(name) => format!("🔀 Queue shuffled{source}; the rest of {name} is shuffled in once checked"),
+            None => format!("🔀 Queue shuffled{source}"),
+        };
+        self.update_web_state();
+    }
+
+    /// Move the cursor to where its entry went: `moved[i]` is the new position of the track that
+    /// was at `i`.
+    fn follow_queue_cursor(&mut self, moved: &[usize]) {
+        match moved.get(self.queue_cursor) {
+            Some(&to) => self.queue_cursor = to,
+            None => self.clamp_queue_cursor(),
+        }
+    }
+
     /// Keep the queue cursor on a real row after the queue shrinks.
     pub fn clamp_queue_cursor(&mut self) {
         self.queue_cursor = self.queue_cursor.min(self.queue.len().saturating_sub(1));

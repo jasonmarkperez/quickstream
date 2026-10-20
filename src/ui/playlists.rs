@@ -90,6 +90,9 @@ struct StartedPlay {
     /// The held skip's track loads paused: an output switch found the paused started track
     /// over while it was held (issue #48).
     pause_after_skip: bool,
+    /// The queue was shuffled while the rest was checked: the rest is shuffled in after the
+    /// current track, not put around the started track in playlist order (issue #122).
+    shuffle_rest: bool,
 }
 
 /// What to do once the rest of the playlist `Enter` started is in the queue.
@@ -2089,6 +2092,7 @@ impl AppUI {
             playback_error,
             pending_skip: None,
             pause_after_skip: false,
+            shuffle_rest: false,
         });
         self.update_web_state();
     }
@@ -2133,6 +2137,20 @@ impl AppUI {
         true
     }
 
+    /// The queue was just shuffled: if the rest of a playlist `Enter` started is still being
+    /// checked, shuffle it in when it arrives rather than undo the shuffle (issue #122). A shuffle
+    /// doesn't supersede the fill as Clear does: that would leave the rest of the playlist out
+    /// of the queue. Returns the playlist's name when there is a rest to come.
+    pub(super) fn shuffle_in_playlist_fill(&mut self) -> Option<String> {
+        let generation = self.playlists.checks.queue_generation;
+        let started = self.playlists.checks.started.as_mut()?;
+        if started.generation != generation {
+            return None;
+        }
+        started.shuffle_rest = true;
+        self.playlists.checks.queue_pending.clone()
+    }
+
     /// The skip [`Self::hold_skip_for_playlist_fill`] holds, if any, loads its track paused once
     /// the rest of the playlist arrives: an output switch found the paused track over (#48).
     pub(super) fn pause_after_held_skip(&mut self) {
@@ -2149,7 +2167,8 @@ impl AppUI {
     /// its path, so a file listed twice is queued once per entry. If no planned track is the
     /// started entry (which the worker's start rule rules out), nothing is left out: every
     /// planned track goes around it. If the started track has left the queue, the rest is
-    /// appended in playlist order.
+    /// appended in playlist order. After a shuffle (`shuffle_rest`) the rest is shuffled in after
+    /// the current track instead.
     fn fill_playlist_around(
         &mut self,
         started: &StartedPlay,
@@ -2165,6 +2184,11 @@ impl AppUI {
                 after.push(track);
             }
             // `index == started.entry_index`: the started track itself, already queued.
+        }
+        if started.shuffle_rest {
+            before.extend(after);
+            self.shuffle_queue_tracks_in(before);
+            return;
         }
         match self.started_queue_position(started) {
             Some(position) => {
@@ -2219,9 +2243,11 @@ impl AppUI {
         // never reported as plain success.
         let mut skip = None;
         let mut pause_after_skip = false;
+        let mut shuffled_in = false;
         let playback_error = match (result.play_from, start_index, started) {
             (Some(_), Some(_), Some(started)) => {
                 self.fill_playlist_around(&started, tracks, &entry_indices);
+                shuffled_in = started.shuffle_rest;
                 // Only while the started track is still the current one: the user may have
                 // played something else meanwhile.
                 if self.queue.current_track().is_some_and(|t| t.filepath == started.path) {
@@ -2244,7 +2270,7 @@ impl AppUI {
                 None
             }
         };
-        let summary = if missing == 0 {
+        let mut summary = if missing == 0 {
             format!("Queued {} from {}", track_count_label(queued), result.name)
         } else {
             format!(
@@ -2254,6 +2280,9 @@ impl AppUI {
                 missing
             )
         };
+        if shuffled_in {
+            summary.push_str(", shuffled in");
+        }
         // The started track ended, or Next / Previous was pressed, while the rest was checked:
         // the track to go to is queued now. A playback error from that start replaces the one
         // from the started track.

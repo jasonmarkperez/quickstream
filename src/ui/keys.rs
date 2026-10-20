@@ -366,13 +366,7 @@ impl AppUI {
                     self.open_fuzzy_search();
                 }
             }
-            (KeyCode::Char('z' | 'Z'), KeyModifiers::NONE) => {
-                if !self.queue.is_empty() {
-                    self.queue.shuffle();
-                    self.status_message = "🔀 Queue shuffled".to_string();
-                    self.update_web_state();
-                }
-            }
+            (KeyCode::Char('z' | 'Z'), KeyModifiers::NONE) => self.shuffle_queue(""),
             (KeyCode::Char('p'), KeyModifiers::NONE) => {
                 let target_dir = if self.in_bookmarks_view {
                     if self.browser_cursor > 0 && self.browser_cursor < self.browser_entries.len() {

@@ -348,21 +348,76 @@ impl PlaybackQueue {
     }
 
     /// Shuffle the queue in-place. If a track is actively playing, keep it at index 0 and shuffle the rest.
-    pub fn shuffle(&mut self) {
-        if self.tracks.len() <= 1 {
-            return;
+    /// Returns where each track went: entry `i` of the result is the new position of the track
+    /// that was at `i`, so a caller can follow one entry even when a file is queued twice.
+    pub fn shuffle(&mut self) -> Vec<usize> {
+        let len = self.tracks.len();
+        if len <= 1 {
+            return (0..len).collect();
         }
         let mut rng = FastRng::new();
-        if self.current_index < self.tracks.len() {
-            let current = self.tracks.remove(self.current_index);
-            rng.shuffle(&mut self.tracks);
-            self.tracks.insert(0, current);
-            self.current_index = 0;
+        // `order[new] = old`.
+        let mut order: Vec<usize> = (0..len).collect();
+        if self.current_index < len {
+            order.remove(self.current_index);
+            rng.shuffle(&mut order);
+            order.insert(0, self.current_index);
         } else {
-            rng.shuffle(&mut self.tracks);
-            self.current_index = 0;
+            rng.shuffle(&mut order);
+        }
+        self.current_index = 0;
+        self.reorder(&order)
+    }
+
+    /// Put the track at `order[i]` at position `i` (`order` is a permutation of the positions),
+    /// and return where each old position went.
+    fn reorder(&mut self, order: &[usize]) -> Vec<usize> {
+        let mut old: Vec<Option<AudioMetadata>> = self.tracks.drain(..).map(Some).collect();
+        let mut moved = vec![0; order.len()];
+        for (new, &from) in order.iter().enumerate() {
+            moved[from] = new;
+            if let Some(track) = old[from].take() {
+                self.tracks.push(track);
+            }
         }
         self.bump();
+        moved
+    }
+
+    /// Insert `tracks` in random order at random positions after the current track (anywhere,
+    /// when there is none), leaving the current track and the order of the queued tracks as they
+    /// are: the rest of a playlist arriving after a shuffle. Returns where each track that was
+    /// already queued went.
+    pub fn shuffle_in(&mut self, mut tracks: Vec<AudioMetadata>) -> Vec<usize> {
+        let len = self.tracks.len();
+        if tracks.is_empty() {
+            return (0..len).collect();
+        }
+        let mut rng = FastRng::new();
+        rng.shuffle(&mut tracks);
+        let start = if self.current_index < len {
+            self.current_index + 1
+        } else {
+            0
+        };
+        // One slot per track after `start`, old or new; shuffling the slots picks a uniformly
+        // random interleaving that keeps each side's own order.
+        let mut slots = vec![false; len - start];
+        slots.resize(len - start + tracks.len(), true);
+        rng.shuffle(&mut slots);
+        let mut upcoming = self.tracks.split_off(start).into_iter();
+        let mut added = tracks.into_iter();
+        let mut moved: Vec<usize> = (0..start).collect();
+        for is_new in slots {
+            if is_new {
+                self.tracks.extend(added.next());
+            } else {
+                moved.push(self.tracks.len());
+                self.tracks.extend(upcoming.next());
+            }
+        }
+        self.bump();
+        moved
     }
 
     /// Shuffle only upcoming tracks in the queue from current_index + 1 forward.
@@ -709,5 +764,59 @@ mod tests {
         assert_eq!(q.len(), 1);
         assert_eq!(q.current_index, 0);
         assert_eq!(q.tracks[0].title, "Solo");
+    }
+
+    #[test]
+    fn test_queue_shuffle_reports_where_each_track_went() {
+        // Issue #123: the queue cursor follows its entry through a shuffle.
+        let mut q = PlaybackQueue::new();
+        for i in 1..=10 {
+            q.add_track(make_test_track(&format!("Song {}", i), 100.0));
+        }
+        q.current_index = 4;
+        let before: Vec<String> = q.tracks.iter().map(|t| t.title.clone()).collect();
+        let moved = q.shuffle();
+        assert_eq!(moved.len(), 10);
+        assert_eq!(moved[4], 0, "the current track goes in front");
+        for (old, title) in before.iter().enumerate() {
+            assert_eq!(&q.tracks[moved[old]].title, title, "track {old}");
+        }
+        assert_eq!(PlaybackQueue::new().shuffle(), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn test_queue_shuffle_in_keeps_the_current_track_and_the_queued_order() {
+        // Issue #122: the rest of a playlist arriving after a shuffle is shuffled in.
+        for _ in 0..20 {
+            let mut q = PlaybackQueue::new();
+            for i in 1..=6 {
+                q.add_track(make_test_track(&format!("Song {}", i), 100.0));
+            }
+            q.current_index = 2;
+            let before: Vec<String> = q.tracks.iter().map(|t| t.title.clone()).collect();
+            let added: Vec<AudioMetadata> = (1..=5).map(|i| make_test_track(&format!("New {}", i), 100.0)).collect();
+            let revision = q.revision();
+            let moved = q.shuffle_in(added);
+            assert_ne!(q.revision(), revision);
+            assert_eq!(q.len(), 11);
+            assert_eq!(q.current_index, 2);
+            assert_eq!(q.current_track().unwrap().title, "Song 3");
+            for (old, title) in before.iter().enumerate() {
+                assert_eq!(&q.tracks[moved[old]].title, title, "track {old}");
+            }
+            assert_eq!(&moved[..3], &[0, 1, 2], "the current track and those before it stay");
+            assert!(moved.windows(2).all(|w| w[0] < w[1]), "queued tracks keep their order");
+            let mut new: Vec<String> = q.tracks[3..]
+                .iter()
+                .map(|t| t.title.clone())
+                .filter(|t| t.starts_with("New"))
+                .collect();
+            new.sort();
+            assert_eq!(new, ["New 1", "New 2", "New 3", "New 4", "New 5"]);
+        }
+        let mut empty = PlaybackQueue::new();
+        assert!(empty.shuffle_in(vec![make_test_track("Only", 1.0)]).is_empty());
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty.current_track().unwrap().title, "Only");
     }
 }
