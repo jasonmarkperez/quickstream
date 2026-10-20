@@ -453,7 +453,8 @@ fn find_wav_pcm_offset(
     }
 
     let data_len = layout.data_end - layout.data_start;
-    // The cast saturates, so a huge `pos` lands on the last whole block.
+    // The cast saturates, so a `pos` past the end lands at the end of the last
+    // whole block: no audio, or only a trailing partial frame.
     let wanted = (offset_seconds * f64::from(byte_rate)) as u64;
     let skip = (wanted / block_align * block_align).min(data_len / block_align * block_align);
     let start = layout.data_start + skip;
