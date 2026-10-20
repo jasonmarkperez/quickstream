@@ -4,8 +4,9 @@ mod common;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use quickstream::player::local::LocalPlayer;
+use quickstream::player::local::{LocalPlayer, MpvLoadEnd, MpvLoadTracker};
 use quickstream::player::AudioPlayer;
+use serde_json::json;
 
 /// 90s of silence (mp3, like the library), so the test never makes audible noise.
 fn silent_track() -> Option<PathBuf> {
@@ -488,4 +489,108 @@ fn test_mpv_end_of_a_replaced_load_is_not_the_new_loads_end() {
     assert_eq!(player.take_error(), None, "a replaced load's error was reported");
     drop(player);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------------------------
+// MpvLoadTracker fed mpv's messages directly, as each mpv generation sends them
+// ---------------------------------------------------------------------------------------------
+
+/// Feeds `msgs` to `tracker` and returns the end it reported, if any.
+fn feed(tracker: &mut MpvLoadTracker, msgs: &[serde_json::Value]) -> Option<MpvLoadEnd> {
+    msgs.iter().filter_map(|m| tracker.on_message(m)).last()
+}
+
+#[test]
+fn test_mpv_tracker_with_the_entry_in_the_answer_ignores_the_replaced_entry() {
+    common::isolate();
+    let mut tracker = MpvLoadTracker::default();
+    let id = tracker.begin(std::path::Path::new("/m/a.mp3"), true);
+    let end = feed(
+        &mut tracker,
+        &[
+            json!({"request_id": id, "error": "success", "data": {"playlist_entry_id": 2}}),
+            json!({"event": "end-file", "reason": "error", "playlist_entry_id": 1, "file_error": "loading failed"}),
+            json!({"event": "start-file", "playlist_entry_id": 2}),
+            json!({"event": "file-loaded"}),
+        ],
+    );
+    assert_eq!(end, None, "the replaced entry's end is not the new load's");
+    let end = feed(
+        &mut tracker,
+        &[
+            json!({"event": "end-file", "reason": "error", "playlist_entry_id": 2, "file_error": "no audio or video data played"}),
+        ],
+    );
+    assert_eq!(
+        end,
+        Some(MpvLoadEnd::Finished),
+        "a start past the end finishes the track"
+    );
+}
+
+#[test]
+fn test_mpv_tracker_without_the_entry_in_the_answer_takes_it_from_start_file() {
+    common::isolate();
+    // mpv 0.33 to 0.37: the events carry playlist_entry_id, loadfile's answer doesn't.
+    let mut tracker = MpvLoadTracker::default();
+    let id = tracker.begin(std::path::Path::new("/m/a.mp3"), false);
+    let end = feed(
+        &mut tracker,
+        &[
+            json!({"request_id": id, "error": "success"}),
+            json!({"event": "end-file", "reason": "eof", "playlist_entry_id": 1}),
+            json!({"event": "start-file", "playlist_entry_id": 2}),
+            json!({"event": "file-loaded"}),
+        ],
+    );
+    assert_eq!(end, None, "the replaced entry's end is not the new load's");
+    assert!(tracker.is_current());
+    let end = feed(
+        &mut tracker,
+        &[json!({"event": "end-file", "reason": "eof", "playlist_entry_id": 2})],
+    );
+    assert_eq!(end, Some(MpvLoadEnd::Finished));
+}
+
+#[test]
+fn test_mpv_tracker_without_any_entry_ids_still_sees_the_track_end() {
+    common::isolate();
+    // mpv older than 0.33 names no playlist entries at all: after loadfile's answer and the
+    // next start-file, the events are the newest load's, so a track still ends.
+    let mut tracker = MpvLoadTracker::default();
+    let id = tracker.begin(std::path::Path::new("/m/a.mp3"), false);
+    let end = feed(
+        &mut tracker,
+        &[
+            json!({"request_id": id, "error": "success"}),
+            json!({"event": "end-file", "reason": "eof"}),
+            json!({"event": "start-file"}),
+            json!({"event": "file-loaded"}),
+        ],
+    );
+    assert_eq!(end, None, "the end before the new start-file is the replaced load's");
+    assert!(tracker.is_current(), "eof-reached counts once the new load has started");
+    let end = feed(&mut tracker, &[json!({"event": "end-file", "reason": "eof"})]);
+    assert_eq!(end, Some(MpvLoadEnd::Finished), "the track's own end is seen");
+}
+
+#[test]
+fn test_mpv_tracker_without_any_entry_ids_still_reports_a_failed_load() {
+    common::isolate();
+    let mut tracker = MpvLoadTracker::default();
+    let id = tracker.begin(std::path::Path::new("/m/gone.mp3"), true);
+    let end = feed(
+        &mut tracker,
+        &[
+            json!({"request_id": id, "error": "success"}),
+            json!({"event": "start-file"}),
+            json!({"event": "end-file", "reason": "error", "file_error": "loading failed"}),
+        ],
+    );
+    assert_eq!(
+        end,
+        Some(MpvLoadEnd::Failed(
+            "couldn't play gone.mp3 (loading failed)".to_string()
+        ))
+    );
 }

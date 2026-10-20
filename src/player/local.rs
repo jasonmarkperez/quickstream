@@ -42,8 +42,10 @@ pub enum MpvLoadEnd {
 /// Follows mpv's events for the newest `loadfile`, so a late `end-file` from a load it replaced
 /// is never taken for its own (issue #48). Each `loadfile` carries a `request_id`; mpv answers
 /// it with the new playlist entry's id (`playlist_entry_id`), and only an `end-file` for that
-/// entry counts. Without an id in the answer (an older mpv), the latest `start-file` after the
-/// answer names it.
+/// entry counts. Without an id in the answer (mpv 0.33 to 0.37), the latest `start-file` after
+/// the answer names it. An mpv that names no entries at all (older than 0.33) has its events
+/// taken for the newest load from the first `start-file` after the answer, as before entries had
+/// ids, so a track's end is never missed.
 ///
 /// An `end-file` with reason `error` counts as the track finishing only when the load started
 /// past 0:00, mpv got as far as loading the file, and it reports that nothing played
@@ -68,6 +70,8 @@ pub struct MpvLoadTracker {
     started: Option<i64>,
     /// mpv reported `file-loaded` for the newest load's entry.
     file_loaded: bool,
+    /// mpv names no playlist entries (older than 0.33), and the newest load's `start-file` came.
+    unnamed_entries: bool,
 }
 
 impl MpvLoadTracker {
@@ -84,12 +88,14 @@ impl MpvLoadTracker {
         self.entry = None;
         self.entry_from_answer = false;
         self.file_loaded = false;
+        self.unnamed_entries = false;
         self.generation
     }
 
-    /// Whether mpv's events now concern the newest load (its entry is known).
+    /// Whether mpv's events now concern the newest load (its entry is known, or mpv names no
+    /// entries and the load has started).
     pub fn is_current(&self) -> bool {
-        self.answered && self.entry.is_some()
+        self.answered && (self.entry.is_some() || self.unnamed_entries)
     }
 
     /// Read one message from mpv. Returns how the newest load ended when this message says so.
@@ -108,14 +114,15 @@ impl MpvLoadTracker {
                 self.started = id;
                 if self.answered && !self.entry_from_answer {
                     self.entry = id;
+                    self.unnamed_entries = id.is_none();
                 }
-                if self.entry.is_some() && self.entry == id {
+                if self.is_current() && self.entry == id {
                     self.file_loaded = false;
                 }
                 None
             }
             "file-loaded" => {
-                if self.entry.is_some() && self.started == self.entry {
+                if self.is_current() && self.started == self.entry {
                     self.file_loaded = true;
                 }
                 None
