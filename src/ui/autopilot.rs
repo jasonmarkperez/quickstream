@@ -273,8 +273,9 @@ impl AppUI {
             }
         }
 
-        // 3. Reuse any subdirectories already discovered by the browser if viewing the same folder
-        let known_subdirs: Vec<PathBuf> = if self.browser_dir == dir {
+        // 3. Reuse any subdirectories already discovered by the browser if viewing the same
+        // folder, once it is listed whole: a partial list would leave the rest of it out.
+        let known_subdirs: Vec<PathBuf> = if self.browser_dir == dir && !self.browser_loading {
             self.browser_entries
                 .iter()
                 .filter(|(_, p, is_dir)| *is_dir && p.to_string_lossy() != "___MUSIC_HOMES___")

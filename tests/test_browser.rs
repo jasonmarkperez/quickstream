@@ -2,6 +2,7 @@ mod common;
 
 use std::fs::{self, File};
 use std::io::Write;
+use std::path::PathBuf;
 
 use quickstream::metadata::AudioMetadata;
 use quickstream::settings::SettingsManager;
@@ -48,6 +49,7 @@ fn test_browser_metadata_view_toggle() {
     settings_mgr.settings.metadata_view = true;
 
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
     // Wait for background metadata worker to extract tags and poll
     for _ in 0..50 {
@@ -127,19 +129,16 @@ fn test_browser_non_blocking_navigation_large_directory() {
     settings_mgr.settings.metadata_view = true;
 
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
-    let start = std::time::Instant::now();
+    // Navigation never waits for the listing: the folder is read on a worker, and until the
+    // poll takes its scan in, the previous folder stays on screen.
     app.navigate_browser(music_dir.clone());
-    let nav_elapsed = start.elapsed();
+    assert_eq!(app.opening_folder(), Some(music_dir.as_path()));
+    assert_eq!(app.browser_dir, temp_dir);
 
-    // Navigation must be instantaneous (under 200ms) with zero UI freeze
-    assert!(
-        nav_elapsed < std::time::Duration::from_millis(200),
-        "Navigation took too long: {:?}",
-        nav_elapsed
-    );
-
-    // All 30 folders and 30 tracks + Homes + Parent must be immediately present
+    // All 30 folders and 30 tracks + Homes + Parent are present once the poll has the scan
+    common::wait_for_dir_scan(&mut app);
     assert_eq!(app.browser_entries.len(), 62);
 
     // Initial labels for uncached tracks should be fast filenames
@@ -191,6 +190,7 @@ fn test_browser_scrolling_beyond_viewport() {
     let config_path = temp_dir.join("config.json");
     let settings_mgr = SettingsManager::with_path(config_path);
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
     let total_entries = app.browser_entries.len();
     assert!(
@@ -251,6 +251,7 @@ fn test_browser_paging_and_jump_shortcuts() {
     let config_path = temp_dir.join("config.json");
     let settings_mgr = SettingsManager::with_path(config_path);
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
     app.browser_page_height = 10;
 
     let total_entries = app.browser_entries.len();
@@ -365,6 +366,7 @@ fn test_browser_navigate_into_folder_resets_cursor_and_offset() {
     let config_path = temp_dir.join("config.json");
     let settings_mgr = SettingsManager::with_path(config_path);
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
     let backend = ratatui::backend::TestBackend::new(80, 20);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -398,6 +400,7 @@ fn test_browser_navigate_into_folder_resets_cursor_and_offset() {
 
     // Press Enter to navigate into folder_35
     app.handle_tab_key(crossterm::event::KeyCode::Enter);
+    common::wait_for_dir_scan(&mut app);
 
     // VERIFY:
     // 1. Current directory changed
@@ -458,6 +461,7 @@ fn test_browser_spotlight_subfolder_jump() {
     let config_path = temp_dir.join("config.json");
     let settings_mgr = SettingsManager::with_path(config_path);
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
     let ambient_idx = app
         .browser_entries
@@ -647,6 +651,7 @@ fn test_browser_cache_instant_back_navigation() {
     let config_path = temp_dir.join("config.json");
     let settings_mgr = SettingsManager::with_path(config_path);
     let mut app = AppUI::new(Some(parent_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
     // Initial load of parent_dir
     assert_eq!(app.browser_dir, parent_dir);
@@ -655,6 +660,7 @@ fn test_browser_cache_instant_back_navigation() {
 
     // Navigate into sub_dir
     app.navigate_browser(sub_dir.clone());
+    common::wait_for_dir_scan(&mut app);
     assert_eq!(app.browser_dir, sub_dir);
 
     // Navigate back to parent_dir
@@ -699,15 +705,17 @@ fn test_browser_small_folder_streaming_and_incremental_sorting() {
     let config_path = temp_dir.join("config.json");
     let settings_mgr = SettingsManager::with_path(config_path);
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
-    let start = std::time::Instant::now();
+    // Opening the folder only starts its scan: the listing comes in through the poll (#101),
+    // and the previous folder stays on screen until then.
+    let shown = app.browser_entries.clone();
     app.navigate_browser(album_dir.clone());
-    let elapsed = start.elapsed();
-
-    // Fast-path should load all items quickly
-    assert!(elapsed < std::time::Duration::from_millis(200));
+    assert_eq!(app.opening_folder(), Some(album_dir.as_path()));
+    assert_eq!(app.browser_dir, temp_dir);
+    assert_eq!(app.browser_entries, shown);
+    common::wait_for_dir_scan(&mut app);
     assert_eq!(app.browser_dir, album_dir);
-    assert!(!app.browser_loading);
 
     // Verify all 3 items + 2 headers are present: Homes, Parent, Bonus_Discs, Track_A, Track_B
     assert_eq!(app.browser_entries.len(), 5);
@@ -731,7 +739,12 @@ fn test_browser_small_folder_streaming_and_incremental_sorting() {
         c.files.clear();
     }
     app.refresh_browser();
-    // After refresh_browser, it should rescan and complete
+    assert_eq!(
+        app.opening_folder(),
+        Some(album_dir.as_path()),
+        "an incomplete cache entry is scanned again"
+    );
+    common::wait_for_dir_scan(&mut app);
     assert_eq!(app.browser_entries.len(), 5);
 
     let _ = fs::remove_dir_all(&temp_dir);
@@ -819,6 +832,7 @@ fn test_browser_add_track_to_queue_does_not_start_playback() {
     let config_path = temp_dir.join("config.json");
     let settings_mgr = SettingsManager::with_path(config_path);
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
     // Initial state: queue is empty, player is not playing
     assert_eq!(app.queue.len(), 0);
@@ -1086,6 +1100,7 @@ fn test_browser_metadata_view_toggle_in_place_and_settings_tab() {
     settings_mgr.settings.metadata_view = false;
 
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
     // Filenames mode initially
     let initial_entry = app.browser_entries.iter().find(|(_, p, is_dir)| !*is_dir && p == &song);
@@ -1196,14 +1211,16 @@ fn test_browser_perf_and_scan_lifecycle_tracking() {
     let settings_mgr = SettingsManager::with_path(config_path);
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
 
-    // Initial load: AppUI::new navigates to temp_dir
-    assert!(!app.browser_loading);
+    // Initial load: AppUI::new starts the scan of temp_dir
+    assert!(app.browser_loading);
+    assert!(app.browser_load_start.is_some());
+    common::wait_for_dir_scan(&mut app);
     assert!(app.browser_load_start.is_none());
 
-    // Navigate to folder
+    // Navigate to folder: it is being opened until the poll sees DirScanEvent::Complete
     app.navigate_browser(folder.clone());
-    // Since folder is small, fast path reads it immediately and fires DirScanEvent::Complete
-    assert!(!app.browser_loading);
+    assert_eq!(app.opening_folder(), Some(folder.as_path()));
+    common::wait_for_dir_scan(&mut app);
     assert!(app.browser_load_start.is_none());
     assert!(app
         .browser_entries
@@ -1218,7 +1235,8 @@ fn test_browser_perf_and_scan_lifecycle_tracking() {
     // When cache is cleared, refresh_browser triggers a fresh scan
     app.browser_dir_cache.remove(&folder);
     app.refresh_browser();
-    assert!(!app.browser_loading);
+    assert_eq!(app.opening_folder(), Some(folder.as_path()));
+    common::wait_for_dir_scan(&mut app);
     assert!(app.browser_load_start.is_none());
 
     let _ = fs::remove_dir_all(&temp_dir);
@@ -1239,6 +1257,7 @@ fn test_queue_rendering_without_file_type_and_file_list_display_swap() {
     settings_mgr.settings.metadata_view = true;
 
     let mut app = AppUI::new(Some(temp_dir.clone()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
 
     let meta = AudioMetadata {
         filepath: song_path.clone(),
@@ -1435,5 +1454,732 @@ fn test_browser_drops_duplicate_directory_entries_from_os() {
 
     let shown = app.browser_entries.iter().filter(|(_, p, _)| p == &sub).count();
     assert_eq!(shown, 1, "Artist/ listed {} times", shown);
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+/// Stands in for a slow share when the browser lists one folder: its entries come in reverse
+/// name order (so later batches sort above earlier ones), and the read stops before the entry
+/// at each of `pauses` (0: before the first) until the test resumes it. `wait_paused` returns
+/// once it has stopped there, when the scan has sent everything it flushed before. Other
+/// folders are read at once; `reads` counts the gated folder's reads. Dropping it lets the
+/// read run to its end.
+struct GatedRead {
+    resumes: std::sync::Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+    paused: std::sync::mpsc::Receiver<usize>,
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// The gated folder's entries, handed out by `GatedRead`'s rules.
+struct GatedEntries {
+    entries: std::vec::IntoIter<std::io::Result<fs::DirEntry>>,
+    index: usize,
+    pauses: Vec<usize>,
+    passed: usize,
+    resumes: std::sync::Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+    paused: std::sync::mpsc::Sender<usize>,
+}
+
+impl Iterator for GatedEntries {
+    type Item = std::io::Result<fs::DirEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pauses.get(self.passed) == Some(&self.index) {
+            let _ = self.paused.send(self.index);
+            let (lock, cvar) = &*self.resumes;
+            let passed = self.passed;
+            drop(
+                cvar.wait_while(lock.lock().unwrap(), |resumes| *resumes <= passed)
+                    .unwrap(),
+            );
+            self.passed += 1;
+        }
+        self.index += 1;
+        self.entries.next()
+    }
+}
+
+impl GatedRead {
+    fn install(app: &mut AppUI, gated: &std::path::Path, pauses: &[usize]) -> Self {
+        let resumes = std::sync::Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new()));
+        let (paused_tx, paused) = std::sync::mpsc::channel();
+        let paused_tx = std::sync::Mutex::new(paused_tx);
+        let (gated, pauses, gate) = (gated.to_path_buf(), pauses.to_vec(), resumes.clone());
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = reads.clone();
+        app.set_dir_reader(std::sync::Arc::new(move |dir: &std::path::Path| {
+            let entries = fs::read_dir(dir)?;
+            if dir != gated {
+                return Ok(Box::new(entries) as quickstream::ui::DirEntries);
+            }
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut entries: Vec<_> = entries.collect();
+            entries.sort_by_key(|e| std::cmp::Reverse(e.as_ref().map(|e| e.file_name()).ok()));
+            Ok(Box::new(GatedEntries {
+                entries: entries.into_iter(),
+                index: 0,
+                pauses: pauses.clone(),
+                passed: 0,
+                resumes: gate.clone(),
+                paused: paused_tx.lock().unwrap().clone(),
+            }) as quickstream::ui::DirEntries)
+        }));
+        GatedRead { resumes, paused, reads }
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait (at most 5 s, a deadlock guard) until the read stops at its next pause.
+    fn wait_paused(&self) -> usize {
+        self.paused
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the gated read never paused")
+    }
+
+    fn resume(&self) {
+        let (lock, cvar) = &*self.resumes;
+        *lock.lock().unwrap() += 1;
+        cvar.notify_all();
+    }
+}
+
+impl Drop for GatedRead {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.resumes;
+        *lock.lock().unwrap() = usize::MAX;
+        cvar.notify_all();
+    }
+}
+
+/// Long enough that only the end of its scan shows a folder being opened.
+const NO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn key(app: &mut AppUI, code: crossterm::event::KeyCode) -> bool {
+    app.handle_input_key(crossterm::event::KeyEvent::new(
+        code,
+        crossterm::event::KeyModifiers::NONE,
+    ))
+    .unwrap()
+}
+
+fn listed_files(app: &AppUI) -> usize {
+    app.browser_entries.iter().filter(|(_, _, is_dir)| !is_dir).count()
+}
+
+fn row_of(app: &AppUI, path: &std::path::Path) -> usize {
+    app.browser_entries
+        .iter()
+        .position(|(_, p, _)| p == path)
+        .unwrap_or_else(|| panic!("{} not listed", path.display()))
+}
+
+fn selected(app: &AppUI) -> PathBuf {
+    app.browser_entries[app.browser_cursor].1.clone()
+}
+
+fn browser_app(temp_dir: &std::path::Path, start: &std::path::Path) -> AppUI {
+    let mut settings_mgr = SettingsManager::with_path(temp_dir.join("config.json"));
+    settings_mgr.settings.metadata_view = false;
+    let mut app = AppUI::new(Some(start.to_path_buf()), settings_mgr);
+    common::wait_for_dir_scan(&mut app);
+    app.active_tab = 1;
+    app
+}
+
+#[test]
+fn test_browser_open_folder_does_not_wait_for_a_slow_read() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_slow_open_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let slow = temp_dir.join("Slow");
+    fs::create_dir_all(&slow).unwrap();
+    for name in ["a", "b", "c", "d", "e", "f", "g"] {
+        create_dummy_wav(&slow.join(format!("{name}.wav")));
+    }
+    let mut app = browser_app(&temp_dir, &temp_dir);
+    app.set_folder_open_deadline(NO_DEADLINE);
+
+    // The read sends its first batch (5 files), then stops.
+    let gate = GatedRead::install(&mut app, &slow, &[5]);
+    app.browser_cursor = row_of(&app, &slow);
+    assert!(!key(&mut app, crossterm::event::KeyCode::Enter));
+    // Enter only started the scan: nothing of it was taken in (waiting for it would have).
+    assert_eq!(app.opening_folder(), Some(slow.as_path()));
+    assert_eq!(app.browser_dir, temp_dir, "the previous folder stays on screen");
+    assert!(!app.browser_dir_cache.contains_key(&slow));
+    gate.wait_paused();
+    assert!(
+        !app.browser_dir_cache.contains_key(&slow),
+        "nothing is taken in before a poll"
+    );
+
+    // The poll takes the batch in without showing it: the previous folder keeps the screen.
+    app.poll_background_dir_scan();
+    assert_eq!(app.browser_dir_cache[&slow].files.len(), 5);
+    assert_eq!(app.browser_dir, temp_dir);
+    let screen = common::tui::render_text(&mut app, 120, 40);
+    assert!(!screen.contains("READING DIRECTORY"), "{}", screen);
+    assert!(screen.contains("SLOW/"), "{}", screen);
+
+    gate.resume();
+    common::wait_for_dir_scan(&mut app);
+    assert_eq!(app.browser_dir, slow);
+    assert_eq!(listed_files(&app), 7);
+    let screen = common::tui::render_text(&mut app, 120, 40);
+    assert!(!screen.contains("READING DIRECTORY"), "{}", screen);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+/// A parent with eight folders: in the gated read's reverse order, the first batch is
+/// Hotel … Delta and Charlie, Bravo, Alpha come after the pause.
+fn parent_with_folders(tag: &str) -> (PathBuf, PathBuf) {
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_{}_{}", tag, std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let parent = temp_dir.join("Music");
+    for name in ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel"] {
+        fs::create_dir_all(parent.join(name)).unwrap();
+    }
+    (temp_dir, parent)
+}
+
+#[test]
+fn test_browser_backspace_restores_cursor_once_slow_parent_is_listed() {
+    common::isolate();
+    let (temp_dir, parent) = parent_with_folders("slow_parent");
+    let bravo = parent.join("Bravo");
+    let mut app = browser_app(&temp_dir, &bravo);
+    assert!(!app.browser_dir_cache.contains_key(&parent));
+
+    // Shown at the deadline with its first batch, which doesn't hold Bravo.
+    app.set_folder_open_deadline(std::time::Duration::ZERO);
+    let gate = GatedRead::install(&mut app, &parent, &[5]);
+    assert!(!key(&mut app, crossterm::event::KeyCode::Backspace));
+    assert_eq!(app.opening_folder(), Some(parent.as_path()));
+    assert_eq!(app.browser_dir, bravo);
+    gate.wait_paused();
+    app.poll_background_dir_scan();
+    assert_eq!(app.browser_dir, parent);
+    assert!(app.browser_loading);
+    assert_eq!(app.pending_parent_restore.as_ref(), Some(&bravo));
+
+    gate.resume();
+    common::wait_for_dir_scan(&mut app);
+    assert_eq!(selected(&app), bravo, "cursor back on the folder Backspace left");
+    assert_eq!(app.pending_parent_restore, None);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_browser_backspace_restore_never_undoes_the_users_moves() {
+    common::isolate();
+    let (temp_dir, parent) = parent_with_folders("restore_moves");
+    let bravo = parent.join("Bravo");
+    let mut app = browser_app(&temp_dir, &bravo);
+
+    app.set_folder_open_deadline(std::time::Duration::ZERO);
+    let gate = GatedRead::install(&mut app, &parent, &[5]);
+    key(&mut app, crossterm::event::KeyCode::Backspace);
+    gate.wait_paused();
+    app.poll_background_dir_scan();
+    assert_eq!(app.pending_parent_restore.as_ref(), Some(&bravo));
+
+    // The user moves to Delta while the rest (Bravo among it) is still being read.
+    key(&mut app, crossterm::event::KeyCode::Char('j'));
+    key(&mut app, crossterm::event::KeyCode::Char('j'));
+    assert_eq!(selected(&app), parent.join("Delta"));
+    gate.resume();
+    common::wait_for_dir_scan(&mut app);
+    assert_eq!(
+        selected(&app),
+        parent.join("Delta"),
+        "the cursor stays where the user put it"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_browser_cursor_stays_on_its_entry_while_batches_sort_in() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_resort_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let folder = temp_dir.join("X");
+    // Reverse order: M5 … M1 in the first batch, then A5 … A1, which sort above them.
+    for name in ["A1", "A2", "A3", "A4", "A5", "M1", "M2", "M3", "M4", "M5"] {
+        fs::create_dir_all(folder.join(name)).unwrap();
+    }
+    let mut app = browser_app(&temp_dir, &temp_dir);
+    app.set_folder_open_deadline(std::time::Duration::ZERO);
+    let gate = GatedRead::install(&mut app, &folder, &[5]);
+    app.navigate_browser(folder.clone());
+    gate.wait_paused();
+    app.poll_background_dir_scan();
+    assert_eq!(app.browser_dir, folder);
+    assert!(app.browser_loading);
+
+    // Header rows, then M1 M2 M3: the cursor goes to M3.
+    for _ in 0..4 {
+        key(&mut app, crossterm::event::KeyCode::Char('j'));
+    }
+    let m3 = folder.join("M3");
+    assert_eq!(selected(&app), m3);
+    gate.resume();
+    common::wait_for_dir_scan(&mut app);
+    assert_eq!(
+        selected(&app),
+        m3,
+        "the rows sorted in above don't move the cursor off M3"
+    );
+
+    // So Enter opens the folder that was highlighted.
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    common::wait_for_dir_scan(&mut app);
+    assert_eq!(app.browser_dir, m3);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_browser_rescan_keeps_the_listing_until_the_slow_read_answers() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_slow_rescan_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    create_dummy_wav(&temp_dir.join("a.wav"));
+    let mut app = browser_app(&temp_dir, &temp_dir);
+    app.set_folder_open_deadline(NO_DEADLINE);
+    assert_eq!(listed_files(&app), 1);
+
+    let gate = GatedRead::install(&mut app, &temp_dir, &[0]);
+    app.browser_cursor = 0; // the Music Homes row: `r` rescans the folder
+    key(&mut app, crossterm::event::KeyCode::Char('r'));
+    assert!(app.status_message.contains("Refreshing directory"));
+    assert_eq!(app.opening_folder(), Some(temp_dir.as_path()));
+    assert!(!app.browser_loading);
+    assert_eq!(listed_files(&app), 1, "the listing stays while the read is held");
+
+    gate.resume();
+    common::wait_for_dir_scan(&mut app);
+    assert_eq!(app.opening_folder(), None);
+    assert_eq!(listed_files(&app), 1);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_browser_backspace_again_keeps_opening_the_same_parent() {
+    common::isolate();
+    let (temp_dir, parent) = parent_with_folders("backspace_twice");
+    let bravo = parent.join("Bravo");
+    let mut app = browser_app(&temp_dir, &bravo);
+    let deadline = std::time::Duration::from_millis(300);
+    app.set_folder_open_deadline(deadline);
+
+    let gate = GatedRead::install(&mut app, &parent, &[0]);
+    let first = std::time::Instant::now();
+    key(&mut app, crossterm::event::KeyCode::Backspace);
+    gate.wait_paused();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // A second Backspace (a held key) acts on Bravo, still shown: the parent keeps opening.
+    key(&mut app, crossterm::event::KeyCode::Backspace);
+    assert_eq!(app.opening_folder(), Some(parent.as_path()));
+    assert_eq!(app.browser_dir, bravo);
+
+    // The deadline still counts from the first Backspace, so the parent shows on time.
+    while first.elapsed() < deadline + std::time::Duration::from_millis(20) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    app.poll_background_dir_scan();
+    assert_eq!(app.browser_dir, parent, "shown at the first Backspace's deadline");
+    assert!(app.browser_loading);
+
+    gate.resume();
+    common::wait_for_dir_scan(&mut app);
+    assert_eq!(gate.reads(), 1, "the parent is read once");
+    assert_eq!(selected(&app), bravo);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_browser_removing_another_home_keeps_opening_the_home() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_remove_home_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let homes: Vec<PathBuf> = ["H1", "H2", "H3"].iter().map(|n| temp_dir.join(n)).collect();
+    for home in &homes {
+        fs::create_dir_all(home.join("Sub")).unwrap();
+    }
+    let mut app = browser_app(&temp_dir, &temp_dir);
+    app.set_folder_open_deadline(NO_DEADLINE);
+    app.bookmarks = homes.iter().map(|h| h.to_string_lossy().to_string()).collect();
+    app.navigate_browser(PathBuf::from("___MUSIC_HOMES___"));
+
+    let gate = GatedRead::install(&mut app, &homes[0], &[0]);
+    app.browser_cursor = 1;
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert_eq!(app.opening_folder(), Some(homes[0].as_path()));
+    gate.wait_paused();
+
+    // `d` on H2 removes it; H1 keeps opening.
+    app.browser_cursor = 2;
+    key(&mut app, crossterm::event::KeyCode::Char('d'));
+    assert_eq!(app.bookmarks.len(), 2);
+    assert_eq!(app.opening_folder(), Some(homes[0].as_path()));
+    gate.resume();
+    common::wait_for_dir_scan(&mut app);
+    assert_eq!(app.browser_dir, homes[0], "the home being opened is shown");
+    assert!(!app.in_bookmarks_view);
+
+    // Removing the home being opened stops opening it.
+    app.navigate_browser(PathBuf::from("___MUSIC_HOMES___"));
+    let gate = GatedRead::install(&mut app, &homes[2], &[0]);
+    app.browser_cursor = 2;
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert_eq!(app.opening_folder(), Some(homes[2].as_path()));
+    gate.wait_paused();
+    key(&mut app, crossterm::event::KeyCode::Char('d'));
+    assert_eq!(app.opening_folder(), None);
+    gate.resume();
+    app.poll_background_dir_scan();
+    assert!(app.in_bookmarks_view);
+    assert_eq!(app.browser_entries.len(), 2, "`..` and H1");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_browser_spotlight_closes_when_the_folder_being_opened_shows() {
+    common::isolate();
+    let (temp_dir, folder) = folder_with_subfolders("spotlight_opening");
+    fs::create_dir_all(temp_dir.join("Sierra")).unwrap();
+    let mut app = browser_app(&temp_dir, &temp_dir);
+    app.set_folder_open_deadline(NO_DEADLINE);
+
+    let gate = GatedRead::install(&mut app, &folder, &[0]);
+    app.navigate_browser(folder.clone());
+    gate.wait_paused();
+    // A spotlight opened on the folder still shown.
+    key(&mut app, crossterm::event::KeyCode::Char('/'));
+    app.browser_spotlight = Some("s".to_string());
+    app.jump_spotlight_to_first_match();
+    assert_eq!(selected(&app), temp_dir.join("Sierra"));
+
+    gate.resume();
+    common::wait_for_dir_scan(&mut app);
+    assert_eq!(app.browser_dir, folder);
+    assert_eq!(app.browser_spotlight, None, "its query was for the previous folder");
+    assert!(!app.status_message.starts_with("Spotlight:"), "{}", app.status_message);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_event_loop_ticks_at_frame_rate_only_while_a_folder_is_being_read() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_key_poll_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let slow = temp_dir.join("Slow");
+    fs::create_dir_all(&slow).unwrap();
+    let mut app = browser_app(&temp_dir, &temp_dir);
+    let frame = std::time::Duration::from_millis(16);
+    assert_eq!(app.key_poll_timeout(), quickstream::ui::TickClock::FULL_TICK);
+
+    app.set_folder_open_deadline(NO_DEADLINE);
+    let _gate = GatedRead::install(&mut app, &slow, &[0]);
+    app.navigate_browser(slow.clone());
+    assert!(app.opening_folder().is_some());
+    assert_eq!(app.key_poll_timeout(), frame, "while the folder is being opened");
+
+    app.set_folder_open_deadline(std::time::Duration::ZERO);
+    app.poll_background_dir_scan();
+    assert!(app.opening_folder().is_none() && app.browser_loading);
+    assert_eq!(app.key_poll_timeout(), frame, "in the read's first moments");
+
+    // A read that keeps going (a hung share) goes back to the usual tick.
+    let opened = std::time::Instant::now()
+        .checked_sub(AppUI::FAST_TICK_WHILE_READING + std::time::Duration::from_millis(1))
+        .unwrap();
+    app.browser_load_start = Some(opened);
+    assert!(app.browser_loading);
+    assert_eq!(app.key_poll_timeout(), quickstream::ui::TickClock::FULL_TICK);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_event_loop_runs_its_other_pollers_at_their_usual_rate() {
+    common::isolate();
+    use quickstream::ui::TickClock;
+    let ms = std::time::Duration::from_millis;
+    let t0 = std::time::Instant::now();
+    let mut clock = TickClock::new(t0);
+    assert!(clock.full_tick(t0), "the first tick polls everything");
+
+    // Frame-rate ticks in between poll only the directory scan.
+    for n in 1..=6 {
+        assert!(!clock.full_tick(t0 + ms(16 * n)), "tick at {} ms", 16 * n);
+    }
+    assert_eq!(
+        clock.wait(t0 + ms(96), ms(16)),
+        ms(4),
+        "never waits past the next full tick"
+    );
+    assert!(clock.full_tick(t0 + ms(100)));
+    assert!(!clock.full_tick(t0 + ms(116)));
+    assert_eq!(clock.wait(t0 + ms(120), ms(100)), ms(80));
+
+    // A key makes the next tick a full one.
+    clock.input(t0 + ms(130));
+    assert_eq!(clock.wait(t0 + ms(130), ms(16)), ms(0));
+    assert!(clock.full_tick(t0 + ms(130)));
+    assert!(!clock.full_tick(t0 + ms(146)));
+}
+
+#[test]
+fn test_browser_stopped_scan_never_lists_into_music_homes() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_stopped_scan_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let folder = temp_dir.join("X");
+    for name in ["A1", "A2", "A3", "A4", "A5", "A6", "A7"] {
+        fs::create_dir_all(folder.join(name)).unwrap();
+    }
+    let homes: Vec<PathBuf> = ["HomeA", "HomeB", "HomeC"].iter().map(|n| temp_dir.join(n)).collect();
+    for home in &homes {
+        fs::create_dir_all(home).unwrap();
+    }
+    let mut app = browser_app(&temp_dir, &temp_dir);
+    app.bookmarks = homes.iter().map(|h| h.to_string_lossy().to_string()).collect();
+
+    // X's first batch is sent but not yet polled when Music Homes opens.
+    let gate = GatedRead::install(&mut app, &folder, &[5]);
+    app.navigate_browser(folder.clone());
+    gate.wait_paused();
+    app.navigate_browser(PathBuf::from("___MUSIC_HOMES___"));
+    app.poll_background_dir_scan();
+
+    let listed: Vec<&PathBuf> = app.browser_entries.iter().skip(1).map(|(_, p, _)| p).collect();
+    assert_eq!(
+        listed,
+        homes.iter().collect::<Vec<_>>(),
+        "Music Homes lists only the homes"
+    );
+
+    // `d` on a home removes that home, not one a stray row pushed down.
+    app.browser_cursor = 2;
+    app.handle_tab_key(crossterm::event::KeyCode::Char('d'));
+    assert!(!app.bookmarks.contains(&homes[1].to_string_lossy().to_string()));
+    assert_eq!(app.bookmarks.len(), 2);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+/// A folder with six subfolders S1 … S6 next to `start`'s other entries.
+fn folder_with_subfolders(tag: &str) -> (PathBuf, PathBuf) {
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_{}_{}", tag, std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let folder = temp_dir.join("Slow");
+    for name in ["S1", "S2", "S3", "S4", "S5", "S6"] {
+        fs::create_dir_all(folder.join(name)).unwrap();
+    }
+    (temp_dir, folder)
+}
+
+#[test]
+fn test_browser_esc_while_a_folder_is_being_opened_stays_and_never_quits() {
+    common::isolate();
+    let (temp_dir, folder) = folder_with_subfolders("esc_opening");
+    let mut app = browser_app(&temp_dir, &temp_dir);
+    app.set_folder_open_deadline(NO_DEADLINE);
+    let shown = app.browser_entries.clone();
+
+    let gate = GatedRead::install(&mut app, &folder, &[5]);
+    app.navigate_browser(folder.clone());
+    gate.wait_paused(); // its first batch is sent, not yet polled
+    assert!(!key(&mut app, crossterm::event::KeyCode::Esc), "Esc never quits here");
+    assert_eq!(app.status_message, "Stopped opening 'Slow'");
+    assert_eq!(app.opening_folder(), None);
+    assert_eq!(app.browser_dir, temp_dir);
+
+    gate.resume();
+    app.poll_background_dir_scan();
+    assert_eq!(app.browser_entries, shown, "the folder on screen stays as it was");
+    assert!(!app.browser_dir_cache.contains_key(&folder));
+
+    // With nothing loading, Esc quits.
+    assert!(key(&mut app, crossterm::event::KeyCode::Esc));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_browser_cancelled_scan_never_lists_later() {
+    common::isolate();
+    let (temp_dir, folder) = folder_with_subfolders("cancel_scan");
+    let mut app = browser_app(&temp_dir, &temp_dir);
+    app.set_folder_open_deadline(std::time::Duration::ZERO);
+
+    // Shown at the deadline before anything is read, so READING DIRECTORY is on screen.
+    let gate = GatedRead::install(&mut app, &folder, &[0, 5]);
+    app.navigate_browser(folder.clone());
+    gate.wait_paused();
+    app.poll_background_dir_scan();
+    assert_eq!(app.browser_dir, folder);
+    assert!(app.browser_loading);
+    // The first batch is sent, not yet polled, when Esc cancels the scan.
+    gate.resume();
+    gate.wait_paused();
+    assert!(!key(&mut app, crossterm::event::KeyCode::Esc));
+    assert_eq!(app.status_message, "Cancelled directory scan");
+    app.poll_background_dir_scan();
+    assert_eq!(app.browser_entries.len(), 2, "the cancelled scan's rows are dropped");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+/// One tick of `AppUI::event_loop` without a terminal: poll the scan, then draw.
+fn tick(app: &mut AppUI) -> String {
+    app.poll_background_dir_scan();
+    common::tui::render_text(app, 120, 40)
+}
+
+#[test]
+fn test_event_loop_never_draws_reading_directory_for_a_fast_folder() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_first_frame_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let folders: Vec<PathBuf> = (0..10).map(|i| temp_dir.join(format!("F{i:02}"))).collect();
+    for folder in &folders {
+        fs::create_dir_all(folder.join("Sub")).unwrap();
+        create_dummy_wav(&folder.join("a.wav"));
+    }
+    let mut app = browser_app(&temp_dir, &temp_dir);
+    // Only the scan's end shows the folder, however long the machine takes to list it.
+    app.set_folder_open_deadline(NO_DEADLINE);
+
+    for folder in &folders {
+        app.navigate_browser(folder.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let frame = tick(&mut app);
+            assert!(!frame.contains("READING DIRECTORY"), "{}", frame);
+            if app.browser_dir == *folder {
+                assert!(frame.contains("SUB/"), "{}", frame);
+                break;
+            }
+            assert!(frame.contains("F00/"), "the previous folder until then: {}", frame);
+            assert!(std::time::Instant::now() < deadline, "{} never shown", folder.display());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        app.navigate_browser(temp_dir.clone());
+        common::wait_for_dir_scan(&mut app);
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_event_loop_draws_reading_directory_once_a_slow_read_passes_the_deadline() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_deadline_slow_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let slow = temp_dir.join("Slow");
+    fs::create_dir_all(slow.join("Sub")).unwrap();
+    let mut app = browser_app(&temp_dir, &temp_dir);
+    app.set_folder_open_deadline(std::time::Duration::ZERO);
+
+    let gate = GatedRead::install(&mut app, &slow, &[0]);
+    app.navigate_browser(slow.clone());
+    let frame = common::tui::render_text(&mut app, 120, 40);
+    assert!(
+        !frame.contains("READING DIRECTORY"),
+        "the previous folder until the poll: {}",
+        frame
+    );
+    assert!(frame.contains("SLOW/"), "{}", frame);
+    gate.wait_paused();
+    let frame = tick(&mut app);
+    assert!(frame.contains("READING DIRECTORY"), "{}", frame);
+
+    gate.resume();
+    common::wait_for_dir_scan(&mut app);
+    let frame = tick(&mut app);
+    assert!(frame.contains("SUB/"), "{}", frame);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_browser_add_all_waits_for_the_whole_folder() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_add_partial_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let slow = temp_dir.join("Slow");
+    fs::create_dir_all(&slow).unwrap();
+    for name in ["a", "b", "c", "d", "e", "f", "g"] {
+        create_dummy_wav(&slow.join(format!("{name}.wav")));
+    }
+    let mut app = browser_app(&temp_dir, &temp_dir);
+    app.player = Box::new(common::fake_player::FakePlayer::default());
+    app.set_folder_open_deadline(std::time::Duration::ZERO);
+    let gate = GatedRead::install(&mut app, &slow, &[5]);
+    app.navigate_browser(slow.clone());
+    gate.wait_paused();
+    app.poll_background_dir_scan();
+    assert!(app.browser_loading);
+    assert_eq!(listed_files(&app), 5);
+
+    // Five of seven files are listed: `a` adds none of them yet.
+    key(&mut app, crossterm::event::KeyCode::Char('a'));
+    assert_eq!(app.queue.len(), 0);
+    assert_eq!(app.status_message, "Still reading Slow, try again when it's listed");
+
+    gate.resume();
+    common::wait_for_dir_scan(&mut app);
+    key(&mut app, crossterm::event::KeyCode::Char('a'));
+    assert_eq!(app.queue.len(), 7);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_autopilot_reads_a_folder_still_being_listed_itself() {
+    common::isolate();
+    let temp_dir = std::env::temp_dir().join(format!("qs_browser_autopilot_partial_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let folder = temp_dir.join("Library");
+    // 90 folders; only D000 … D004 hold tracks, and the gated read lists them last.
+    for i in 0..90 {
+        let sub = folder.join(format!("D{i:03}"));
+        fs::create_dir_all(&sub).unwrap();
+        if i < 5 {
+            create_dummy_wav(&sub.join("track.wav"));
+        }
+    }
+    let mut app = browser_app(&temp_dir, &temp_dir);
+    app.player = Box::new(common::fake_player::FakePlayer::default());
+    app.set_folder_open_deadline(std::time::Duration::ZERO);
+    // Batches of 5, 40 and 40 folders, then a pause: 85 listed, enough for autopilot to take
+    // the browser's subfolders instead of reading the folder.
+    let gate = GatedRead::install(&mut app, &folder, &[85]);
+    app.navigate_browser(folder.clone());
+    gate.wait_paused();
+    app.poll_background_dir_scan();
+    assert!(app.browser_loading);
+    assert_eq!(app.browser_entries.len() - app.browser_header_rows(), 85);
+
+    key(&mut app, crossterm::event::KeyCode::Char('p'));
+    app.wait_for_autopilot_scan(std::time::Duration::from_secs(20));
+    assert!(!app.is_autopilot_scanning, "autopilot scan did not finish");
+    assert_eq!(
+        app.queue.len(),
+        5,
+        "the tracks in the folders not listed yet are found too"
+    );
+
     let _ = fs::remove_dir_all(&temp_dir);
 }
