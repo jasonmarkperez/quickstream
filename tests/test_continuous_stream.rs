@@ -425,16 +425,25 @@ fn test_continuous_stream_learns_an_unknown_length_mid_track() {
     app.web_server = Some(handle);
     app.update_web_state();
     let state = app.web_state.clone();
+    // The UI has published A as the current track already (its title too), but not as playing:
+    // the local player is stopped. Only the stream marks it playing, once it has started A.
+    assert!(!state.read().unwrap().is_playing);
 
-    // The renderer reads the response head, then nothing more.
+    // The renderer reads the response head, then nothing more. The stream marks itself active
+    // only after that head, and starts A later still, so wait for both (#79).
     let (status, reader) = open(port, &path);
     assert_eq!(status, 200);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while state.read().unwrap().title != "Track 0" && Instant::now() < deadline {
+    let a_started = || {
+        let s = state.read().unwrap();
+        controller.is_active.load(Ordering::SeqCst) && s.is_playing && s.filepath.as_deref() == Some(a.as_path())
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !a_started() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(2));
     }
     assert!(controller.is_active.load(Ordering::SeqCst), "stream never started");
-    assert_eq!(state.read().unwrap().title, "Track 0", "track A never started");
+    assert!(a_started(), "track A never started");
+    assert_eq!(state.read().unwrap().title, "Track 0");
     assert_eq!(*controller.current_duration.lock().unwrap(), 0.0);
 
     // Wait until the writer is stuck: while writes go through it moves the position every
