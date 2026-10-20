@@ -425,29 +425,38 @@ fn test_continuous_stream_learns_an_unknown_length_mid_track() {
     app.web_server = Some(handle);
     app.update_web_state();
     let state = app.web_state.clone();
-    // The UI has published A as the current track already (its title too), but not as playing:
-    // the local player is stopped. Only the stream marks it playing, once it has started A.
+    // The UI has published A as the current track already (its title and path too), but not as
+    // playing: the local player is stopped. Only the stream marks it playing, once it has started A.
     assert!(!state.read().unwrap().is_playing);
 
-    // The renderer reads the response head, then nothing more. The stream marks itself active
-    // only after that head, and starts A later still, so wait for both (#79).
+    // The renderer reads the response head, then nothing more. The stream is active before it
+    // writes that head (#79), and starts A after it.
     let (status, reader) = open(port, &path);
     assert_eq!(status, 200);
-    let a_started = || {
-        let s = state.read().unwrap();
-        controller.is_active.load(Ordering::SeqCst) && s.is_playing && s.filepath.as_deref() == Some(a.as_path())
-    };
+    assert!(
+        controller.is_active.load(Ordering::SeqCst),
+        "active before the head was sent"
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !a_started() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(2));
+    while !state.read().unwrap().is_playing && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(controller.is_active.load(Ordering::SeqCst), "stream never started");
-    assert!(a_started(), "track A never started");
-    assert_eq!(state.read().unwrap().title, "Track 0");
+    {
+        let s = state.read().unwrap();
+        let index = *controller.current_track_index.lock().unwrap();
+        assert!(
+            s.is_playing && index == 0 && s.filepath.as_deref() == Some(a.as_path()),
+            "track A never started: is_playing {}, index {}, filepath {:?}",
+            s.is_playing,
+            index,
+            s.filepath
+        );
+    }
     assert_eq!(*controller.current_duration.lock().unwrap(), 0.0);
 
     // Wait until the writer is stuck: while writes go through it moves the position every
-    // 250 ms, so a position that holds for a second means the socket is full.
+    // 250 ms, so a position that holds for a second means the socket is full. (It can hold at 0:
+    // a socket that fills within the first 250 ms never publishes a position.)
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let before = *controller.current_position.lock().unwrap();
