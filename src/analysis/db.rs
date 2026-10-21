@@ -10,7 +10,7 @@ use std::time::Duration;
 
 /// Current database schema version (tracked via PRAGMA user_version).
 /// Always equal to `MIGRATIONS.len()` (checked at compile time below).
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// How long a connection waits on a lock held by another handle before failing with
 /// `SQLITE_BUSY`. The app opens more than one handle (autopilot scanner and UI).
@@ -62,6 +62,24 @@ const MIGRATIONS: &[&str] = &[
         complete INTEGER NOT NULL DEFAULT 0,
         subtree_complete INTEGER NOT NULL DEFAULT 0,
         walked_at INTEGER NOT NULL
+    );
+    "#,
+    // v3 (#41 review): folder freshness and failed files. `dir_mtime` is the folder's own mtime
+    // (nanoseconds since the epoch, as the share reports it) seen when it was listed for the
+    // subtree mark it goes with: set together with `subtree_complete` once the whole subtree has
+    // been walked, so a mix compares it for equality with the folder's mtime now and no clock is
+    // involved. NULL (every v2 record) is never trusted. `library_index_failures` remembers the
+    // files whose stat or tag read failed (or panicked), per stamp (-1, -1 for a failed stat),
+    // so a file that always fails stops keeping its folder incomplete from its second pass on.
+    r#"
+    ALTER TABLE library_index_dirs ADD COLUMN dir_mtime INTEGER;
+
+    CREATE TABLE IF NOT EXISTS library_index_failures (
+        filepath TEXT PRIMARY KEY,
+        mtime INTEGER NOT NULL,
+        file_size INTEGER NOT NULL,
+        panicked INTEGER NOT NULL DEFAULT 0,
+        failed_at INTEGER NOT NULL
     );
     "#,
 ];
@@ -151,6 +169,23 @@ pub struct IndexedDir {
     pub audio_files: usize,
     pub complete: bool,
     pub walked_at: u64,
+}
+
+/// A file the library index couldn't index: the stamp (mtime, size) it failed for, `None` when
+/// the file couldn't even be stat'ed, and whether its tag read panicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexFailure {
+    pub stamp: Option<(u64, u64)>,
+    pub panicked: bool,
+}
+
+/// A modification time as the library index stores a folder's (`dir_mtime`): nanoseconds since
+/// the epoch, negative before it; `None` outside the range an i64 holds.
+pub fn mtime_nanos(t: std::time::SystemTime) -> Option<i64> {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(after) => i64::try_from(after.as_nanos()).ok(),
+        Err(before) => i64::try_from(before.duration().as_nanos()).ok().map(|n| -n),
+    }
 }
 
 /// The columns [`row_to_features`] reads, in its order.
@@ -429,10 +464,18 @@ impl AnalysisDatabase {
                 ])?;
             }
         }
+        if !rows.is_empty() {
+            // A file read now is no longer a failure.
+            let mut stmt = tx.prepare_cached("DELETE FROM library_index_failures WHERE filepath = ?1")?;
+            for row in rows {
+                stmt.execute(params![row.filepath.to_string_lossy().to_string()])?;
+            }
+        }
         if let Some(dir) = dir {
-            // A folder listed again is not whole until the walk below it is done again
-            // (`set_subtree_complete`): its subfolders may have changed since the last walk, and
-            // the fresh `walked_at` would otherwise vouch for them.
+            // The subtree mark and the folder mtime it was set for are left as they are: only
+            // `set_subtree_complete` changes them, once the walk below the folder is done again.
+            // A re-listing doesn't refresh them early, and doesn't take them away either: a mix
+            // trusts the mark only while the folder's mtime still equals `dir_mtime`.
             tx.execute(
                 r#"
                 INSERT INTO library_index_dirs (dirpath, audio_files, complete, subtree_complete, walked_at)
@@ -440,7 +483,6 @@ impl AnalysisDatabase {
                 ON CONFLICT(dirpath) DO UPDATE SET
                     audio_files = excluded.audio_files,
                     complete = excluded.complete,
-                    subtree_complete = 0,
                     walked_at = excluded.walked_at;
                 "#,
                 params![
@@ -476,33 +518,92 @@ impl AnalysisDatabase {
         out
     }
 
-    /// Record whether `dir` and every folder under it have all their rows. Returns false when
-    /// `dir` has no record (none is created).
-    pub fn set_subtree_complete(&self, dir: &Path, complete: bool) -> Result<bool> {
+    /// Record whether `dir` and every folder under it have all their rows: `Some(mtime)` when the
+    /// whole subtree was walked, `mtime` being the folder's own mtime ([`mtime_nanos`]) as seen
+    /// when it was listed for that walk; `None` takes the mark away. Returns false when `dir` has
+    /// no record (none is created).
+    pub fn set_subtree_complete(&self, dir: &Path, whole_at: Option<i64>) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute(
-            "UPDATE library_index_dirs SET subtree_complete = ?2 WHERE dirpath = ?1",
-            params![dir_key(dir), complete as i64],
+            "UPDATE library_index_dirs SET subtree_complete = ?2, dir_mtime = ?3 WHERE dirpath = ?1",
+            params![dir_key(dir), whole_at.is_some() as i64, whole_at],
         )?;
         Ok(changed > 0)
     }
 
-    /// The folders among `dirs` whose whole subtree is indexed, each with when its own record was
-    /// last walked (`walked_at`, seconds), so a reader can tell whether the folder changed since.
-    pub fn indexed_subtrees(&self, dirs: &[PathBuf]) -> HashMap<PathBuf, u64> {
+    /// The folders among `dirs` whose whole subtree is indexed, each with the folder mtime its
+    /// mark was set for ([`Self::set_subtree_complete`]). A reader trusts the mark only while the
+    /// folder's mtime is still exactly that (`!=`, never `>`: the share's clock is not ours).
+    pub fn indexed_subtrees(&self, dirs: &[PathBuf]) -> HashMap<PathBuf, i64> {
         let conn = self.conn.lock().unwrap();
         let mut out = HashMap::new();
-        let Ok(mut stmt) = conn
-            .prepare_cached("SELECT walked_at FROM library_index_dirs WHERE dirpath = ?1 AND subtree_complete != 0")
-        else {
+        let Ok(mut stmt) = conn.prepare_cached(
+            "SELECT dir_mtime FROM library_index_dirs \
+             WHERE dirpath = ?1 AND subtree_complete != 0 AND dir_mtime IS NOT NULL",
+        ) else {
             return out;
         };
         for dir in dirs {
-            if let Ok(walked_at) = stmt.query_row(params![dir_key(dir)], |r| r.get::<_, i64>(0)) {
-                out.insert(dir.clone(), walked_at.max(0) as u64);
+            if let Ok(mtime) = stmt.query_row(params![dir_key(dir)], |r| r.get::<_, i64>(0)) {
+                out.insert(dir.clone(), mtime);
             }
         }
         out
+    }
+
+    /// The failures recorded for these files ([`Self::record_index_failure`]), keyed by the lossy
+    /// path string; files without one are left out.
+    pub fn index_failures(&self, paths: &[PathBuf]) -> HashMap<String, IndexFailure> {
+        let conn = self.conn.lock().unwrap();
+        let mut out = HashMap::new();
+        let Ok(mut stmt) =
+            conn.prepare_cached("SELECT mtime, file_size, panicked FROM library_index_failures WHERE filepath = ?1")
+        else {
+            return out;
+        };
+        for path in paths {
+            let key = path.to_string_lossy().to_string();
+            let failure = stmt.query_row(params![key], |r| {
+                let (mtime, size) = (r.get::<_, i64>(0)?, r.get::<_, i64>(1)?);
+                Ok(IndexFailure {
+                    stamp: (mtime >= 0 && size >= 0).then_some((mtime as u64, size as u64)),
+                    panicked: r.get::<_, i64>(2)? != 0,
+                })
+            });
+            if let Ok(failure) = failure {
+                out.insert(key, failure);
+            }
+        }
+        out
+    }
+
+    /// Remember that the library index couldn't stat `path` (`stamp` `None`) or read its tags for
+    /// `stamp` (`panicked` when the read panicked), replacing an earlier failure of it.
+    pub fn record_index_failure(&self, path: &Path, failure: IndexFailure, failed_at: u64) -> Result<()> {
+        let (mtime, size) = match failure.stamp {
+            Some((mtime, size)) => (mtime as i64, size as i64),
+            None => (-1, -1),
+        };
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO library_index_failures (filepath, mtime, file_size, panicked, failed_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(filepath) DO UPDATE SET
+                mtime = excluded.mtime,
+                file_size = excluded.file_size,
+                panicked = excluded.panicked,
+                failed_at = excluded.failed_at;
+            "#,
+            params![
+                path.to_string_lossy().to_string(),
+                mtime,
+                size,
+                failure.panicked as i64,
+                failed_at as i64
+            ],
+        )?;
+        Ok(())
     }
 
     /// A folder's record, and whether its whole subtree is indexed.

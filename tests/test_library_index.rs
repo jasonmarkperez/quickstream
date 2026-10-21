@@ -14,8 +14,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use quickstream::analysis::db::TrackFeatures;
 use quickstream::analysis::index::{
-    default_tag_reader, run_library_index, IndexConfig, IndexControl, IndexProgress, IndexSnapshot, IndexState,
-    IndexTagReader,
+    default_tag_reader, folder_mtime, run_library_index, IndexConfig, IndexControl, IndexProgress, IndexSnapshot,
+    IndexState, IndexTagReader,
 };
 use quickstream::analysis::worker::TagReadError;
 use quickstream::analysis::AnalysisDatabase;
@@ -909,9 +909,16 @@ fn a_mix_folder_is_indexed_first() {
     );
 }
 
-/// A folder re-listed by a later pass loses its subtree mark until its whole subtree has been
-/// walked again: stopped inside an album added since the last pass, neither the artist folder
-/// nor the root reads as whole, so a mix walks them and finds the new album.
+/// Whether a mix trusts `dir`'s subtree mark: recorded, and for the folder's mtime as it is now.
+fn trusted(db: &AnalysisDatabase, dir: &Path) -> bool {
+    let marks = db.indexed_subtrees(&[dir.to_path_buf()]);
+    marks.get(dir).is_some_and(|&mtime| folder_mtime(dir) == Some(mtime))
+}
+
+/// A folder that gained an album since the last pass isn't trusted until its subtree has been
+/// walked again: stopped inside the new album, the artist folder's mark is still the one for its
+/// old mtime, so a mix walks it and finds the album. Its album walked whole, and the root (whose
+/// own mtime didn't change), keep theirs. Once a pass has walked it whole it is trusted again.
 #[test]
 fn a_rewalked_folder_is_not_whole_until_its_subtree_is_walked_again() {
     common::isolate();
@@ -921,7 +928,7 @@ fn a_rewalked_folder_is_not_whole_until_its_subtree_is_walked_again() {
     let artist = lib.join("Artist 00");
     {
         let db = AnalysisDatabase::open_at(&db_path).unwrap();
-        assert_eq!(db.indexed_subtrees(&[lib.clone(), artist.clone()]).len(), 2);
+        assert!(trusted(&db, &lib) && trusted(&db, &artist));
     }
 
     let new_album = artist.join("NewAlbum");
@@ -949,16 +956,61 @@ fn a_rewalked_folder_is_not_whole_until_its_subtree_is_walked_again() {
 
     let db = AnalysisDatabase::open_at(&db_path).unwrap();
     assert!(
-        db.indexed_subtrees(std::slice::from_ref(&artist)).is_empty(),
+        !trusted(&db, &artist),
         "the artist folder was stopped inside its new album"
     );
     assert!(
-        db.indexed_subtrees(std::slice::from_ref(&lib)).is_empty(),
-        "the root was stopped part-way"
-    );
-    assert_eq!(
-        db.indexed_subtrees(&[artist.join("Album")]).len(),
-        1,
+        trusted(&db, &artist.join("Album")),
         "the album walked whole keeps its mark"
     );
+    assert!(trusted(&db, &lib), "the root's own mtime didn't change");
+
+    one_pass(&db_path, vec![lib.clone()], default_tag_reader());
+    assert!(trusted(&db, &artist), "walked whole again");
+}
+
+/// A pass over a library that hasn't changed takes no mark away while it runs (#146 review):
+/// half-way through (a touched file's tags being read), the root and every top-level folder are
+/// still trusted, including the one being walked.
+#[test]
+fn marks_stay_while_a_pass_walks_an_unchanged_library() {
+    common::isolate();
+    let (lib, db_path) = scratch("marks_stay");
+    let files = library_tree(&lib, 3, 2);
+    one_pass(&db_path, vec![lib.clone()], default_tag_reader());
+    let tops: Vec<PathBuf> = (0..3).map(|a| lib.join(format!("Artist {a:02}"))).collect();
+
+    // A file's content changes in place (a retag): its folder's mtime stays.
+    let touched = files.iter().find(|p| p.starts_with(&tops[1])).unwrap().clone();
+    let file = fs::File::options().write(true).open(&touched).unwrap();
+    file.set_modified(SystemTime::now() + Duration::from_secs(120)).unwrap();
+    drop(file);
+
+    let (entered_tx, entered_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let reader: IndexTagReader = {
+        let (entered_tx, release_rx, real) = (Mutex::new(entered_tx), Mutex::new(release_rx), default_tag_reader());
+        Arc::new(move |path: &Path, stamp| {
+            let _ = entered_tx.lock().unwrap().send(());
+            let _ = release_rx.lock().unwrap().recv_timeout(Duration::from_secs(20));
+            real(path, stamp)
+        })
+    };
+    let run = spawn(&db_path, config(vec![lib.clone()]), reader);
+    entered_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the touched file is read");
+    {
+        let db = AnalysisDatabase::open_at(&db_path).unwrap();
+        assert!(trusted(&db, &lib), "the root keeps its mark during the pass");
+        for top in &tops {
+            assert!(trusted(&db, top), "{} keeps its mark", top.display());
+        }
+    }
+    drop(release_tx);
+    run.wait_state(IndexState::Done);
+    let snap = run.finish();
+    assert_eq!((snap.read, snap.unchanged), (1, files.len() - 1));
+    let db = AnalysisDatabase::open_at(&db_path).unwrap();
+    assert!(trusted(&db, &lib) && tops.iter().all(|t| trusted(&db, t)));
 }

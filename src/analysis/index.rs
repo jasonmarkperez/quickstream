@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::db::{walk_skips, AnalysisDatabase, IndexedDir, TrackFeatures};
+use super::db::{mtime_nanos, walk_skips, AnalysisDatabase, IndexedDir, TrackFeatures};
 use super::worker::{stamp_of, tag_features, TagReadError};
 use crate::library::SeenPaths;
 use crate::metadata::is_supported_audio_file;
@@ -299,6 +299,13 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// A folder's own mtime as the index records it with a subtree mark ([`mtime_nanos`]): what a
+/// mix compares with the recorded one (`!=`) to tell whether the folder changed since its
+/// subtree was walked. `None` when it can't be read.
+pub fn folder_mtime(dir: &Path) -> Option<i64> {
+    std::fs::metadata(dir).ok()?.modified().ok().and_then(mtime_nanos)
+}
+
 /// A folder's audio files and subfolders, as the walk takes them.
 #[derive(Default)]
 struct Listing {
@@ -306,10 +313,12 @@ struct Listing {
     dirs: Vec<PathBuf>,
 }
 
-/// One root of a pass: whether its own files and every top-level folder under it came out whole.
+/// One root of a pass: whether its own files and every top-level folder under it came out whole,
+/// and its mtime when it was listed (the subtree mark is recorded for it).
 struct RootPlan {
     root: PathBuf,
     whole: bool,
+    mtime: Option<i64>,
 }
 
 struct Indexer<'a> {
@@ -473,14 +482,16 @@ impl Indexer<'_> {
     }
 
     /// List `dir`, index its files and record it. Returns the listing (empty when it failed),
-    /// whether its own files are whole, or `None` when stopped.
-    fn index_dir(&self, dir: &Path) -> Option<(Listing, bool)> {
+    /// whether its own files are whole and the folder's mtime as seen just before the listing
+    /// (what its subtree mark is recorded for), or `None` when stopped.
+    fn index_dir(&self, dir: &Path) -> Option<(Listing, bool, Option<i64>)> {
         if !self.hold() {
             return None;
         }
-        // A file added in the second the folder is listed may not be in the listing: the record
-        // is dated a second earlier, so a folder changed then reads as changed (the mix walks it).
-        let listed_at = now_secs().saturating_sub(1);
+        // The folder's mtime first, then its listing: an entry added after the stat changes the
+        // mtime again, so the recorded one never vouches for an entry the listing missed.
+        let mtime = self.timed("stat", dir, || folder_mtime(dir));
+        let listed_at = now_secs();
         let (listing, ok) = match self.list(dir) {
             Ok(listing) => (listing, true),
             Err(e) => {
@@ -492,12 +503,14 @@ impl Indexer<'_> {
             return None;
         }
         let own = self.index_files(dir, &listing.files, listed_at, ok)?;
-        Some((listing, own))
+        Some((listing, own && mtime.is_some(), mtime))
     }
 
-    /// Record whether `dir` and everything under it are indexed.
-    fn set_subtree(&self, dir: &Path, whole: bool) {
-        if let Err(e) = self.db.set_subtree_complete(dir, whole) {
+    /// Record whether `dir` and everything under it are indexed: whole as of the folder mtime
+    /// `mtime` (seen when this walk listed it), or not.
+    fn set_subtree(&self, dir: &Path, whole: bool, mtime: Option<i64>) {
+        let whole_at = if whole { mtime } else { None };
+        if let Err(e) = self.db.set_subtree_complete(dir, whole_at) {
             crate::log_warn!("index", "Couldn't record '{}': {e}", dir.display());
         }
     }
@@ -508,7 +521,7 @@ impl Indexer<'_> {
         if let Some(&whole) = self.walked.get(dir) {
             return Some(whole);
         }
-        let (listing, own) = self.index_dir(dir)?;
+        let (listing, own, mtime) = self.index_dir(dir)?;
         let mut whole = own;
         if !listing.dirs.is_empty() && depth >= self.cfg.max_depth {
             // Too deep to walk: what is under it is not indexed.
@@ -518,7 +531,7 @@ impl Indexer<'_> {
                 whole &= self.walk_tree(sub, depth + 1)?;
             }
         }
-        self.set_subtree(dir, whole);
+        self.set_subtree(dir, whole, mtime);
         Some(whole)
     }
 
@@ -533,13 +546,17 @@ impl Indexer<'_> {
         let mut plans = Vec::new();
         let mut queue: VecDeque<(usize, PathBuf)> = VecDeque::new();
         for root in self.cfg.roots.clone() {
-            let Some((mut listing, own)) = self.index_dir(&root) else {
+            let Some((mut listing, own, mtime)) = self.index_dir(&root) else {
                 return false;
             };
             rng.shuffle(&mut listing.dirs);
             self.progress.top_total.fetch_add(listing.dirs.len(), Ordering::SeqCst);
             let at = plans.len();
-            plans.push(RootPlan { root, whole: own });
+            plans.push(RootPlan {
+                root,
+                whole: own,
+                mtime,
+            });
             queue.extend(listing.dirs.into_iter().map(|dir| (at, dir)));
         }
 
@@ -560,7 +577,7 @@ impl Indexer<'_> {
             self.progress.top_done.fetch_add(1, Ordering::SeqCst);
         }
         for plan in &plans {
-            self.set_subtree(&plan.root, plan.whole);
+            self.set_subtree(&plan.root, plan.whole, plan.mtime);
         }
         true
     }

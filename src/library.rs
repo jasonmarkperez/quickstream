@@ -267,11 +267,11 @@ const MIX_SCAN_THREADS: usize = 4;
 const TAG_READS_PER_FOLDER: usize = 4;
 
 /// A folder a profile mix gathers from: walked, or drawn from the library index (#41) unless
-/// it changed since the index walked it (`walked_at`, seconds).
+/// its mtime is no longer the one its subtree mark was recorded for (`dir_mtime`).
 #[derive(Clone, Copy)]
 enum FolderJob<'a> {
     Walk(&'a Path),
-    Index(&'a Path, u64),
+    Index(&'a Path, i64),
 }
 
 /// What a mix worker gathered from one folder: tracks (each with whether it matched the
@@ -317,17 +317,6 @@ fn cached_tags(
         }
     }
     Some(meta)
-}
-
-/// A folder's mtime in seconds, `None` when it can't be read.
-fn folder_mtime(dir: &Path) -> Option<u64> {
-    fs::metadata(dir)
-        .ok()?
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_secs())
 }
 
 /// The tracks a profile mix sends for analysis (issue #30): its matched candidates first, then
@@ -1081,9 +1070,13 @@ impl LibraryManager {
                 };
 
                 // An indexed folder, drawn from its rows without opening a file: one stat of the
-                // folder itself, and one of each row's file it offers. A folder changed since the
-                // index walked it (an album added, say: its mtime is newer than `walked_at`) is
-                // walked instead, so new files are never invisible to the mix.
+                // folder itself, and one of each row's file it offers. A folder whose mtime is not
+                // the one its subtree mark was recorded for (an album added, say) is walked
+                // instead. The mtimes are compared for equality, the share's own clock against
+                // itself, so a share whose clock is behind ours still has its changes seen. Only
+                // this folder's own mtime is checked: a file added deeper (a CD2 folder inside an
+                // album already indexed) leaves it as it was, and reaches mixes from the index
+                // once the indexer's next pass (each launch, then every 6 h) has read it.
                 //
                 // The rows, to the walk's depth and shuffled, are judged as walked tracks would
                 // be, and at most `per_subdir` matches and `TAG_READS_PER_FOLDER` others are
@@ -1093,11 +1086,11 @@ impl LibraryManager {
                 // file as that check found it; a file changed since it was indexed keeps its place
                 // (judged on its row, as a walked file's stale row is) and goes out for analysis.
                 let index_folder = |dir: &Path,
-                                    walked_at: u64,
+                                    dir_mtime: i64,
                                     rng: &mut crate::queue::FastRng,
                                     halt: &AtomicBool|
                  -> Option<FolderGathered> {
-                    if folder_mtime(dir).is_none_or(|mtime| mtime > walked_at) {
+                    if crate::analysis::index::folder_mtime(dir) != Some(dir_mtime) {
                         return walk_folder(dir, rng, halt);
                     }
                     let mut rows = db.tracks_under(dir, 3);
@@ -1186,8 +1179,8 @@ impl LibraryManager {
                                     };
                                     let gathered = match *job {
                                         FolderJob::Walk(dir) => walk_folder(dir, &mut rng, halt),
-                                        FolderJob::Index(dir, walked_at) => {
-                                            index_folder(dir, walked_at, &mut rng, halt)
+                                        FolderJob::Index(dir, dir_mtime) => {
+                                            index_folder(dir, dir_mtime, &mut rng, halt)
                                         }
                                     };
                                     let Some(gathered) = gathered else {
@@ -1253,10 +1246,10 @@ impl LibraryManager {
                 // the mix then draws from many more artists.
                 let max_folders = limits.max_folders.min(subdirs.len());
                 let visiting = &subdirs[..max_folders];
-                let walked_at = db.indexed_subtrees(visiting);
+                let indexed = db.indexed_subtrees(visiting);
                 let (index_jobs, walk_jobs): (Vec<FolderJob>, Vec<FolderJob>) = visiting
                     .iter()
-                    .map(|dir| match walked_at.get(dir) {
+                    .map(|dir| match indexed.get(dir) {
                         Some(&at) => FolderJob::Index(dir, at),
                         None => FolderJob::Walk(dir),
                     })
