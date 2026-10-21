@@ -287,8 +287,8 @@ fn a_half_indexed_library_draws_from_both_halves_within_the_folder_limit() {
     assert!(counter(&run.gathered, "tag_reads") <= 4 * folders, "{}", run.gathered);
 }
 
-/// Index rows are never pruned, so a row can outlive its file: every index-sourced track is
-/// checked just before it is sent, and a missing one is dropped (and counted).
+/// Index rows are never pruned, so a row can outlive its file: every row is checked before it is
+/// offered to the mix, and a missing one is dropped (and counted).
 #[test]
 fn a_missing_indexed_file_is_never_sent() {
     common::isolate();
@@ -466,4 +466,52 @@ fn index_sourced_mixes_keep_the_artist_cooldown() {
             );
         }
     }
+}
+
+/// A row whose file is gone never takes a place in the mix: it is checked before it is offered,
+/// so it neither counts toward the 80 matches nor gets a queue position the cooldowns count on.
+/// Each of 70 folders holds 3 matching rows, one of them for a deleted file; the mix still
+/// sends 60 tracks with section 4's artist cooldown intact (PR #145 review).
+#[test]
+fn missing_indexed_files_never_hold_a_place_in_the_mix() {
+    common::isolate();
+    let lib = library("phantoms");
+    let db = AnalysisDatabase::open_in_memory().unwrap();
+    let mut gone = HashSet::new();
+    for a in 0..70 {
+        let folder = lib.join(format!("Artist {a:02}"));
+        let files = tracks(&folder, 3);
+        let rows: Vec<TrackFeatures> = files
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                row(
+                    p,
+                    &format!("Artist {a:02}"),
+                    &format!("Album {a}-{i}"),
+                    "House",
+                    Some(120.0),
+                )
+            })
+            .collect();
+        index_folder(&db, &folder, &rows);
+        fs::remove_file(&files[0]).unwrap();
+        gone.insert(files[0].clone());
+    }
+
+    let run = run_mix(&lib, &db, bpm_flow(), ProfileScanLimits::default());
+    assert!(run.tracks.iter().all(|t| !gone.contains(t)), "{:?}", run.tracks);
+    assert_eq!(run.tracks.len(), 60, "the mix is not cut short: {}", run.complete);
+    let artist = |p: &PathBuf| p.parent().unwrap().file_name().unwrap().to_string_lossy().to_string();
+    for (i, track) in run.tracks.iter().enumerate() {
+        for later in run.tracks.iter().skip(i + 1).take(8) {
+            assert_ne!(
+                artist(track),
+                artist(later),
+                "artist repeats within 8 at {i}: {:?}",
+                run.tracks
+            );
+        }
+    }
+    assert!(run.candidates.iter().all(|t| !gone.contains(t)), "{:?}", run.candidates);
 }

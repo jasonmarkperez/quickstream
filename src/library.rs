@@ -895,9 +895,6 @@ impl LibraryManager {
             // the rest of the mix is sequenced to follow it.
             let mut first_sent: Option<AudioMetadata> = None;
             let over_budget = || scan_start.elapsed() >= limits.time_budget;
-            // Tracks drawn from the library index: their files are checked just before they are
-            // sent, since index rows are never pruned (#41).
-            let mut index_sourced: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
             if !subdirs.is_empty() {
                 let per_subdir = if subdirs.len() >= 60 {
@@ -934,32 +931,19 @@ impl LibraryManager {
                 let mut take_folder = |metas: Vec<GatheredTrack>| -> (bool, usize, usize) {
                     let mut artist_match_count = 0;
                     for (meta, stamp, indexed) in metas {
-                        let from_index = indexed.is_some();
                         if is_match(&meta, stamp, indexed.as_ref()) {
-                            if first_sent.is_none() {
-                                if from_index && !still_a_file(&meta.filepath) {
-                                    MixScanStats::count(&stats.index_missing);
-                                    continue;
-                                }
-                                if tx.send(AutopilotEvent::Track(meta.clone())).is_ok() {
-                                    total_sent += 1;
-                                    first_sent = Some(meta);
-                                    artist_match_count += 1;
-                                    continue;
-                                }
+                            if first_sent.is_none() && tx.send(AutopilotEvent::Track(meta.clone())).is_ok() {
+                                total_sent += 1;
+                                first_sent = Some(meta);
+                                artist_match_count += 1;
+                                continue;
                             }
                             if artist_match_count < per_subdir && matched_candidates.len() < 120 {
-                                if from_index {
-                                    index_sourced.insert(meta.filepath.clone());
-                                }
                                 matched_candidates.push(meta.clone());
                                 all_candidates.push(meta);
                                 artist_match_count += 1;
                             }
                         } else if all_candidates.len() < 200 {
-                            if from_index {
-                                index_sourced.insert(meta.filepath.clone());
-                            }
                             all_candidates.push(meta);
                         }
                     }
@@ -1006,15 +990,20 @@ impl LibraryManager {
                                 Self::metadata_from_row(&path, row.clone(), row.file_size)
                             }
                         };
-                        if is_match_untimed(&meta, Some(&row)) {
-                            if matches >= per_subdir {
-                                continue;
-                            }
+                        let matched = is_match_untimed(&meta, Some(&row));
+                        if (matched && matches >= per_subdir) || (!matched && others >= TAG_READS_PER_FOLDER) {
+                            continue;
+                        }
+                        // Index rows outlive deleted files, so each row is checked before it is
+                        // offered (a stat, no file opened): a missing one takes no quota, no
+                        // match toward the 80 and no queue position the cooldowns count on.
+                        if !still_a_file(&row.filepath) {
+                            MixScanStats::count(&stats.index_missing);
+                            continue;
+                        }
+                        if matched {
                             matches += 1;
                         } else {
-                            if others >= TAG_READS_PER_FOLDER {
-                                continue;
-                            }
                             others += 1;
                         }
                         let stamp = Some((row.mtime, row.file_size));
@@ -1258,12 +1247,6 @@ impl LibraryManager {
             for track in sequenced {
                 if stop_flag.load(Ordering::Relaxed) {
                     return;
-                }
-                // Index rows outlive deleted files: each index-sourced track (at most the mix's
-                // 60) is checked just before it goes out.
-                if index_sourced.contains(&track.filepath) && !still_a_file(&track.filepath) {
-                    MixScanStats::count(&stats.index_missing);
-                    continue;
                 }
                 if tx.send(AutopilotEvent::Track(track)).is_ok() {
                     total_sent += 1;

@@ -1033,3 +1033,76 @@ fn autopilot_candidates_reach_the_analysis_worker_but_not_the_queue() {
     assert_eq!(app.analysis_db.get_track(&a).and_then(|f| f.bpm), Some(118.0));
     let _ = fs::remove_dir_all(&music);
 }
+
+/// A tag read that fails with an I/O error (a share returning EIO, here a file the process may
+/// not read) stores nothing, even when the acoustic pass would succeed: it must never replace a
+/// good tag-only index row with path heuristics and a current stamp (PR #145 review).
+#[cfg(unix)]
+#[test]
+fn test_worker_keeps_an_index_row_when_the_tag_read_fails_with_an_io_error() {
+    common::isolate();
+    use std::os::unix::fs::PermissionsExt;
+    let music = scratch_dir("worker_tag_io_error");
+    let cache = scratch_dir("worker_tag_io_error_db");
+    let track = music.join("Some Artist - Some Song.wav");
+    write_wav(&track, &[0i16; 64]);
+    let md = fs::metadata(&track).unwrap();
+    let stamp = (
+        md.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        md.len(),
+    );
+
+    let db = AnalysisDatabase::open_at(&cache.join("track_analysis.db")).unwrap();
+    let indexed = TrackFeatures {
+        filepath: track.clone(),
+        mtime: stamp.0,
+        file_size: stamp.1,
+        title: "Index Title".to_string(),
+        artist: "Index Artist".to_string(),
+        genre: "Ambient".to_string(),
+        initial_key: Some("Am".to_string()),
+        camelot_key: Some("8A".to_string()),
+        needs_acoustic: true,
+        analyzed_at: 1,
+        ..Default::default()
+    };
+    db.write_index_batch(std::slice::from_ref(&indexed), None).unwrap();
+
+    fs::set_permissions(&track, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::File::open(&track).is_ok() {
+        eprintln!("running with permission to read any file; skipping");
+        fs::set_permissions(&track, fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = fs::remove_dir_all(&music);
+        let _ = fs::remove_dir_all(&cache);
+        return;
+    }
+    // ffmpeg answers with audio whatever the file, as it would a moment after the share recovers.
+    let log = cache.join("calls.log");
+    let ffmpeg = fake_ffmpeg(
+        &cache,
+        &log,
+        &format!("head -c {} /dev/zero\nexit 0", TEN_SECONDS_PCM_BYTES),
+    );
+    let cfg = FfmpegConfig {
+        binary: ffmpeg,
+        ..FfmpegConfig::default()
+    };
+    let mut worker = AnalysisWorker::spawn_with_ffmpeg(db.clone(), 1, cfg);
+    worker.enqueue(vec![track.clone()]);
+    let idle = worker.wait_until_idle(Duration::from_secs(20));
+    worker.shutdown();
+    fs::set_permissions(&track, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(idle, "worker did not finish");
+
+    let row = db.get_track(&track).unwrap();
+    assert_eq!(
+        (row.title.as_str(), row.artist.as_str(), row.genre.as_str()),
+        ("Index Title", "Index Artist", "Ambient"),
+        "the index row is kept"
+    );
+    assert_eq!(row.camelot_key.as_deref(), Some("8A"));
+    assert!(row.needs_acoustic, "still waiting for a full analysis");
+    assert_eq!(worker.progress().analyzed, 0);
+    let _ = fs::remove_dir_all(&music);
+    let _ = fs::remove_dir_all(&cache);
+}

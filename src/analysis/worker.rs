@@ -467,7 +467,8 @@ fn features_from_tags(path: &Path, (mtime, file_size): (u64, u64), tags: TagInfo
 /// Why [`analyze_track`] produced no features. None of these may be persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisError {
-    /// The path is missing or not a regular file.
+    /// The path is missing or not a regular file, or its tags couldn't be read (an I/O error,
+    /// not a file that parses badly).
     Unreadable,
     /// `cancel` was raised before the analysis finished.
     Cancelled,
@@ -489,8 +490,21 @@ fn analyze_track_with(
 ) -> Result<TrackFeatures, AnalysisError> {
     let cancelled = || cancel.is_some_and(|c| c.load(Ordering::SeqCst));
     let stamp = file_stamp(path).ok_or(AnalysisError::Unreadable)?;
-    // As before #41, tags that can't be read leave the path fallbacks and the acoustic pass.
-    let tags = read_tags_checked(path).unwrap_or_default();
+    // A file that parses badly gets its path fallbacks and the acoustic pass. One that can't be
+    // read (an SMB share returning EIO or ETIMEDOUT) stores nothing: path heuristics with a
+    // current stamp would never be read again, and would replace a good tag-only index row.
+    let tags = match read_tags_checked(path) {
+        Ok(tags) => tags,
+        Err(TagReadError::Io(e)) => {
+            crate::log_info!(
+                "analysis",
+                "Couldn't read the tags of '{}' ({}); will retry later",
+                path.display(),
+                e
+            );
+            return Err(AnalysisError::Unreadable);
+        }
+    };
     let mut features = features_from_tags(path, stamp, tags);
 
     if features.bpm.is_none() {
