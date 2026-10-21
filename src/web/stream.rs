@@ -1834,6 +1834,15 @@ impl SilencePacer {
     }
 }
 
+/// Whether a pass with nothing to decode skips its silence: only while it `waits` (on a file
+/// check, or to try a decoder again), no silence runs yet and the renderer still has the audio
+/// before it to play. Silence that runs goes on every tick, paced from its own start: `lead`
+/// forgives the time a renderer ran dry, so after a pass that ran late (a loaded machine) it
+/// would hold silence off for about as long, then send it all at once (#139).
+fn holds_off_silence(waits: bool, silence: &Option<SilencePacer>, lead: &mut RendererLead) -> bool {
+    waits && silence.is_none() && !lead.running_dry()
+}
+
 /// Send the silence due now through `silence`, started if it wasn't running. Returns false, and
 /// logs it with `doing`, when the write failed: the renderer has gone.
 fn send_silence(
@@ -2169,7 +2178,7 @@ pub(super) fn serve_continuous_stream(
             // A check that is merely slow (a track's end on a slow share) writes no silence while
             // the renderer still has the audio before it to play: silence only as that runs out,
             // so the next track follows gaplessly once the check answers.
-            if waiting_on_checks && !lead.running_dry() {
+            if holds_off_silence(waiting_on_checks, &silence, &mut lead) {
                 wait_out_tick(pass_started);
                 continue;
             }
@@ -2270,7 +2279,7 @@ pub(super) fn serve_continuous_stream(
                 // No thread to read it (the system is short of them): the decoder may well decode
                 // the file, so the track is tried again (below, as after a read error), not
                 // counted as one that gave no audio. Once a tick has passed, with silence if the
-                // renderer is running out, so the tries are paced.
+                // renderer is running out or silence already runs, so the tries are paced.
                 if !spawn_failure_logged {
                     crate::log_warn!(
                         "web",
@@ -2279,7 +2288,7 @@ pub(super) fn serve_continuous_stream(
                     );
                     spawn_failure_logged = true;
                 }
-                if !lead.running_dry() {
+                if holds_off_silence(true, &silence, &mut lead) {
                     wait_out_tick(pass_started);
                 } else if !send_silence(
                     &mut silence,
@@ -2530,5 +2539,61 @@ mod tests {
             DecoderOutput::Failed(e) => panic!("an interrupted read failed the decoder: {}", e),
         }
         assert!(matches!(next(), DecoderOutput::End));
+    }
+
+    /// One pass of the stream with nothing to decode while it waits on a file check, writing to
+    /// `sink`. Returns whether it sent silence.
+    fn check_wait_pass(sink: &mut Vec<u8>, silence: &mut Option<SilencePacer>, lead: &mut RendererLead) -> bool {
+        let pass_started = Instant::now();
+        if holds_off_silence(true, silence, lead) {
+            wait_out_tick(pass_started);
+            return false;
+        }
+        assert!(send_silence(silence, sink, lead, pass_started, "in the test"));
+        true
+    }
+
+    /// Silence sent while a file check hangs goes on every tick after a pass that ran late (a
+    /// loaded machine), as before #133: the renderer's estimated lead, which forgives the time it
+    /// ran dry, never holds it off once it runs, so it isn't sent in bursts that leave the
+    /// renderer waiting (#139 CI).
+    #[test]
+    fn test_silence_waiting_on_a_file_check_goes_on_every_tick_after_a_late_pass() {
+        let (mut sink, mut silence, mut lead) = (Vec::new(), None, RendererLead::new());
+        assert!(
+            check_wait_pass(&mut sink, &mut silence, &mut lead),
+            "silence as the wait begins"
+        );
+        for _ in 0..3 {
+            check_wait_pass(&mut sink, &mut silence, &mut lead);
+        }
+        // The stream runs late: a renderer playing at real time ran dry meanwhile.
+        std::thread::sleep(Duration::from_millis(400));
+        for pass in 0..20 {
+            let before = sink.len();
+            assert!(
+                check_wait_pass(&mut sink, &mut silence, &mut lead) && sink.len() > before,
+                "pass {} after the late one sent no silence",
+                pass
+            );
+        }
+    }
+
+    /// Before any silence runs, a pass waiting on a file check holds it off while the renderer
+    /// still has the audio before it, so the next track follows gaplessly.
+    #[test]
+    fn test_a_file_check_holds_off_silence_while_the_renderer_has_audio() {
+        let mut lead = RendererLead::new();
+        lead.write(&mut Vec::new(), &vec![0u8; pcm_bytes(Duration::from_secs(2)) as usize])
+            .unwrap();
+        assert!(holds_off_silence(true, &None, &mut lead));
+        assert!(
+            !holds_off_silence(false, &None, &mut lead),
+            "only while waiting on a check"
+        );
+        assert!(
+            !holds_off_silence(true, &Some(SilencePacer::new()), &mut lead),
+            "not once silence runs"
+        );
     }
 }
