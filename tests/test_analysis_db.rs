@@ -684,13 +684,15 @@ fn test_indexed_subtrees_and_index_stamps() {
     let asked = vec![PathBuf::from("/m/A"), PathBuf::from("/m/B"), PathBuf::from("/m/C")];
     let indexed = db.indexed_subtrees(&asked);
     assert_eq!(indexed.len(), 2);
-    assert!(indexed.contains(Path::new("/m/A")) && indexed.contains(Path::new("/m/B")));
+    // Each with when its record was walked.
+    assert_eq!(indexed.get(Path::new("/m/A")), Some(&77));
+    assert_eq!(indexed.get(Path::new("/m/B")), Some(&77));
 
     // Written again as incomplete (a read failed), the folder's subtree is no longer complete.
     db.write_index_batch(&[], Some(&dir_record("/m/B", 1, false))).unwrap();
     let indexed = db.indexed_subtrees(&asked);
     assert_eq!(indexed.len(), 1);
-    assert!(indexed.contains(Path::new("/m/A")));
+    assert!(indexed.contains_key(Path::new("/m/A")));
 
     let stamps = db.index_stamps(&[PathBuf::from("/m/A/1.flac"), PathBuf::from("/m/A/none.flac")]);
     assert_eq!(stamps.len(), 1);

@@ -3,7 +3,7 @@
 
 use rusqlite::{params, Connection, Result, Row, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -486,20 +486,19 @@ impl AnalysisDatabase {
         Ok(changed > 0)
     }
 
-    /// The folders among `dirs` whose whole subtree is indexed.
-    pub fn indexed_subtrees(&self, dirs: &[PathBuf]) -> HashSet<PathBuf> {
+    /// The folders among `dirs` whose whole subtree is indexed, each with when its own record was
+    /// last walked (`walked_at`, seconds), so a reader can tell whether the folder changed since.
+    pub fn indexed_subtrees(&self, dirs: &[PathBuf]) -> HashMap<PathBuf, u64> {
         let conn = self.conn.lock().unwrap();
-        let mut out = HashSet::new();
-        let Ok(mut stmt) = conn.prepare_cached("SELECT subtree_complete FROM library_index_dirs WHERE dirpath = ?1")
+        let mut out = HashMap::new();
+        let Ok(mut stmt) = conn
+            .prepare_cached("SELECT walked_at FROM library_index_dirs WHERE dirpath = ?1 AND subtree_complete != 0")
         else {
             return out;
         };
         for dir in dirs {
-            let complete = stmt
-                .query_row(params![dir_key(dir)], |r| r.get::<_, i64>(0))
-                .is_ok_and(|v| v != 0);
-            if complete {
-                out.insert(dir.clone());
+            if let Ok(walked_at) = stmt.query_row(params![dir_key(dir)], |r| r.get::<_, i64>(0)) {
+                out.insert(dir.clone(), walked_at.max(0) as u64);
             }
         }
         out

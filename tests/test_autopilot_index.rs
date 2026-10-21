@@ -18,6 +18,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use quickstream::analysis::db::IndexedDir;
 use quickstream::analysis::{AnalysisDatabase, MixProfile, MoodType, TrackFeatures};
 use quickstream::library::{AutopilotEvent, LibraryManager, MetadataCache, ProfileScanLimits};
+use quickstream::metadata::AudioMetadata;
 
 /// Mixes that read the log run one at a time, so their lines don't interleave.
 static LOG_LOCK: Mutex<()> = Mutex::new(());
@@ -76,13 +77,25 @@ fn row(path: &Path, artist: &str, album: &str, genre: &str, bpm: Option<f64>) ->
     }
 }
 
-/// Record `folder` as indexed: its rows, its folder record, and its subtree marked complete.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Record `folder` as indexed now: its rows, its folder record, and its subtree marked complete.
 fn index_folder(db: &AnalysisDatabase, folder: &Path, rows: &[TrackFeatures]) {
+    index_folder_at(db, folder, rows, now_secs());
+}
+
+/// Record `folder` as indexed at `walked_at` (seconds).
+fn index_folder_at(db: &AnalysisDatabase, folder: &Path, rows: &[TrackFeatures], walked_at: u64) {
     let record = IndexedDir {
         dirpath: folder.to_path_buf(),
         audio_files: rows.len(),
         complete: true,
-        walked_at: 1,
+        walked_at,
     };
     db.write_index_batch(rows, Some(&record)).unwrap();
     assert!(db.set_subtree_complete(folder, true).unwrap());
@@ -108,12 +121,23 @@ fn bpm_flow() -> MixProfile {
 
 struct MixRun {
     tracks: Vec<PathBuf>,
+    metas: Vec<AudioMetadata>,
     candidates: Vec<PathBuf>,
     gathered: String,
     complete: String,
 }
 
 fn run_mix(dir: &Path, db: &AnalysisDatabase, profile: MixProfile, limits: ProfileScanLimits) -> MixRun {
+    run_mix_with_cache(dir, db, profile, limits, MetadataCache::default())
+}
+
+fn run_mix_with_cache(
+    dir: &Path,
+    db: &AnalysisDatabase,
+    profile: MixProfile,
+    limits: ProfileScanLimits,
+    cache: MetadataCache,
+) -> MixRun {
     let _serial = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let log_path = quickstream::logger::init();
     quickstream::logger::flush();
@@ -125,7 +149,7 @@ fn run_mix(dir: &Path, db: &AnalysisDatabase, profile: MixProfile, limits: Profi
         LibraryManager::scan_directory_autopilot_with_profile_limits(
             scan_dir,
             Vec::new(),
-            MetadataCache::default(),
+            cache,
             profile,
             scan_db,
             tx,
@@ -133,12 +157,13 @@ fn run_mix(dir: &Path, db: &AnalysisDatabase, profile: MixProfile, limits: Profi
             limits,
         )
     });
-    let (mut sent, mut candidates, mut finished) = (Vec::new(), Vec::new(), false);
+    let (mut sent, mut metas, mut candidates, mut finished) = (Vec::new(), Vec::new(), Vec::new(), false);
     while let Ok(event) = rx.recv_timeout(Duration::from_secs(60)) {
         match event {
             AutopilotEvent::Track(meta) => {
                 assert!(candidates.is_empty(), "tracks come before the candidates");
-                sent.push(meta.filepath);
+                sent.push(meta.filepath.clone());
+                metas.push(meta);
             }
             AutopilotEvent::Candidates(paths) => candidates = paths,
             AutopilotEvent::Finished(count) => {
@@ -160,6 +185,7 @@ fn run_mix(dir: &Path, db: &AnalysisDatabase, profile: MixProfile, limits: Profi
     };
     MixRun {
         tracks: sent,
+        metas,
         candidates,
         gathered: line("[autopilot] candidates gathered"),
         complete: line("[autopilot] mix complete"),
@@ -455,6 +481,8 @@ fn index_sourced_mixes_keep_the_artist_cooldown() {
     // 70 folders: 2 matches each, and gathering stops once 80 wait in the pool (the first
     // match went out at once).
     assert_eq!(counter(&run.gathered, "index_folders"), 41, "{}", run.gathered);
+    // The matches taken: the first sent, and 81 in the pool.
+    assert_eq!(counter(&run.gathered, "index_matches"), 82, "{}", run.gathered);
     let artist = |p: &PathBuf| p.parent().unwrap().file_name().unwrap().to_string_lossy().to_string();
     for (i, track) in run.tracks.iter().enumerate() {
         for later in run.tracks.iter().skip(i + 1).take(8) {
@@ -514,4 +542,187 @@ fn missing_indexed_files_never_hold_a_place_in_the_mix() {
         }
     }
     assert!(run.candidates.iter().all(|t| !gone.contains(t)), "{:?}", run.candidates);
+}
+
+/// Make `path` a different file than the one indexed: a few more bytes, so its size changes.
+fn change_file(path: &Path) {
+    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(&[0u8; 64]).unwrap();
+}
+
+/// An index row is current only for the file it was read from: the mix judges it against the
+/// stamp of its own check of the file, so a file changed since it was indexed goes out as a
+/// candidate for analysis, while an unchanged complete row does not (PR #145 review).
+#[test]
+fn a_file_changed_since_it_was_indexed_goes_out_for_analysis() {
+    common::isolate();
+    let lib = library("changed");
+    let db = AnalysisDatabase::open_in_memory().unwrap();
+    let mut changed = HashSet::new();
+    let mut unchanged = HashSet::new();
+    for a in 0..25 {
+        let folder = lib.join(format!("Artist {a:02}"));
+        let files = tracks(&folder, 5);
+        let artist = format!("Artist {a:02}");
+        let mut rows: Vec<TrackFeatures> = files[..3]
+            .iter()
+            .enumerate()
+            .map(|(i, p)| row(p, &artist, &format!("Album {a}-{i}"), "", Some(120.0)))
+            .collect();
+        // Two complete rows that don't match: one file stays as indexed, one changes after.
+        rows.push(row(&files[3], &artist, "Other", "", Some(90.0)));
+        rows.push(row(&files[4], &artist, "Other", "", Some(90.0)));
+        index_folder(&db, &folder, &rows);
+        unchanged.insert(files[3].clone());
+        change_file(&files[4]);
+        changed.insert(files[4].clone());
+    }
+
+    let run = run_mix(&lib, &db, bpm_flow(), ProfileScanLimits::default());
+    // 75 matches (3 a folder): enough for the 60, so no other track is queued.
+    assert_eq!(run.tracks.len(), 60);
+    assert!(run
+        .tracks
+        .iter()
+        .all(|t| !changed.contains(t) && !unchanged.contains(t)));
+    for path in &changed {
+        assert!(
+            run.candidates.contains(path),
+            "{} changed since it was indexed: {:?}",
+            path.display(),
+            run.candidates
+        );
+    }
+    assert!(
+        run.candidates.iter().all(|c| !unchanged.contains(c)),
+        "an unchanged complete row is current"
+    );
+}
+
+/// For a file changed since it was indexed, the tags `MetadataCache` holds for the file as it is
+/// now (its size) are used, not the row's (PR #145 review).
+#[test]
+fn a_changed_indexed_file_takes_its_cached_tags_at_its_new_size() {
+    common::isolate();
+    let lib = library("changed_cache");
+    let db = AnalysisDatabase::open_in_memory().unwrap();
+    let folder = lib.join("Artist");
+    let files = tracks(&folder.join("Album"), 3);
+    let rows: Vec<TrackFeatures> = files
+        .iter()
+        .map(|p| row(p, "Artist", "Album", "House", Some(120.0)))
+        .collect();
+    index_folder(&db, &folder, &rows);
+    change_file(&files[0]);
+    let cache = MetadataCache::default();
+    cache.insert(AudioMetadata {
+        filepath: files[0].clone(),
+        filename: "00 Song.wav".to_string(),
+        title: "Fresh Title".to_string(),
+        artist: "Artist".to_string(),
+        duration_seconds: 300.0,
+        file_size: fs::metadata(&files[0]).unwrap().len(),
+        ..Default::default()
+    });
+
+    let run = run_mix_with_cache(&lib, &db, bpm_flow(), ProfileScanLimits::default(), cache);
+    assert_eq!(run.tracks.len(), 3, "{:?}", run.tracks);
+    let sent = run.metas.iter().find(|m| m.filepath == files[0]).unwrap();
+    assert_eq!(sent.title, "Fresh Title");
+    assert_eq!(sent.duration_seconds, 300.0);
+    assert_eq!(sent.file_size, fs::metadata(&files[0]).unwrap().len());
+}
+
+/// A folder changed since the index walked it (here a new album under an indexed artist: the
+/// artist folder's mtime is newer than its record's `walked_at`) is walked instead of drawn
+/// from its rows, so the new tracks reach the mix; a folder unchanged since is still drawn from
+/// the index (PR #145 review).
+#[test]
+fn a_folder_changed_since_it_was_indexed_is_walked() {
+    common::isolate();
+    let lib = library("new_album");
+    let db = AnalysisDatabase::open_in_memory().unwrap();
+    let fresh = lib.join("Fresh Artist");
+    let fresh_rows: Vec<TrackFeatures> = tracks(&fresh.join("Album"), 2)
+        .iter()
+        .map(|p| row(p, "Fresh Artist", "Album", "House", Some(120.0)))
+        .collect();
+    index_folder(&db, &fresh, &fresh_rows);
+
+    let grown = lib.join("Grown Artist");
+    let old_rows: Vec<TrackFeatures> = tracks(&grown.join("Old Album"), 2)
+        .iter()
+        .map(|p| row(p, "Grown Artist", "Old Album", "House", Some(120.0)))
+        .collect();
+    let new_album = tracks(&grown.join("New Album"), 2);
+    // Indexed before the new album came: its record is older than the folder's mtime.
+    let (grown_mtime, _) = stamp(&grown);
+    index_folder_at(&db, &grown, &old_rows, grown_mtime - 1);
+
+    let run = run_mix(&lib, &db, bpm_flow(), ProfileScanLimits::default());
+    assert_eq!(counter(&run.gathered, "index_folders"), 1, "{}", run.gathered);
+    assert_eq!(counter(&run.gathered, "folders"), 1, "{}", run.gathered);
+    assert_eq!(counter(&run.gathered, "files"), 4, "{}", run.gathered);
+    let reached: HashSet<&PathBuf> = run.tracks.iter().chain(&run.candidates).collect();
+    for path in &new_album {
+        assert!(reached.contains(path), "{} is new: {:?}", path.display(), reached);
+    }
+}
+
+/// The index rows' files are checked on the mix's worker threads, not one at a time on the
+/// scanner thread: with a check that waits until another runs beside it, the checks meet
+/// (PR #145 review: 500 folders of checks over SMB would spend most of the 20 s budget).
+#[test]
+fn index_rows_are_checked_on_several_threads() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Instant;
+    common::isolate();
+    let lib = library("parallel");
+    let db = AnalysisDatabase::open_in_memory().unwrap();
+    for a in 0..8 {
+        let folder = lib.join(format!("Artist {a}"));
+        let rows: Vec<TrackFeatures> = tracks(&folder, 4)
+            .iter()
+            .map(|p| row(p, &format!("Artist {a}"), &format!("Album {a}"), "House", Some(120.0)))
+            .collect();
+        index_folder(&db, &folder, &rows);
+    }
+
+    let (in_flight, peak, calls) = (
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let gave_up = Arc::new(AtomicBool::new(false));
+    let check: quickstream::library::IndexFileCheck = {
+        let (in_flight, peak, calls, gave_up) = (in_flight.clone(), peak.clone(), calls.clone(), gave_up.clone());
+        Arc::new(move |path: &Path| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while peak.load(Ordering::SeqCst) < 2 && !gave_up.load(Ordering::SeqCst) {
+                if Instant::now() >= deadline {
+                    gave_up.store(true, Ordering::SeqCst);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let found = fs::metadata(path)
+                .ok()
+                .filter(|md| md.is_file())
+                .map(|md| quickstream::analysis::worker::stamp_of(&md));
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            found
+        })
+    };
+    let limits = ProfileScanLimits {
+        index_check: Some(check),
+        ..ProfileScanLimits::default()
+    };
+    let run = run_mix(&lib, &db, bpm_flow(), limits);
+    assert!(!gave_up.load(Ordering::SeqCst), "the checks never ran side by side");
+    assert!(peak.load(Ordering::SeqCst) >= 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 32, "one check per row offered");
+    assert_eq!(run.tracks.len(), 32, "{}", run.gathered);
+    assert_eq!(counter(&run.gathered, "index_folders"), 8, "{}", run.gathered);
 }
