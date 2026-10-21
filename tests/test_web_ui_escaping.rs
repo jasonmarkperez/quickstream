@@ -235,6 +235,9 @@ fn hostile_state() -> NowPlayingState {
             is_active: i == 0,
         })
         .collect();
+    // Up Next from that queue: hostile titles and artists too.
+    s.queue_mode = "loop".to_string();
+    s.publish_up_next(false);
     s
 }
 
@@ -258,6 +261,9 @@ fn test_status_api_round_trips_hostile_names() {
     assert_eq!(got.output_device, want.output_device);
     assert_eq!(got.next_track_title, want.next_track_title);
     assert_eq!(got.queue, want.queue);
+    assert_eq!(got.up_next, want.up_next);
+    let listed: Vec<&str> = want.up_next.iter().map(|t| t.artist.as_str()).collect();
+    assert_eq!(listed, HOSTILE[1..=quickstream::web::WEB_UP_NEXT_LIMIT]);
     assert_eq!(got.devices, want.devices);
 }
 

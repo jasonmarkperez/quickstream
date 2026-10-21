@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use quickstream::settings::setting;
 use quickstream::web::{NowPlayingState, WebBrowserResponse, WebCommand, WebServer};
@@ -1102,7 +1102,11 @@ fn test_path_commands_outside_roots_are_rejected() {
     assert_eq!(status, 200);
     assert_eq!(
         rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-        WebCommand::SeedRadio(inside_file)
+        WebCommand::SeedRadio {
+            seed: inside_file,
+            preferred: None,
+            fallback: music.join("Album"),
+        }
     );
     // Path-less set_home still clears the home.
     let (status, _, _) = post_json(port, r#"{"action":"set_home"}"#);
@@ -1295,7 +1299,7 @@ fn test_remote_access_off_pages_name_the_setting() {
     );
 
     let mut page = Vec::new();
-    write_decision_response(&mut page, &decision, "/", TOKEN, PORT).unwrap();
+    write_decision_response(&mut page, &decision, "/", TOKEN, PORT, false).unwrap();
     let page = String::from_utf8(page).unwrap();
     assert!(page.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{}", page);
     assert!(page.contains("Content-Type: text/html"), "{}", page);
@@ -1303,7 +1307,7 @@ fn test_remote_access_off_pages_name_the_setting() {
 
     // The API keeps its JSON error, which the dashboard shows instead of OFFLINE.
     let mut api = Vec::new();
-    write_decision_response(&mut api, &decision, "/api/status", TOKEN, PORT).unwrap();
+    write_decision_response(&mut api, &decision, "/api/status", TOKEN, PORT, false).unwrap();
     let api = String::from_utf8(api).unwrap();
     assert!(api.contains("Content-Type: application/json"), "{}", api);
     assert!(
@@ -1311,6 +1315,46 @@ fn test_remote_access_off_pages_name_the_setting() {
         "{}",
         api
     );
+}
+
+/// The head of an answer (through the blank line) and its body.
+fn split_answer(answer: &[u8]) -> (String, Vec<u8>) {
+    let text = String::from_utf8_lossy(answer);
+    let end = text.find("\r\n\r\n").expect("a complete head") + 4;
+    (text[..end].to_string(), answer[end..].to_vec())
+}
+
+/// A HEAD request refused by the access checks gets the head a GET gets, with its
+/// `Content-Length`, and no body (issue #125): the 401 for an unpaired peer and the 403 for remote
+/// access off, on a page and on the API.
+#[test]
+fn test_head_refusals_have_the_get_head_and_no_body() {
+    common::isolate();
+    for decision in [AuthDecision::Unauthorized, AuthDecision::Forbidden(REMOTE_ACCESS_OFF)] {
+        for path in ["/", "/api/status"] {
+            let mut get = Vec::new();
+            write_decision_response(&mut get, &decision, path, TOKEN, PORT, false).unwrap();
+            let (get_head, get_body) = split_answer(&get);
+            assert!(!get_body.is_empty(), "{:?} {}: GET has a body", decision, path);
+            assert!(
+                get_head.contains(&format!("Content-Length: {}\r\n", get_body.len())),
+                "{:?} {}: {}",
+                decision,
+                path,
+                get_head
+            );
+
+            let mut head = Vec::new();
+            write_decision_response(&mut head, &decision, path, TOKEN, PORT, true).unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&head),
+                get_head,
+                "{:?} {}: the GET head and nothing after it",
+                decision,
+                path
+            );
+        }
+    }
 }
 
 #[test]
@@ -1491,6 +1535,316 @@ fn test_pathless_web_autopilot_refusal_status() {
     tx.send(WebCommand::Autopilot(music.clone())).unwrap();
     app.handle_web_commands();
     assert_eq!(app.autopilot_dir, Some(music.clone()));
+    app.reset_playback_session();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Web Seed Radio scans only inside the allowed folders (issue #126): the folder the terminal is
+/// browsing when it lies inside them, else the seed's own folder. The terminal's `r` still scans
+/// the browsed folder wherever it is.
+#[test]
+fn test_web_seed_radio_scans_the_terminal_folder_only_inside_the_allowed_folders() {
+    common::isolate();
+    let dir = temp_dir("seed_radio_folder");
+    let music = dir.join("Music");
+    let album = music.join("Album");
+    let other = music.join("Other");
+    let elsewhere = dir.join("Elsewhere");
+    for d in [&album, &other, &elsewhere] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let seed = album.join("a.mp3");
+    fs::write(&seed, b"x").unwrap();
+    // Launched in Music, which makes it the allowed folder.
+    let mut app = web_app(music.clone(), None);
+    app.player = Box::new(common::fake_player::FakePlayer::default());
+    let port = app.web_server.as_ref().expect("server running").port;
+    let body = format!(
+        r#"{{"action":"seed_radio","path":{}}}"#,
+        serde_json::to_string(&seed.to_string_lossy()).unwrap()
+    );
+    // The folder the mix the web request starts scans.
+    let web_seed_radio = |app: &mut quickstream::ui::AppUI, browsing: &Path| -> Option<PathBuf> {
+        app.browser_dir = browsing.to_path_buf();
+        app.update_web_state();
+        let (status, _, _) = post_json(port, &body);
+        assert_eq!(status, 200, "browsing {}", browsing.display());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.autopilot_dir.is_none() && Instant::now() < deadline {
+            app.handle_web_commands();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let scanned = app.autopilot_dir.clone();
+        app.reset_playback_session();
+        scanned
+    };
+
+    // The terminal browses a folder the web may not reach: the seed's folder instead.
+    assert_eq!(web_seed_radio(&mut app, &elsewhere), Some(album.clone()));
+    // Inside the allowed folders, the terminal's folder.
+    assert_eq!(web_seed_radio(&mut app, &other), Some(other.clone()));
+
+    // The terminal's own Seed Radio is not limited to the web's folders.
+    app.browser_dir = elsewhere.clone();
+    app.start_seed_radio(seed.clone());
+    assert_eq!(app.autopilot_dir, Some(elsewhere.clone()));
+    app.reset_playback_session();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The web thread picks the folders web Seed Radio scans (issue #126): the terminal's as it
+/// published it, when it resolves inside the allowed folders, and the seed's as the fallback,
+/// without a `PathRejected` for the terminal's folder. A seed outside them is refused as before.
+#[test]
+fn test_web_seed_radio_resolves_its_folder_on_the_web_thread() {
+    common::isolate();
+    let dir = temp_dir("seed_radio_web_thread");
+    let music = dir.join("Music");
+    let album = music.join("Album");
+    let jazz = music.join("Jazz");
+    let elsewhere = dir.join("Elsewhere");
+    for d in [&album, &jazz, &elsewhere] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let seed = album.join("a.mp3");
+    fs::write(&seed, b"x").unwrap();
+    let outside_seed = elsewhere.join("b.mp3");
+    fs::write(&outside_seed, b"x").unwrap();
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    state.write().unwrap().allowed_roots = vec![music.clone()];
+    let (handle, rx) = start(state.clone());
+    let port = handle.port;
+    let body = |seed: &Path| {
+        let path = serde_json::to_string(&seed.to_string_lossy()).unwrap();
+        format!(r#"{{"action":"seed_radio","path":{}}}"#, path)
+    };
+    let seed_radio = |preferred: Option<&Path>| WebCommand::SeedRadio {
+        seed: seed.clone(),
+        preferred: preferred.map(Path::to_path_buf),
+        fallback: album.clone(),
+    };
+
+    // The terminal hasn't published a folder, or browses one the web may not reach (or one that
+    // is gone): the seed's folder, and nothing is rejected.
+    for terminal in [None, Some(elsewhere.clone()), Some(music.join("Gone"))] {
+        state.write().unwrap().terminal_dir = terminal.clone();
+        let (status, _, _) = post_json(port, &body(&seed));
+        assert_eq!(status, 200, "{:?}", terminal);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            seed_radio(None),
+            "{:?}",
+            terminal
+        );
+        assert!(rx.try_recv().is_err(), "{:?}: nothing else is sent", terminal);
+    }
+
+    // Inside them (spelled with `..`): the terminal's folder as it published it, which the
+    // browser compares its own folder with.
+    let spelled = music.join("Album").join("..").join("Jazz");
+    state.write().unwrap().terminal_dir = Some(spelled.clone());
+    let (status, _, _) = post_json(port, &body(&seed));
+    assert_eq!(status, 200);
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        seed_radio(Some(&spelled))
+    );
+    // In Music Homes the terminal's `r` has no browsed folder, and neither has the web's.
+    {
+        let mut s = state.write().unwrap();
+        s.terminal_dir = Some(jazz.clone());
+        s.in_music_homes = true;
+    }
+    let (status, _, _) = post_json(port, &body(&seed));
+    assert_eq!(status, 200);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), seed_radio(None));
+    state.write().unwrap().in_music_homes = false;
+
+    // A seed outside them is refused, whatever the terminal browses.
+    let (status, _, _) = post_json(port, &body(&outside_seed));
+    assert_eq!(status, 403);
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        WebCommand::PathRejected(outside_seed.clone())
+    );
+    assert!(rx.try_recv().is_err(), "no Seed Radio for a seed outside");
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A web Seed Radio seed is an audio file inside the allowed folders, as `add_file` takes it
+/// (issue #126 review): an allowed folder itself, a folder in one or a file that isn't audio is
+/// refused with 400, and a link to a file outside them with 403, so the folder the station scans
+/// (the seed's) is never outside them, e.g. an allowed folder's parent.
+#[test]
+fn test_web_seed_radio_needs_an_audio_file_inside_the_allowed_folders() {
+    common::isolate();
+    let dir = temp_dir("seed_radio_seed");
+    let music = dir.join("Music");
+    let album = music.join("Album");
+    fs::create_dir_all(&album).unwrap();
+    let seed = album.join("a.mp3");
+    fs::write(&seed, b"x").unwrap();
+    let notes = album.join("notes.txt");
+    fs::write(&notes, b"x").unwrap();
+    // A link in an allowed folder to a file in its parent, outside.
+    let outside = dir.join("outside.mp3");
+    fs::write(&outside, b"x").unwrap();
+    let link = music.join("link.mp3");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    state.write().unwrap().allowed_roots = vec![music.clone()];
+    let (handle, rx) = start(state);
+    let port = handle.port;
+    let post = |seed: &Path| {
+        let path = serde_json::to_string(&seed.to_string_lossy()).unwrap();
+        let (status, _, body) = post_json(port, &format!(r#"{{"action":"seed_radio","path":{}}}"#, path));
+        (status, serde_json::from_slice::<serde_json::Value>(&body).unwrap())
+    };
+
+    for not_audio in [&music, &album, &notes] {
+        let (status, body) = post(not_audio);
+        assert_eq!(status, 400, "{}", not_audio.display());
+        assert_eq!(body["error"], "Not an audio file", "{}", not_audio.display());
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "{}: nothing is sent",
+            not_audio.display()
+        );
+    }
+
+    let (status, _) = post(&link);
+    assert_eq!(status, 403);
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        WebCommand::PathRejected(link.clone())
+    );
+    assert!(rx.try_recv().is_err(), "no Seed Radio for a link leading outside");
+
+    let (status, _) = post(&seed);
+    assert_eq!(status, 200);
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        WebCommand::SeedRadio {
+            seed: seed.clone(),
+            preferred: None,
+            fallback: album.clone(),
+        }
+    );
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The terminal's folder reached through a symlink is sent as the terminal names it (issue #126
+/// review), so the mix reuses the browser's listing and names the folder the browser shows; a
+/// link leading out of the allowed folders is passed over.
+#[test]
+fn test_web_seed_radio_sends_a_symlinked_terminal_folder_as_the_terminal_names_it() {
+    common::isolate();
+    let dir = temp_dir("seed_radio_symlink");
+    let music = dir.join("Music");
+    let album = music.join("Album");
+    let jazz = music.join("Jazz");
+    let elsewhere = dir.join("Elsewhere");
+    for d in [&album, &jazz, &elsewhere] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let seed = album.join("a.mp3");
+    fs::write(&seed, b"x").unwrap();
+    let jazz_link = music.join("JazzLink");
+    std::os::unix::fs::symlink(&jazz, &jazz_link).unwrap();
+    let out_link = music.join("OutLink");
+    std::os::unix::fs::symlink(&elsewhere, &out_link).unwrap();
+    // Launched in Music, which makes it the allowed folder.
+    let mut app = web_app(music.clone(), None);
+    app.player = Box::new(common::fake_player::FakePlayer::default());
+    let port = app.web_server.as_ref().expect("server running").port;
+    let body = format!(
+        r#"{{"action":"seed_radio","path":{}}}"#,
+        serde_json::to_string(&seed.to_string_lossy()).unwrap()
+    );
+
+    for (browsing, scanned) in [(&jazz_link, &jazz_link), (&out_link, &album)] {
+        app.browser_dir = browsing.clone();
+        app.update_web_state();
+        let (status, _, _) = post_json(port, &body);
+        assert_eq!(status, 200, "browsing {}", browsing.display());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.autopilot_dir.is_none() && Instant::now() < deadline {
+            app.handle_web_commands();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.wait_for_autopilot_scan(Duration::from_secs(5));
+        assert_eq!(
+            app.autopilot_dir.as_ref(),
+            Some(scanned),
+            "browsing {}",
+            browsing.display()
+        );
+        app.reset_playback_session();
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// In Music Homes the web follows the terminal's keys (issue #126 review): Seed Radio scans the
+/// seed's folder, as `r` there does, and Autopilot without a path the highlighted home, as `p`
+/// there does.
+#[test]
+fn test_web_seed_radio_and_autopilot_in_music_homes_follow_the_terminal_keys() {
+    common::isolate();
+    let dir = temp_dir("seed_radio_homes");
+    let music = dir.join("Music");
+    let album = music.join("Album");
+    let other = music.join("Other");
+    let jazz = dir.join("Jazz");
+    for d in [&album, &other, &jazz] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let seed = album.join("a.mp3");
+    fs::write(&seed, b"x").unwrap();
+    let mut app = web_app(music.clone(), None);
+    app.player = Box::new(common::fake_player::FakePlayer::default());
+    let port = app.web_server.as_ref().expect("server running").port;
+    app.bookmarks = vec![jazz.to_string_lossy().to_string()];
+    app.browser_dir = other.clone();
+    app.navigate_browser(PathBuf::from("___MUSIC_HOMES___"));
+    assert!(app.in_bookmarks_view);
+    // The cursor on the Jazz home.
+    app.browser_cursor = 1;
+    app.update_web_state();
+    let web_mix = |app: &mut quickstream::ui::AppUI, body: &str| -> Option<PathBuf> {
+        let (status, _, _) = post_json(port, body);
+        assert_eq!(status, 200, "{}", body);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.autopilot_dir.is_none() && Instant::now() < deadline {
+            app.handle_web_commands();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.wait_for_autopilot_scan(Duration::from_secs(5));
+        let scanned = app.autopilot_dir.clone();
+        app.reset_playback_session();
+        scanned
+    };
+
+    let seed_radio = format!(
+        r#"{{"action":"seed_radio","path":{}}}"#,
+        serde_json::to_string(&seed.to_string_lossy()).unwrap()
+    );
+    assert_eq!(web_mix(&mut app, &seed_radio), Some(album.clone()));
+    app.start_seed_radio(seed.clone());
+    app.wait_for_autopilot_scan(Duration::from_secs(5));
+    assert_eq!(app.autopilot_dir, Some(album.clone()), "the terminal's `r` alike");
+    app.reset_playback_session();
+
+    assert_eq!(web_mix(&mut app, r#"{"action":"autopilot"}"#), Some(jazz.clone()));
+    app.handle_input_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('p'),
+        crossterm::event::KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert_eq!(app.autopilot_dir, Some(jazz.clone()), "the terminal's `p` alike");
     app.reset_playback_session();
     let _ = fs::remove_dir_all(&dir);
 }

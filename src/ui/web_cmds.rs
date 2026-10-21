@@ -83,7 +83,9 @@ impl AppUI {
                     self.update_web_state();
                 }
                 crate::web::WebCommand::AddFile(path) => {
-                    if path.exists() && crate::metadata::is_supported_audio_file(&path) {
+                    // The web thread has resolved the path inside the allowed folders, so it was
+                    // there; looking it up again here would stat the share on the UI thread.
+                    if crate::metadata::is_supported_audio_file(&path) {
                         let meta = self.quick_metadata(&path);
                         let title = meta.display_title().to_string();
                         self.enqueue_tracks(vec![meta]);
@@ -166,9 +168,12 @@ impl AppUI {
                     self.status_message = format!("⚡ Mix Profile set to: {}", self.active_mix_profile.name());
                     self.update_web_state();
                 }
-                crate::web::WebCommand::SeedRadio(path) => {
-                    self.start_seed_radio(path);
-                }
+                // The web thread resolved the folder inside the allowed ones (issue #126).
+                crate::web::WebCommand::SeedRadio {
+                    seed,
+                    preferred,
+                    fallback,
+                } => self.start_seed_radio_in(seed, preferred, fallback),
                 crate::web::WebCommand::PathRejected(path) => {
                     self.status_message = format!(
                         "Ignored web request: {} is outside your home, bookmarks and launch folder",
@@ -229,6 +234,23 @@ impl AppUI {
         roots
     }
 
+    /// The queue index the web state names as playing: while the continuous stream plays, the
+    /// track it plays (`current_track_index`, which the queue follows at the event loop's next
+    /// `sync_continuous_stream_index`), else the queue's current track. So the published index,
+    /// current track and Up Next name one track even before the queue has followed the stream.
+    fn web_playing_index(&self) -> usize {
+        let current = self.queue.current_index();
+        let Some(ws) = self.web_server.as_ref().filter(|_| self.continuous_stream_active()) else {
+            return current;
+        };
+        let streamed = *ws.stream_state().continuous.current_track_index.lock().unwrap();
+        if streamed < self.queue.len() {
+            streamed
+        } else {
+            current
+        }
+    }
+
     pub fn update_web_state(&mut self) {
         // Published even while no server runs, so a server started later never begins with an
         // old value.
@@ -238,6 +260,8 @@ impl AppUI {
         if self.web_server.is_none() {
             return;
         }
+        // Read before the web state's lock, which the stream takes before its own.
+        let playing = self.web_playing_index();
         if let Ok(mut state) = self.web_state.write() {
             state.is_playing = self.player.is_playing();
             state.is_paused = self.player.is_paused();
@@ -249,13 +273,14 @@ impl AppUI {
                 .get_active_device()
                 .map(|d| d.friendly_name)
                 .unwrap_or_else(|| "Local Audio".to_string());
-            state.queue_index = self.queue.current_index();
+            state.queue_index = playing;
             state.queue_total = self.queue.len();
             state.queue_mode = self.settings_mgr.settings.queue_mode.clone();
             state.is_scanning = self.device_manager.is_scanning();
             state.home_dir = self.settings_mgr.settings.home_dir.clone();
             state.current_browser_dir = self.browser_dir.to_string_lossy().to_string();
-            state.terminal_dir = Some(self.browser_dir.clone());
+            state.terminal_dir = Some(self.autopilot_key_dir());
+            state.in_music_homes = self.in_bookmarks_view;
             state.allowed_roots = self.web_allowed_roots();
             state.bookmarks = self.bookmarks.clone();
             state.is_autopilot = self.autopilot_dir.is_some();
@@ -274,7 +299,7 @@ impl AppUI {
                     album: track.album.clone(),
                     duration_seconds: track.duration_seconds,
                     filepath: track.filepath.to_string_lossy().to_string(),
-                    is_current: idx == self.queue.current_index(),
+                    is_current: idx == playing,
                 })
                 .collect();
             if let Some(ws) = &self.web_server {
@@ -307,7 +332,7 @@ impl AppUI {
             }
             state.devices = devices;
 
-            if let Some(track) = self.queue.current_track() {
+            if let Some(track) = self.queue.tracks().get(playing) {
                 state.title = track.title.clone();
                 state.artist = track.artist.clone();
                 state.album = track.album.clone();
@@ -338,17 +363,10 @@ impl AppUI {
                 state.key = None;
             }
 
-            if self.queue.len() > 1 && self.queue.current_index() + 1 < self.queue.len() {
-                state.next_track_title = self
-                    .queue
-                    .tracks()
-                    .get(self.queue.current_index() + 1)
-                    .map(|t| t.display_title().to_string());
-            } else if !self.queue.is_empty() && self.settings_mgr.settings.queue_mode == "loop" {
-                state.next_track_title = self.queue.tracks().first().map(|t| t.display_title().to_string());
-            } else {
-                state.next_track_title = None;
-            }
+            // What plays next, as tab [1]'s UP NEXT lists it (`now_playing::up_next_summary`):
+            // the same rule, from the queue and index just published, so the list, count and
+            // end always come from one snapshot. The continuous stream publishes none of it.
+            state.publish_up_next(self.continuous_stream_active());
         }
         self.publish_web_playlists();
     }

@@ -518,6 +518,52 @@ fn test_head_error_answers_have_no_body() {
     handle.stop();
 }
 
+/// The access checks' HEAD answers have no body either (issue #125): the 403 for no allowed
+/// folder and for a foreign Host, and the pairing link's 303. The head is the one a GET gets.
+#[test]
+fn test_head_access_answers_have_no_body() {
+    common::isolate();
+    let (handle, rx) = start();
+    let port = handle.port;
+    let loopback = format!("127.0.0.1:{port}");
+    let pair = format!("/?token={}", quickstream::web_access::web_token());
+
+    let cases = [
+        // No allowed folder to list.
+        ("/api/browser", loopback.as_str(), 403),
+        // A foreign Host (DNS rebinding): plain text on a page, JSON on the API.
+        ("/", "rebind.example", 403),
+        ("/api/status", "rebind.example", 403),
+        // The pairing link: the session cookie and a redirect, with an empty body.
+        (pair.as_str(), loopback.as_str(), 303),
+    ];
+    for (path, host, code) in cases {
+        let exchange = |method: &str| {
+            let req = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+            parse(&raw_exchange(port, req.as_bytes()))
+        };
+        let (get_status, get_headers, get_body) = exchange("GET");
+        assert_eq!(get_status, code, "GET {path}: {get_headers}");
+        assert_eq!(get_body.is_empty(), code == 303, "GET {path}: {get_headers}");
+        let (status, headers, body) = exchange("HEAD");
+        assert_eq!(status, code, "HEAD {path}: {headers}");
+        assert!(
+            body.is_empty(),
+            "HEAD {path} has no body: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(headers, get_headers, "HEAD {path} gets the head a GET gets");
+        assert_eq!(
+            header_value(&headers, "content-length"),
+            Some(get_body.len().to_string()),
+            "HEAD {path}"
+        );
+    }
+
+    assert!(rx.try_recv().is_err(), "no command for a refused HEAD");
+    handle.stop();
+}
+
 /// Send `method path` declaring a 5-byte body, send the body `delay` later, then read the answer.
 /// Returns the bytes read and whether the read ended cleanly (no connection reset).
 fn exchange_with_late_body(port: u16, method: &str, path: &str, delay: Duration) -> (Vec<u8>, bool) {
