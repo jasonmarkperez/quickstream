@@ -522,8 +522,8 @@ fn hidden_folders_recycle_bins_and_symlinks_are_skipped() {
 #[cfg(unix)]
 #[test]
 fn a_name_that_is_not_utf8_leaves_its_folder_incomplete() {
-    use std::os::unix::ffi::OsStrExt;
     common::isolate();
+    use std::os::unix::ffi::OsStrExt;
     let (lib, db_path) = scratch("not_utf8");
     library_tree(&lib, 2, 1);
     let odd = lib.join("Artist 00").join(std::ffi::OsStr::from_bytes(b"caf\xe9.wav"));
