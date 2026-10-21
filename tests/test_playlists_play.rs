@@ -1366,3 +1366,365 @@ fn test_output_switch_while_the_rest_is_checked_keeps_a_paused_track_paused() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_shuffle_while_the_rest_is_checked_shuffles_the_rest_in() {
+    common::isolate();
+    // Issue #122: `z` (or the web's Shuffle) while the rest of the playlist was still being
+    // checked shuffled the one-track queue; then the rest was put around the started track in
+    // playlist order, undoing the shuffle. The rest is shuffled in when it arrives instead, so
+    // every playlist track is still queued, and the status says so.
+    for web in [false, true] {
+        let dir = temp_dir(if web { "shuffle_fill_web" } else { "shuffle_fill" });
+        let paths: Vec<PathBuf> = (0..8).map(|i| dir.join(format!("{i}.mp3"))).collect();
+        for path in &paths {
+            touch(path);
+        }
+        write_playlist(
+            paths
+                .iter()
+                .enumerate()
+                .map(|(i, p)| entry(p, "Artist", &format!("Track {i}")))
+                .collect(),
+        );
+        let mut app = app_with_playlist(&dir);
+        let calls = install_recording_player(&mut app);
+        let (checker, gate_tx, _) = checker_answering_first(vec![(paths[3].clone(), true)]);
+        app.playlists.set_exists_checker(checker);
+        let (web_tx, web_rx) = std::sync::mpsc::channel();
+        app.web_cmd_rx = Some(web_rx);
+
+        app.queue_selected_playlist(Some(3));
+        assert!(poll_until(&mut app, |_| !play_calls(&calls).is_empty()));
+        // Something queued meanwhile, with the queue pane's cursor on it.
+        app.queue.add_track(old_track(&dir));
+        app.queue_cursor = 1;
+        if web {
+            web_tx.send(quickstream::web::WebCommand::ShuffleQueue).unwrap();
+            app.handle_web_commands();
+        } else {
+            press(&mut app, crossterm::event::KeyCode::Char('z'));
+        }
+        assert!(
+            app.status_message.contains("Queue shuffled")
+                && app
+                    .status_message
+                    .ends_with("the rest of Road Trip is shuffled in once checked"),
+            "web {web}: {}",
+            app.status_message
+        );
+        assert!(
+            app.playlists.queue_check_pending(),
+            "the shuffle doesn't drop the check"
+        );
+
+        drop(gate_tx);
+        assert!(
+            poll_until(&mut app, |app| app.status_message.starts_with("Queued")),
+            "web {web}: status {}",
+            app.status_message
+        );
+        assert_eq!(app.status_message, "Queued 8 tracks from Road Trip, shuffled in");
+        let mut queued = queue_paths(&app);
+        queued.sort();
+        let mut expected = paths.clone();
+        expected.push(dir.join("old.mp3"));
+        expected.sort();
+        assert_eq!(queued, expected, "web {web}: every playlist track is queued once");
+        assert_eq!(
+            app.queue.current_index(),
+            0,
+            "web {web}: the playing track stays in front, as the shuffle left it; queue {:?}",
+            queue_paths(&app)
+        );
+        assert_eq!(app.queue.current_track().unwrap().filepath, paths[3]);
+        assert_eq!(
+            app.queue.tracks()[app.queue_cursor].filepath,
+            dir.join("old.mp3"),
+            "web {web}: the cursor stays on its track"
+        );
+        assert_eq!(
+            play_calls(&calls).len(),
+            1,
+            "filling the queue must not restart playback"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Eight tracks, `Road Trip` selected, entry 3 started and playing; the checker blocks on the
+/// other entries until the returned gate is dropped.
+fn eight_track_play(name: &str) -> (AppUI, PathBuf, Vec<PathBuf>, std::sync::mpsc::Sender<()>) {
+    let dir = temp_dir(name);
+    let paths: Vec<PathBuf> = (0..8).map(|i| dir.join(format!("{i}.mp3"))).collect();
+    for path in &paths {
+        touch(path);
+    }
+    write_playlist(
+        paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| entry(p, "Artist", &format!("Track {i}")))
+            .collect(),
+    );
+    let mut app = app_with_playlist(&dir);
+    let calls = install_recording_player(&mut app);
+    let (checker, gate_tx, _) = checker_answering_first(vec![(paths[3].clone(), true)]);
+    app.playlists.set_exists_checker(checker);
+    app.queue_selected_playlist(Some(3));
+    assert!(poll_until(&mut app, |_| !play_calls(&calls).is_empty()));
+    (app, dir, paths, gate_tx)
+}
+
+fn queued_meta(dir: &Path, name: &str) -> AudioMetadata {
+    let mut meta = old_track(dir);
+    meta.filepath = dir.join(name);
+    meta.title = name.to_string();
+    meta
+}
+
+#[test]
+fn test_tracks_queued_after_a_shuffle_stay_after_the_shuffled_in_rest() {
+    common::isolate();
+    // The rest of the playlist is shuffled into the tracks the shuffle mixed: a track queued
+    // after the shuffle stays after them, as one queued while the queue is in playlist order
+    // does (PR #127 review).
+    for round in 0..4 {
+        let (mut app, dir, paths, gate_tx) = eight_track_play(&format!("shuffle_then_queue_{round}"));
+        app.queue.add_track(queued_meta(&dir, "before.mp3"));
+        press(&mut app, crossterm::event::KeyCode::Char('z'));
+        app.queue.add_track(queued_meta(&dir, "after1.mp3"));
+        app.queue.add_track(queued_meta(&dir, "after2.mp3"));
+        drop(gate_tx);
+        assert!(poll_until(&mut app, |app| !app.playlists.queue_check_pending()));
+        let queued = queue_paths(&app);
+        assert_eq!(queued.len(), 11, "round {round}: {queued:?}");
+        assert_eq!(queued[0], paths[3], "round {round}");
+        assert_eq!(
+            queued[9..],
+            [dir.join("after1.mp3"), dir.join("after2.mp3")],
+            "round {round}: {queued:?}"
+        );
+        let mut mixed = queued[1..9].to_vec();
+        mixed.sort();
+        let mut expected: Vec<PathBuf> = paths.iter().filter(|p| **p != paths[3]).cloned().collect();
+        expected.push(dir.join("before.mp3"));
+        expected.sort();
+        assert_eq!(mixed, expected, "round {round}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn test_a_row_removed_after_a_shuffle_leaves_later_tracks_after_the_rest() {
+    common::isolate();
+    // A shuffled row removed before the rest arrives: the rows the shuffle mixed are one fewer,
+    // so a track queued after the shuffle still stays after the shuffled-in rest.
+    for round in 0..4 {
+        let (mut app, dir, paths, gate_tx) = eight_track_play(&format!("shuffle_remove_{round}"));
+        app.queue.add_track(queued_meta(&dir, "before.mp3"));
+        press(&mut app, crossterm::event::KeyCode::Char('z'));
+        assert_eq!(queue_paths(&app), vec![paths[3].clone(), dir.join("before.mp3")]);
+        app.remove_queue_track(1);
+        app.queue.add_track(queued_meta(&dir, "after.mp3"));
+        drop(gate_tx);
+        assert!(poll_until(&mut app, |app| !app.playlists.queue_check_pending()));
+        let queued = queue_paths(&app);
+        assert_eq!(queued.len(), 9, "round {round}: {queued:?}");
+        assert_eq!(queued[0], paths[3], "round {round}");
+        assert_eq!(queued[8], dir.join("after.mp3"), "round {round}: {queued:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn test_previous_after_a_shuffle_restarts_the_started_track() {
+    common::isolate();
+    // After a shuffle the started track is first in the queue and the rest goes after it, so
+    // there is no track before it: Previous restarts it, rather than wrapping to the last track
+    // (PR #127 review). Pressed before the shuffle, it is held and restarts it once the rest is
+    // in; pressed after, it restarts it at once.
+    for held in [true, false] {
+        let SlowShare {
+            mut app,
+            dir,
+            paths,
+            calls,
+            gate_tx,
+        } = slow_share_app(
+            if held {
+                "prev_held_shuffle"
+            } else {
+                "prev_after_shuffle"
+            },
+            1,
+        );
+        app.queue_selected_playlist(Some(1));
+        assert!(poll_until(&mut app, |_| !play_calls(&calls).is_empty()));
+        if held {
+            press(&mut app, crossterm::event::KeyCode::Left);
+            press(&mut app, crossterm::event::KeyCode::Char('z'));
+            assert!(
+                app.status_message.contains("Queue shuffled")
+                    && app
+                        .status_message
+                        .ends_with("Previous restarts this track once Road Trip is checked…"),
+                "the held skip's note stays: {}",
+                app.status_message
+            );
+            assert_eq!(play_calls(&calls).len(), 1, "held");
+        } else {
+            press(&mut app, crossterm::event::KeyCode::Char('z'));
+            press(&mut app, crossterm::event::KeyCode::Left);
+            assert_eq!(
+                play_calls(&calls),
+                vec![format!("play {}", paths[1].display()); 2],
+                "restarted at once"
+            );
+        }
+
+        drop(gate_tx);
+        assert!(poll_until(&mut app, |app| !app.playlists.queue_check_pending()));
+        assert_eq!(app.queue.len(), 3, "held {held}");
+        assert_eq!(app.queue.current_index(), 0, "held {held}");
+        assert_eq!(app.queue.current_track().unwrap().filepath, paths[1], "held {held}");
+        assert_eq!(
+            play_calls(&calls),
+            vec![format!("play {}", paths[1].display()); 2],
+            "held {held}: the started track restarted once, nothing else played"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn test_previous_after_a_shuffle_goes_back_when_the_started_track_is_not_first() {
+    common::isolate();
+    // Another track was current at the shuffle, so it went in front and the started track
+    // after it: Previous goes back to that track, as it does in any queue, rather than restart
+    // the started one (PR #127 review). Pressed before the shuffle, it is held and goes back to
+    // it once the rest is in; pressed after, it goes back at once.
+    for held in [true, false] {
+        let SlowShare {
+            mut app,
+            dir,
+            paths,
+            calls,
+            gate_tx,
+        } = slow_share_app(if held { "prev_held_not_first" } else { "prev_not_first" }, 1);
+        app.queue_selected_playlist(Some(1));
+        assert!(poll_until(&mut app, |_| !play_calls(&calls).is_empty()));
+        if held {
+            press(&mut app, crossterm::event::KeyCode::Left);
+            assert_eq!(app.status_message, "Previous track plays once Road Trip is checked…");
+        }
+        let x = dir.join("x.mp3");
+        app.queue.add_track(queued_meta(&dir, "x.mp3"));
+        app.queue.set_current_index(1);
+        app.play_current_track();
+        press(&mut app, crossterm::event::KeyCode::Char('z'));
+        assert_eq!(queue_paths(&app), vec![x.clone(), paths[1].clone()], "held {held}");
+        if held {
+            assert!(
+                app.status_message
+                    .ends_with("Previous track plays once Road Trip is checked…"),
+                "the started track won't be first: {}",
+                app.status_message
+            );
+        }
+        app.queue.set_current_index(1);
+        app.play_current_track();
+        let plays = play_calls(&calls).len();
+        if !held {
+            press(&mut app, crossterm::event::KeyCode::Left);
+            assert_eq!(app.queue.current_index(), 0, "went back at once");
+            assert_eq!(app.queue.current_track().unwrap().filepath, x);
+            assert_eq!(play_calls(&calls).len(), plays, "the started track was not restarted");
+        }
+
+        drop(gate_tx);
+        assert!(poll_until(&mut app, |app| !app.playlists.queue_check_pending()));
+        assert_eq!(app.queue.len(), 4, "held {held}: {:?}", queue_paths(&app));
+        assert_eq!(app.queue.current_index(), 0, "held {held}");
+        assert_eq!(app.queue.current_track().unwrap().filepath, x, "held {held}");
+        if held {
+            assert_eq!(
+                play_calls(&calls)[plays..],
+                [format!("play {}", x.display())],
+                "the held Previous went back to the track before"
+            );
+        } else {
+            assert_eq!(play_calls(&calls).len(), plays, "the fill plays nothing");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn test_shuffle_keeps_the_note_of_a_held_next() {
+    common::isolate();
+    let SlowShare {
+        mut app,
+        dir,
+        calls,
+        gate_tx,
+        ..
+    } = slow_share_app("next_held_shuffle", 0);
+    app.queue_selected_playlist(Some(0));
+    assert!(poll_until(&mut app, |_| !play_calls(&calls).is_empty()));
+    press(&mut app, crossterm::event::KeyCode::Right);
+    press(&mut app, crossterm::event::KeyCode::Char('z'));
+    assert_eq!(
+        app.status_message,
+        "🔀 Queue shuffled; the rest of Road Trip is shuffled in once checked. Next track plays once Road Trip is checked…"
+    );
+
+    drop(gate_tx);
+    assert!(poll_until(&mut app, |app| !app.playlists.queue_check_pending()));
+    assert_eq!(
+        app.queue.current_index(),
+        1,
+        "the held Next went on in the shuffled order"
+    );
+    assert_eq!(play_calls(&calls).len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_shuffle_says_shuffled_in_only_when_tracks_were() {
+    common::isolate();
+    // Every other entry turns out missing: nothing is shuffled in, and the status doesn't say
+    // so (PR #127 review).
+    let dir = temp_dir("shuffle_nothing_in");
+    let paths: Vec<PathBuf> = ["a.mp3", "b.mp3", "c.mp3"].iter().map(|n| dir.join(n)).collect();
+    touch(&paths[0]);
+    write_playlist(vec![
+        entry(&paths[0], "Alpha", "One"),
+        entry(&paths[1], "Beta", "Two"),
+        entry(&paths[2], "Gamma", "Three"),
+    ]);
+    let mut app = app_with_playlist(&dir);
+    let calls = install_recording_player(&mut app);
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+    let gate_rx = Arc::new(Mutex::new(gate_rx));
+    let first = paths[0].clone();
+    let checker: ExistsChecker = Arc::new(move |path: &Path| {
+        if path != first {
+            let _ = gate_rx.lock().unwrap().recv();
+        }
+        path.exists().then(|| path.to_path_buf())
+    });
+    app.playlists.set_exists_checker(checker);
+    app.queue_selected_playlist(Some(0));
+    assert!(poll_until(&mut app, |_| !play_calls(&calls).is_empty()));
+    press(&mut app, crossterm::event::KeyCode::Char('z'));
+    assert_eq!(
+        app.status_message,
+        "🔀 Queue shuffled; the rest of Road Trip is shuffled in once checked"
+    );
+    drop(gate_tx);
+    assert!(poll_until(&mut app, |app| !app.playlists.queue_check_pending()));
+    assert_eq!(app.status_message, "Queued 1 track from Road Trip, 2 missing");
+    assert_eq!(queue_paths(&app), vec![paths[0].clone()]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

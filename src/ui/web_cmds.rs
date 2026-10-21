@@ -148,11 +148,7 @@ impl AppUI {
                     // wrap that is the track it plays next, which it may have named since this
                     // tick's sync.
                     self.sync_continuous_stream_index();
-                    if !self.queue.is_empty() {
-                        self.queue.shuffle();
-                        self.status_message = "🔀 Queue shuffled (web)".to_string();
-                        self.update_web_state();
-                    }
+                    self.shuffle_queue(" (web)");
                 }
                 crate::web::WebCommand::SetMixProfile(profile_str) => {
                     let profile = match profile_str.to_lowercase().as_str() {
@@ -306,9 +302,14 @@ impl AppUI {
                     is_current: idx == playing,
                 })
                 .collect();
-            // A track the continuous stream started with an unknown length takes it from the
-            // queue as soon as it is published here, not only when the stream next writes.
             if let Some(ws) = &self.web_server {
+                // A reorder reaches the stream with the order it made, so the stream never picks
+                // a track by its old row from the new queue, or the other way round.
+                if let Some(moved) = self.stream_reorder.take() {
+                    ws.stream_state().continuous.queue_reordered(&moved);
+                }
+                // A track the continuous stream started with an unknown length takes it from the
+                // queue as soon as it is published here, not only when the stream next writes.
                 ws.stream_state().continuous.learn_published_duration(&mut state);
             }
 

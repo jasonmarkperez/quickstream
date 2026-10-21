@@ -536,7 +536,7 @@ fn test_upnp_continuous_seek_is_clamped_to_the_known_length() {
 
 /// A fake ffmpeg for the continuous stream (issues #106, #107): logs its arguments, one line per
 /// run, and its pid (so the test can kill any it leaves). An input whose name contains `short`
-/// gets 100 ms of PCM and ends 0.5 s later; one with `endless` gets PCM as fast as it is read
+/// gets 100 ms of PCM and ends 0.5 s later, one with `long` 3 s later; one with `endless` gets PCM as fast as it is read
 /// until it is killed (for a renderer that stops reading); one with `live` gets PCM at about real
 /// time until it is killed (for one that keeps reading, so it doesn't load the machine); one with
 /// `bad` gets nothing and an exit at once (a file ffmpeg can't decode); any other input gets
@@ -555,7 +555,7 @@ impl FakeDecoder {
         let log = dir.join("ffmpeg.log");
         let pids = dir.join("ffmpeg.pids");
         let text = format!(
-            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$in\" in\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *endless*) exec cat /dev/zero ;;\n  *live*) while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *bad*) exit 1 ;;\nesac\nexec sleep 30\n",
+            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$in\" in\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *long*) head -c 17640 /dev/zero; exec sleep 3 ;;\n  *endless*) exec cat /dev/zero ;;\n  *live*) while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *late*) sleep 1; while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *bad*) exit 1 ;;\nesac\nexec sleep 30\n",
             pids = pids.display(),
             log = log.display()
         );
@@ -744,6 +744,11 @@ struct DecoderFixture {
 #[cfg(unix)]
 impl DecoderFixture {
     fn start(name: &str, names: &[&str], first: usize) -> Self {
+        Self::start_with(name, names, first, |_| {})
+    }
+
+    /// As [`Self::start`], with `edit` applied to the published queue before the stream starts.
+    fn start_with(name: &str, names: &[&str], first: usize, edit: impl FnOnce(&mut Vec<WebQueueItem>)) -> Self {
         let dir = temp_dir(name);
         let decoder = FakeDecoder::new(&dir);
         let tracks: Vec<PathBuf> = names.iter().map(|n| dir.join(n)).collect();
@@ -751,7 +756,11 @@ impl DecoderFixture {
             std::fs::write(track, b"never opened: the fake decoder makes up its output").unwrap();
         }
         let state = Arc::new(RwLock::new(NowPlayingState::default()));
-        state.write().unwrap().queue = tracks.iter().enumerate().map(|(i, p)| queue_item(i, p)).collect();
+        {
+            let mut s = state.write().unwrap();
+            s.queue = tracks.iter().enumerate().map(|(i, p)| queue_item(i, p)).collect();
+            edit(&mut s.queue);
+        }
         let (handle, rx) = start(state.clone());
         let controller = handle.stream_state().continuous.clone();
         controller.set_decoder(&decoder.binary);
@@ -1344,6 +1353,243 @@ fn test_continuous_reshuffle_follows_the_stream_index_first() {
         handle.stop();
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `z` while the continuous stream plays: the shuffle puts the playing track in front, and the
+/// stream's index goes with it, so the event loop's sync doesn't move the queue back to the row
+/// the track had before (PR #127 review).
+#[test]
+fn test_shuffle_while_the_continuous_stream_plays_keeps_its_track_current() {
+    common::isolate();
+    let dir = temp_dir("shuffle_stream_index");
+    let tracks: Vec<PathBuf> = (0..8).map(|i| dir.join(format!("t{}.wav", i))).collect();
+    let settings = SettingsManager::with_path(dir.join("config.json"));
+    let mut app = AppUI::new(Some(dir.clone()), settings);
+    app.queue.add_tracks(
+        tracks
+            .iter()
+            .enumerate()
+            .map(|(i, p)| track_meta(p, &format!("Track {}", i), 60.0))
+            .collect(),
+    );
+    app.queue.set_current_index(5);
+    let (tx, _web_rx) = mpsc::channel();
+    let handle = WebServer::start(0, app.web_state.clone(), tx).expect("start web server");
+    let controller = handle.stream_state().continuous.clone();
+    controller.is_active.store(true, Ordering::SeqCst);
+    *controller.current_track_index.lock().unwrap() = 5;
+    app.web_server = Some(handle);
+    app.update_web_state();
+
+    // A skip the stream hasn't acted on yet names a track by its row too.
+    controller.skip_to_index(6);
+    controller.skip_to_index(5);
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    app.web_cmd_rx = Some(cmd_rx);
+    for round in 0..4 {
+        if round % 2 == 0 {
+            app.handle_input_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('z'),
+                crossterm::event::KeyModifiers::NONE,
+            ))
+            .unwrap();
+        } else {
+            cmd_tx.send(WebCommand::ShuffleQueue).unwrap();
+            app.handle_web_commands();
+        }
+        assert_eq!(*controller.current_track_index.lock().unwrap(), 0, "round {round}");
+        assert_eq!(
+            controller.pending_request().map(|r| r.index),
+            Some(0),
+            "round {round}: the pending skip follows its track"
+        );
+        app.sync_continuous_stream_index();
+        assert_eq!(app.queue.current_index(), 0, "round {round}");
+        assert_eq!(
+            app.queue.current_track().map(|t| t.filepath.clone()),
+            Some(tracks[5].clone()),
+            "round {round}: the playing track stays current"
+        );
+    }
+
+    if let Some(handle) = app.web_server.take() {
+        handle.stream_state().close_active_streams();
+        handle.stop();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// After a shuffle in the UI, the track after the playing one is the one the shuffle put after
+/// it, not the one at the row after its old row; and a track that was last before the shuffle
+/// doesn't make the stream wrap and reshuffle again when it ends (PR #127 review).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_goes_on_in_the_order_a_shuffle_left() {
+    common::isolate();
+    let f = DecoderFixture::start("follow_shuffle", &["t0.wav", "t1.wav", "t2.wav", "t3_long.wav"], 3);
+    assert_eq!(f.run(1), (f.tracks[3].clone(), None));
+
+    {
+        // What the UI's shuffle does: publish the new order and tell the stream where each
+        // track went, under the web state's lock.
+        let mut s = f.state.write().unwrap();
+        let old = s.queue.clone();
+        // New order t3, t1, t0, t2: the track at old row `i` went to row `moved[i]`.
+        let moved = [2, 1, 3, 0];
+        for (from, &to) in moved.iter().enumerate() {
+            s.queue[to] = old[from].clone();
+            s.queue[to].index = to;
+        }
+        f.controller.queue_reordered(&moved);
+    }
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 0);
+    assert_eq!(
+        f.run(2),
+        (f.tracks[1].clone(), None),
+        "the track the shuffle put after the playing one"
+    );
+    assert!(
+        !matches!(f.rx.try_recv(), Ok(WebCommand::ShuffleQueue)),
+        "the stream didn't wrap"
+    );
+}
+
+/// What the UI's shuffle does to the stream: put the track at row `i` of the published queue at
+/// row `moved[i]` and tell the stream where each track went, under the web state's lock, after
+/// `edit` (on the new order) under the same lock.
+#[cfg(unix)]
+fn publish_reorder(f: &DecoderFixture, moved: &[usize], edit: impl FnOnce(&mut NowPlayingState)) {
+    let mut s = f.state.write().unwrap();
+    let old = s.queue.clone();
+    for (from, &to) in moved.iter().enumerate() {
+        s.queue[to] = old[from].clone();
+        s.queue[to].index = to;
+    }
+    f.controller.queue_reordered(moved);
+    edit(&mut s);
+}
+
+/// Two shuffles while one track plays, before the stream has followed either: it goes on to
+/// the track the second one put after the playing one (PR #127 review).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_follows_two_shuffles_during_one_track() {
+    common::isolate();
+    let f = DecoderFixture::start("two_shuffles", &["t0.wav", "t1.wav", "t2.wav", "t3_long.wav"], 3);
+    assert_eq!(f.run(1), (f.tracks[3].clone(), None));
+    // t3, t1, t0, t2; then t3, t0, t2, t1.
+    publish_reorder(&f, &[2, 1, 3, 0], |_| {});
+    publish_reorder(&f, &[0, 3, 1, 2], |_| {});
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 0);
+    assert_eq!(
+        f.run(2),
+        (f.tracks[0].clone(), None),
+        "the track the second shuffle put after the playing one"
+    );
+}
+
+/// The track being decoded keeps its row through a shuffle: once the UI publishes its length at
+/// its new row, `learn_published_duration` takes it (PR #127 review).
+#[cfg(unix)]
+#[test]
+fn test_continuous_decoded_track_row_follows_a_shuffle() {
+    common::isolate();
+    let f = DecoderFixture::start_with(
+        "decoded_row",
+        &["t0.wav", "t1.wav", "t2_live.wav", "t3.wav"],
+        2,
+        |queue| queue[2].duration_seconds = 0.0,
+    );
+    assert_eq!(f.run(1), (f.tracks[2].clone(), None));
+    assert_eq!(*f.controller.current_duration.lock().unwrap(), 0.0);
+    // t2, t0, t1, t3, with t2's length read meanwhile.
+    publish_reorder(&f, &[1, 2, 0, 3], |s| {
+        s.queue[0].duration_seconds = 60.0;
+        assert!(
+            f.controller.learn_published_duration(s),
+            "learned at the row the shuffle moved it to"
+        );
+    });
+    assert_eq!(*f.controller.current_duration.lock().unwrap(), 60.0);
+    assert_eq!(f.state.read().unwrap().duration_seconds, 60.0);
+}
+
+/// The stream's own check while it writes finds the decoded track at the row a shuffle moved it
+/// to too, so its length shows even when the UI never offers it (PR #127 review).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_learns_a_length_after_a_shuffle_while_it_writes() {
+    common::isolate();
+    let f = DecoderFixture::start_with(
+        "writer_length",
+        &["t0.wav", "t1.wav", "t2_live.wav", "t3.wav"],
+        2,
+        |queue| queue[2].duration_seconds = 0.0,
+    );
+    assert_eq!(f.run(1), (f.tracks[2].clone(), None));
+    publish_reorder(&f, &[1, 2, 0, 3], |s| s.queue[0].duration_seconds = 60.0);
+    wait_until("the write loop never learned the length", || {
+        *f.controller.current_duration.lock().unwrap() == 60.0
+    });
+    assert_eq!(f.state.read().unwrap().duration_seconds, 60.0);
+}
+
+/// A track tried while nothing gives audio is shown only once it gives some: a shuffle in
+/// between moves the row it is shown at with it (PR #127 review).
+#[cfg(unix)]
+#[test]
+fn test_continuous_track_shown_after_a_shuffle_is_at_its_new_row() {
+    common::isolate();
+    let f = DecoderFixture::start("shown_row", &["t0_bad.wav", "t1_late.wav", "t2.wav", "t3.wav"], 0);
+    assert_eq!(f.run(1), (f.tracks[0].clone(), None));
+    // t1_late gives no audio for a second: tried, not shown yet.
+    assert_eq!(f.run(2), (f.tracks[1].clone(), None));
+    // t1_late, t3, t0_bad, t2.
+    publish_reorder(&f, &[2, 0, 3, 1], |_| {});
+    wait_until("nothing was shown after t0_bad", || {
+        f.state.read().unwrap().filepath.as_deref() != Some(f.tracks[0].as_path())
+    });
+    let s = f.state.read().unwrap();
+    assert_eq!(s.filepath.as_deref(), Some(f.tracks[1].as_path()), "t1_late is shown");
+    assert_eq!(s.queue_index, 0, "at its new row");
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 0);
+}
+
+/// A shuffle while the stream sends silence on a queue whose files are all missing: once they
+/// are back, it goes on from the row the shuffle moved its track to (PR #127 review).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_idle_on_missing_files_goes_on_from_a_shuffled_row() {
+    common::isolate();
+    let names = ["t0_live.wav", "t1_live.wav", "t2_live.wav", "t3_live.wav"];
+    let f = DecoderFixture::start_with("idle_shuffle", &names, 1, |queue| {
+        for (item, name) in queue.iter_mut().zip(names) {
+            item.filepath = format!(
+                "{}/gone/{}",
+                Path::new(&item.filepath).parent().unwrap().display(),
+                name
+            );
+        }
+    });
+    let gone = f.dir.join("gone");
+    // Silence follows the pass that found every file missing and will go on from row 1.
+    wait_until("no silence while every file is missing", || {
+        f.renderer.as_ref().unwrap().received.load(Ordering::SeqCst) > 0
+    });
+    // t0, t2, t3, t1.
+    publish_reorder(&f, &[0, 3, 1, 2], |_| {});
+    // Every file comes back at once, so the stream never finds only some of them.
+    let staging = f.dir.join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    for name in names {
+        std::fs::write(staging.join(name), b"back").unwrap();
+    }
+    std::fs::rename(&staging, &gone).unwrap();
+    assert_eq!(
+        f.run(1),
+        (gone.join("t1_live.wav"), None),
+        "the track that was at row 1, now at row 3"
+    );
 }
 
 /// A skip or seek asked while the queue is empty is dropped: the next queue starts at its top,
