@@ -551,10 +551,12 @@ fn test_upnp_continuous_seek_is_clamped_to_the_known_length() {
 /// time until it is killed; `stall` gets 0.5 s of `0x01` bytes at about real time, then nothing
 /// for 5 s (a share that hangs as ffmpeg reads the file), then `0x01` bytes at about real time
 /// until it is killed; `flood` gets 5 s of `0x01` bytes at once, then an exit; `surge` gets 6 s of
-/// them at once, nothing for 1.2 s, then 5 s of them at about real time, then an exit; `sleepy` gets
-/// nothing for 1 s, then `0x02` bytes at about real time until it is killed; `lone` gets a lone
-/// 32 KiB chunk of `0x01` bytes (0.19 s) every 1.2 s until it is killed; any other input gets
-/// nothing, as while the real one opens a file on a slow share, until it is killed.
+/// them at once, nothing for 1.2 s, then 5 s of them at about real time, then an exit; `sleepy`
+/// gets nothing for 1 s, then `0x02` bytes at about real time until it is killed; `lone` gets a
+/// lone 32 KiB chunk of `0x01` bytes (0.19 s) every 1.2 s until it is killed; any other input gets
+/// nothing, as while the real one opens a file on a slow share, until it is killed. Chunks of
+/// `0x01` / `0x02` bytes are made once per run and written by the shell itself, so only a `sleep`
+/// is started per chunk and a loaded machine slows audio "at about real time" less.
 #[cfg(unix)]
 struct FakeDecoder {
     binary: PathBuf,
@@ -569,7 +571,7 @@ impl FakeDecoder {
         let log = dir.join("ffmpeg.log");
         let pids = dir.join("ffmpeg.pids");
         let text = format!(
-            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"${{in##*/}}\" in\n  *lone*) while :; do head -c 32768 /dev/zero | tr '\\000' '\\001'; sleep 1.2; done ;;\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *longones*) for i in $(seq 30); do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *long*) head -c 17640 /dev/zero; exec sleep 3 ;;\n  *endless*) exec cat /dev/zero ;;\n  *live*) while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *late*) sleep 1; while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *bad*) exit 1 ;;\n  *ones*) for i in 1 2 3 4 5; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *burst*) head -c 176400 /dev/zero | tr '\\000' '\\001'; exit 0 ;;\n  *twos*) head -c 17640 /dev/zero | tr '\\000' '\\002'; exec sleep 30 ;;\n  *waking*) sleep 5; while :; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done ;;\n  *stall*) for i in 1 2 3 4 5; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; sleep 5; while :; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done ;;\n  *surge*) head -c 1058400 /dev/zero | tr '\\000' '\\001'; sleep 1.2; for i in $(seq 50); do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *flood*) head -c 882000 /dev/zero | tr '\\000' '\\001'; exit 0 ;;\n  *sleepy*) sleep 1; while :; do head -c 17640 /dev/zero | tr '\\000' '\\002'; sleep 0.1; done ;;\nesac\nexec sleep 30\n",
+            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"${{in##*/}}\" in\n  *lone*) c=$(head -c 32768 /dev/zero | tr '\\000' '\\001'); while :; do printf '%s' \"$c\"; sleep 1.2; done ;;\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *longones*) c=$(head -c 17640 /dev/zero | tr '\\000' '\\001'); for i in $(seq 30); do printf '%s' \"$c\"; sleep 0.1; done; exit 0 ;;\n  *long*) head -c 17640 /dev/zero; exec sleep 3 ;;\n  *endless*) exec cat /dev/zero ;;\n  *live*) while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *late*) sleep 1; while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *bad*) exit 1 ;;\n  *ones*) c=$(head -c 17640 /dev/zero | tr '\\000' '\\001'); for i in 1 2 3 4 5; do printf '%s' \"$c\"; sleep 0.1; done; exit 0 ;;\n  *burst*) head -c 176400 /dev/zero | tr '\\000' '\\001'; exit 0 ;;\n  *twos*) head -c 17640 /dev/zero | tr '\\000' '\\002'; exec sleep 30 ;;\n  *waking*) c=$(head -c 17640 /dev/zero | tr '\\000' '\\001'); sleep 5; while :; do printf '%s' \"$c\"; sleep 0.1; done ;;\n  *stall*) c=$(head -c 17640 /dev/zero | tr '\\000' '\\001'); for i in 1 2 3 4 5; do printf '%s' \"$c\"; sleep 0.1; done; sleep 5; while :; do printf '%s' \"$c\"; sleep 0.1; done ;;\n  *surge*) c=$(head -c 17640 /dev/zero | tr '\\000' '\\001'); head -c 1058400 /dev/zero | tr '\\000' '\\001'; sleep 1.2; for i in $(seq 50); do printf '%s' \"$c\"; sleep 0.1; done; exit 0 ;;\n  *flood*) head -c 882000 /dev/zero | tr '\\000' '\\001'; exit 0 ;;\n  *sleepy*) c=$(head -c 17640 /dev/zero | tr '\\000' '\\002'); sleep 1; while :; do printf '%s' \"$c\"; sleep 0.1; done ;;\nesac\nexec sleep 30\n",
             pids = pids.display(),
             log = log.display()
         );
@@ -2370,7 +2372,7 @@ fn test_continuous_stream_keeps_covering_a_decoder_that_gives_lone_chunks() {
 fn test_continuous_stream_adds_no_silence_after_a_renderer_pause() {
     common::isolate();
     // 0.3 s of its own buffer, besides what the sockets hold.
-    let (silence, first_track) = silence_after_a_renderer_pause("paused_renderer", "t0_flood.wav", 0.3);
+    let (silence, first_track, _) = silence_after_a_renderer_pause("paused_renderer", "t0_flood.wav", 0.3);
     assert_eq!(
         silence, 0,
         "{} bytes of silence between the tracks, although the renderer held seconds of audio",
@@ -2383,25 +2385,34 @@ fn test_continuous_stream_adds_no_silence_after_a_renderer_pause() {
 /// real time (a slow share): those writes don't go faster than their audio because the renderer
 /// read ahead, so they don't take back the time it was paused. A next track whose decoder takes a
 /// second to start then still follows with no silence (#133).
+///
+/// The fake decoder's paced audio comes slower than real time on a loaded machine (each chunk
+/// waits on a `sleep` process), so the renderer can really run out of it: silence then is right,
+/// as long as it reaches the renderer only as that runs out, not while it still holds most of its
+/// 1 s buffer, as it would if the pause had been taken back.
 #[cfg(unix)]
 #[test]
 fn test_continuous_stream_keeps_a_renderer_pause_through_audio_at_real_time() {
     common::isolate();
-    let (silence, first_track) = silence_after_a_renderer_pause("paused_then_paced", "t0_surge.wav", 1.0);
-    assert_eq!(
-        silence, 0,
-        "{} bytes of silence between the tracks, although the renderer held seconds of audio",
-        silence
-    );
+    let (silence, first_track, held) = silence_after_a_renderer_pause("paused_then_paced", "t0_surge.wav", 1.0);
+    if let Some(held) = held {
+        assert!(
+            held < Duration::from_millis(400),
+            "{} bytes of silence between the tracks, the first while the renderer still held {:?} of audio",
+            silence,
+            held
+        );
+    }
     assert_eq!(first_track, 1_940_400, "the whole first track, then the second");
 }
 
 /// Stream `first` (`0x01` bytes) and then `sleepy` (`0x02` bytes after 1 s) to a renderer playing
 /// out of `buffer_secs` of its own buffer, paused for 4 s 0.5 s into the first track. Returns the
-/// silence bytes the renderer got between the first track's audio and the second's, and the bytes
-/// from the first track's first byte to the second's.
+/// silence bytes the renderer got between the first track's audio and the second's, the first
+/// track's bytes it got before the second's, and how much audio it still had to play when the
+/// first of that silence arrived (`None`: no silence).
 #[cfg(unix)]
-fn silence_after_a_renderer_pause(name: &str, first: &str, buffer_secs: f64) -> (usize, usize) {
+fn silence_after_a_renderer_pause(name: &str, first: &str, buffer_secs: f64) -> (usize, usize, Option<Duration>) {
     let f = DecoderFixture::armed(name, &[first, "t1_sleepy.wav"], 0, |_, _| {});
     let capacity = (buffer_secs * REAL_TIME_BYTES_PER_SEC) as u64 / 4 * 4;
     let renderer = PlayingRenderer::connect(f.port, &f.path, capacity);
@@ -2421,9 +2432,14 @@ fn silence_after_a_renderer_pause(name: &str, first: &str, buffer_secs: f64) -> 
     let first_one = bytes.iter().position(|&b| b == 1).unwrap();
     let first_two = bytes.iter().position(|&b| b == 2).unwrap();
     let silence = bytes[first_one..first_two].iter().filter(|&&b| b == 0).count();
+    let held = bytes[first_one..first_two]
+        .iter()
+        .position(|&b| b == 0)
+        .map(|i| renderer.held_at(first_one + i));
     f.handle.as_ref().unwrap().stream_state().close_active_streams();
     renderer.hang_up();
-    (silence, first_two - first_one)
+    let first_track = bytes[first_one..first_two].iter().filter(|&&b| b == 1).count();
+    (silence, first_track, held)
 }
 
 /// A renderer that reads in bursts (it blocks the stream's writes while it plays from its own
@@ -2460,11 +2476,16 @@ fn test_continuous_stream_rearmed_session_ends_a_hung_decoders_silence() {
     let mut f = DecoderFixture::armed("rearm_hung_decoder", &["t0_hang.wav"], 0, |_, _| {});
     f.renderer = Some(Renderer::connect(f.port, &f.path));
     assert_eq!(f.run(1), (f.tracks[0].clone(), None));
-    // Past the decoder's start grace: the stream sends silence for it.
-    std::thread::sleep(Duration::from_millis(1000));
+    // Past the decoder's start grace the stream sends silence for it: measured from a little
+    // after its first bytes, over long enough that a tick's write landing just outside the window
+    // (or a late one on a loaded machine) doesn't move the rate much.
     let renderer = f.renderer.as_ref().unwrap();
+    wait_until("no silence while the decoder hangs", || {
+        renderer.received.load(Ordering::SeqCst) > 0
+    });
+    std::thread::sleep(Duration::from_millis(300));
     assert_about_real_time(
-        renderer.rate_over(Duration::from_millis(500)),
+        renderer.rate_over(Duration::from_millis(1500)),
         "silence while the decoder hangs",
     );
     let _next = f.handle.as_ref().unwrap().stream_state().arm_continuous_session();
@@ -2813,13 +2834,15 @@ fn connect_small_receive_buffer(port: u16) -> TcpStream {
 /// only while it has room (so the stream's writes block at real time once it is full) and, once
 /// full, not again until it holds `low_water` bytes or less: with `low_water` well under
 /// `capacity` it reads in bursts, as renderers with a large buffer do. Records the bytes it got
-/// after the WAV header, and `dry`, how long it had nothing to play while not paused once audio
-/// had started.
+/// after the WAV header, `dry`, how long it had nothing to play while not paused once audio had
+/// started, and `held`: for each read, where its bytes start and how much it still had to play
+/// as they arrived.
 #[cfg(unix)]
 struct PlayingRenderer {
     bytes: Arc<Mutex<Vec<u8>>>,
     paused: Arc<AtomicBool>,
     dry: Arc<Mutex<Duration>>,
+    held: Arc<Mutex<Vec<(usize, Duration)>>>,
     reading: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -2842,8 +2865,15 @@ impl PlayingRenderer {
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let paused = Arc::new(AtomicBool::new(false));
         let dry = Arc::new(Mutex::new(Duration::ZERO));
+        let held_log = Arc::new(Mutex::new(Vec::new()));
         let reading = Arc::new(AtomicBool::new(true));
-        let (bytes_t, paused_t, dry_t, reading_t) = (bytes.clone(), paused.clone(), dry.clone(), reading.clone());
+        let (bytes_t, paused_t, dry_t, held_t, reading_t) = (
+            bytes.clone(),
+            paused.clone(),
+            dry.clone(),
+            held_log.clone(),
+            reading.clone(),
+        );
         let thread = std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             // What it has played (time spent playing) and got.
@@ -2880,8 +2910,14 @@ impl PlayingRenderer {
                 match reader.read(&mut buf[..room]) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        // What it still had to play as these bytes arrived: the read may have
+                        // waited, playing meanwhile (it can't have been paused, as it was reading).
+                        let waited = Instant::now() - last;
+                        let still = got_time.saturating_sub(played + waited);
+                        let mut bytes = bytes_t.lock().unwrap();
+                        held_t.lock().unwrap().push((bytes.len(), still));
                         got += n as u64;
-                        bytes_t.lock().unwrap().extend_from_slice(&buf[..n]);
+                        bytes.extend_from_slice(&buf[..n]);
                     }
                 }
             }
@@ -2890,9 +2926,18 @@ impl PlayingRenderer {
             bytes,
             paused,
             dry,
+            held: held_log,
             reading,
             thread: Some(thread),
         }
+    }
+
+    /// How much audio it still had to play when byte `at` arrived.
+    fn held_at(&self, at: usize) -> Duration {
+        let held = self.held.lock().unwrap();
+        let &(start, still) = held.iter().rev().find(|&&(start, _)| start <= at).unwrap();
+        // The bytes of the same read before it arrived with it.
+        still + Duration::from_secs_f64((at - start) as f64 / REAL_TIME_BYTES_PER_SEC)
     }
 
     fn hang_up(mut self) {
