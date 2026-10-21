@@ -430,7 +430,9 @@ impl AnalysisDatabase {
             }
         }
         if let Some(dir) = dir {
-            // A folder that is no longer complete can't have a complete subtree.
+            // A folder listed again is not whole until the walk below it is done again
+            // (`set_subtree_complete`): its subfolders may have changed since the last walk, and
+            // the fresh `walked_at` would otherwise vouch for them.
             tx.execute(
                 r#"
                 INSERT INTO library_index_dirs (dirpath, audio_files, complete, subtree_complete, walked_at)
@@ -438,8 +440,7 @@ impl AnalysisDatabase {
                 ON CONFLICT(dirpath) DO UPDATE SET
                     audio_files = excluded.audio_files,
                     complete = excluded.complete,
-                    subtree_complete = CASE WHEN excluded.complete = 0 THEN 0
-                                            ELSE library_index_dirs.subtree_complete END,
+                    subtree_complete = 0,
                     walked_at = excluded.walked_at;
                 "#,
                 params![

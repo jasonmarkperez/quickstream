@@ -663,7 +663,8 @@ fn test_folder_record_commits_together_with_its_rows() {
 }
 
 /// `indexed_subtrees` names the folders whose whole subtree is indexed; a folder written again
-/// as incomplete loses its subtree mark. `index_stamps` gives the stamps of the rows it has.
+/// at all (incomplete, or re-listed by a later pass) loses its subtree mark until it is set again.
+/// `index_stamps` gives the stamps of the rows it has.
 #[test]
 fn test_indexed_subtrees_and_index_stamps() {
     common::isolate();
@@ -693,6 +694,13 @@ fn test_indexed_subtrees_and_index_stamps() {
     let indexed = db.indexed_subtrees(&asked);
     assert_eq!(indexed.len(), 1);
     assert!(indexed.contains_key(Path::new("/m/A")));
+
+    // Written again as complete (re-listed by a later pass), the folder's subtree is not whole
+    // until the walk below it sets the mark again.
+    db.write_index_batch(&[], Some(&dir_record("/m/A", 1, true))).unwrap();
+    assert!(db.indexed_subtrees(&asked).is_empty());
+    assert!(db.set_subtree_complete(Path::new("/m/A"), true).unwrap());
+    assert_eq!(db.indexed_subtrees(&asked).len(), 1);
 
     let stamps = db.index_stamps(&[PathBuf::from("/m/A/1.flac"), PathBuf::from("/m/A/none.flac")]);
     assert_eq!(stamps.len(), 1);

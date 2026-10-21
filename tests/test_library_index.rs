@@ -908,3 +908,57 @@ fn a_mix_folder_is_indexed_first() {
         "{order:?}"
     );
 }
+
+/// A folder re-listed by a later pass loses its subtree mark until its whole subtree has been
+/// walked again: stopped inside an album added since the last pass, neither the artist folder
+/// nor the root reads as whole, so a mix walks them and finds the new album.
+#[test]
+fn a_rewalked_folder_is_not_whole_until_its_subtree_is_walked_again() {
+    common::isolate();
+    let (lib, db_path) = scratch("rewalk");
+    library_tree(&lib, 2, 2);
+    one_pass(&db_path, vec![lib.clone()], default_tag_reader());
+    let artist = lib.join("Artist 00");
+    {
+        let db = AnalysisDatabase::open_at(&db_path).unwrap();
+        assert_eq!(db.indexed_subtrees(&[lib.clone(), artist.clone()]).len(), 2);
+    }
+
+    let new_album = artist.join("NewAlbum");
+    silent_wav(&new_album.join("01 New.wav"));
+    silent_wav(&new_album.join("02 New.wav"));
+
+    // The second pass reads only the new album's files: stop at its first one.
+    let control = Arc::new(IndexControl::new());
+    let progress = Arc::new(IndexProgress::new());
+    let reader: IndexTagReader = {
+        let (control, real) = (control.clone(), default_tag_reader());
+        Arc::new(move |path: &Path, stamp| {
+            control.stop();
+            real(path, stamp)
+        })
+    };
+    let path = db_path.clone();
+    run_library_index(
+        || AnalysisDatabase::open_at(&path),
+        config(vec![lib.clone()]),
+        &control,
+        &progress,
+        reader,
+    );
+
+    let db = AnalysisDatabase::open_at(&db_path).unwrap();
+    assert!(
+        db.indexed_subtrees(std::slice::from_ref(&artist)).is_empty(),
+        "the artist folder was stopped inside its new album"
+    );
+    assert!(
+        db.indexed_subtrees(std::slice::from_ref(&lib)).is_empty(),
+        "the root was stopped part-way"
+    );
+    assert_eq!(
+        db.indexed_subtrees(&[artist.join("Album")]).len(),
+        1,
+        "the album walked whole keeps its mark"
+    );
+}
