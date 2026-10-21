@@ -1619,6 +1619,33 @@ fn test_status_up_next_follows_the_continuous_stream() {
     stop_up_next_app(app);
 }
 
+/// A single track under the continuous stream: the stream plays it again (a one-track queue is
+/// not reshuffled), so the end is `loops` and the next track is that one, whatever the mode (#134).
+#[test]
+fn test_status_up_next_single_track_under_the_continuous_stream_repeats() {
+    common::isolate();
+    let mut app = up_next_app_with(&[200.0]);
+    for mode in ["stop", "loop", "repeat_one"] {
+        app.settings_mgr.settings.queue_mode = mode.to_string();
+        app.queue.set_current_index(0);
+        stream_plays(&app, 0);
+        assert_up_next(
+            &mut app,
+            &format!("{mode}, stream on the only track"),
+            WantUpNext {
+                listed: &[],
+                remaining: 0,
+                end: "loops",
+                next: Some("T0"),
+                wraps_before: None,
+                shows_end: true,
+                total: None,
+            },
+        );
+    }
+    stop_up_next_app(app);
+}
+
 /// The stream has started a later track than the UI's queue names (it follows at its next tick):
 /// the dashboard shows the stream's track and what follows it, all from one index (#104).
 #[test]

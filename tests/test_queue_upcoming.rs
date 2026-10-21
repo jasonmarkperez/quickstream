@@ -78,7 +78,7 @@ fn test_upcoming_per_mode() {
 }
 
 /// The UPnP continuous stream plays on to the end of the queue whatever the mode, then
-/// reshuffles and starts over (a single track repeats).
+/// reshuffles and starts over.
 #[test]
 fn test_upcoming_with_the_continuous_stream() {
     common::isolate();
@@ -89,6 +89,16 @@ fn test_upcoming_with_the_continuous_stream() {
         let last = queue(5, 4).upcoming(mode, true);
         assert_eq!(last.len(), 0, "{mode}");
         assert_eq!(last.end(), QueueEnd::Reshuffles, "{mode}");
+    }
+}
+
+/// A single track under the continuous stream: the stream doesn't reshuffle a one-track queue,
+/// it plays the track again, so the end is `Loops` (UP NEXT's "repeats this track"), never
+/// `Reshuffles`, whatever the mode (#134).
+#[test]
+fn test_upcoming_single_track_under_the_continuous_stream_repeats() {
+    common::isolate();
+    for mode in ["stop", "loop", "repeat_one"] {
         let single = queue(1, 0).upcoming(mode, true);
         assert_eq!(single.len(), 0, "{mode}");
         assert_eq!(single.end(), QueueEnd::Loops, "{mode}");

@@ -64,10 +64,11 @@ pub enum QueueEnd {
     /// The current track plays again, and again (repeat-one mode); nothing else is next.
     RepeatOne,
     /// The queue loops: after the listed tracks (which already wrap past the end to the first
-    /// track) the current one plays again. With a single track it simply repeats.
+    /// track) the current one plays again. With a single track it simply repeats, in loop mode
+    /// and under the UPnP continuous stream alike (the stream doesn't reshuffle one track).
     Loops,
     /// The UPnP continuous stream reshuffles the queue and starts over, so what follows the
-    /// listed tracks isn't known yet.
+    /// listed tracks isn't known yet. Only for a queue of two or more tracks.
     Reshuffles,
 }
 
@@ -326,7 +327,8 @@ impl PlaybackQueue {
 
     /// The tracks that play after the current one, as [`Self::next_track`] in `mode` will play
     /// them (`wrap: false`), or as the UPnP continuous stream does (`wrap: true`): it plays on to
-    /// the end of the queue whatever the mode, then reshuffles and starts over. Stop mode lists
+    /// the end of the queue whatever the mode, then reshuffles and starts over (a single track
+    /// has nothing to reshuffle and just repeats: [`QueueEnd::Loops`]). Stop mode lists
     /// the tracks to the end of the queue; loop mode every other track, past the end to the
     /// first; repeat-one none, since the current track repeats.
     pub fn upcoming(&self, mode: &str, wrap: bool) -> Upcoming {
