@@ -173,6 +173,13 @@ impl AppUI {
             Some(&to) => self.queue_cursor = to,
             None => self.clamp_queue_cursor(),
         }
+        self.stream_follow_rows(moved);
+    }
+
+    /// While the continuous stream plays, note where each queued track went (`moved[i]`: the new
+    /// row of the track that was at row `i`), for the next publish of the queue
+    /// (`update_web_state`) to hand the stream with the new queue.
+    fn stream_follow_rows(&mut self, moved: Vec<usize>) {
         if self.continuous_stream_active() {
             self.stream_reorder = Some(match self.stream_reorder.take() {
                 // Reordered twice before a publish: where each track went in the end.
@@ -189,10 +196,22 @@ impl AppUI {
 
     /// Remove a queue row (TUI `d` or the web dashboard). Removing the track that is playing or
     /// paused moves playback on to the track that took its place; emptying the queue stops it.
+    /// While the continuous stream plays, the rows after the removed one move up one for the
+    /// stream too, published at once, so the event loop's sync and the web state stay on the
+    /// track it plays (#136).
     pub fn remove_queue_track(&mut self, index: usize) -> Option<crate::metadata::AudioMetadata> {
+        let old_len = self.queue.len();
         let removed = self.queue.remove(index)?;
         self.playlist_fill_row_removed(index);
         self.clamp_queue_cursor();
+        if self.continuous_stream_active() {
+            // The removed row names the track that took its place.
+            let moved = (0..old_len)
+                .map(|row| if row > index { row - 1 } else { row })
+                .collect();
+            self.stream_follow_rows(moved);
+            self.update_web_state();
+        }
         if removed.was_current {
             if self.queue.is_empty() {
                 let _ = self.player.stop();

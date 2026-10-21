@@ -1457,6 +1457,119 @@ fn test_shuffle_while_the_continuous_stream_plays_keeps_its_track_current() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Removing queue rows before the continuous stream's track (`d` in the queue pane, the web
+/// dashboard's remove) moves the stream's index with its track, so the event loop's sync, the
+/// web state's ▶ and a pending skip stay on the track playing, not the one after it (#136).
+#[test]
+fn test_removing_a_row_before_the_continuous_streams_track_keeps_it_current() {
+    common::isolate();
+    let dir = temp_dir("remove_before_stream_index");
+    let tracks: Vec<PathBuf> = (0..8).map(|i| dir.join(format!("t{}.wav", i))).collect();
+    let settings = SettingsManager::with_path(dir.join("config.json"));
+    let mut app = AppUI::new(Some(dir.clone()), settings);
+    app.queue.add_tracks(
+        tracks
+            .iter()
+            .enumerate()
+            .map(|(i, p)| track_meta(p, &format!("Track {}", i), 60.0))
+            .collect(),
+    );
+    app.queue.set_current_index(5);
+    let (tx, _web_rx) = mpsc::channel();
+    let handle = WebServer::start(0, app.web_state.clone(), tx).expect("start web server");
+    let controller = handle.stream_state().continuous.clone();
+    controller.is_active.store(true, Ordering::SeqCst);
+    *controller.current_track_index.lock().unwrap() = 5;
+    app.web_server = Some(handle);
+    app.update_web_state();
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    app.web_cmd_rx = Some(cmd_rx);
+    app.active_tab = 1;
+    app.queue_focus = true;
+
+    // Each round removes one row before the playing track: from the terminal, then the web.
+    for (round, row) in [2usize, 0, 1, 0].into_iter().enumerate() {
+        let expected = 4 - round;
+        if round % 2 == 0 {
+            app.queue_cursor = row;
+            app.handle_input_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('d'),
+                crossterm::event::KeyModifiers::NONE,
+            ))
+            .unwrap();
+        } else {
+            // A skip the stream hasn't acted on yet names a track by its row too.
+            controller.skip_to_index(expected + 1);
+            controller.skip_to_index(expected + 1);
+            cmd_tx.send(WebCommand::RemoveIndex(row)).unwrap();
+            app.handle_web_commands();
+            assert_eq!(
+                controller.pending_request().map(|r| r.index),
+                Some(expected),
+                "round {round}: the pending skip follows its track"
+            );
+        }
+        assert_eq!(app.queue.len(), 7 - round, "round {round}");
+        assert_eq!(
+            *controller.current_track_index.lock().unwrap(),
+            expected,
+            "round {round}"
+        );
+        app.sync_continuous_stream_index();
+        assert_eq!(app.queue.current_index(), expected, "round {round}");
+        assert_eq!(
+            app.queue.current_track().map(|t| t.filepath.clone()),
+            Some(tracks[5].clone()),
+            "round {round}: the playing track stays current"
+        );
+        let state = app.web_state.read().unwrap();
+        assert_eq!(state.queue_index, expected, "round {round}");
+        let marked: Vec<&str> = state
+            .queue
+            .iter()
+            .filter(|t| t.is_current)
+            .map(|t| t.filepath.as_str())
+            .collect();
+        assert_eq!(
+            marked,
+            vec![tracks[5].to_string_lossy().as_ref()],
+            "round {round}: the web ▶ stays on the playing track"
+        );
+    }
+
+    if let Some(handle) = app.web_server.take() {
+        handle.stream_state().close_active_streams();
+        handle.stop();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A row removed before the playing track: the stream goes on to the track after the one
+/// playing, not to the one two rows on (#136).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_goes_on_after_a_row_removed_before_its_track() {
+    common::isolate();
+    let f = DecoderFixture::start(
+        "follow_removal",
+        &["t0.wav", "t1.wav", "t2.wav", "t3_long.wav", "t4.wav", "t5.wav"],
+        3,
+    );
+    assert_eq!(f.run(1), (f.tracks[3].clone(), None));
+    {
+        // What the UI's removal of row 1 does: publish the shorter queue and tell the stream
+        // where each track went, under the web state's lock.
+        let mut s = f.state.write().unwrap();
+        s.queue.remove(1);
+        for (i, t) in s.queue.iter_mut().enumerate() {
+            t.index = i;
+        }
+        f.controller.queue_reordered(&[0, 1, 1, 2, 3, 4]);
+    }
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 2);
+    assert_eq!(f.run(2), (f.tracks[4].clone(), None), "the track after the playing one");
+}
+
 /// After a shuffle in the UI, the track after the playing one is the one the shuffle put after
 /// it, not the one at the row after its old row; and a track that was last before the shuffle
 /// doesn't make the stream wrap and reshuffle again when it ends (PR #127 review).
