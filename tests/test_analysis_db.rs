@@ -270,17 +270,17 @@ fn dir_record(dir: &str, files: usize, complete: bool) -> IndexedDir {
     }
 }
 
-/// A v1 database opens at version 2: its row is kept, reads `needs_acoustic == false` (every v1
-/// row is a full analysis) and stays current for the worker.
+/// A v1 database opens at the current version: its row is kept, reads `needs_acoustic == false`
+/// (every v1 row is a full analysis) and stays current for the worker.
 #[test]
-fn test_v1_database_migrates_to_v2_keeping_rows_current() {
+fn test_v1_database_migrates_keeping_rows_current() {
     common::isolate();
     let dir = scratch_dir("v1_to_v2");
     let path = dir.join("track_analysis.db");
     write_v1_fixture(&path);
 
     let db = AnalysisDatabase::open_at(&path).unwrap();
-    assert_eq!(CURRENT_SCHEMA_VERSION, 2);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 3);
     let legacy = db.get_track(Path::new("/music/legacy.flac")).expect("row kept");
     assert_eq!(legacy.title, "Legacy");
     assert_eq!(legacy.bpm, Some(124.0));
@@ -289,14 +289,15 @@ fn test_v1_database_migrates_to_v2_keeping_rows_current() {
     assert!(row_is_current(&legacy, (11, 22)));
     assert!(!row_is_current(&legacy, (12, 22)));
     drop(db);
-    assert_eq!(user_version(&path), 2);
+    assert_eq!(user_version(&path), CURRENT_SCHEMA_VERSION);
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The v2 step adds the `needs_acoustic` column and the `library_index_dirs` table, and nothing
-/// else: no index on track_features, no other table.
+/// The v2 and v3 steps add the `needs_acoustic` column, the `library_index_dirs` table (v3: its
+/// `dir_mtime`) and the `library_index_failures` table, and nothing else: no index on
+/// track_features, no other table.
 #[test]
-fn test_v2_step_adds_only_the_column_and_the_table() {
+fn test_v2_and_v3_steps_add_only_their_columns_and_tables() {
     common::isolate();
     let dir = scratch_dir("v2_shape");
     let path = dir.join("track_analysis.db");
@@ -320,16 +321,32 @@ fn test_v2_step_adds_only_the_column_and_the_table() {
     assert!(
         new_indexes
             .iter()
-            .all(|i| i.starts_with("sqlite_autoindex_library_index_dirs")),
-        "only the new table's primary key index: {new_indexes:?}"
+            .all(|i| i.starts_with("sqlite_autoindex_library_index_")),
+        "only the new tables' primary key indexes: {new_indexes:?}"
     );
     assert_eq!(
         names(&conn, "SELECT name FROM sqlite_master WHERE type = 'table'"),
-        vec!["library_index_dirs".to_string(), "track_features".to_string()]
+        vec![
+            "library_index_dirs".to_string(),
+            "library_index_failures".to_string(),
+            "track_features".to_string()
+        ]
     );
+    // v3 adds `dir_mtime` (the folder mtime a subtree mark is for) and the failures table.
     assert_eq!(
         columns(&conn, "library_index_dirs"),
-        vec!["audio_files", "complete", "dirpath", "subtree_complete", "walked_at"]
+        vec![
+            "audio_files",
+            "complete",
+            "dir_mtime",
+            "dirpath",
+            "subtree_complete",
+            "walked_at"
+        ]
+    );
+    assert_eq!(
+        columns(&conn, "library_index_failures"),
+        vec!["failed_at", "file_size", "filepath", "mtime", "panicked"]
     );
     let flag: i64 = conn
         .query_row(
@@ -339,6 +356,39 @@ fn test_v2_step_adds_only_the_column_and_the_table() {
         )
         .unwrap();
     assert_eq!(flag, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A v2 database (a subtree mark recorded with no folder mtime) opens at v3 with its record
+/// kept, but the mark is not trusted: it has no mtime to compare a folder with.
+#[test]
+fn test_v2_subtree_marks_are_not_trusted_after_v3() {
+    common::isolate();
+    let dir = scratch_dir("v2_to_v3");
+    let path = dir.join("track_analysis.db");
+    write_v1_fixture(&path);
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+            ALTER TABLE track_features ADD COLUMN needs_acoustic INTEGER NOT NULL DEFAULT 0;
+            CREATE TABLE library_index_dirs (
+                dirpath TEXT PRIMARY KEY, audio_files INTEGER NOT NULL,
+                complete INTEGER NOT NULL DEFAULT 0, subtree_complete INTEGER NOT NULL DEFAULT 0,
+                walked_at INTEGER NOT NULL
+            );
+            INSERT INTO library_index_dirs VALUES ('/music/A', 3, 1, 1, 99);
+            PRAGMA user_version = 2;
+            "#,
+        )
+        .unwrap();
+    }
+    let db = AnalysisDatabase::open_at(&path).unwrap();
+    let (record, _) = db.index_dir(Path::new("/music/A")).expect("the record is kept");
+    assert_eq!((record.audio_files, record.walked_at), (3, 99));
+    assert!(db.indexed_subtrees(&[PathBuf::from("/music/A")]).is_empty());
+    drop(db);
+    assert_eq!(user_version(&path), 3);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -662,8 +712,10 @@ fn test_folder_record_commits_together_with_its_rows() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// `indexed_subtrees` names the folders whose whole subtree is indexed; a folder written again
-/// as incomplete loses its subtree mark. `index_stamps` gives the stamps of the rows it has.
+/// `indexed_subtrees` names the folders whose whole subtree is indexed, each with the folder
+/// mtime its mark was set for. Writing a folder's record again (re-listed by a later pass, or
+/// incomplete) leaves the mark and its mtime alone; only `set_subtree_complete` changes them.
+/// `index_stamps` gives the stamps of the rows it has.
 #[test]
 fn test_indexed_subtrees_and_index_stamps() {
     common::isolate();
@@ -674,25 +726,38 @@ fn test_indexed_subtrees_and_index_stamps() {
     )
     .unwrap();
     db.write_index_batch(&[], Some(&dir_record("/m/B", 0, true))).unwrap();
-    assert!(db.set_subtree_complete(Path::new("/m/A"), true).unwrap());
-    assert!(db.set_subtree_complete(Path::new("/m/B/"), true).unwrap());
+    let asked = vec![PathBuf::from("/m/A"), PathBuf::from("/m/B"), PathBuf::from("/m/C")];
     assert!(
-        !db.set_subtree_complete(Path::new("/m/C"), true).unwrap(),
+        db.indexed_subtrees(&asked).is_empty(),
+        "no mark until the subtree is walked"
+    );
+    assert!(db.set_subtree_complete(Path::new("/m/A"), Some(1_000)).unwrap());
+    assert!(db.set_subtree_complete(Path::new("/m/B/"), Some(-5)).unwrap());
+    assert!(
+        !db.set_subtree_complete(Path::new("/m/C"), Some(1)).unwrap(),
         "no record, nothing set"
     );
 
-    let asked = vec![PathBuf::from("/m/A"), PathBuf::from("/m/B"), PathBuf::from("/m/C")];
     let indexed = db.indexed_subtrees(&asked);
     assert_eq!(indexed.len(), 2);
-    // Each with when its record was walked.
-    assert_eq!(indexed.get(Path::new("/m/A")), Some(&77));
-    assert_eq!(indexed.get(Path::new("/m/B")), Some(&77));
+    assert_eq!(indexed.get(Path::new("/m/A")), Some(&1_000));
+    assert_eq!(
+        indexed.get(Path::new("/m/B")),
+        Some(&-5),
+        "an mtime before 1970 is kept"
+    );
 
-    // Written again as incomplete (a read failed), the folder's subtree is no longer complete.
+    // Re-listed by a later pass (complete or not): the mark and its mtime stay.
+    db.write_index_batch(&[], Some(&dir_record("/m/A", 1, true))).unwrap();
     db.write_index_batch(&[], Some(&dir_record("/m/B", 1, false))).unwrap();
+    assert_eq!(db.indexed_subtrees(&asked).len(), 2);
+
+    // A walk that didn't come out whole takes the mark away; a whole one sets its new mtime.
+    assert!(db.set_subtree_complete(Path::new("/m/B"), None).unwrap());
+    assert!(db.set_subtree_complete(Path::new("/m/A"), Some(2_000)).unwrap());
     let indexed = db.indexed_subtrees(&asked);
     assert_eq!(indexed.len(), 1);
-    assert!(indexed.contains_key(Path::new("/m/A")));
+    assert_eq!(indexed.get(Path::new("/m/A")), Some(&2_000));
 
     let stamps = db.index_stamps(&[PathBuf::from("/m/A/1.flac"), PathBuf::from("/m/A/none.flac")]);
     assert_eq!(stamps.len(), 1);

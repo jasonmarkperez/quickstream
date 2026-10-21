@@ -28,6 +28,7 @@ impl AppUI {
         }
         self.playlists.stop_checks();
         self.track_features.stop();
+        self.stop_library_index();
         // Dropping the inbox wakes queue metadata workers blocked waiting for work.
         self.queue_metadata_tx = None;
         if let Some(mut modal) = self.search_modal.take() {
@@ -97,6 +98,8 @@ impl AppUI {
 
     pub fn run(&mut self) -> anyhow::Result<()> {
         self.device_manager.start_background_scan();
+        // The indexer's thread waits a few seconds before it reads anything (startup stays quiet).
+        self.start_library_index();
         enable_raw_mode()?;
         // From here on the terminal is restored on every exit path, including `?` and panics.
         let guard = TerminalGuard::claim();
@@ -148,6 +151,8 @@ impl AppUI {
 
         // Poll progressive background autopilot discovery
         self.poll_background_autopilot();
+        // After the autopilot poll, so a mix that just finished no longer holds the indexer.
+        self.poll_library_index();
 
         if let Some(ref mut modal) = self.search_modal {
             modal.poll_background_scan();

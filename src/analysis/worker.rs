@@ -439,7 +439,9 @@ pub fn tag_features(path: &Path, stamp: (u64, u64)) -> Result<TrackFeatures, Tag
     Ok(features)
 }
 
-fn now_secs() -> u64 {
+/// Now, in whole seconds since the epoch (0 if the clock is before it): what `analyzed_at` and
+/// the library index's records are dated with.
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

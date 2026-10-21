@@ -15,7 +15,13 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
+use lofty::config::WriteOptions;
+use lofty::prelude::*;
+use lofty::tag::{ItemKey, Tag, TagType};
 use quickstream::analysis::db::IndexedDir;
+use quickstream::analysis::index::{
+    default_tag_reader, folder_mtime, run_library_index, IndexConfig, IndexControl, IndexProgress, IndexState,
+};
 use quickstream::analysis::{AnalysisDatabase, MixProfile, MoodType, TrackFeatures};
 use quickstream::library::{AutopilotEvent, LibraryManager, MetadataCache, ProfileScanLimits};
 use quickstream::metadata::AudioMetadata;
@@ -77,28 +83,27 @@ fn row(path: &Path, artist: &str, album: &str, genre: &str, bpm: Option<f64>) ->
     }
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
-
-/// Record `folder` as indexed now: its rows, its folder record, and its subtree marked complete.
+/// Record `folder` as indexed as it is now: its rows, its folder record, and its subtree marked
+/// complete for its current mtime.
 fn index_folder(db: &AnalysisDatabase, folder: &Path, rows: &[TrackFeatures]) {
-    index_folder_at(db, folder, rows, now_secs());
+    index_folder_at(db, folder, rows, folder_mtime(folder).unwrap());
 }
 
-/// Record `folder` as indexed at `walked_at` (seconds).
-fn index_folder_at(db: &AnalysisDatabase, folder: &Path, rows: &[TrackFeatures], walked_at: u64) {
+/// Record `folder` as indexed with its subtree mark set for the folder mtime `dir_mtime`.
+fn index_folder_at(db: &AnalysisDatabase, folder: &Path, rows: &[TrackFeatures], dir_mtime: i64) {
     let record = IndexedDir {
         dirpath: folder.to_path_buf(),
         audio_files: rows.len(),
         complete: true,
-        walked_at,
+        walked_at: 1,
     };
     db.write_index_batch(rows, Some(&record)).unwrap();
-    assert!(db.set_subtree_complete(folder, true).unwrap());
+    assert!(db.set_subtree_complete(folder, Some(dir_mtime)).unwrap());
+}
+
+/// Set a folder's mtime, as a share whose clock reads `t` would.
+fn set_folder_mtime(folder: &Path, t: std::time::SystemTime) {
+    File::open(folder).unwrap().set_modified(t).unwrap();
 }
 
 /// `n` silent tracks in `folder`.
@@ -236,6 +241,54 @@ fn a_fully_indexed_chill_mix_reads_no_tags_and_walks_no_folders() {
     assert_eq!(unique.len(), run.tracks.len(), "no track is sent twice");
 }
 
+/// End to end with the background indexer (PR 2 of #41): a library the indexer has walked is
+/// mixed from its rows, with no tag read and no folder walked.
+#[test]
+fn a_library_the_indexer_walked_is_mixed_without_reading_tags() {
+    common::isolate();
+    let lib = library("indexer_end_to_end");
+    for a in 0..12 {
+        for path in tracks(&lib.join(format!("Artist {a:02}")).join("Album"), 3) {
+            let mut tag = Tag::new(TagType::Id3v2);
+            tag.set_artist(format!("Artist {a:02}"));
+            tag.insert_text(ItemKey::IntegerBpm, "120".to_string());
+            tag.save_to_path(&path, WriteOptions::default()).unwrap();
+        }
+    }
+    // A folder whose mtime is within the indexer's 2 s tick of its listing gets no subtree mark
+    // (the mix walks it): let the clock move past the tree's mtimes first.
+    std::thread::sleep(Duration::from_millis(2100));
+    let db_path = lib.with_extension("db");
+    let _ = fs::remove_file(&db_path);
+
+    let control = Arc::new(IndexControl::new());
+    let progress = Arc::new(IndexProgress::new());
+    let (c, p, path, root) = (control.clone(), progress.clone(), db_path.clone(), lib.clone());
+    let indexer = std::thread::spawn(move || {
+        let cfg = IndexConfig {
+            start_delay: Duration::ZERO,
+            ..IndexConfig::new(vec![root])
+        };
+        run_library_index(|| AnalysisDatabase::open_at(&path), cfg, &c, &p, default_tag_reader());
+    });
+    let start = std::time::Instant::now();
+    while progress.state() != IndexState::Done {
+        assert!(start.elapsed() < Duration::from_secs(20), "the pass didn't finish");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    control.stop();
+    indexer.join().unwrap();
+    assert_eq!(progress.snapshot().read, 36);
+
+    let db = AnalysisDatabase::open_at(&db_path).unwrap();
+    let run = run_mix(&lib, &db, bpm_flow(), ProfileScanLimits::default());
+    assert_eq!(counter(&run.gathered, "tag_reads"), 0, "{}", run.gathered);
+    assert_eq!(counter(&run.gathered, "folders"), 0, "{}", run.gathered);
+    assert_eq!(counter(&run.gathered, "index_folders"), 12, "{}", run.gathered);
+    assert_eq!(run.tracks.len(), 36, "{}", run.gathered);
+    assert!(run.candidates.is_empty(), "BPM-tagged rows need no analysis");
+}
+
 /// An indexed folder gives no more matches than a walked one would (`per_subdir`), however
 /// many of its rows match.
 #[test]
@@ -328,11 +381,13 @@ fn a_missing_indexed_file_is_never_sent() {
             .iter()
             .map(|p| row(p, &format!("Artist {a}"), &format!("Album {a}"), "House", Some(121.0)))
             .collect();
-        index_folder(&db, &folder, &rows);
         for path in &files[..2] {
             fs::remove_file(path).unwrap();
             gone.insert(path.clone());
         }
+        // Recorded as the folder is now (the removals change its mtime), so it is drawn from
+        // the index, its rows for the removed files included.
+        index_folder(&db, &folder, &rows);
     }
 
     let run = run_mix(&lib, &db, bpm_flow(), ProfileScanLimits::default());
@@ -634,9 +689,9 @@ fn a_changed_indexed_file_takes_its_cached_tags_at_its_new_size() {
 }
 
 /// A folder changed since the index walked it (here a new album under an indexed artist: the
-/// artist folder's mtime is newer than its record's `walked_at`) is walked instead of drawn
-/// from its rows, so the new tracks reach the mix; a folder unchanged since is still drawn from
-/// the index (PR #145 review).
+/// artist folder's mtime is no longer the one its subtree mark was recorded for) is walked
+/// instead of drawn from its rows, so the new tracks reach the mix; a folder unchanged since is
+/// still drawn from the index (PR #145 review).
 #[test]
 fn a_folder_changed_since_it_was_indexed_is_walked() {
     common::isolate();
@@ -655,14 +710,46 @@ fn a_folder_changed_since_it_was_indexed_is_walked() {
         .map(|p| row(p, "Grown Artist", "Old Album", "House", Some(120.0)))
         .collect();
     let new_album = tracks(&grown.join("New Album"), 2);
-    // Indexed before the new album came: its record is older than the folder's mtime.
-    let (grown_mtime, _) = stamp(&grown);
-    index_folder_at(&db, &grown, &old_rows, grown_mtime - 1);
+    // Indexed before the new album came: its mark is for an earlier folder mtime.
+    index_folder_at(&db, &grown, &old_rows, folder_mtime(&grown).unwrap() - 1);
 
     let run = run_mix(&lib, &db, bpm_flow(), ProfileScanLimits::default());
     assert_eq!(counter(&run.gathered, "index_folders"), 1, "{}", run.gathered);
     assert_eq!(counter(&run.gathered, "folders"), 1, "{}", run.gathered);
     assert_eq!(counter(&run.gathered, "files"), 4, "{}", run.gathered);
+    let reached: HashSet<&PathBuf> = run.tracks.iter().chain(&run.candidates).collect();
+    for path in &new_album {
+        assert!(reached.contains(path), "{} is new: {:?}", path.display(), reached);
+    }
+}
+
+/// A share whose clock is behind ours (#146 review): the folder was indexed with an mtime hours
+/// before our now, and the album added since gives it an mtime still before the time the index
+/// walked it. The mix compares the mtimes for equality, not with our clock, so it walks the
+/// folder and finds the new album.
+#[test]
+fn a_change_on_a_share_whose_clock_is_behind_is_still_seen() {
+    common::isolate();
+    let lib = library("nas_clock");
+    let db = AnalysisDatabase::open_in_memory().unwrap();
+    let artist = lib.join("Behind Artist");
+    let old_rows: Vec<TrackFeatures> = tracks(&artist.join("Old Album"), 2)
+        .iter()
+        .map(|p| row(p, "Behind Artist", "Old Album", "House", Some(120.0)))
+        .collect();
+    let now = std::time::SystemTime::now();
+    let three_hours = Duration::from_secs(3 * 60 * 60);
+    set_folder_mtime(&artist, now - three_hours);
+    index_folder(&db, &artist, &old_rows);
+
+    // The NAS adds an album and stamps the folder with its own clock, still hours behind ours.
+    let new_album = tracks(&artist.join("New Album"), 2);
+    set_folder_mtime(&artist, now - three_hours + Duration::from_secs(60));
+    assert!(fs::metadata(&artist).unwrap().modified().unwrap() < now);
+
+    let run = run_mix(&lib, &db, bpm_flow(), ProfileScanLimits::default());
+    assert_eq!(counter(&run.gathered, "index_folders"), 0, "{}", run.gathered);
+    assert_eq!(counter(&run.gathered, "folders"), 1, "{}", run.gathered);
     let reached: HashSet<&PathBuf> = run.tracks.iter().chain(&run.candidates).collect();
     for path in &new_album {
         assert!(reached.contains(path), "{} is new: {:?}", path.display(), reached);

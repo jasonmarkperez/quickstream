@@ -36,6 +36,10 @@ pub struct Settings {
     /// Playlist the add picker (`L`) highlights first: the one last added to.
     #[serde(default)]
     pub last_playlist: Option<String>,
+    /// Read the tags of the Music Homes and the startup home in the background (#41), so
+    /// profile mixes find their matches in the analysis database. On unless turned off.
+    #[serde(default = "default_library_index")]
+    pub library_index: bool,
 }
 
 fn default_web_port() -> u16 {
@@ -43,6 +47,10 @@ fn default_web_port() -> u16 {
 }
 
 fn default_gapless_autopilot() -> bool {
+    true
+}
+
+fn default_library_index() -> bool {
     true
 }
 
@@ -68,6 +76,7 @@ impl Default for Settings {
             online_enrichment: false,
             web_server_lan: false,
             last_playlist: None,
+            library_index: true,
         }
     }
 }
@@ -200,6 +209,13 @@ pub const SETTING_DEFINITIONS: &[SettingDefinition] = &[
             "Lets phones and other devices on your network open the web remote. DLNA renderers always can while in use.",
         group: SettingGroup::Web,
     },
+    SettingDefinition {
+        key: "library_index",
+        label: "Library Index",
+        description:
+            "Reads the tags in your Music Homes and startup home in the background so mixes find matches fast. Never changes your files.",
+        group: SettingGroup::Library,
+    },
 ];
 
 /// Whether `a` and `b` are the same string, at compile time.
@@ -248,6 +264,7 @@ pub mod setting {
     pub const DEFAULT_MIX_PROFILE: usize = setting_index("default_mix_profile");
     pub const ONLINE_ENRICHMENT: usize = setting_index("online_enrichment");
     pub const WEB_SERVER_LAN: usize = setting_index("web_server_lan");
+    pub const LIBRARY_INDEX: usize = setting_index("library_index");
 
     /// The settings whose rows show the web address (web server, web remote access).
     pub const WEB: [usize; 2] = [WEB_SERVER_ENABLED, WEB_SERVER_LAN];
@@ -255,8 +272,9 @@ pub mod setting {
 
 /// The order the Settings tab lists `SETTING_DEFINITIONS` in (mockup 2e): PLAYBACK (engine, seek,
 /// volume step, queue mode, gapless, transcoding), LIBRARY (file list display, startup home, mix
-/// algorithm, tag enrichment), WEB (web server, remote access). `j`/`k` move along it.
-pub const SETTING_DISPLAY_ORDER: [usize; 12] = [
+/// algorithm, tag enrichment, library index), WEB (web server, remote access). `j`/`k` move
+/// along it.
+pub const SETTING_DISPLAY_ORDER: [usize; 13] = [
     setting::PLAYER_BACKEND,
     setting::SEEK_STEP_SECONDS,
     setting::VOLUME_STEP,
@@ -267,6 +285,7 @@ pub const SETTING_DISPLAY_ORDER: [usize; 12] = [
     setting::HOME_DIR,
     setting::DEFAULT_MIX_PROFILE,
     setting::ONLINE_ENRICHMENT,
+    setting::LIBRARY_INDEX,
     setting::WEB_SERVER_ENABLED,
     setting::WEB_SERVER_LAN,
 ];
@@ -447,7 +466,7 @@ impl Default for SettingsManager {
 
 // The named indexes, as match patterns.
 use setting::{
-    DEFAULT_MIX_PROFILE, FORCE_TRANSCODE, GAPLESS_AUTOPILOT, HOME_DIR, METADATA_VIEW, ONLINE_ENRICHMENT,
+    DEFAULT_MIX_PROFILE, FORCE_TRANSCODE, GAPLESS_AUTOPILOT, HOME_DIR, LIBRARY_INDEX, METADATA_VIEW, ONLINE_ENRICHMENT,
     PLAYER_BACKEND, QUEUE_MODE, SEEK_STEP_SECONDS, VOLUME_STEP, WEB_SERVER_ENABLED, WEB_SERVER_LAN,
 };
 
@@ -543,6 +562,7 @@ impl SettingsManager {
             DEFAULT_MIX_PROFILE => SettingValue::Text(s.default_mix_profile.clone()),
             ONLINE_ENRICHMENT => SettingValue::Bool(s.online_enrichment),
             WEB_SERVER_LAN => SettingValue::Bool(s.web_server_lan),
+            LIBRARY_INDEX => SettingValue::Bool(s.library_index),
             _ => return None,
         })
     }
@@ -563,6 +583,7 @@ impl SettingsManager {
             (DEFAULT_MIX_PROFILE, SettingValue::Text(v)) => s.default_mix_profile = v,
             (ONLINE_ENRICHMENT, SettingValue::Bool(v)) => s.online_enrichment = v,
             (WEB_SERVER_LAN, SettingValue::Bool(v)) => s.web_server_lan = v,
+            (LIBRARY_INDEX, SettingValue::Bool(v)) => s.library_index = v,
             _ => {}
         }
     }
@@ -581,7 +602,8 @@ impl SettingsManager {
             SEEK_STEP_SECONDS => SEEK_STEPS.iter().map(|&v| SettingValue::Seconds(v)).collect(),
             VOLUME_STEP => VOLUME_STEPS.iter().map(|&v| SettingValue::Percent(v)).collect(),
             QUEUE_MODE => texts(&QUEUE_MODES),
-            FORCE_TRANSCODE | WEB_SERVER_ENABLED | GAPLESS_AUTOPILOT | ONLINE_ENRICHMENT | WEB_SERVER_LAN => bools(),
+            FORCE_TRANSCODE | WEB_SERVER_ENABLED | GAPLESS_AUTOPILOT | ONLINE_ENRICHMENT | WEB_SERVER_LAN
+            | LIBRARY_INDEX => bools(),
             HOME_DIR => {
                 let mut paths: Vec<Option<String>> = vec![None];
                 let listed = context
@@ -749,6 +771,12 @@ impl SettingsManager {
                 "Any device on your network"
             } else {
                 "This computer only"
+            }
+            .to_string(),
+            LIBRARY_INDEX => if self.settings.library_index {
+                "On (reads tags in the background)"
+            } else {
+                "Off"
             }
             .to_string(),
             _ => String::new(),

@@ -105,6 +105,7 @@ fn named_setting_indexes_match_their_keys() {
         (setting::DEFAULT_MIX_PROFILE, "default_mix_profile"),
         (setting::ONLINE_ENRICHMENT, "online_enrichment"),
         (setting::WEB_SERVER_LAN, "web_server_lan"),
+        (setting::LIBRARY_INDEX, "library_index"),
     ];
     for (index, key) in named {
         assert_eq!(SETTING_DEFINITIONS[index].key, key);
@@ -137,7 +138,13 @@ fn display_order_groups_settings_as_mockup_2e() {
     );
     assert_eq!(
         keys_of(SettingGroup::Library),
-        ["metadata_view", "home_dir", "default_mix_profile", "online_enrichment"]
+        [
+            "metadata_view",
+            "home_dir",
+            "default_mix_profile",
+            "online_enrichment",
+            "library_index"
+        ]
     );
     assert_eq!(keys_of(SettingGroup::Web), ["web_server_enabled", "web_server_lan"]);
 
@@ -153,6 +160,47 @@ fn display_order_groups_settings_as_mockup_2e() {
         runs.iter().map(|g| g.label()).collect::<Vec<_>>(),
         ["PLAYBACK", "LIBRARY", "WEB"]
     );
+}
+
+/// The Library Index (#41): a LIBRARY setting listed after tag enrichment, on by default (also
+/// for a config.json saved before it existed), cycling ON and OFF.
+#[test]
+fn library_index_is_on_by_default_after_tag_enrichment() {
+    common::isolate();
+    let index = quickstream::settings::setting::LIBRARY_INDEX;
+    let def = &SETTING_DEFINITIONS[index];
+    assert_eq!((def.label, def.group), ("Library Index", SettingGroup::Library));
+    assert!(def.description.contains("Never changes your files"));
+    let pos = display_position(index).unwrap();
+    assert_eq!(
+        SETTING_DISPLAY_ORDER[pos - 1],
+        quickstream::settings::setting::ONLINE_ENRICHMENT
+    );
+    assert_eq!(SETTING_DISPLAY_ORDER.len(), 13);
+
+    assert!(quickstream::settings::Settings::default().library_index);
+    let legacy: quickstream::settings::Settings = serde_json::from_str(
+        r#"{"metadata_view":true,"default_device":"local-audio","seek_step_seconds":10.0,"volume_step":5,"queue_mode":"loop","force_transcode":false,"player_backend":"mpv"}"#,
+    )
+    .unwrap();
+    assert!(
+        legacy.library_index,
+        "a config saved before the setting existed indexes"
+    );
+
+    let mut mgr = manager("library_index");
+    let context = SettingsContext::default();
+    let options = mgr.options(index, &context);
+    let labels: Vec<&str> = options.choices.iter().map(|c| c.label.as_str()).collect();
+    assert_eq!(labels, ["OFF", "ON"]);
+    assert_eq!(options.current, Some(1));
+    assert_eq!(mgr.short_value(index, &context), "ON");
+    mgr.cycle_setting(index, true, &context);
+    assert!(!mgr.settings.library_index);
+    assert_eq!(mgr.short_value(index, &context), "OFF");
+    assert_eq!(mgr.get_display_value(index, &context), "Off");
+    mgr.cycle_setting(index, true, &context);
+    assert!(mgr.settings.library_index);
 }
 
 #[test]

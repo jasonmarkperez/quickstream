@@ -1,13 +1,16 @@
 //! Tab 4 Settings in the Telemetry style (mockup 2e at 120×40, width rules 3h): the SETTINGS
 //! list, grouped PLAYBACK / LIBRARY / WEB in `SETTING_DISPLAY_ORDER`, and, from 110 columns, the
 //! option panel for the selected setting beside it (its choices with ●/○, a description, the web
-//! address and the keys that change it). The LIBRARY group ends with a read-only TRACK ANALYSIS
-//! row: the background analysis worker's counters this session (issue #30).
+//! address and the keys that change it). The LIBRARY group ends with two read-only rows: TRACK
+//! ANALYSIS, the background analysis worker's counters this session (issue #30), and INDEX
+//! PROGRESS, what the background library indexer is doing (#41; the Library Index setting just
+//! above turns it on and off).
 //!
 //! Only what is in memory is drawn: the settings and their `AppUI::settings_context` (the Music
 //! Homes the app holds, never bookmarks.json; the music folder once its startup worker has found
 //! it; the home folder; the port the running web server bound) and the cached LAN address
-//! (`SettingsManager::web_url`); the analysis counters are atomics (`AnalysisWorker::progress`).
+//! (`SettingsManager::web_url`); the analysis counters and the indexer's progress are atomics
+//! (`AnalysisWorker::progress`, `AppUI::library_index_progress`).
 //! The startup home editor stays inline: while it is open its row shows the typed text with a
 //! block cursor.
 
@@ -18,6 +21,7 @@ use super::kit::{self, text_width, Col, PanelSpec, RowMark};
 use super::queue_tab::{display_path, SEP};
 use super::screen::{Screen, WidthTier};
 use super::{theme, AppUI};
+use crate::analysis::index::{IndexSnapshot, IndexState};
 use crate::analysis::worker::AnalysisProgress;
 use crate::settings::{self, setting, SettingGroup, SETTING_DEFINITIONS, SETTING_DISPLAY_ORDER};
 
@@ -39,8 +43,9 @@ const MARK_COLS: u16 = 4;
 /// for home, or nothing for the launch folder).
 const EDIT_HELP: &str = "Type a folder (~ for home). Leave it empty for the launch folder.";
 
-/// The label of the read-only row that ends the LIBRARY group.
+/// The labels of the read-only rows that end the LIBRARY group.
 const ANALYSIS_LABEL: &str = "Track Analysis";
+const INDEX_LABEL: &str = "Index Progress";
 
 /// One row of the SETTINGS list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,12 +55,14 @@ enum Entry {
     /// The analysis worker's counters, after the LIBRARY settings. Not a setting: the cursor
     /// (a setting index) never lands on it.
     Analysis,
+    /// The library indexer's progress, after the analysis row; read-only too.
+    Index,
     Blank,
 }
 
 /// The list's rows: each group's heading, then its settings (the LIBRARY group then the
-/// analysis row), with a blank row between groups when `spaced` (spacer rows go first on short
-/// terminals, 3h).
+/// analysis and index rows), with a blank row between groups when `spaced` (spacer rows go first
+/// on short terminals, 3h).
 fn list_entries(spaced: bool) -> Vec<Entry> {
     let mut entries = Vec::new();
     let mut group = None;
@@ -63,7 +70,7 @@ fn list_entries(spaced: bool) -> Vec<Entry> {
         let this = SETTING_DEFINITIONS[index].group;
         if group != Some(this) {
             if group == Some(SettingGroup::Library) {
-                entries.push(Entry::Analysis);
+                entries.extend([Entry::Analysis, Entry::Index]);
             }
             if spaced && group.is_some() {
                 entries.push(Entry::Blank);
@@ -74,7 +81,7 @@ fn list_entries(spaced: bool) -> Vec<Entry> {
         entries.push(Entry::Setting(index));
     }
     if group == Some(SettingGroup::Library) {
-        entries.push(Entry::Analysis);
+        entries.extend([Entry::Analysis, Entry::Index]);
     }
     entries
 }
@@ -100,7 +107,44 @@ fn analysis_value(progress: AnalysisProgress) -> String {
     }
 }
 
-/// `05 / 12`: where setting `index` is listed, of how many.
+/// `READING  ·  412 / 5,981 FOLDERS  ·  18,330 READ  ·  40,112 UNCHANGED  ·  2 FAILED`: what
+/// the library indexer is doing (`OFF` while the setting is off, `WAITING` before it starts or
+/// while a restart waits for the old thread to finish). The folder count shows once the
+/// total is known, and the file counts at zero are left out. The state comes first, as the value
+/// is cut from its end.
+fn index_value(progress: IndexSnapshot, on: bool) -> String {
+    let state = match progress.state {
+        _ if !on => return "OFF".to_string(),
+        // On again, its restart waiting for the old thread to finish.
+        IndexState::Off | IndexState::Waiting => return "WAITING".to_string(),
+        IndexState::NoFolders => return "NO FOLDERS".to_string(),
+        IndexState::Unavailable => return "UNAVAILABLE".to_string(),
+        IndexState::Reading => "READING",
+        IndexState::Paused => "PAUSED",
+        IndexState::Done => "DONE",
+    };
+    let mut parts = vec![state.to_string()];
+    if progress.top_total > 0 {
+        parts.push(format!(
+            "{} / {} FOLDERS",
+            kit::grouped(progress.top_done),
+            kit::grouped(progress.top_total)
+        ));
+    }
+    parts.extend(
+        [
+            (progress.read, "READ"),
+            (progress.unchanged, "UNCHANGED"),
+            (progress.failed, "FAILED"),
+        ]
+        .into_iter()
+        .filter(|&(n, _)| n > 0)
+        .map(|(n, what)| format!("{} {what}", kit::grouped(n))),
+    );
+    parts.join(SEP)
+}
+
+/// `05 / 13`: where setting `index` is listed, of how many.
 fn position_note(index: usize) -> String {
     let n = SETTING_DISPLAY_ORDER.len();
     let pos = settings::display_position(index).map_or(0, |p| p + 1);
@@ -255,11 +299,10 @@ impl AppUI {
     }
 
     /// The grouped list: headings (DIM), each setting's label (MID) and value (INK), the
-    /// analysis row (MID, read-only); the selected one in the cursor bar as `◂ VALUE ▸`, or the
-    /// startup home being typed. The blank rows between groups go when the list does not fit,
-    /// then it scrolls to keep the cursor
-    /// (and the heading of its group, for a group's first row; the analysis row, for the LIBRARY
-    /// group's last) on screen.
+    /// analysis and index rows (MID, read-only); the selected one in the cursor bar as
+    /// `◂ VALUE ▸`, or the startup home being typed. The blank rows between groups go when the
+    /// list does not fit, then it scrolls to keep the cursor (and the heading of its group, for a
+    /// group's first row; the two read-only rows, for the LIBRARY group's last) on screen.
     fn render_settings_list(&mut self, f: &mut Frame, list: Rect) {
         let height = usize::from(list.height);
         let mut entries = list_entries(true);
@@ -280,9 +323,16 @@ impl AppUI {
             window = at - 1..(at - 1 + height).min(entries.len());
             *self.settings_state.offset_mut() = window.start;
         }
-        // Likewise the LIBRARY group's last setting brings the analysis row under it.
-        if window.end == at + 1 && height >= 2 && entries.get(at + 1) == Some(&Entry::Analysis) {
-            window = window.start + 1..at + 2;
+        // Likewise the LIBRARY group's last setting brings the read-only rows under it, as many
+        // as fit with it.
+        let read_only = entries[at + 1..]
+            .iter()
+            .take_while(|e| matches!(e, Entry::Analysis | Entry::Index))
+            .count()
+            .min(height.saturating_sub(1));
+        if read_only > 0 && window.end < at + 1 + read_only {
+            let end = at + 1 + read_only;
+            window = end.saturating_sub(height).max(window.start)..end;
             *self.settings_state.offset_mut() = window.start;
         }
 
@@ -299,12 +349,17 @@ impl AppUI {
                 Entry::Heading(group) => {
                     kit::list_row(f, row, &[Col::flex(group.label(), theme::dim())], RowMark::Plain);
                 }
-                Entry::Analysis => {
+                Entry::Analysis | Entry::Index => {
                     // MID throughout: INK marks the values the keys change.
-                    let value = kit::clip(&analysis_value(self.analysis_worker.progress()), value_cols);
+                    let (label, value) = if *entry == Entry::Analysis {
+                        (ANALYSIS_LABEL, analysis_value(self.analysis_worker.progress()))
+                    } else {
+                        let on = self.settings_mgr.settings.library_index;
+                        (INDEX_LABEL, index_value(self.library_index_progress().snapshot(), on))
+                    };
                     let cols = [
-                        Col::fixed(kit::upper(ANALYSIS_LABEL), label_cols, theme::mid()),
-                        Col::flex(value, theme::mid()),
+                        Col::fixed(kit::upper(label), label_cols, theme::mid()),
+                        Col::flex(kit::clip(&value, value_cols), theme::mid()),
                     ];
                     kit::list_row(f, row, &cols, RowMark::Plain);
                 }
