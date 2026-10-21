@@ -76,7 +76,7 @@ fn reordering_and_shuffling_bump_revision() {
     q.set_current_index(1);
     assert_bumps(&mut q, "shuffle_from_next", |q| q.shuffle_from_next());
     assert_bumps(&mut q, "shuffle_in", |q| {
-        q.shuffle_in(vec![track(7), track(8)]);
+        q.shuffle_in(vec![track(7), track(8)], usize::MAX);
     });
 }
 
@@ -185,7 +185,7 @@ fn calls_that_change_nothing_do_not_bump_revision() {
         q.shuffle();
     });
     assert_keeps(&mut empty, "shuffle_in of no tracks", |q| {
-        q.shuffle_in(Vec::new());
+        q.shuffle_in(Vec::new(), 0);
     });
     assert_keeps(&mut empty, "next_track on an empty queue", |q| {
         assert!(q.next_track("loop").is_none());

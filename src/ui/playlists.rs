@@ -63,6 +63,8 @@ struct QueueStart {
     /// The checked (canonical) path to queue.
     resolved: std::path::PathBuf,
     generation: u64,
+    /// How many entries the playlist has.
+    entries: usize,
 }
 
 /// What a `playlist-queue` worker sends: for `Enter`, the track to start on as soon as it is
@@ -90,9 +92,14 @@ struct StartedPlay {
     /// The held skip's track loads paused: an output switch found the paused started track
     /// over while it was held (issue #48).
     pause_after_skip: bool,
+    /// The playlist's other entries: the rest still to come, before the checks drop the
+    /// missing ones.
+    others: usize,
     /// The queue was shuffled while the rest was checked: the rest is shuffled in after the
-    /// current track, not put around the started track in playlist order (issue #122).
-    shuffle_rest: bool,
+    /// current track, among the first this many queued tracks (the ones the last shuffle mixed,
+    /// less those removed since), not put around the started track in playlist order (issue
+    /// #122). Tracks queued after the shuffle stay after the rest.
+    shuffled_len: Option<usize>,
 }
 
 /// What to do once the rest of the playlist `Enter` started is in the queue.
@@ -2010,6 +2017,7 @@ impl AppUI {
                         entry: entry.clone(),
                         resolved: path.clone(),
                         generation,
+                        entries: entries.len(),
                     }));
                 }
             }
@@ -2092,7 +2100,8 @@ impl AppUI {
             playback_error,
             pending_skip: None,
             pause_after_skip: false,
-            shuffle_rest: false,
+            others: start.entries.saturating_sub(1),
+            shuffled_len: None,
         });
         self.update_web_state();
     }
@@ -2120,35 +2129,79 @@ impl AppUI {
     /// still being checked (a slow share). The track to go to isn't queued yet, so remember the
     /// skip and do it once the rest arrives (`apply_playlist_queue`), instead of stopping at the
     /// end of a one-track queue or playing the started track again. Returns true when held.
+    ///
+    /// After a shuffle the started track is first and the rest goes after it, so Previous has
+    /// no track to go back to: pressed then, it restarts the started track at once (and one held
+    /// from before the shuffle restarts it once the rest is in).
     pub(super) fn hold_skip_for_playlist_fill(&mut self, skip: PlaylistSkip) -> bool {
         if !self.started_track_is_current() {
             return false;
         }
-        let name = self.playlists.checks.queue_pending.clone().unwrap_or_default();
-        if let Some(started) = self.playlists.checks.started.as_mut() {
-            started.pending_skip = Some(skip);
-        }
-        self.status_message = match skip {
-            PlaylistSkip::Ended => format!("Waiting for the rest of {}…", name),
-            PlaylistSkip::Next => format!("Next track plays once {} is checked…", name),
-            PlaylistSkip::Previous => format!("Previous track plays once {} is checked…", name),
+        let Some(started) = self.playlists.checks.started.as_mut() else {
+            return false;
         };
+        if skip == PlaylistSkip::Previous && started.shuffled_len.is_some() {
+            started.pending_skip = None;
+            self.play_current_track();
+            return true;
+        }
+        started.pending_skip = Some(skip);
+        self.status_message = self.held_skip_note().unwrap_or_default();
         self.update_web_state();
         true
+    }
+
+    /// What the skip [`Self::hold_skip_for_playlist_fill`] holds will do once the rest of the
+    /// playlist is in, if one is held.
+    fn held_skip_note(&self) -> Option<String> {
+        let started = self.playlists.checks.started.as_ref()?;
+        let name = self.playlists.checks.queue_pending.as_deref().unwrap_or_default();
+        Some(match started.pending_skip? {
+            PlaylistSkip::Ended => format!("Waiting for the rest of {}…", name),
+            PlaylistSkip::Next => format!("Next track plays once {} is checked…", name),
+            PlaylistSkip::Previous if started.shuffled_len.is_some() => {
+                format!("Previous restarts this track once {} is checked…", name)
+            }
+            PlaylistSkip::Previous => format!("Previous track plays once {} is checked…", name),
+        })
     }
 
     /// The queue was just shuffled: if the rest of a playlist `Enter` started is still being
     /// checked, shuffle it in when it arrives rather than undo the shuffle (issue #122). A shuffle
     /// doesn't supersede the fill as Clear does: that would leave the rest of the playlist out
-    /// of the queue. Returns the playlist's name when there is a rest to come.
+    /// of the queue. Returns what to add to the shuffle's status: that the rest is shuffled in
+    /// (when the playlist has other entries) and the note of a held skip.
     pub(super) fn shuffle_in_playlist_fill(&mut self) -> Option<String> {
         let generation = self.playlists.checks.queue_generation;
+        let queued = self.queue.len();
         let started = self.playlists.checks.started.as_mut()?;
         if started.generation != generation {
             return None;
         }
-        started.shuffle_rest = true;
-        self.playlists.checks.queue_pending.clone()
+        started.shuffled_len = Some(queued);
+        let others = started.others;
+        let name = self.playlists.checks.queue_pending.clone()?;
+        let rest = (others > 0).then(|| format!("the rest of {} is shuffled in once checked", name));
+        match (rest, self.held_skip_note()) {
+            (Some(rest), Some(held)) => Some(format!("{}. {}", rest, held)),
+            (rest, held) => rest.or(held),
+        }
+    }
+
+    /// Queue row `index` was removed: the rows a shuffle mixed, which the rest of the playlist
+    /// is shuffled in among, are one fewer if it was one of them.
+    pub(super) fn playlist_fill_row_removed(&mut self, index: usize) {
+        if let Some(len) = self
+            .playlists
+            .checks
+            .started
+            .as_mut()
+            .and_then(|started| started.shuffled_len.as_mut())
+        {
+            if index < *len {
+                *len -= 1;
+            }
+        }
     }
 
     /// The skip [`Self::hold_skip_for_playlist_fill`] holds, if any, loads its track paused once
@@ -2167,14 +2220,15 @@ impl AppUI {
     /// its path, so a file listed twice is queued once per entry. If no planned track is the
     /// started entry (which the worker's start rule rules out), nothing is left out: every
     /// planned track goes around it. If the started track has left the queue, the rest is
-    /// appended in playlist order. After a shuffle (`shuffle_rest`) the rest is shuffled in after
-    /// the current track instead.
+    /// appended in playlist order. After a shuffle (`shuffled_len`) the rest is shuffled in after
+    /// the current track instead, among the tracks that shuffle mixed. Returns how many tracks
+    /// were shuffled in.
     fn fill_playlist_around(
         &mut self,
         started: &StartedPlay,
         tracks: Vec<crate::metadata::AudioMetadata>,
         entry_indices: &[usize],
-    ) {
+    ) -> usize {
         let mut before = Vec::new();
         let mut after = Vec::new();
         for (track, &index) in tracks.into_iter().zip(entry_indices) {
@@ -2185,10 +2239,11 @@ impl AppUI {
             }
             // `index == started.entry_index`: the started track itself, already queued.
         }
-        if started.shuffle_rest {
+        if let Some(end) = started.shuffled_len {
             before.extend(after);
-            self.shuffle_queue_tracks_in(before);
-            return;
+            let shuffled_in = before.len();
+            self.shuffle_queue_tracks_in(before, end);
+            return shuffled_in;
         }
         match self.started_queue_position(started) {
             Some(position) => {
@@ -2200,6 +2255,7 @@ impl AppUI {
                 self.enqueue_tracks(before);
             }
         }
+        0
     }
 
     /// Queue the files of a checked playlist that exist. Replace (`play_from` set) only clears
@@ -2243,11 +2299,12 @@ impl AppUI {
         // never reported as plain success.
         let mut skip = None;
         let mut pause_after_skip = false;
-        let mut shuffled_in = false;
+        let mut shuffled_in = 0;
+        let mut shuffled = false;
         let playback_error = match (result.play_from, start_index, started) {
             (Some(_), Some(_), Some(started)) => {
-                self.fill_playlist_around(&started, tracks, &entry_indices);
-                shuffled_in = started.shuffle_rest;
+                shuffled_in = self.fill_playlist_around(&started, tracks, &entry_indices);
+                shuffled = started.shuffled_len.is_some();
                 // Only while the started track is still the current one: the user may have
                 // played something else meanwhile.
                 if self.queue.current_track().is_some_and(|t| t.filepath == started.path) {
@@ -2280,7 +2337,7 @@ impl AppUI {
                 missing
             )
         };
-        if shuffled_in {
+        if shuffled_in > 0 {
             summary.push_str(", shuffled in");
         }
         // The started track ended, or Next / Previous was pressed, while the rest was checked:
@@ -2291,6 +2348,10 @@ impl AppUI {
                 self.status_message.clear();
                 match skip {
                     PlaylistSkip::Ended | PlaylistSkip::Next => self.play_next_track(),
+                    // The shuffle left the started track first: nothing comes before it.
+                    PlaylistSkip::Previous if shuffled => {
+                        self.play_current_track();
+                    }
                     PlaylistSkip::Previous => self.play_prev_track(),
                 }
                 if pause_after_skip && self.player.is_playing() {

@@ -536,7 +536,7 @@ fn test_upnp_continuous_seek_is_clamped_to_the_known_length() {
 
 /// A fake ffmpeg for the continuous stream (issues #106, #107): logs its arguments, one line per
 /// run, and its pid (so the test can kill any it leaves). An input whose name contains `short`
-/// gets 100 ms of PCM and ends 0.5 s later; one with `endless` gets PCM as fast as it is read
+/// gets 100 ms of PCM and ends 0.5 s later, one with `long` 3 s later; one with `endless` gets PCM as fast as it is read
 /// until it is killed (for a renderer that stops reading); one with `live` gets PCM at about real
 /// time until it is killed (for one that keeps reading, so it doesn't load the machine); one with
 /// `bad` gets nothing and an exit at once (a file ffmpeg can't decode); any other input gets
@@ -555,7 +555,7 @@ impl FakeDecoder {
         let log = dir.join("ffmpeg.log");
         let pids = dir.join("ffmpeg.pids");
         let text = format!(
-            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$in\" in\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *endless*) exec cat /dev/zero ;;\n  *live*) while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *bad*) exit 1 ;;\nesac\nexec sleep 30\n",
+            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$in\" in\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *long*) head -c 17640 /dev/zero; exec sleep 3 ;;\n  *endless*) exec cat /dev/zero ;;\n  *live*) while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *bad*) exit 1 ;;\nesac\nexec sleep 30\n",
             pids = pids.display(),
             log = log.display()
         );
@@ -1277,6 +1277,105 @@ fn test_continuous_reshuffle_follows_the_stream_index_first() {
         handle.stop();
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `z` while the continuous stream plays: the shuffle puts the playing track in front, and the
+/// stream's index goes with it, so the event loop's sync doesn't move the queue back to the row
+/// the track had before (PR #127 review).
+#[test]
+fn test_shuffle_while_the_continuous_stream_plays_keeps_its_track_current() {
+    common::isolate();
+    let dir = temp_dir("shuffle_stream_index");
+    let tracks: Vec<PathBuf> = (0..8).map(|i| dir.join(format!("t{}.wav", i))).collect();
+    let settings = SettingsManager::with_path(dir.join("config.json"));
+    let mut app = AppUI::new(Some(dir.clone()), settings);
+    app.queue.add_tracks(
+        tracks
+            .iter()
+            .enumerate()
+            .map(|(i, p)| track_meta(p, &format!("Track {}", i), 60.0))
+            .collect(),
+    );
+    app.queue.set_current_index(5);
+    let (tx, _web_rx) = mpsc::channel();
+    let handle = WebServer::start(0, app.web_state.clone(), tx).expect("start web server");
+    let controller = handle.stream_state().continuous.clone();
+    controller.is_active.store(true, Ordering::SeqCst);
+    *controller.current_track_index.lock().unwrap() = 5;
+    app.web_server = Some(handle);
+    app.update_web_state();
+
+    // A skip the stream hasn't acted on yet names a track by its row too.
+    controller.skip_to_index(6);
+    controller.skip_to_index(5);
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    app.web_cmd_rx = Some(cmd_rx);
+    for round in 0..4 {
+        if round % 2 == 0 {
+            app.handle_input_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('z'),
+                crossterm::event::KeyModifiers::NONE,
+            ))
+            .unwrap();
+        } else {
+            cmd_tx.send(WebCommand::ShuffleQueue).unwrap();
+            app.handle_web_commands();
+        }
+        assert_eq!(*controller.current_track_index.lock().unwrap(), 0, "round {round}");
+        assert_eq!(
+            controller.pending_request().map(|r| r.index),
+            Some(0),
+            "round {round}: the pending skip follows its track"
+        );
+        app.sync_continuous_stream_index();
+        assert_eq!(app.queue.current_index(), 0, "round {round}");
+        assert_eq!(
+            app.queue.current_track().map(|t| t.filepath.clone()),
+            Some(tracks[5].clone()),
+            "round {round}: the playing track stays current"
+        );
+    }
+
+    if let Some(handle) = app.web_server.take() {
+        handle.stream_state().close_active_streams();
+        handle.stop();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// After a shuffle in the UI, the track after the playing one is the one the shuffle put after
+/// it, not the one at the row after its old row; and a track that was last before the shuffle
+/// doesn't make the stream wrap and reshuffle again when it ends (PR #127 review).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_goes_on_in_the_order_a_shuffle_left() {
+    common::isolate();
+    let f = DecoderFixture::start("follow_shuffle", &["t0.wav", "t1.wav", "t2.wav", "t3_long.wav"], 3);
+    assert_eq!(f.run(1), (f.tracks[3].clone(), None));
+
+    {
+        // What the UI's shuffle does: publish the new order and tell the stream where each
+        // track went, under the web state's lock.
+        let mut s = f.state.write().unwrap();
+        let old = s.queue.clone();
+        // New order t3, t1, t0, t2: the track at old row `i` went to row `moved[i]`.
+        let moved = [2, 1, 3, 0];
+        for (from, &to) in moved.iter().enumerate() {
+            s.queue[to] = old[from].clone();
+            s.queue[to].index = to;
+        }
+        f.controller.queue_reordered(&moved);
+    }
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 0);
+    assert_eq!(
+        f.run(2),
+        (f.tracks[1].clone(), None),
+        "the track the shuffle put after the playing one"
+    );
+    assert!(
+        !matches!(f.rx.try_recv(), Ok(WebCommand::ShuffleQueue)),
+        "the stream didn't wrap"
+    );
 }
 
 /// A skip or seek asked while the queue is empty is dropped: the next queue starts at its top,

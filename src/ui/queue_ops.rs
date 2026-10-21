@@ -90,76 +90,88 @@ impl AppUI {
             .unwrap_or_else(|| crate::metadata::fallback_metadata(path))
     }
 
+    /// Put tracks in the queue with `put`, after registering their files with the web server's
+    /// stream, then resolve missing tags on background workers. Returns what `put` returns
+    /// (`None` when there are no tracks: `put` isn't called).
+    fn queue_new_tracks<R>(
+        &mut self,
+        tracks: Vec<crate::metadata::AudioMetadata>,
+        put: impl FnOnce(&mut Self, Vec<crate::metadata::AudioMetadata>) -> R,
+    ) -> Option<R> {
+        if tracks.is_empty() {
+            return None;
+        }
+        for meta in &tracks {
+            self.register_stream_file(&meta.filepath);
+        }
+        let result = put(self, tracks);
+        self.start_queue_metadata_fetch();
+        Some(result)
+    }
+
     /// Append tracks to the queue and resolve missing tags on background workers.
     pub(super) fn enqueue_tracks(&mut self, tracks: Vec<crate::metadata::AudioMetadata>) -> usize {
         let added = tracks.len();
-        for meta in tracks {
-            self.register_stream_file(&meta.filepath);
-            self.queue.add_track(meta);
-        }
-        if added > 0 {
-            self.start_queue_metadata_fetch();
-        }
+        self.queue_new_tracks(tracks, |app, tracks| app.queue.add_tracks(tracks));
         added
     }
 
     /// Insert tracks before queue position `index`, keeping the current track and the cursor on
     /// the rows they were on, and resolve missing tags on background workers.
     pub(super) fn insert_queue_tracks(&mut self, index: usize, tracks: Vec<crate::metadata::AudioMetadata>) {
-        let count = tracks.len();
-        if count == 0 {
-            return;
-        }
-        let index = index.min(self.queue.len());
-        for meta in &tracks {
-            self.register_stream_file(&meta.filepath);
-        }
-        if !self.queue.is_empty() && index <= self.queue_cursor {
-            self.queue_cursor += count;
-        }
-        self.queue.insert_tracks(index, tracks);
-        self.start_queue_metadata_fetch();
+        self.queue_new_tracks(tracks, |app, tracks| {
+            let index = index.min(app.queue.len());
+            if !app.queue.is_empty() && index <= app.queue_cursor {
+                app.queue_cursor += tracks.len();
+            }
+            app.queue.insert_tracks(index, tracks);
+        });
     }
 
-    /// Insert tracks at random positions after the current track, keeping the current track, the
-    /// order of the queued tracks and the cursor on the entry it was on, and resolve missing tags
-    /// on background workers: the rest of a playlist arriving after a shuffle (issue #122).
-    pub(super) fn shuffle_queue_tracks_in(&mut self, tracks: Vec<crate::metadata::AudioMetadata>) {
-        if tracks.is_empty() {
-            return;
-        }
-        for meta in &tracks {
-            self.register_stream_file(&meta.filepath);
-        }
-        let moved = self.queue.shuffle_in(tracks);
-        self.follow_queue_cursor(&moved);
-        self.start_queue_metadata_fetch();
+    /// Insert tracks at random positions after the current track and before queue position
+    /// `end`, keeping the current track, the order of the queued tracks and the cursor on the
+    /// entry it was on, and resolve missing tags on background workers: the rest of a playlist
+    /// arriving after a shuffle, mixed into the tracks that shuffle mixed (issue #122).
+    pub(super) fn shuffle_queue_tracks_in(&mut self, tracks: Vec<crate::metadata::AudioMetadata>, end: usize) {
+        self.queue_new_tracks(tracks, |app, tracks| {
+            let moved = app.queue.shuffle_in(tracks, end);
+            app.follow_queue_reorder(moved);
+        });
     }
 
     /// Shuffle the queue (`z` / `Z`, the web dashboard's Shuffle, the continuous stream's
     /// reshuffle on a wrap): the current track goes in front and the cursor stays on the entry it
-    /// was on (issue #123). While the rest of a playlist `Enter` started is still being checked,
-    /// that rest is shuffled in when it arrives (issue #122). `source` ends the status
-    /// (`" (web)"`).
+    /// was on (issue #123), as does the continuous stream. While the rest of a playlist `Enter`
+    /// started is still being checked, that rest is shuffled in when it arrives (issue #122).
+    /// `source` ends the status (`" (web)"`).
     pub(super) fn shuffle_queue(&mut self, source: &str) {
         if self.queue.is_empty() {
             return;
         }
         let moved = self.queue.shuffle();
-        self.follow_queue_cursor(&moved);
+        self.follow_queue_reorder(moved);
         self.status_message = match self.shuffle_in_playlist_fill() {
-            Some(name) => format!("🔀 Queue shuffled{source}; the rest of {name} is shuffled in once checked"),
+            Some(note) => format!("🔀 Queue shuffled{source}; {note}"),
             None => format!("🔀 Queue shuffled{source}"),
         };
         self.update_web_state();
     }
 
-    /// Move the cursor to where its entry went: `moved[i]` is the new position of the track that
-    /// was at `i`.
-    fn follow_queue_cursor(&mut self, moved: &[usize]) {
+    /// The queue was reordered: `moved[i]` is the new position of the track that was at `i`.
+    /// The cursor moves with its entry, and while the continuous stream plays, the stream is told
+    /// where its tracks went when the new order is published (`update_web_state`), so it goes on
+    /// in that order.
+    fn follow_queue_reorder(&mut self, moved: Vec<usize>) {
         match moved.get(self.queue_cursor) {
             Some(&to) => self.queue_cursor = to,
             None => self.clamp_queue_cursor(),
+        }
+        if self.continuous_stream_active() {
+            self.stream_reorder = Some(match self.stream_reorder.take() {
+                // Reordered twice before a publish: where each track went in the end.
+                Some(earlier) => earlier.iter().map(|&at| moved.get(at).copied().unwrap_or(at)).collect(),
+                None => moved,
+            });
         }
     }
 
@@ -172,6 +184,7 @@ impl AppUI {
     /// paused moves playback on to the track that took its place; emptying the queue stops it.
     pub fn remove_queue_track(&mut self, index: usize) -> Option<crate::metadata::AudioMetadata> {
         let removed = self.queue.remove(index)?;
+        self.playlist_fill_row_removed(index);
         self.clamp_queue_cursor();
         if removed.was_current {
             if self.queue.is_empty() {

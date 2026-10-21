@@ -277,9 +277,14 @@ impl AppUI {
                     is_current: idx == self.queue.current_index(),
                 })
                 .collect();
-            // A track the continuous stream started with an unknown length takes it from the
-            // queue as soon as it is published here, not only when the stream next writes.
             if let Some(ws) = &self.web_server {
+                // A reorder reaches the stream with the order it made, so the stream never picks
+                // a track by its old row from the new queue, or the other way round.
+                if let Some(moved) = self.stream_reorder.take() {
+                    ws.stream_state().continuous.queue_reordered(&moved);
+                }
+                // A track the continuous stream started with an unknown length takes it from the
+                // queue as soon as it is published here, not only when the stream next writes.
                 ws.stream_state().continuous.learn_published_duration(&mut state);
             }
 

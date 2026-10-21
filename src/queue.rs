@@ -356,39 +356,31 @@ impl PlaybackQueue {
             return (0..len).collect();
         }
         let mut rng = FastRng::new();
-        // `order[new] = old`.
-        let mut order: Vec<usize> = (0..len).collect();
+        // Each track with the position it had, so where it went is read off the result.
+        let mut entries: Vec<(usize, AudioMetadata)> = self.tracks.drain(..).enumerate().collect();
         if self.current_index < len {
-            order.remove(self.current_index);
-            rng.shuffle(&mut order);
-            order.insert(0, self.current_index);
+            let current = entries.remove(self.current_index);
+            rng.shuffle(&mut entries);
+            entries.insert(0, current);
         } else {
-            rng.shuffle(&mut order);
+            rng.shuffle(&mut entries);
         }
         self.current_index = 0;
-        self.reorder(&order)
-    }
-
-    /// Put the track at `order[i]` at position `i` (`order` is a permutation of the positions),
-    /// and return where each old position went.
-    fn reorder(&mut self, order: &[usize]) -> Vec<usize> {
-        let mut old: Vec<Option<AudioMetadata>> = self.tracks.drain(..).map(Some).collect();
-        let mut moved = vec![0; order.len()];
-        for (new, &from) in order.iter().enumerate() {
-            moved[from] = new;
-            if let Some(track) = old[from].take() {
-                self.tracks.push(track);
-            }
+        let mut moved = vec![0; len];
+        for (new, (old, track)) in entries.into_iter().enumerate() {
+            moved[old] = new;
+            self.tracks.push(track);
         }
         self.bump();
         moved
     }
 
     /// Insert `tracks` in random order at random positions after the current track (anywhere,
-    /// when there is none), leaving the current track and the order of the queued tracks as they
-    /// are: the rest of a playlist arriving after a shuffle. Returns where each track that was
-    /// already queued went.
-    pub fn shuffle_in(&mut self, mut tracks: Vec<AudioMetadata>) -> Vec<usize> {
+    /// when there is none) and before position `end`, leaving the current track and the order
+    /// of the queued tracks as they are: the rest of a playlist arriving after a shuffle, mixed
+    /// into the tracks that shuffle mixed. The tracks from `end` on (queued after the shuffle)
+    /// stay after them, in their order. Returns where each track that was already queued went.
+    pub fn shuffle_in(&mut self, mut tracks: Vec<AudioMetadata>, end: usize) -> Vec<usize> {
         let len = self.tracks.len();
         if tracks.is_empty() {
             return (0..len).collect();
@@ -400,22 +392,27 @@ impl PlaybackQueue {
         } else {
             0
         };
-        // One slot per track after `start`, old or new; shuffling the slots picks a uniformly
-        // random interleaving that keeps each side's own order.
-        let mut slots = vec![false; len - start];
-        slots.resize(len - start + tracks.len(), true);
+        let end = end.clamp(start, len);
+        let added = tracks.len();
+        // One slot per track from `start` to `end`, old or new; shuffling the slots picks a
+        // uniformly random interleaving that keeps each side's own order.
+        let mut slots = vec![false; end - start];
+        slots.resize(end - start + added, true);
         rng.shuffle(&mut slots);
+        let later = self.tracks.split_off(end);
         let mut upcoming = self.tracks.split_off(start).into_iter();
-        let mut added = tracks.into_iter();
+        let mut added_tracks = tracks.into_iter();
         let mut moved: Vec<usize> = (0..start).collect();
         for is_new in slots {
             if is_new {
-                self.tracks.extend(added.next());
+                self.tracks.extend(added_tracks.next());
             } else {
                 moved.push(self.tracks.len());
                 self.tracks.extend(upcoming.next());
             }
         }
+        moved.extend((end..len).map(|old| old + added));
+        self.tracks.extend(later);
         self.bump();
         moved
     }
@@ -796,7 +793,7 @@ mod tests {
             let before: Vec<String> = q.tracks.iter().map(|t| t.title.clone()).collect();
             let added: Vec<AudioMetadata> = (1..=5).map(|i| make_test_track(&format!("New {}", i), 100.0)).collect();
             let revision = q.revision();
-            let moved = q.shuffle_in(added);
+            let moved = q.shuffle_in(added, usize::MAX);
             assert_ne!(q.revision(), revision);
             assert_eq!(q.len(), 11);
             assert_eq!(q.current_index, 2);
@@ -815,8 +812,32 @@ mod tests {
             assert_eq!(new, ["New 1", "New 2", "New 3", "New 4", "New 5"]);
         }
         let mut empty = PlaybackQueue::new();
-        assert!(empty.shuffle_in(vec![make_test_track("Only", 1.0)]).is_empty());
+        assert!(empty.shuffle_in(vec![make_test_track("Only", 1.0)], 0).is_empty());
         assert_eq!(empty.len(), 1);
         assert_eq!(empty.current_track().unwrap().title, "Only");
+    }
+
+    #[test]
+    fn test_queue_shuffle_in_leaves_the_tracks_from_its_end_in_order_after_the_rest() {
+        // The rest of a playlist arriving after a shuffle is mixed into the tracks that shuffle
+        // mixed, rows 1 to 4 here; tracks queued after the shuffle (rows 5 and 6) stay after
+        // them, in their order (PR #127 review).
+        for _ in 0..20 {
+            let mut q = PlaybackQueue::new();
+            for i in 0..7 {
+                q.add_track(make_test_track(&format!("Song {}", i), 100.0));
+            }
+            let added: Vec<AudioMetadata> = (1..=4).map(|i| make_test_track(&format!("New {}", i), 100.0)).collect();
+            let moved = q.shuffle_in(added, 5);
+            let titles: Vec<String> = q.tracks.iter().map(|t| t.title.clone()).collect();
+            assert_eq!(titles.len(), 11);
+            assert_eq!(titles[0], "Song 0", "the current track stays first");
+            assert_eq!(titles[9..], ["Song 5", "Song 6"], "{titles:?}");
+            let old: Vec<&String> = titles[1..9].iter().filter(|t| t.starts_with("Song")).collect();
+            assert_eq!(old, ["Song 1", "Song 2", "Song 3", "Song 4"], "{titles:?}");
+            for (from, &to) in moved.iter().enumerate() {
+                assert_eq!(titles[to], format!("Song {from}"), "moved {moved:?}");
+            }
+        }
     }
 }
