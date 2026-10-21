@@ -112,6 +112,27 @@ fn test_fallback_metadata_leaves_audio_properties_unknown() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A file found but not parsed fails with `UnreadableTags`, carrying the size the read found,
+/// with the parser's message; a file not found at all fails with another error (issue #124).
+#[test]
+fn test_unreadable_tags_carry_the_file_size() {
+    common::isolate();
+    let dir = temp_dir("unreadable");
+    let path = dir.join("garbage.ogg");
+    fs::write(&path, vec![0x55u8; 12_345]).unwrap();
+
+    let err = extract_metadata(&path).unwrap_err();
+    let unreadable = err
+        .downcast_ref::<quickstream::metadata::UnreadableTags>()
+        .expect("the size travels with the error");
+    assert_eq!(unreadable.file_size, 12_345);
+    assert_eq!(err.to_string(), unreadable.source.to_string());
+
+    let err = extract_metadata(&dir.join("missing.ogg")).unwrap_err();
+    assert!(err.downcast_ref::<quickstream::metadata::UnreadableTags>().is_none());
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The scoped scan's placeholders for files it hasn't read leave the audio properties unknown.
 #[test]
 fn test_scoped_scan_placeholders_leave_audio_properties_unknown() {

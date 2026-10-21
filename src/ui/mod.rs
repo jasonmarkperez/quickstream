@@ -294,21 +294,17 @@ pub struct AppUI {
     pub settings_mgr: SettingsManager,
     /// Shared with background scanners; clone the handle, never the map (issue #4).
     pub metadata_cache: crate::library::MetadataCache,
-    pub metadata_tx: std::sync::mpsc::Sender<crate::metadata::AudioMetadata>,
-    pub metadata_rx: std::sync::mpsc::Receiver<crate::metadata::AudioMetadata>,
+    pub metadata_tx: std::sync::mpsc::Sender<tag_reads::TagUpdate>,
+    pub metadata_rx: std::sync::mpsc::Receiver<tag_reads::TagUpdate>,
     pub queue_add_tx: std::sync::mpsc::Sender<Vec<crate::metadata::AudioMetadata>>,
     pub queue_add_rx: std::sync::mpsc::Receiver<Vec<crate::metadata::AudioMetadata>>,
     pub metadata_worker_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Inbox of the queue metadata worker pool (spawned on first use; workers exit when dropped).
     pub queue_metadata_tx: Option<std::sync::mpsc::Sender<PathBuf>>,
-    /// Sizes the queue metadata pool found for files whose tags it couldn't read (issue #124).
-    queue_size_tx: std::sync::mpsc::Sender<(PathBuf, u64)>,
-    queue_size_rx: std::sync::mpsc::Receiver<(PathBuf, u64)>,
-    /// The sizes received on `queue_size_rx` this session, for files queued again.
-    queue_file_sizes: std::collections::HashMap<PathBuf, u64>,
     /// Tells the queue metadata pool to stop reading tags (set on shutdown).
     pub queue_metadata_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Paths already sent to the queue metadata workers this session.
+    /// Paths already sent to the queue metadata workers this session (a read that couldn't find
+    /// the file takes its path out again, so a later add reads it once more).
     pub queue_metadata_attempted: std::collections::HashSet<PathBuf>,
     /// Tag reads shared by the browser, queue and folder-add workers, so no two of them read
     /// the same file at once (issue #52).
@@ -446,7 +442,6 @@ impl AppUI {
 
         let (metadata_tx, metadata_rx) = std::sync::mpsc::channel();
         let (queue_add_tx, queue_add_rx) = std::sync::mpsc::channel();
-        let (queue_size_tx, queue_size_rx) = std::sync::mpsc::channel();
         let metadata_cache = crate::library::MetadataCache::from(crate::library::LibraryManager::load_cache_map());
         let tag_reads = SharedTagReads::new(metadata_cache.clone(), metadata_tx.clone());
         let (dir_scan_tx, dir_scan_rx) = std::sync::mpsc::channel();
@@ -498,9 +493,6 @@ impl AppUI {
             queue_add_rx,
             metadata_worker_stop: None,
             queue_metadata_tx: None,
-            queue_size_tx,
-            queue_size_rx,
-            queue_file_sizes: std::collections::HashMap::new(),
             queue_metadata_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             queue_metadata_attempted: std::collections::HashSet::new(),
             tag_reads,

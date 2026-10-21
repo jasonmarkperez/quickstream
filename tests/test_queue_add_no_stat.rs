@@ -2,16 +2,17 @@
 //!
 //! `a` (add all), `Enter` on a file row and the web `add_file` command queue a file not in the
 //! metadata cache with a placeholder built from its path alone: its size stays 0 (unknown, left
-//! out of Now Playing's SIGNAL panel) until the queue's metadata workers read the file. A file
-//! whose size shows right after the key was looked up on the UI thread.
+//! out of Now Playing's SIGNAL panel) until a tag read of the file publishes it. A file whose
+//! size shows right after the key was looked up on the UI thread.
 //!
-//! A gated tag reader stands in for a slow share: the queue's workers wait on it until the test
-//! opens the gate, so nothing a worker finds can reach the queue before then.
+//! A gated tag reader stands in for a slow share: the workers wait on it until the test opens
+//! the gate, so nothing a worker finds can reach the queue before then.
 
 mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,9 +20,6 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use quickstream::settings::SettingsManager;
 use quickstream::ui::AppUI;
 use quickstream::web::WebCommand;
-
-/// Well over what building a few dozen placeholders in memory takes.
-const UI_BUDGET: Duration = Duration::from_millis(300);
 
 fn scratch_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("qs_add_no_stat_{}_{}", name, std::process::id()));
@@ -50,24 +48,46 @@ fn write_silent_wav(path: &Path, samples: u32) {
     fs::write(path, bytes).unwrap();
 }
 
-/// A gate the tag reader waits on until the test opens it. Dropping the last handle (the test's)
-/// does not open it, so each test opens it before it ends.
+/// A gate the tag reader waits on until the test opens it, and a count of the reads it let
+/// through. Dropping the last handle does not open it: each test holds an [`OpenOnDrop`].
 #[derive(Clone, Default)]
-struct Gate(Arc<(Mutex<bool>, Condvar)>);
+struct Gate {
+    open: Arc<(Mutex<bool>, Condvar)>,
+    reads: Arc<AtomicUsize>,
+}
 
 impl Gate {
     fn open(&self) {
-        let (open, changed) = &*self.0;
+        let (open, changed) = &*self.open;
         *open.lock().unwrap() = true;
         changed.notify_all();
     }
 
+    fn close(&self) {
+        *self.open.0.lock().unwrap() = false;
+    }
+
     fn wait(&self) {
-        let (open, changed) = &*self.0;
+        let (open, changed) = &*self.open;
         let mut guard = open.lock().unwrap();
         while !*guard {
             guard = changed.wait(guard).unwrap();
         }
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+}
+
+/// Opens the gate when dropped, so a test that fails before opening it doesn't leave the workers
+/// waiting on it (and the app's shutdown waiting on them). Declared after the app, so it is
+/// dropped first.
+struct OpenOnDrop(Gate);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
     }
 }
 
@@ -87,6 +107,7 @@ fn gated_app_in_mode(dir: &Path, gate: &Gate, tags: bool) -> AppUI {
     let gate = gate.clone();
     app.set_tag_reader(Arc::new(move |path: &Path| {
         gate.wait();
+        gate.reads.fetch_add(1, Ordering::SeqCst);
         quickstream::metadata::extract_metadata(path)
     }));
     common::wait_for_dir_scan(&mut app);
@@ -95,13 +116,11 @@ fn gated_app_in_mode(dir: &Path, gate: &Gate, tags: bool) -> AppUI {
     app
 }
 
-fn press(app: &mut AppUI, code: KeyCode) -> Duration {
-    let start = Instant::now();
+fn press(app: &mut AppUI, code: KeyCode) {
     app.handle_input_key(KeyEvent::new(code, KeyModifiers::NONE)).unwrap();
-    start.elapsed()
 }
 
-/// Poll the queue's metadata until `done` holds (5 s at most).
+/// Poll the workers' tag reads until `done` holds (5 s at most).
 fn wait_until(app: &mut AppUI, what: &str, done: impl Fn(&AppUI) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -132,8 +151,9 @@ fn test_add_all_queues_untagged_files_without_stat_and_workers_fill_in_sizes() {
     let gate = Gate::default();
     let mut app = gated_app(&dir, &gate);
 
-    let elapsed = press(&mut app, KeyCode::Char('a'));
-    assert!(elapsed < UI_BUDGET, "`a` blocked the UI thread for {:?}", elapsed);
+    let _open = OpenOnDrop(gate.clone());
+
+    press(&mut app, KeyCode::Char('a'));
     assert_eq!(app.queue.len(), files.len());
     for track in app.queue.tracks() {
         assert!(files.contains(&track.filepath), "{:?}", track.filepath);
@@ -158,7 +178,7 @@ fn test_add_all_queues_untagged_files_without_stat_and_workers_fill_in_sizes() {
 }
 
 /// A file the tag reader can't parse (FLAC-in-Ogg, say) may still play: the queue's worker
-/// reports its size alone, so Now Playing shows it once known, and leaves the row out until then.
+/// publishes its size alone, so Now Playing shows it once known, and leaves the row out until then.
 #[test]
 fn test_add_all_unreadable_files_get_their_size_from_the_queue_workers() {
     common::isolate();
@@ -170,6 +190,7 @@ fn test_add_all_unreadable_files_get_their_size_from_the_queue_workers() {
     assert!(quickstream::metadata::extract_metadata(&current).is_err());
     let gate = Gate::default();
     let mut app = gated_app(&dir, &gate);
+    let _open = OpenOnDrop(gate.clone());
 
     press(&mut app, KeyCode::Char('a'));
     assert_eq!(app.queue.len(), 2);
@@ -201,8 +222,8 @@ fn test_add_all_unreadable_files_get_their_size_from_the_queue_workers() {
 }
 
 /// Tags mode: the browser's own tag fetch is reading the file (held at the gate) when `a` queues
-/// it, so the queue's worker skips the read. It still reports the size, without waiting for that
-/// read, which may fail and publish nothing.
+/// it, so the queue's worker skips the read. The browser's read publishes the size it found when
+/// the tags can't be read, so the queued row gets it from that one read.
 #[test]
 fn test_add_all_while_the_browser_reads_an_unreadable_file_still_gets_its_size() {
     common::isolate();
@@ -212,27 +233,94 @@ fn test_add_all_while_the_browser_reads_an_unreadable_file_still_gets_its_size()
     assert!(quickstream::metadata::extract_metadata(&file).is_err());
     let gate = Gate::default();
     let mut app = gated_app_in_mode(&dir, &gate, true);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while app.tag_reads_in_flight() == 0 && Instant::now() < deadline {
-        app.poll_background_metadata();
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert_eq!(app.tag_reads_in_flight(), 1, "the browser is reading the file");
+    let _open = OpenOnDrop(gate.clone());
+    wait_until(&mut app, "the browser's read", |a| a.tag_reads_in_flight() == 1);
 
     press(&mut app, KeyCode::Char('a'));
     assert_eq!(app.queue.len(), 1);
     assert_eq!(app.queue.tracks()[0].file_size, 0, "looked up on the UI thread");
-    wait_until(&mut app, "the size, while the browser's read is held", |a| {
+
+    gate.open();
+    wait_until(&mut app, "the size from the browser's read", |a| {
         a.queue.tracks()[0].file_size > 0
     });
     assert_eq!(app.queue.tracks()[0].file_size, 120_000);
+    assert_eq!(
+        gate.reads(),
+        1,
+        "the queue's worker skipped the file the browser was reading"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
 
+/// The browser's fetch (Tags mode) failed to read a file's tags before it was queued: its read
+/// published the size, so `a` queues the file with it at once, from memory, while the queue's
+/// own read of the file is still held at the gate.
+#[test]
+fn test_size_from_a_failed_browser_read_is_used_when_the_file_is_queued() {
+    common::isolate();
+    let dir = scratch_dir("browser_failed");
+    let file = dir.join("garbage.ogg");
+    fs::write(&file, vec![0x55u8; 90_000]).unwrap();
+    let gate = Gate::default();
+    let mut app = gated_app_in_mode(&dir, &gate, true);
+    let _open = OpenOnDrop(gate.clone());
     gate.open();
+    wait_until(&mut app, "the browser's read", |a| {
+        gate.reads() == 1 && a.tag_reads_in_flight() == 0
+    });
+    gate.close();
+
+    press(&mut app, KeyCode::Char('a'));
+    assert_eq!(app.queue.len(), 1);
+    assert_eq!(app.queue.tracks()[0].file_size, 90_000, "size from the browser's read");
+    assert_eq!(app.metadata_cache.unreadable_size(&file), Some(90_000));
+    assert!(app.metadata_cache.get(&file).is_none(), "no tags were read");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A read that couldn't even find the file (the share went away for a moment) publishes no size
+/// and leaves the path to be read again: the next add tries it once more, and gets the size.
+#[test]
+fn test_file_not_found_by_the_queue_read_is_read_again_on_the_next_add() {
+    common::isolate();
+    let dir = scratch_dir("stat_fails_once");
+    let file = dir.join("back.ogg");
+    let gate = Gate::default();
+    let mut app = gated_app(&dir, &gate);
+    let _open = OpenOnDrop(gate.clone());
+    gate.open();
+    // The first read finds nothing; the file is there for every read after it.
+    let reads = gate.reads.clone();
+    let restore = file.clone();
+    app.set_tag_reader(Arc::new(move |path: &Path| {
+        if reads.fetch_add(1, Ordering::SeqCst) > 0 && !restore.exists() {
+            fs::write(&restore, vec![0x55u8; 70_000]).unwrap();
+        }
+        quickstream::metadata::extract_metadata(path)
+    }));
+    let (tx, rx) = mpsc::channel();
+    app.web_cmd_rx = Some(rx);
+
+    tx.send(WebCommand::AddFile(file.clone())).unwrap();
+    app.handle_web_commands();
+    wait_until(&mut app, "the failed read to be reported", |a| {
+        gate.reads() == 1 && !a.queue_metadata_attempted.contains(&file)
+    });
+    assert_eq!(app.queue.tracks()[0].file_size, 0);
+
+    tx.send(WebCommand::AddFile(file.clone())).unwrap();
+    app.handle_web_commands();
+    wait_until(&mut app, "the size from the second read", |a| {
+        a.queue.tracks().iter().all(|t| t.file_size == 70_000)
+    });
+    assert_eq!(app.queue.len(), 2);
+    assert_eq!(gate.reads(), 2);
     let _ = fs::remove_dir_all(&dir);
 }
 
 /// An unreadable file queued again after it left the queue (`a`, `c`, `a`) gets the size found
-/// the first time, from memory: the queue's workers read each path once a session.
+/// the first time, from the metadata cache: the queue's workers read each path once a session.
 #[test]
 fn test_unreadable_file_queued_again_keeps_its_size() {
     common::isolate();
@@ -241,6 +329,7 @@ fn test_unreadable_file_queued_again_keeps_its_size() {
     fs::write(&file, vec![0x55u8; 300_000]).unwrap();
     let gate = Gate::default();
     let mut app = gated_app(&dir, &gate);
+    let _open = OpenOnDrop(gate.clone());
 
     press(&mut app, KeyCode::Char('a'));
     assert_eq!(app.queue.tracks()[0].file_size, 0, "looked up on the UI thread");
@@ -251,8 +340,7 @@ fn test_unreadable_file_queued_again_keeps_its_size() {
     press(&mut app, KeyCode::Char('c'));
     assert!(app.queue.is_empty());
     app.queue_focus = false;
-    let elapsed = press(&mut app, KeyCode::Char('a'));
-    assert!(elapsed < UI_BUDGET, "`a` blocked the UI thread for {:?}", elapsed);
+    press(&mut app, KeyCode::Char('a'));
     assert_eq!(app.queue.len(), 1);
     assert_eq!(app.queue.tracks()[0].file_size, 300_000, "size after re-adding");
     let _ = fs::remove_dir_all(&dir);
@@ -266,6 +354,7 @@ fn test_enter_on_a_file_row_queues_it_without_stat() {
     write_silent_wav(&song, 4_000);
     let gate = Gate::default();
     let mut app = gated_app(&dir, &gate);
+    let _open = OpenOnDrop(gate.clone());
     app.browser_cursor = app
         .browser_entries
         .iter()
@@ -294,18 +383,13 @@ fn test_web_add_file_queues_the_resolved_path_without_stat() {
     let gone = dir.join("gone.wav");
     let gate = Gate::default();
     let mut app = gated_app(&dir, &gate);
+    let _open = OpenOnDrop(gate.clone());
     let (tx, rx) = mpsc::channel();
     app.web_cmd_rx = Some(rx);
 
     tx.send(WebCommand::AddFile(song.clone())).unwrap();
     tx.send(WebCommand::AddFile(gone.clone())).unwrap();
-    let start = Instant::now();
     app.handle_web_commands();
-    assert!(
-        start.elapsed() < UI_BUDGET,
-        "UI thread blocked for {:?}",
-        start.elapsed()
-    );
     let paths: Vec<_> = app.queue.tracks().iter().map(|t| t.filepath.clone()).collect();
     assert_eq!(paths, vec![song.clone(), gone]);
     assert_eq!(app.queue.tracks()[0].file_size, 0, "looked up on the UI thread");

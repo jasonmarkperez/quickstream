@@ -324,7 +324,7 @@ fn test_queue_background_metadata_update() {
     let mut updated_meta = app.queue.tracks()[0].clone();
     updated_meta.artist = "Ludovico Einaudi (Official)".to_string();
     updated_meta.duration_seconds = 234.0;
-    app.metadata_tx.send(updated_meta).unwrap();
+    app.metadata_tx.send(updated_meta.into()).unwrap();
 
     // Poll background metadata - must update queue tracks in-place
     app.poll_background_metadata();
