@@ -7,7 +7,7 @@ mod common;
 use std::path::PathBuf;
 
 use quickstream::metadata::AudioMetadata;
-use quickstream::queue::PlaybackQueue;
+use quickstream::queue::{PlaybackQueue, RowMap};
 
 fn track(n: usize) -> AudioMetadata {
     AudioMetadata {
@@ -236,4 +236,40 @@ fn different_queues_never_share_a_revision() {
 
     let d = PlaybackQueue::default();
     assert_ne!(d.revision(), PlaybackQueue::default().revision(), "default queues");
+}
+
+/// `remove` says where each row went (`RemovedTrack::rows`): the rows after it move up one and
+/// the removed one names the track that took its place; two changes compose (`RowMap::then`),
+/// and a walk that was to go on after a removed track goes on from the one that took its place.
+#[test]
+fn remove_returns_where_each_row_went() {
+    common::isolate();
+    let mut q = queue_of(5);
+    let rows = q.remove(1).expect("row 1").rows;
+    assert_eq!((0..5).map(|r| rows.row(r)).collect::<Vec<_>>(), vec![0, 1, 1, 2, 3]);
+    assert_eq!(
+        (0..5).map(|r| rows.was_removed(r)).collect::<Vec<_>>(),
+        vec![false, true, false, false, false]
+    );
+    assert_eq!(
+        rows.follow_step(1, 1),
+        (1, 0),
+        "after the removed track: the one that took its row"
+    );
+    assert_eq!(rows.follow_step(3, 1), (2, 1));
+
+    // Then the last row: nothing takes its place, so it names the end of the queue.
+    let last = q.remove(3).expect("row 3").rows;
+    let both = rows.then(&last);
+    assert_eq!((0..5).map(|r| both.row(r)).collect::<Vec<_>>(), vec![0, 1, 1, 2, 3]);
+    assert_eq!(
+        (0..5).map(|r| both.was_removed(r)).collect::<Vec<_>>(),
+        vec![false, true, false, false, true]
+    );
+    assert_eq!(q.len(), 3);
+
+    let shuffle = RowMap::moved(vec![2, 0, 1]);
+    let all = both.then(&shuffle);
+    assert_eq!((0..5).map(|r| all.row(r)).collect::<Vec<_>>(), vec![2, 0, 0, 1, 3]);
+    assert!(all.was_removed(1) && all.was_removed(4) && !all.was_removed(2));
 }
