@@ -1016,6 +1016,28 @@ fn test_continuous_track_end_without_a_request_moves_on() {
     assert!(f.rx.try_recv().is_err(), "not the last track: no reshuffle");
 }
 
+/// A queue of one track: at its end the stream plays that track again from its start and asks
+/// for no reshuffle (there is nothing to reorder), and Up Next says it repeats, as tab [1] and
+/// the dashboard do (#134).
+#[cfg(unix)]
+#[test]
+fn test_continuous_single_track_repeats_without_a_reshuffle() {
+    common::isolate();
+    use quickstream::queue::QueueEnd;
+    let f = DecoderFixture::start("single_track", &["t0_short.wav"], 0);
+    assert_eq!(f.run(1), (f.tracks[0].clone(), None));
+    assert_eq!(f.run(2), (f.tracks[0].clone(), None));
+    assert_eq!(f.run(3), (f.tracks[0].clone(), None));
+    if let Ok(cmd) = f.rx.recv_timeout(Duration::from_millis(300)) {
+        panic!("a one-track queue's wrap sent {:?}", cmd);
+    }
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 0);
+    assert_eq!(
+        published_up_next(&f.state.read().unwrap()),
+        (vec![], 0, Some(QueueEnd::Loops), Some("Track 0".to_string()))
+    );
+}
+
 /// A skip and seek still pending when the session ends (the stream was blocked writing to a
 /// renderer that stopped reading) are dropped with it: the next session starts where the UI
 /// rewound it, not on the stale track or offset.
