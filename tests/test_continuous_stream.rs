@@ -540,8 +540,8 @@ fn test_upnp_continuous_seek_is_clamped_to_the_known_length() {
 /// until it is killed (for a renderer that stops reading); one with `live` gets PCM at about real
 /// time until it is killed (for one that keeps reading, so it doesn't load the machine); one with
 /// `bad` gets nothing and an exit at once (a file ffmpeg can't decode); `ones` gets 0.5 s of
-/// `0x01` bytes at about real time and `burst` 1 s of them at once, then an exit (a track that
-/// ends); `twos` gets 0.1 s of `0x02` bytes, then nothing until killed; any other input gets
+/// `0x01` bytes at about real time (`longones` 3 s) and `burst` 1 s of them at once, then an exit
+/// (a track that ends); `twos` gets 0.1 s of `0x02` bytes, then nothing until killed; any other input gets
 /// nothing, as while the real one opens a file on a slow share, until it is killed.
 #[cfg(unix)]
 struct FakeDecoder {
@@ -557,7 +557,7 @@ impl FakeDecoder {
         let log = dir.join("ffmpeg.log");
         let pids = dir.join("ffmpeg.pids");
         let text = format!(
-            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$in\" in\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *endless*) exec cat /dev/zero ;;\n  *live*) while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *bad*) exit 1 ;;\n  *ones*) for i in 1 2 3 4 5; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *burst*) head -c 176400 /dev/zero | tr '\\000' '\\001'; exit 0 ;;\n  *twos*) head -c 17640 /dev/zero | tr '\\000' '\\002'; exec sleep 30 ;;\nesac\nexec sleep 30\n",
+            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$in\" in\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *endless*) exec cat /dev/zero ;;\n  *live*) while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *bad*) exit 1 ;;\n  *longones*) for i in $(seq 30); do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *ones*) for i in 1 2 3 4 5; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *burst*) head -c 176400 /dev/zero | tr '\\000' '\\001'; exit 0 ;;\n  *twos*) head -c 17640 /dev/zero | tr '\\000' '\\002'; exec sleep 30 ;;\nesac\nexec sleep 30\n",
             pids = pids.display(),
             log = log.display()
         );
@@ -1855,6 +1855,62 @@ fn test_continuous_late_file_check_answer_counts_for_the_next_look() {
     f.controller.skip_to_index(2);
     assert_eq!(f.run(3), (f.tracks[2].clone(), None), "played on its late answer");
     assert_eq!(slow.started(&f.tracks[2]), 1, "not checked again");
+}
+
+/// A next file found missing as the track before it started is checked again as that track
+/// ends: one back on the share meanwhile (a remount) plays, rather than being passed over on an
+/// answer seconds old (#117).
+#[cfg(unix)]
+#[test]
+fn test_continuous_file_back_while_the_track_before_plays_is_played() {
+    common::isolate();
+    let checks = SlowPathCheck::default();
+    let f = DecoderFixture::start_with(
+        "remount_ahead",
+        &["a_longones.wav", "b_live.wav", "c_live.wav"],
+        0,
+        |c, t| {
+            std::fs::remove_file(&t[1]).unwrap();
+            checks.install(c, &[], Duration::ZERO)
+        },
+    );
+    assert_eq!(f.run(1), (f.tracks[0].clone(), None));
+    wait_until("the next file was never checked ahead", || {
+        checks.answered(&f.tracks[1]) == 1
+    });
+    std::fs::write(&f.tracks[1], b"back").unwrap();
+    assert_eq!(
+        f.run(2),
+        (f.tracks[1].clone(), None),
+        "the file back on the share plays"
+    );
+    assert_eq!(
+        checks.started(&f.tracks[1]),
+        2,
+        "checked again as the track before ended"
+    );
+}
+
+/// A late answer still unused when the track before its file starts is kept for that track's
+/// end: the check ahead made as the track starts doesn't use it up, so the file plays rather than
+/// being checked again only to miss the deadline once more (#117).
+#[cfg(unix)]
+#[test]
+fn test_continuous_late_answer_is_not_used_up_by_the_check_ahead() {
+    common::isolate();
+    let slow = SlowPathCheck::default();
+    let f = DecoderFixture::start_with(
+        "late_ahead",
+        &["a_longones.wav", "b_live.wav", "c_live.wav"],
+        1,
+        |c, t| slow.install(c, &t[1..2], Duration::from_millis(2500)),
+    );
+    assert_eq!(f.run(1), (f.tracks[2].clone(), None), "passed over while unanswered");
+    wait_until("the slow check never answered", || slow.answered(&f.tracks[1]) == 1);
+    f.controller.skip_to_index(0);
+    assert_eq!(f.run(2), (f.tracks[0].clone(), None));
+    assert_eq!(f.run(3), (f.tracks[1].clone(), None), "played on its late answer");
+    assert_eq!(slow.started(&f.tracks[1]), 1, "not checked again");
 }
 
 /// Files whose checks hang are checked at the same time, not one deadline after another, so a

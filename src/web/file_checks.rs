@@ -3,7 +3,8 @@
 //! on a helper thread, at most one in flight per path and at most `MAX_HELPERS` at once, and the
 //! stream polls for the answers while it sends paced silence. A look through the queue checks
 //! the files after a slow one ahead of time, so a playable file past hung ones is found within
-//! about one deadline. A helper that answered takes the next check that comes within
+//! about one deadline, while fewer than `MAX_HELPERS` checks hang: past that many, the files
+//! after them wait (passed over meanwhile) until a hung check answers. A helper that answered takes the next check that comes within
 //! `HELPER_IDLE`, so the rechecks of a missing queue don't start a thread per file each time.
 
 use std::collections::{HashMap, VecDeque};
@@ -142,6 +143,18 @@ impl FileChecks {
         since: Instant,
         wait_until: Instant,
     ) -> Look {
+        self.look_using(len, path_at, since, wait_until, true)
+    }
+
+    /// As `look`; a late answer it uses counts as used only when `use_up` is set.
+    fn look_using<'p>(
+        &self,
+        len: usize,
+        path_at: impl Fn(usize) -> &'p Path,
+        since: Instant,
+        wait_until: Instant,
+        use_up: bool,
+    ) -> Look {
         let check = self.check();
         let mut tried_spawning = false;
         let mut checks = self.shared.checks.lock().unwrap();
@@ -149,7 +162,7 @@ impl FileChecks {
             let (look, late) = walk(&mut checks, len, &path_at, since, &check);
             if look.outcome != LookOutcome::Pending {
                 // A late answer counts once: the next look asks afresh.
-                for p in late {
+                for p in late.into_iter().filter(|_| use_up) {
                     if let Some(Entry::Answered { late, .. }) = checks.entries.get_mut(path_at(p)) {
                         *late = false;
                     }
@@ -184,9 +197,18 @@ impl FileChecks {
 
     /// Start checking `path` unless an answer given since `since` is known or a check is in
     /// flight, without waiting for it: the stream asks for the next file as a track starts, so
-    /// the answer is there when the track ends.
+    /// the answer is there when the track ends. A late answer is left for the look as the track
+    /// ends.
     pub(super) fn prefetch(&self, path: &Path, since: Instant) {
-        self.look(1, |_| path, since, Instant::now());
+        self.look_using(1, |_| path, since, Instant::now(), false);
+    }
+
+    /// Whether an answer given since `since` says `path` exists.
+    pub(super) fn exists_since(&self, path: &Path, since: Instant) -> bool {
+        matches!(
+            self.shared.checks.lock().unwrap().entries.get(path),
+            Some(Entry::Answered { exists: true, at, .. }) if *at >= since
+        )
     }
 
     /// Start a helper thread, which takes the queued checks. Returns whether it started.
@@ -220,7 +242,7 @@ fn walk<'p>(
             Some(Entry::Answered { exists, at, late })
                 if *at >= since || (*late && now.duration_since(*at) < LATE_ANSWER_KEEP) =>
             {
-                if *at < since {
+                if *late {
                     late_used.push(p);
                 }
                 if *exists {

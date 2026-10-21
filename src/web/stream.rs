@@ -1316,8 +1316,9 @@ pub(super) fn serve_continuous_stream(
     let mut spawn_failure_logged = false;
     // The look through the queue still waiting on a file check: answers given since its
     // `Instant` are used as the stream looks again on the next passes, until a request newer than
-    // its `request_seq` comes (which starts a fresh look). Set as a track ends too, from when its
-    // decoder started, when the next file's check was made. `None`: no look is waiting.
+    // its `request_seq` comes (which starts a fresh look). Set as a track ends too: from when its
+    // decoder started (when the next file's check was made) if that check found the file, else
+    // from the end. `None`: no look is waiting.
     let mut look: Option<(Instant, u64)> = None;
 
     'pass: while controller.is_active.load(Ordering::SeqCst) {
@@ -1701,8 +1702,16 @@ pub(super) fn serve_continuous_stream(
                 nothing_playable = Some((tracks.into_iter().map(|(path, _)| path).collect(), Instant::now()));
             } else {
                 nothing_playable = None;
-                // The next look takes the answer to the check made as this track started.
-                look = Some((decoder_started, seq));
+                // The next look takes the answer to the check made as this track started when it
+                // found the file. A missing one is asked again: the track may have played for
+                // minutes, long enough for the share to come back.
+                let next = Path::new(&tracks[(track_index + 1) % queue_len].0);
+                let since = if controller.file_checks.exists_since(next, decoder_started) {
+                    decoder_started
+                } else {
+                    Instant::now()
+                };
+                look = Some((since, seq));
             }
         } else {
             drop(pending);
