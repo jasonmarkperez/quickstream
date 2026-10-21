@@ -388,9 +388,80 @@ pub fn stamp_of(md: &std::fs::Metadata) -> (u64, u64) {
     (mtime, md.len())
 }
 
-/// Whether `row` is current for a file stamped `stamp` ([`stamp_of`]), as the worker checks.
+/// Whether `row` is current for a file stamped `stamp` ([`stamp_of`]), as the worker checks: the
+/// stamp matches and the row is a full analysis (a tag-only index row still waiting for its
+/// acoustic pass, `needs_acoustic`, is not).
 pub fn row_is_current(row: &TrackFeatures, stamp: (u64, u64)) -> bool {
+    row_stamp_matches(row, stamp) && !row.needs_acoustic
+}
+
+/// Whether `row` was written for a file stamped `stamp`, whatever it still needs: the library
+/// index uses it to tell which files it needs to read again.
+pub fn row_stamp_matches(row: &TrackFeatures, stamp: (u64, u64)) -> bool {
     (row.mtime, row.file_size) == stamp
+}
+
+/// Why [`tag_features`] could not read a file's tags. A file that parses badly or has no tags is
+/// not an error (it gets a row from its path); only a failure to read the file is, so an I/O
+/// error on a network share is never stored as an untagged file.
+#[derive(Debug)]
+pub enum TagReadError {
+    /// Opening or reading the file failed.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for TagReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TagReadError::Io(e) => write!(f, "couldn't read the file: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for TagReadError {}
+
+/// A track's row from its tags alone, for a file stamped `stamp` (the tag half of
+/// [`analyze_track`]): the same path fallbacks for a missing title, artist or album, the Camelot
+/// key from the tagged key, and `needs_acoustic` set when there is no BPM tag. Never modifies the
+/// file and never runs ffmpeg.
+pub fn tag_features(path: &Path, stamp: (u64, u64)) -> Result<TrackFeatures, TagReadError> {
+    let tags = read_tags_checked(path)?;
+    let mut features = features_from_tags(path, stamp, tags);
+    features.needs_acoustic = features.bpm.is_none();
+    features.analyzed_at = now_secs();
+    Ok(features)
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn features_from_tags(path: &Path, (mtime, file_size): (u64, u64), tags: TagInfo) -> TrackFeatures {
+    let (h_title, h_artist, h_album) = crate::metadata::parse_path_heuristics(path);
+    let or_else =
+        |tagged: Option<String>, fallback: String| tagged.filter(|s| !s.trim().is_empty()).unwrap_or(fallback);
+
+    TrackFeatures {
+        filepath: path.to_path_buf(),
+        mtime,
+        file_size,
+        title: or_else(tags.title, h_title),
+        artist: or_else(tags.artist, h_artist),
+        album: or_else(tags.album, h_album),
+        genre: tags.genre.unwrap_or_default(),
+        year: tags.year,
+        bpm: tags.bpm,
+        camelot_key: tags
+            .initial_key
+            .as_deref()
+            .and_then(MusicalKey::parse_to_camelot)
+            .map(|k| k.to_string()),
+        initial_key: tags.initial_key,
+        ..Default::default()
+    }
 }
 
 /// Why [`analyze_track`] produced no features. None of these may be persisted.
@@ -417,31 +488,10 @@ fn analyze_track_with(
     cancel: Option<&AtomicBool>,
 ) -> Result<TrackFeatures, AnalysisError> {
     let cancelled = || cancel.is_some_and(|c| c.load(Ordering::SeqCst));
-    let (mtime, file_size) = file_stamp(path).ok_or(AnalysisError::Unreadable)?;
-    let tags = read_tags(path);
-
-    let (h_title, h_artist, h_album) = crate::metadata::parse_path_heuristics(path);
-    let or_else =
-        |tagged: Option<String>, fallback: String| tagged.filter(|s| !s.trim().is_empty()).unwrap_or(fallback);
-
-    let mut features = TrackFeatures {
-        filepath: path.to_path_buf(),
-        mtime,
-        file_size,
-        title: or_else(tags.title, h_title),
-        artist: or_else(tags.artist, h_artist),
-        album: or_else(tags.album, h_album),
-        genre: tags.genre.unwrap_or_default(),
-        year: tags.year,
-        bpm: tags.bpm,
-        camelot_key: tags
-            .initial_key
-            .as_deref()
-            .and_then(MusicalKey::parse_to_camelot)
-            .map(|k| k.to_string()),
-        initial_key: tags.initial_key,
-        ..Default::default()
-    };
+    let stamp = file_stamp(path).ok_or(AnalysisError::Unreadable)?;
+    // As before #41, tags that can't be read leave the path fallbacks and the acoustic pass.
+    let tags = read_tags_checked(path).unwrap_or_default();
+    let mut features = features_from_tags(path, stamp, tags);
 
     if features.bpm.is_none() {
         if cancelled() {
@@ -460,10 +510,9 @@ fn analyze_track_with(
         return Err(AnalysisError::Cancelled);
     }
 
-    features.analyzed_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    // A full analysis: stored with the flag cleared whatever the BPM came out as.
+    features.needs_acoustic = false;
+    features.analyzed_at = now_secs();
     Ok(features)
 }
 
@@ -478,17 +527,49 @@ struct TagInfo {
     initial_key: Option<String>,
 }
 
-fn read_tags(path: &Path) -> TagInfo {
+/// The operating system error at the root of a lofty error, if the file couldn't be opened or
+/// read (a network share that failed, a file that went away). lofty reports a file that parses
+/// badly as an I/O error too: `InvalidInput` / `UnexpectedEof` without an OS error code, or an
+/// OS `EINVAL` when it seeks outside a short file. Those are left out: reading the file again
+/// won't help.
+fn io_failure(err: &(dyn std::error::Error + 'static)) -> Option<std::io::Error> {
+    use std::io::ErrorKind;
+    let mut source = Some(err);
+    while let Some(e) = source {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            let parse_problem = matches!(
+                io.kind(),
+                ErrorKind::InvalidInput | ErrorKind::InvalidData | ErrorKind::UnexpectedEof
+            );
+            return match io.raw_os_error() {
+                Some(code) if !parse_problem => Some(std::io::Error::from_raw_os_error(code)),
+                _ => None,
+            };
+        }
+        source = e.source();
+    }
+    None
+}
+
+/// A file's tags. A file that can't be opened or read fails with [`TagReadError::Io`]; one that
+/// parses badly, or has no tags, gives empty tags.
+fn read_tags_checked(path: &Path) -> Result<TagInfo, TagReadError> {
     use lofty::config::ParseOptions;
     use lofty::prelude::*;
     use lofty::probe::Probe;
     use lofty::tag::ItemKey;
 
-    let Ok(probe) = Probe::open(path) else {
-        return TagInfo::default();
+    let fail = |e: lofty::error::FileParseError| match io_failure(&e) {
+        Some(io) => Err(TagReadError::Io(io)),
+        None => Ok(TagInfo::default()),
     };
-    let Ok(tagged_file) = probe.options(ParseOptions::new().read_cover_art(false)).read() else {
-        return TagInfo::default();
+    let probe = match Probe::open(path) {
+        Ok(probe) => probe,
+        Err(e) => return fail(e),
+    };
+    let tagged_file = match probe.options(ParseOptions::new().read_cover_art(false)).read() {
+        Ok(file) => file,
+        Err(e) => return fail(e),
     };
 
     // Prefer the primary tag, then fall back to any other tag present in the file.
@@ -501,7 +582,7 @@ fn read_tags(path: &Path) -> TagInfo {
         tags.iter().find_map(|t| f(t).filter(|s| !s.trim().is_empty()))
     };
 
-    TagInfo {
+    Ok(TagInfo {
         title: text(&|t| t.title().map(|s| s.to_string())),
         artist: text(&|t| t.artist().map(|s| s.to_string())),
         album: text(&|t| t.album().map(|s| s.to_string())),
@@ -509,5 +590,125 @@ fn read_tags(path: &Path) -> TagInfo {
         year: tags.iter().find_map(|t| t.date()).map(|d| d.year as u32),
         bpm: tags.iter().find_map(|t| BpmAnalyzer::bpm_from_tag(t)),
         initial_key: text(&|t| t.get_string(ItemKey::InitialKey).map(|s| s.trim().to_string())),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "quickstream_tag_features_{}_{}_{}",
+            name,
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn silent_wav(path: &Path) {
+        let data_len = 400u32;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data_len).to_le_bytes());
+        b.extend_from_slice(b"WAVEfmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&8000u32.to_le_bytes());
+        b.extend_from_slice(&16000u32.to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&16u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data_len.to_le_bytes());
+        b.extend(std::iter::repeat_n(0u8, data_len as usize));
+        std::fs::write(path, b).unwrap();
+    }
+
+    /// An untagged file gets a row from its path, waiting for its acoustic pass.
+    #[test]
+    fn an_untagged_file_gets_a_heuristics_row_that_needs_acoustics() {
+        let dir = scratch("untagged");
+        let track = dir.join("Some Artist - Some Song.wav");
+        silent_wav(&track);
+        let row = tag_features(&track, (11, 22)).unwrap();
+        let (title, artist, album) = crate::metadata::parse_path_heuristics(&track);
+        assert_eq!((row.title, row.artist, row.album), (title, artist, album));
+        assert_eq!((row.mtime, row.file_size), (11, 22));
+        assert_eq!((row.bpm, row.energy), (None, None));
+        assert!(row.needs_acoustic);
+        assert!(row.analyzed_at > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A BPM tag is all the acoustic pass would add for matching, so the row needs none.
+    #[test]
+    fn a_bpm_tagged_file_needs_no_acoustic_pass() {
+        use lofty::config::WriteOptions;
+        use lofty::prelude::*;
+        use lofty::tag::{ItemKey, Tag, TagType};
+
+        let dir = scratch("tagged");
+        let track = dir.join("tagged.wav");
+        silent_wav(&track);
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_title("Tagged".to_string());
+        tag.insert_text(ItemKey::IntegerBpm, "124".to_string());
+        tag.insert_text(ItemKey::InitialKey, "Am".to_string());
+        tag.save_to_path(&track, WriteOptions::default()).unwrap();
+
+        let row = tag_features(&track, (1, 2)).unwrap();
+        assert_eq!(row.title, "Tagged");
+        assert_eq!(row.bpm, Some(124.0));
+        assert_eq!(row.camelot_key.as_deref(), Some("8A"));
+        assert!(!row.needs_acoustic);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that parses badly is not an I/O error: it gets a row from its path.
+    #[test]
+    fn a_corrupt_file_gets_a_heuristics_row() {
+        let dir = scratch("corrupt");
+        let track = dir.join("broken.mp3");
+        std::fs::write(&track, b"not really an mp3 at all").unwrap();
+        let row = tag_features(&track, (1, 2)).unwrap();
+        assert!(row.needs_acoustic);
+        let truncated = dir.join("short.wav");
+        std::fs::write(&truncated, b"RIFF\x24\x00\x00\x00WAVEfmt ").unwrap();
+        assert!(tag_features(&truncated, (1, 2)).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that can't be read is an error, so no row is stored for it.
+    #[test]
+    fn an_unreadable_file_is_an_io_error() {
+        let dir = scratch("missing");
+        let gone = dir.join("gone.flac");
+        assert!(matches!(tag_features(&gone, (1, 2)), Err(TagReadError::Io(_))));
+        let folder = dir.join("folder.flac");
+        std::fs::create_dir_all(&folder).unwrap();
+        assert!(
+            tag_features(&folder, (1, 2)).is_err(),
+            "a directory can't be read as a file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn row_is_current_needs_the_stamp_and_a_full_analysis() {
+        let mut row = TrackFeatures {
+            mtime: 3,
+            file_size: 4,
+            ..Default::default()
+        };
+        assert!(row_is_current(&row, (3, 4)));
+        assert!(!row_is_current(&row, (3, 5)));
+        row.needs_acoustic = true;
+        assert!(!row_is_current(&row, (3, 4)));
+        assert!(row_stamp_matches(&row, (3, 4)));
+        assert!(!row_stamp_matches(&row, (2, 4)));
     }
 }

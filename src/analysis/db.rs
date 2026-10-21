@@ -1,15 +1,16 @@
 //! SQLite storage for track features, acoustic metrics, and mix vectors.
 //! Strictly isolated inside ~/.cache/quickstream/track_analysis.db (never touches user library).
 
-use rusqlite::{params, Connection, Result, TransactionBehavior};
+use rusqlite::{params, Connection, Result, Row, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Current database schema version (tracked via PRAGMA user_version).
 /// Always equal to `MIGRATIONS.len()` (checked at compile time below).
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// How long a connection waits on a lock held by another handle before failing with
 /// `SQLITE_BUSY`. The app opens more than one handle (autopilot scanner and UI).
@@ -48,6 +49,20 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_features_artist ON track_features(artist);
     CREATE INDEX IF NOT EXISTS idx_features_mood ON track_features(mood);
     CREATE INDEX IF NOT EXISTS idx_features_energy ON track_features(energy);
+    "#,
+    // v2 (#41): library index. `needs_acoustic = 1` marks a tag-only row (no BPM tag) that still
+    // needs the ffmpeg pass; every v1 row was written by the full analyser and reads 0. Both
+    // statements are O(1): no index is built and no row is rewritten.
+    r#"
+    ALTER TABLE track_features ADD COLUMN needs_acoustic INTEGER NOT NULL DEFAULT 0;
+
+    CREATE TABLE IF NOT EXISTS library_index_dirs (
+        dirpath TEXT PRIMARY KEY,
+        audio_files INTEGER NOT NULL,
+        complete INTEGER NOT NULL DEFAULT 0,
+        subtree_complete INTEGER NOT NULL DEFAULT 0,
+        walked_at INTEGER NOT NULL
+    );
     "#,
 ];
 
@@ -94,6 +109,13 @@ pub struct TrackFeatures {
     pub mood: Option<String>, // "chill", "workout", "focus", "groove"
     pub tags_json: String,   // JSON array of community / style tags
     pub analyzed_at: u64,
+    /// A tag-only row from the library index (#41) with no BPM tag: it still needs the acoustic
+    /// pass, so it is not current to the worker ([`row_is_current`]) whatever its stamp. Every
+    /// full analysis is stored with this cleared.
+    ///
+    /// [`row_is_current`]: crate::analysis::worker::row_is_current
+    #[serde(default)]
+    pub needs_acoustic: bool,
 }
 
 impl Default for TrackFeatures {
@@ -115,7 +137,60 @@ impl Default for TrackFeatures {
             mood: None,
             tags_json: "[]".to_string(),
             analyzed_at: 0,
+            needs_acoustic: false,
         }
+    }
+}
+
+/// A folder the library index has walked: how many audio files sit directly inside it, and
+/// whether every one of them has a current row (`complete`). Written by
+/// [`AnalysisDatabase::write_index_batch`] together with the folder's rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedDir {
+    pub dirpath: PathBuf,
+    pub audio_files: usize,
+    pub complete: bool,
+    pub walked_at: u64,
+}
+
+/// The columns [`row_to_features`] reads, in its order.
+const FEATURE_COLUMNS: &str = "filepath, mtime, file_size, title, artist, album, genre, \
+     year, bpm, initial_key, camelot_key, energy, loudness_lufs, \
+     mood, tags_json, analyzed_at, needs_acoustic";
+
+/// One row selected with [`FEATURE_COLUMNS`]. Any non-zero `needs_acoustic` reads as set, so an
+/// odd value leads to a re-analysis rather than a skip.
+fn row_to_features(row: &Row<'_>) -> Result<TrackFeatures> {
+    Ok(TrackFeatures {
+        filepath: PathBuf::from(row.get::<_, String>(0)?),
+        mtime: row.get::<_, i64>(1)? as u64,
+        file_size: row.get::<_, i64>(2)? as u64,
+        title: row.get(3)?,
+        artist: row.get(4)?,
+        album: row.get(5)?,
+        genre: row.get(6)?,
+        year: row.get(7)?,
+        bpm: row.get(8)?,
+        initial_key: row.get(9)?,
+        camelot_key: row.get(10)?,
+        energy: row.get(11)?,
+        loudness_lufs: row.get(12)?,
+        mood: row.get(13)?,
+        tags_json: row.get(14)?,
+        analyzed_at: row.get::<_, i64>(15)? as u64,
+        needs_acoustic: row.get::<_, i64>(16)? != 0,
+    })
+}
+
+/// How a folder is keyed in `library_index_dirs` and bounds `tracks_under`: the lossy string
+/// form with no trailing `/` (the root stays `/`).
+fn dir_key(dir: &Path) -> String {
+    let s = dir.to_string_lossy();
+    let trimmed = s.trim_end_matches('/');
+    if trimmed.is_empty() && s.starts_with('/') {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -175,6 +250,8 @@ fn apply_migrations(conn: &mut Connection, steps: &[&str], label: &str) -> anyho
 #[derive(Clone)]
 pub struct AnalysisDatabase {
     conn: Arc<Mutex<Connection>>,
+    /// The file it was opened at ([`Self::open_at`]); `None` in memory.
+    path: Option<PathBuf>,
 }
 
 impl AnalysisDatabase {
@@ -188,7 +265,7 @@ impl AnalysisDatabase {
 
     /// Open an in-memory database (ideal for unit and integration testing).
     pub fn open_in_memory() -> anyhow::Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?, ":memory:")
+        Self::from_connection(Connection::open_in_memory()?, ":memory:", None)
     }
 
     /// Open or create SQLite database at a specific path.
@@ -197,11 +274,17 @@ impl AnalysisDatabase {
     /// by a newer quickstream build.
     pub fn open_at(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
-        Self::from_connection(conn, &path.display().to_string())
+        Self::from_connection(conn, &path.display().to_string(), Some(path.to_path_buf()))
+    }
+
+    /// The file this database was opened at, so another thread can open its own connection to
+    /// it; `None` for an in-memory database.
+    pub fn path(&self) -> Option<PathBuf> {
+        self.path.clone()
     }
 
     /// Configure a freshly opened connection and bring its schema up to date.
-    fn from_connection(mut conn: Connection, label: &str) -> anyhow::Result<Self> {
+    fn from_connection(mut conn: Connection, label: &str, path: Option<PathBuf>) -> anyhow::Result<Self> {
         // Per-connection settings: must be applied on every open, not only on first creation.
         conn.busy_timeout(BUSY_TIMEOUT)?;
 
@@ -217,10 +300,12 @@ impl AnalysisDatabase {
         apply_migrations(&mut conn, MIGRATIONS, label)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            path,
         })
     }
 
-    /// Upsert track analysis features.
+    /// Upsert a full analysis of a track. It always clears `needs_acoustic`, so it replaces a
+    /// tag-only index row whatever the struct carries.
     pub fn upsert_track(&self, features: &TrackFeatures) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -228,9 +313,9 @@ impl AnalysisDatabase {
             INSERT INTO track_features (
                 filepath, mtime, file_size, title, artist, album, genre,
                 year, bpm, initial_key, camelot_key, energy, loudness_lufs,
-                mood, tags_json, analyzed_at
+                mood, tags_json, analyzed_at, needs_acoustic
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 0
             )
             ON CONFLICT(filepath) DO UPDATE SET
                 mtime = excluded.mtime,
@@ -247,7 +332,8 @@ impl AnalysisDatabase {
                 loudness_lufs = excluded.loudness_lufs,
                 mood = excluded.mood,
                 tags_json = excluded.tags_json,
-                analyzed_at = excluded.analyzed_at;
+                analyzed_at = excluded.analyzed_at,
+                needs_acoustic = 0;
             "#,
             params![
                 features.filepath.to_string_lossy().to_string(),
@@ -271,6 +357,190 @@ impl AnalysisDatabase {
         Ok(())
     }
 
+    /// Write the library index's tag-only rows (and, with `dir`, that folder's record) in one
+    /// IMMEDIATE transaction, so a folder is never recorded without its rows. Returns how many
+    /// rows were inserted or changed.
+    ///
+    /// A row already current for the file's stamp (mtime and size) is never touched, whoever
+    /// wrote it. Over a stale row the tags, stamp and `needs_acoustic` are replaced; a missing
+    /// BPM tag keeps the old BPM and energy provisionally (the row is flagged for re-analysis),
+    /// while a BPM tag replaces the BPM and drops the energy measured for the old file. Unknown
+    /// values are stored as NULL; loudness, mood and tags are never written here.
+    pub fn write_index_batch(&self, rows: &[TrackFeatures], dir: Option<&IndexedDir>) -> Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut written = 0;
+        {
+            let mut stmt = tx.prepare_cached(
+                r#"
+                INSERT INTO track_features (
+                    filepath, mtime, file_size, title, artist, album, genre,
+                    year, bpm, initial_key, camelot_key, energy, loudness_lufs,
+                    mood, tags_json, analyzed_at, needs_acoustic
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, NULL, '[]', ?12, ?13
+                )
+                ON CONFLICT(filepath) DO UPDATE SET
+                    mtime = excluded.mtime,
+                    file_size = excluded.file_size,
+                    title = excluded.title,
+                    artist = excluded.artist,
+                    album = excluded.album,
+                    genre = excluded.genre,
+                    year = excluded.year,
+                    initial_key = excluded.initial_key,
+                    camelot_key = excluded.camelot_key,
+                    bpm = COALESCE(excluded.bpm, track_features.bpm),
+                    energy = CASE WHEN excluded.bpm IS NULL THEN track_features.energy ELSE NULL END,
+                    needs_acoustic = excluded.needs_acoustic,
+                    analyzed_at = excluded.analyzed_at
+                WHERE track_features.mtime IS NOT excluded.mtime
+                   OR track_features.file_size IS NOT excluded.file_size;
+                "#,
+            )?;
+            for row in rows {
+                written += stmt.execute(params![
+                    row.filepath.to_string_lossy().to_string(),
+                    row.mtime as i64,
+                    row.file_size as i64,
+                    row.title,
+                    row.artist,
+                    row.album,
+                    row.genre,
+                    row.year,
+                    row.bpm,
+                    row.initial_key,
+                    row.camelot_key,
+                    row.analyzed_at as i64,
+                    row.needs_acoustic as i64,
+                ])?;
+            }
+        }
+        if let Some(dir) = dir {
+            // A folder that is no longer complete can't have a complete subtree.
+            tx.execute(
+                r#"
+                INSERT INTO library_index_dirs (dirpath, audio_files, complete, subtree_complete, walked_at)
+                VALUES (?1, ?2, ?3, 0, ?4)
+                ON CONFLICT(dirpath) DO UPDATE SET
+                    audio_files = excluded.audio_files,
+                    complete = excluded.complete,
+                    subtree_complete = CASE WHEN excluded.complete = 0 THEN 0
+                                            ELSE library_index_dirs.subtree_complete END,
+                    walked_at = excluded.walked_at;
+                "#,
+                params![
+                    dir_key(&dir.dirpath),
+                    dir.audio_files as i64,
+                    dir.complete as i64,
+                    dir.walked_at as i64,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// The stamps (mtime, size) of the rows these files have, keyed by the lossy path string;
+    /// files without a row are left out.
+    pub fn index_stamps(&self, paths: &[PathBuf]) -> HashMap<String, (u64, u64)> {
+        let conn = self.conn.lock().unwrap();
+        let mut out = HashMap::new();
+        let Ok(mut stmt) = conn.prepare_cached("SELECT mtime, file_size FROM track_features WHERE filepath = ?1")
+        else {
+            return out;
+        };
+        for path in paths {
+            let key = path.to_string_lossy().to_string();
+            let stamp = stmt.query_row(params![key], |r| {
+                Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
+            });
+            if let Ok(stamp) = stamp {
+                out.insert(key, stamp);
+            }
+        }
+        out
+    }
+
+    /// Record whether `dir` and every folder under it have all their rows. Returns false when
+    /// `dir` has no record (none is created).
+    pub fn set_subtree_complete(&self, dir: &Path, complete: bool) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE library_index_dirs SET subtree_complete = ?2 WHERE dirpath = ?1",
+            params![dir_key(dir), complete as i64],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// The folders among `dirs` whose whole subtree is indexed.
+    pub fn indexed_subtrees(&self, dirs: &[PathBuf]) -> HashSet<PathBuf> {
+        let conn = self.conn.lock().unwrap();
+        let mut out = HashSet::new();
+        let Ok(mut stmt) = conn.prepare_cached("SELECT subtree_complete FROM library_index_dirs WHERE dirpath = ?1")
+        else {
+            return out;
+        };
+        for dir in dirs {
+            let complete = stmt
+                .query_row(params![dir_key(dir)], |r| r.get::<_, i64>(0))
+                .is_ok_and(|v| v != 0);
+            if complete {
+                out.insert(dir.clone());
+            }
+        }
+        out
+    }
+
+    /// A folder's record, and whether its whole subtree is indexed.
+    pub fn index_dir(&self, dir: &Path) -> Option<(IndexedDir, bool)> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT dirpath, audio_files, complete, walked_at, subtree_complete \
+             FROM library_index_dirs WHERE dirpath = ?1",
+            params![dir_key(dir)],
+            |r| {
+                Ok((
+                    IndexedDir {
+                        dirpath: PathBuf::from(r.get::<_, String>(0)?),
+                        audio_files: r.get::<_, i64>(1)? as usize,
+                        complete: r.get::<_, i64>(2)? != 0,
+                        walked_at: r.get::<_, i64>(3)? as u64,
+                    },
+                    r.get::<_, i64>(4)? != 0,
+                ))
+            },
+        )
+        .ok()
+    }
+
+    /// The rows of files under `dir`, at most `max_depth` levels down (1 = directly inside, as
+    /// `WalkDir::max_depth` counts). A byte range on the primary key (`dir/` up to `dir0`, `0`
+    /// being the byte after `/`), never LIKE, so a sibling that shares the name as a prefix
+    /// (`Jazz Fusion` for `Jazz`) is never included.
+    pub fn tracks_under(&self, dir: &Path, max_depth: usize) -> Vec<TrackFeatures> {
+        let key = dir_key(dir);
+        let base = key.trim_end_matches('/');
+        let (low, high) = (format!("{base}/"), format!("{base}0"));
+        let conn = self.conn.lock().unwrap();
+        let sql = format!("SELECT {FEATURE_COLUMNS} FROM track_features WHERE filepath >= ?1 AND filepath < ?2");
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map(params![low, high], row_to_features) else {
+            return Vec::new();
+        };
+        rows.filter_map(|r| r.ok())
+            .filter(|t| {
+                let path = t.filepath.to_string_lossy();
+                let depth = path
+                    .get(low.len()..)
+                    .map_or(usize::MAX, |rest| rest.split('/').filter(|c| !c.is_empty()).count());
+                depth <= max_depth
+            })
+            .collect()
+    }
+
     /// Retrieve track features by filepath.
     pub fn get_features(&self, path: &Path) -> Option<TrackFeatures> {
         self.get_track(path)
@@ -280,129 +550,45 @@ impl AnalysisDatabase {
     pub fn get_track(&self, path: &Path) -> Option<TrackFeatures> {
         let conn = self.conn.lock().unwrap();
         let path_str = path.to_string_lossy().to_string();
-        let mut stmt = conn
-            .prepare(
-                r#"
-            SELECT filepath, mtime, file_size, title, artist, album, genre,
-                   year, bpm, initial_key, camelot_key, energy, loudness_lufs,
-                   mood, tags_json, analyzed_at
-            FROM track_features
-            WHERE filepath = ?1
-            "#,
-            )
-            .ok()?;
-
-        stmt.query_row(params![path_str], |row| {
-            Ok(TrackFeatures {
-                filepath: PathBuf::from(row.get::<_, String>(0)?),
-                mtime: row.get::<_, i64>(1)? as u64,
-                file_size: row.get::<_, i64>(2)? as u64,
-                title: row.get(3)?,
-                artist: row.get(4)?,
-                album: row.get(5)?,
-                genre: row.get(6)?,
-                year: row.get(7)?,
-                bpm: row.get(8)?,
-                initial_key: row.get(9)?,
-                camelot_key: row.get(10)?,
-                energy: row.get(11)?,
-                loudness_lufs: row.get(12)?,
-                mood: row.get(13)?,
-                tags_json: row.get(14)?,
-                analyzed_at: row.get::<_, i64>(15)? as u64,
-            })
-        })
-        .ok()
+        let sql = format!("SELECT {FEATURE_COLUMNS} FROM track_features WHERE filepath = ?1");
+        let mut stmt = conn.prepare(&sql).ok()?;
+        stmt.query_row(params![path_str], row_to_features).ok()
     }
 
     /// Query tracks by tempo / BPM window.
     pub fn query_bpm_range(&self, min_bpm: f64, max_bpm: f64, limit: usize) -> Vec<TrackFeatures> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare(
-            r#"
-            SELECT filepath, mtime, file_size, title, artist, album, genre,
-                   year, bpm, initial_key, camelot_key, energy, loudness_lufs,
-                   mood, tags_json, analyzed_at
-            FROM track_features
-            WHERE bpm IS NOT NULL AND bpm >= ?1 AND bpm <= ?2
-            ORDER BY RANDOM()
-            LIMIT ?3
-            "#,
-        ) {
+        let sql = format!(
+            "SELECT {FEATURE_COLUMNS} FROM track_features \
+             WHERE bpm IS NOT NULL AND bpm >= ?1 AND bpm <= ?2 ORDER BY RANDOM() LIMIT ?3"
+        );
+        let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-
-        let rows = match stmt.query_map(params![min_bpm, max_bpm, limit as i64], |row| {
-            Ok(TrackFeatures {
-                filepath: PathBuf::from(row.get::<_, String>(0)?),
-                mtime: row.get::<_, i64>(1)? as u64,
-                file_size: row.get::<_, i64>(2)? as u64,
-                title: row.get(3)?,
-                artist: row.get(4)?,
-                album: row.get(5)?,
-                genre: row.get(6)?,
-                year: row.get(7)?,
-                bpm: row.get(8)?,
-                initial_key: row.get(9)?,
-                camelot_key: row.get(10)?,
-                energy: row.get(11)?,
-                loudness_lufs: row.get(12)?,
-                mood: row.get(13)?,
-                tags_json: row.get(14)?,
-                analyzed_at: row.get::<_, i64>(15)? as u64,
-            })
-        }) {
+        let rows = match stmt.query_map(params![min_bpm, max_bpm, limit as i64], row_to_features) {
             Ok(r) => r,
             Err(_) => return Vec::new(),
         };
-
         rows.filter_map(|r| r.ok()).collect()
     }
 
     /// Query tracks by mood (e.g. "chill", "workout", "focus", "groove").
     pub fn query_by_mood(&self, mood: &str, limit: usize) -> Vec<TrackFeatures> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare(
-            r#"
-            SELECT filepath, mtime, file_size, title, artist, album, genre,
-                   year, bpm, initial_key, camelot_key, energy, loudness_lufs,
-                   mood, tags_json, analyzed_at
-            FROM track_features
-            WHERE mood = ?1 OR tags_json LIKE ?2
-            ORDER BY RANDOM()
-            LIMIT ?3
-            "#,
-        ) {
+        let sql = format!(
+            "SELECT {FEATURE_COLUMNS} FROM track_features \
+             WHERE mood = ?1 OR tags_json LIKE ?2 ORDER BY RANDOM() LIMIT ?3"
+        );
+        let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-
         let tag_pattern = format!("%{}%", mood);
-        let rows = match stmt.query_map(params![mood, tag_pattern, limit as i64], |row| {
-            Ok(TrackFeatures {
-                filepath: PathBuf::from(row.get::<_, String>(0)?),
-                mtime: row.get::<_, i64>(1)? as u64,
-                file_size: row.get::<_, i64>(2)? as u64,
-                title: row.get(3)?,
-                artist: row.get(4)?,
-                album: row.get(5)?,
-                genre: row.get(6)?,
-                year: row.get(7)?,
-                bpm: row.get(8)?,
-                initial_key: row.get(9)?,
-                camelot_key: row.get(10)?,
-                energy: row.get(11)?,
-                loudness_lufs: row.get(12)?,
-                mood: row.get(13)?,
-                tags_json: row.get(14)?,
-                analyzed_at: row.get::<_, i64>(15)? as u64,
-            })
-        }) {
+        let rows = match stmt.query_map(params![mood, tag_pattern, limit as i64], row_to_features) {
             Ok(r) => r,
             Err(_) => return Vec::new(),
         };
-
         rows.filter_map(|r| r.ok()).collect()
     }
 

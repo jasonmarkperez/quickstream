@@ -179,6 +179,8 @@ impl Default for ProfileScanLimits {
 
 /// Counters and timings for one autopilot mix build, written to the log as `[autopilot]` PERF
 /// lines so slow mixes show where the time goes (folder walks vs tag reads vs matching).
+/// `folders` and `files` count walked folders only; folders drawn from the library index (#41)
+/// are counted apart, in the `index_*` counters.
 #[derive(Default)]
 struct MixScanStats {
     folders: AtomicUsize,
@@ -192,6 +194,14 @@ struct MixScanStats {
     tag_read_time: AtomicU64,
     fallbacks: AtomicUsize,
     matching: AtomicU64,
+    /// Folders whose candidates came from their index rows, unwalked.
+    index_folders: AtomicUsize,
+    /// Index rows those folders had.
+    index_rows: AtomicUsize,
+    /// Matching index rows taken from them.
+    index_matches: AtomicUsize,
+    /// Index-sourced tracks dropped because their file was gone when they were to be sent.
+    index_missing: AtomicUsize,
 }
 
 impl MixScanStats {
@@ -206,7 +216,7 @@ impl MixScanStats {
     fn summary(&self) -> String {
         let d = |nanos: &AtomicU64| Duration::from_nanos(nanos.load(Ordering::Relaxed));
         format!(
-            "folders={} files={} walk={:.2?} metadata={:.2?} (cache_hits={} db_hits={} tag_reads={} in {:.2?} fallbacks={}) matching={:.2?}",
+            "folders={} files={} walk={:.2?} metadata={:.2?} (cache_hits={} db_hits={} tag_reads={} in {:.2?} fallbacks={}) matching={:.2?} index_folders={} index_rows={} index_matches={} index_missing={}",
             self.folders.load(Ordering::Relaxed),
             self.files.load(Ordering::Relaxed),
             d(&self.walk),
@@ -217,14 +227,31 @@ impl MixScanStats {
             d(&self.tag_read_time),
             self.fallbacks.load(Ordering::Relaxed),
             d(&self.matching),
+            self.index_folders.load(Ordering::Relaxed),
+            self.index_rows.load(Ordering::Relaxed),
+            self.index_matches.load(Ordering::Relaxed),
+            self.index_missing.load(Ordering::Relaxed),
         )
     }
+}
+
+/// Whether a file an index row names is still there to be sent (rows are never pruned, #41).
+fn still_a_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|md| md.is_file())
 }
 
 /// Worker threads that list folders and read tags while gathering profile-mix candidates.
 const MIX_SCAN_THREADS: usize = 4;
 /// Tracks per folder whose tags are read while gathering profile-mix candidates.
 const TAG_READS_PER_FOLDER: usize = 4;
+
+/// A track gathered for a profile mix: its metadata, the stamp (mtime, size) it was read for,
+/// and its analysis row when it was drawn from the library index (#41).
+type GatheredTrack = (
+    AudioMetadata,
+    Option<(u64, u64)>,
+    Option<crate::analysis::TrackFeatures>,
+);
 
 /// The tracks a profile mix sends for analysis (issue #30): its matched candidates first, then
 /// the others (`others` may list matched ones again), each path once, less those `skip` names
@@ -405,6 +432,26 @@ impl LibraryManager {
     /// without reading tags from disk, ensuring instant zero-cost initial display.
     pub fn parse_path_heuristics(path: &Path) -> (String, String, String) {
         crate::metadata::parse_path_heuristics(path)
+    }
+
+    /// A mix candidate's metadata from its analysis row, without touching the file: the row's
+    /// title, artist and album (the path's where the row has none), its genre, the extension as
+    /// the format and `file_len` as the size. Audio properties stay unknown (0), as for any
+    /// placeholder.
+    fn metadata_from_row(path: &Path, feat: crate::analysis::TrackFeatures, file_len: u64) -> AudioMetadata {
+        let (title, artist, album) = Self::parse_path_heuristics(path);
+        let or_path = |tagged: String, fallback: String| if tagged.is_empty() { fallback } else { tagged };
+        AudioMetadata {
+            filepath: path.to_path_buf(),
+            filename: path.file_name().and_then(|f| f.to_str()).unwrap_or("track").to_string(),
+            title: or_path(feat.title, title),
+            artist: or_path(feat.artist, artist),
+            album: or_path(feat.album, album),
+            genre: feat.genre,
+            format_name: path.extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase(),
+            file_size: file_len,
+            ..Default::default()
+        }
     }
 
     pub fn scan_directory_scoped_with_cache(dir: &Path, cache: &HashMap<PathBuf, AudioMetadata>) -> Vec<AudioMetadata> {
@@ -672,18 +719,7 @@ impl LibraryManager {
             }
             if let Some(feat) = db.get_track(path) {
                 MixScanStats::count(&stats.db_hits);
-                let (title, artist, album) = Self::parse_path_heuristics(path);
-                return AudioMetadata {
-                    filepath: path.to_path_buf(),
-                    filename: path.file_name().and_then(|f| f.to_str()).unwrap_or("track").to_string(),
-                    title: if !feat.title.is_empty() { feat.title } else { title },
-                    artist: if !feat.artist.is_empty() { feat.artist } else { artist },
-                    album: if !feat.album.is_empty() { feat.album } else { album },
-                    genre: feat.genre,
-                    format_name: path.extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase(),
-                    file_size: file_len,
-                    ..Default::default()
-                };
+                return Self::metadata_from_row(path, feat, file_len);
             }
             MixScanStats::count(&stats.tag_reads);
             let read_start = Instant::now();
@@ -783,6 +819,20 @@ impl LibraryManager {
             let mut matched_candidates: Vec<AudioMetadata> = Vec::new();
             let mut all_candidates: Vec<AudioMetadata> = Vec::new();
 
+            // Seed Radio's seed: its row is read once per mix, not once per candidate.
+            let seed = match &profile {
+                crate::analysis::MixProfile::SeedRadio(seed_path) => {
+                    let seed_feat = db.get_track(seed_path).unwrap_or_default();
+                    let (_seed_title, seed_artist, _seed_album) = Self::parse_path_heuristics(seed_path);
+                    let seed_artist = if !seed_feat.artist.is_empty() {
+                        seed_feat.artist
+                    } else {
+                        seed_artist
+                    };
+                    Some((seed_artist, seed_feat.genre))
+                }
+                _ => None,
+            };
             let is_match_untimed = |meta: &AudioMetadata, feat: Option<&crate::analysis::TrackFeatures>| -> bool {
                 match &profile {
                     crate::analysis::MixProfile::BpmFlow { target_bpm, tolerance } => {
@@ -801,19 +851,13 @@ impl LibraryManager {
                         if &meta.filepath == seed_path {
                             return false;
                         }
-                        let seed_feat = db.get_track(seed_path).unwrap_or_default();
-                        let (_seed_title, seed_artist, _seed_album) = Self::parse_path_heuristics(seed_path);
-                        let seed_artist = if !seed_feat.artist.is_empty() {
-                            seed_feat.artist
-                        } else {
-                            seed_artist
+                        let Some((seed_artist, seed_genre)) = &seed else {
+                            return false;
                         };
-                        let seed_genre = seed_feat.genre;
-
-                        let artist_match = !seed_artist.is_empty() && meta.artist.eq_ignore_ascii_case(&seed_artist);
+                        let artist_match = !seed_artist.is_empty() && meta.artist.eq_ignore_ascii_case(seed_artist);
                         let genre_match = !seed_genre.is_empty()
-                            && (meta.genre.eq_ignore_ascii_case(&seed_genre)
-                                || feat.map(|f| f.genre.eq_ignore_ascii_case(&seed_genre)).unwrap_or(false));
+                            && (meta.genre.eq_ignore_ascii_case(seed_genre)
+                                || feat.map(|f| f.genre.eq_ignore_ascii_case(seed_genre)).unwrap_or(false));
                         artist_match || genre_match
                     }
                     _ => true,
@@ -822,16 +866,27 @@ impl LibraryManager {
             // Gathered tracks whose analysis row is current for the file as gathering read it
             // (the worker would skip them): left out of the pool sent for analysis.
             let analysed = std::cell::RefCell::new(std::collections::HashSet::new());
-            // Each gathered track's row is read once, for matching and to tell if it is current.
-            let is_match = |meta: &AudioMetadata, stamp: Option<(u64, u64)>| -> bool {
+            // Each gathered track's row is read once, for matching and to tell if it is current;
+            // a track drawn from the library index brings its row (`indexed`).
+            let is_match = |meta: &AudioMetadata,
+                            stamp: Option<(u64, u64)>,
+                            indexed: Option<&crate::analysis::TrackFeatures>|
+             -> bool {
                 let start = Instant::now();
-                let row = db.get_track(&meta.filepath);
-                if let (Some(row), Some(stamp)) = (&row, stamp) {
+                let read;
+                let row = match indexed {
+                    Some(row) => Some(row),
+                    None => {
+                        read = db.get_track(&meta.filepath);
+                        read.as_ref()
+                    }
+                };
+                if let (Some(row), Some(stamp)) = (row, stamp) {
                     if crate::analysis::worker::row_is_current(row, stamp) {
                         analysed.borrow_mut().insert(meta.filepath.clone());
                     }
                 }
-                let matched = is_match_untimed(meta, row.as_ref());
+                let matched = is_match_untimed(meta, row);
                 MixScanStats::time(&stats.matching, start);
                 matched
             };
@@ -840,6 +895,9 @@ impl LibraryManager {
             // the rest of the mix is sequenced to follow it.
             let mut first_sent: Option<AudioMetadata> = None;
             let over_budget = || scan_start.elapsed() >= limits.time_budget;
+            // Tracks drawn from the library index: their files are checked just before they are
+            // sent, since index rows are never pruned (#41).
+            let mut index_sourced: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
             if !subdirs.is_empty() {
                 let per_subdir = if subdirs.len() >= 60 {
@@ -857,7 +915,7 @@ impl LibraryManager {
                     rng.shuffle(&mut immediate_files);
                     for f in immediate_files.iter().take(per_subdir) {
                         let (meta, stamp) = make_metadata(f);
-                        if is_match(&meta, stamp) {
+                        if is_match(&meta, stamp, None) {
                             if first_sent.is_none() && tx.send(AutopilotEvent::Track(meta.clone())).is_ok() {
                                 total_sent += 1;
                                 first_sent = Some(meta);
@@ -869,14 +927,118 @@ impl LibraryManager {
                     }
                 }
 
-                // Walk shuffled subdirectories until we have 80 matching tracks, or have visited
+                // One folder's gathered tracks, walked or from the index (with their rows): the
+                // first match goes out at once, then at most `per_subdir` matches join the pool
+                // (120 matched at most) and the others fill it up to 200. Returns whether gathering
+                // should stop (stopped, 80 matches, or the time budget spent) and the pool's sizes.
+                let mut take_folder = |metas: Vec<GatheredTrack>| -> (bool, usize, usize) {
+                    let mut artist_match_count = 0;
+                    for (meta, stamp, indexed) in metas {
+                        let from_index = indexed.is_some();
+                        if is_match(&meta, stamp, indexed.as_ref()) {
+                            if first_sent.is_none() {
+                                if from_index && !still_a_file(&meta.filepath) {
+                                    MixScanStats::count(&stats.index_missing);
+                                    continue;
+                                }
+                                if tx.send(AutopilotEvent::Track(meta.clone())).is_ok() {
+                                    total_sent += 1;
+                                    first_sent = Some(meta);
+                                    artist_match_count += 1;
+                                    continue;
+                                }
+                            }
+                            if artist_match_count < per_subdir && matched_candidates.len() < 120 {
+                                if from_index {
+                                    index_sourced.insert(meta.filepath.clone());
+                                }
+                                matched_candidates.push(meta.clone());
+                                all_candidates.push(meta);
+                                artist_match_count += 1;
+                            }
+                        } else if all_candidates.len() < 200 {
+                            if from_index {
+                                index_sourced.insert(meta.filepath.clone());
+                            }
+                            all_candidates.push(meta);
+                        }
+                    }
+                    let stop = stop_flag.load(Ordering::Relaxed) || matched_candidates.len() >= 80 || over_budget();
+                    (stop, matched_candidates.len(), all_candidates.len())
+                };
+
+                // The folders gathering may visit (`max_folders`, in shuffled order): those whose
+                // whole subtree is in the library index are drawn from their rows, the rest are
+                // walked. Indexed folders count toward the folder limit and the time budget.
+                let max_folders = limits.max_folders.min(subdirs.len());
+                let visiting = &subdirs[..max_folders];
+                let indexed_dirs = db.indexed_subtrees(visiting);
+                let (indexed, to_walk): (Vec<&PathBuf>, Vec<&PathBuf>) =
+                    visiting.iter().partition(|d| indexed_dirs.contains(*d));
+
+                // Indexed folders first, inline: no file is opened. Their rows, to the walk's
+                // depth and shuffled, are judged as walked tracks would be; at most `per_subdir`
+                // matches and `TAG_READS_PER_FOLDER` others are offered, as a walk reads.
+                let mut gathered_enough = false;
+                for subdir in indexed {
+                    if stop_flag.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let mut rows = db.tracks_under(subdir, 3);
+                    MixScanStats::count(&stats.index_folders);
+                    stats.index_rows.fetch_add(rows.len(), Ordering::Relaxed);
+                    rng.shuffle(&mut rows);
+                    let (mut matches, mut others) = (0, 0);
+                    let mut metas = Vec::new();
+                    for row in rows {
+                        if matches >= per_subdir && others >= TAG_READS_PER_FOLDER {
+                            break;
+                        }
+                        let meta = match cache.get(&row.filepath) {
+                            Some(mut cached) if cached.file_size == row.file_size && !cached.title.is_empty() => {
+                                if cached.genre.is_empty() {
+                                    cached.genre = row.genre.clone();
+                                }
+                                cached
+                            }
+                            _ => {
+                                let path = row.filepath.clone();
+                                Self::metadata_from_row(&path, row.clone(), row.file_size)
+                            }
+                        };
+                        if is_match_untimed(&meta, Some(&row)) {
+                            if matches >= per_subdir {
+                                continue;
+                            }
+                            matches += 1;
+                        } else {
+                            if others >= TAG_READS_PER_FOLDER {
+                                continue;
+                            }
+                            others += 1;
+                        }
+                        let stamp = Some((row.mtime, row.file_size));
+                        metas.push((meta, stamp, Some(row)));
+                    }
+                    stats.index_matches.fetch_add(matches, Ordering::Relaxed);
+                    if take_folder(metas).0 {
+                        gathered_enough = true;
+                        break;
+                    }
+                }
+                if stop_flag.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                // Walk the other folders until we have 80 matching tracks, or have visited
                 // `max_folders` subdirectories, or the time budget is spent (after at least one
                 // folder). Shortfalls are filled from diverse candidates below.
                 //
                 // Tag reads over a network share are latency-bound, so folders are listed and read
                 // by a few worker threads, and only a few tracks per folder are read: within the
                 // time budget the mix then draws from many more artists.
-                let max_folders = limits.max_folders.min(subdirs.len());
+                // Once the index has given enough, nothing is walked.
+                let to_walk: &[&PathBuf] = if gathered_enough { &[] } else { &to_walk };
                 let next_folder = AtomicUsize::new(0);
                 let halt = AtomicBool::new(false);
                 std::thread::scope(|scope| {
@@ -884,8 +1046,8 @@ impl LibraryManager {
                         std::sync::mpsc::channel::<(usize, Vec<(AudioMetadata, Option<(u64, u64)>)>)>();
                     for worker in 0..MIX_SCAN_THREADS {
                         let folder_tx = folder_tx.clone();
-                        let (next_folder, halt, subdirs, stop_flag, stats) =
-                            (&next_folder, &halt, &subdirs, &stop_flag, &stats);
+                        let (next_folder, halt, to_walk, stop_flag, stats) =
+                            (&next_folder, &halt, &to_walk, &stop_flag, &stats);
                         let make_metadata = &make_metadata;
                         scope.spawn(move || {
                             let mut rng = crate::queue::FastRng::new();
@@ -897,13 +1059,13 @@ impl LibraryManager {
                                     break;
                                 }
                                 let idx = next_folder.fetch_add(1, Ordering::Relaxed);
-                                if idx >= max_folders {
+                                if idx >= to_walk.len() {
                                     break;
                                 }
                                 let walk_start = Instant::now();
                                 let mut folder_tracks = Vec::new();
                                 let mut seen = SeenPaths::default();
-                                for entry in WalkDir::new(&subdirs[idx])
+                                for entry in WalkDir::new(to_walk[idx])
                                     .max_depth(3)
                                     .follow_links(false)
                                     .into_iter()
@@ -952,39 +1114,24 @@ impl LibraryManager {
                         stats.folders.fetch_add(1, Ordering::Relaxed);
                         stats.files.fetch_add(files_found, Ordering::Relaxed);
 
-                        let mut artist_match_count = 0;
-                        for (meta, stamp) in metas {
-                            if is_match(&meta, stamp) {
-                                if first_sent.is_none() && tx.send(AutopilotEvent::Track(meta.clone())).is_ok() {
-                                    total_sent += 1;
-                                    first_sent = Some(meta);
-                                    artist_match_count += 1;
-                                    continue;
-                                }
-                                if artist_match_count < per_subdir && matched_candidates.len() < 120 {
-                                    matched_candidates.push(meta.clone());
-                                    all_candidates.push(meta);
-                                    artist_match_count += 1;
-                                }
-                            } else if all_candidates.len() < 200 {
-                                all_candidates.push(meta);
-                            }
-                        }
+                        let (stop, matched, candidates) =
+                            take_folder(metas.into_iter().map(|(meta, stamp)| (meta, stamp, None)).collect());
 
                         if folders_done % 50 == 0 || last_progress.elapsed() >= Duration::from_secs(10) {
                             last_progress = Instant::now();
                             log_autopilot(format!(
-                                "mix progress folders={}/{} files={} matched={} candidates={} elapsed={:.2?}",
+                                "mix progress folders={}/{} index_folders={} files={} matched={} candidates={} elapsed={:.2?}",
                                 folders_done,
                                 subdirs.len(),
+                                stats.index_folders.load(Ordering::Relaxed),
                                 stats.files.load(Ordering::Relaxed),
-                                matched_candidates.len(),
-                                all_candidates.len(),
+                                matched,
+                                candidates,
                                 scan_start.elapsed()
                             ));
                         }
 
-                        if stop_flag.load(Ordering::Relaxed) || matched_candidates.len() >= 80 || over_budget() {
+                        if stop {
                             break;
                         }
                     }
@@ -1030,7 +1177,7 @@ impl LibraryManager {
                         break;
                     }
                     let (meta, stamp) = make_metadata(&p);
-                    if is_match(&meta, stamp) {
+                    if is_match(&meta, stamp, None) {
                         if first_sent.is_none() && tx.send(AutopilotEvent::Track(meta.clone())).is_ok() {
                             total_sent += 1;
                             first_sent = Some(meta);
@@ -1112,6 +1259,12 @@ impl LibraryManager {
                 if stop_flag.load(Ordering::Relaxed) {
                     return;
                 }
+                // Index rows outlive deleted files: each index-sourced track (at most the mix's
+                // 60) is checked just before it goes out.
+                if index_sourced.contains(&track.filepath) && !still_a_file(&track.filepath) {
+                    MixScanStats::count(&stats.index_missing);
+                    continue;
+                }
                 if tx.send(AutopilotEvent::Track(track)).is_ok() {
                     total_sent += 1;
                 }
@@ -1131,9 +1284,10 @@ impl LibraryManager {
 
             if !stop_flag.load(Ordering::Relaxed) {
                 log_autopilot(format!(
-                    "mix complete profile=\"{}\" sent={} total={:.2?}",
+                    "mix complete profile=\"{}\" sent={} index_missing={} total={:.2?}",
                     profile.name(),
                     total_sent,
+                    stats.index_missing.load(Ordering::Relaxed),
                     scan_start.elapsed()
                 ));
                 let _ = tx.send(AutopilotEvent::Finished(total_sent));
