@@ -15,6 +15,7 @@ use quickstream::discovery::DLNADevice;
 use quickstream::metadata::AudioMetadata;
 use quickstream::player::upnp::UPnPPlayer;
 use quickstream::player::AudioPlayer;
+use quickstream::queue::RowMap;
 use quickstream::settings::SettingsManager;
 use quickstream::ui::AppUI;
 use quickstream::web::{
@@ -258,8 +259,8 @@ fn test_armed_continuous_stream_plays_queue_gaplessly_and_shuffles_on_wrap() {
 
     // Both tracks are decoded into the one connection, then the wrap asks for a reshuffle.
     match rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(WebCommand::ShuffleQueue) => {}
-        other => panic!("expected ShuffleQueue after the queue wrapped, got {:?}", other),
+        Ok(WebCommand::StreamReshuffle) => {}
+        other => panic!("expected StreamReshuffle after the queue wrapped, got {:?}", other),
     }
     assert!(state.read().unwrap().title.starts_with("Track "));
 
@@ -271,7 +272,7 @@ fn test_armed_continuous_stream_plays_queue_gaplessly_and_shuffles_on_wrap() {
     while Instant::now() < deadline {
         if let Ok(cmd) = rx.recv_timeout(Duration::from_millis(50)) {
             // A wrap that completed just before the close may still be in flight.
-            assert_eq!(cmd, WebCommand::ShuffleQueue);
+            assert_eq!(cmd, WebCommand::StreamReshuffle);
         }
     }
     assert!(
@@ -601,6 +602,22 @@ impl FakeDecoder {
             .to_string()
     }
 
+    /// Wait for run `n` (from 1) and return its input and `-ss` offset (`None`: from the start).
+    fn run(&self, n: usize) -> (PathBuf, Option<String>) {
+        let calls = self.wait_for_calls(n);
+        let call = &calls[n - 1];
+        let input = call
+            .split(" -i ")
+            .nth(1)
+            .and_then(|rest| rest.split(" -f ").next())
+            .unwrap_or_else(|| panic!("no -i in {:?}", call));
+        let seek = call
+            .strip_prefix("-ss ")
+            .and_then(|rest| rest.split(' ').next())
+            .map(str::to_string);
+        (PathBuf::from(input), seek)
+    }
+
     /// The runs so far, once there are `n` of them.
     fn wait_for_calls(&self, n: usize) -> Vec<String> {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -837,18 +854,7 @@ impl DecoderFixture {
     /// Wait for decoder run `n` (from 1) and return its input and `-ss` offset (`None`: from
     /// the start).
     fn run(&self, n: usize) -> (PathBuf, Option<String>) {
-        let calls = self.decoder.wait_for_calls(n);
-        let call = &calls[n - 1];
-        let input = call
-            .split(" -i ")
-            .nth(1)
-            .and_then(|rest| rest.split(" -f ").next())
-            .unwrap_or_else(|| panic!("no -i in {:?}", call));
-        let seek = call
-            .strip_prefix("-ss ")
-            .and_then(|rest| rest.split(' ').next())
-            .map(str::to_string);
-        (PathBuf::from(input), seek)
+        self.decoder.run(n)
     }
 
     /// Wait for decoder run `n`, then long enough for the stream to be blocked reading its
@@ -1029,6 +1035,28 @@ fn test_continuous_track_end_without_a_request_moves_on() {
     assert_eq!(f.wait_for_startup(2), (f.tracks[1].clone(), None));
     assert_eq!(*f.controller.current_track_index.lock().unwrap(), 1);
     assert!(f.rx.try_recv().is_err(), "not the last track: no reshuffle");
+}
+
+/// A queue of one track: at its end the stream plays that track again from its start and asks
+/// for no reshuffle (there is nothing to reorder), and Up Next says it repeats, as tab [1] and
+/// the dashboard do (#134).
+#[cfg(unix)]
+#[test]
+fn test_continuous_single_track_repeats_without_a_reshuffle() {
+    common::isolate();
+    use quickstream::queue::QueueEnd;
+    let f = DecoderFixture::start("single_track", &["t0_short.wav"], 0);
+    assert_eq!(f.run(1), (f.tracks[0].clone(), None));
+    assert_eq!(f.run(2), (f.tracks[0].clone(), None));
+    assert_eq!(f.run(3), (f.tracks[0].clone(), None));
+    if let Ok(cmd) = f.rx.recv_timeout(Duration::from_millis(300)) {
+        panic!("a one-track queue's wrap sent {:?}", cmd);
+    }
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 0);
+    assert_eq!(
+        published_up_next(&f.state.read().unwrap()),
+        (vec![], 0, Some(QueueEnd::Loops), Some("Track 0".to_string()))
+    );
 }
 
 /// A skip and seek still pending when the session ends (the stream was blocked writing to a
@@ -1319,16 +1347,24 @@ fn test_continuous_two_skips_while_the_stream_is_blocked_land_two_tracks_on() {
 #[test]
 fn test_continuous_seek_just_after_a_track_ends_is_not_applied_to_the_next_track() {
     common::isolate();
-    let f = DecoderFixture::start("seek_after_end", &["t0_short.wav", "t1.wav", "t2.wav"], 0);
+    // Track 1's file check is held while track 0 ends, so the stream has decided that end but
+    // waits to start the next track. (Holding the web state would hold the end itself, which
+    // reads the queue as it is then.)
+    let hang = HeldPathCheck::default();
+    let _release = hang.release_on_drop();
+    let f = DecoderFixture::start_with(
+        "seek_after_end",
+        &["t0_short.wav", "t1.wav", "t2.wav"],
+        0,
+        |c, tracks| hang.install(c, &tracks[1..2]),
+    );
     assert_eq!(f.run(1), (f.tracks[0].clone(), None));
 
-    {
-        // Hold the web state while track 0 ends, so the stream waits to pick the next track.
-        let _held = f.state.write().unwrap();
-        std::thread::sleep(Duration::from_millis(1500));
-        assert_eq!(f.decoder.calls().len(), 1, "the stream waits for the web state");
-        f.controller.seek_to(40.0);
-    }
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(f.decoder.calls().len(), 1, "the stream waits for track 1's check");
+    f.controller.seek_to(40.0);
+    // Within the check's deadline, so track 1 isn't passed over.
+    hang.release();
     assert_eq!(f.run(2), (f.tracks[0].clone(), Some("40.000".to_string())));
     assert_eq!(f.run(3), (f.tracks[1].clone(), None), "the next track from its start");
 }
@@ -1340,24 +1376,32 @@ fn test_continuous_seek_just_after_a_track_ends_is_not_applied_to_the_next_track
 #[test]
 fn test_continuous_wrap_reshuffle_keeps_the_next_track_in_front() {
     common::isolate();
-    let f = DecoderFixture::start("wrap_front", &["t0.wav", "t1_short.wav"], 1);
+    // t0's file check is held while t1 ends, so the stream waits to start the next track until
+    // the UI has acted on the reshuffle. (Holding the web state would hold the end itself, which
+    // reads the queue as it is then.)
+    let hang = HeldPathCheck::default();
+    let _release = hang.release_on_drop();
+    let f = DecoderFixture::start_with("wrap_front", &["t0.wav", "t1_short.wav"], 1, |c, tracks| {
+        hang.install(c, &tracks[..1])
+    });
     assert_eq!(f.run(1), (f.tracks[1].clone(), None));
-    // Past t1's audio (and the position update it may bring), well before t1 ends.
-    std::thread::sleep(Duration::from_millis(200));
 
+    match f.rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(WebCommand::StreamReshuffle) => {}
+        other => panic!("expected StreamReshuffle after the queue wrapped, got {:?}", other),
+    }
     {
-        // Hold the web state while t1 ends, so the stream waits to pick the next track; then do
-        // what one UI tick does with the reshuffle: follow the stream's index, shuffle with that
+        // What one UI tick does with the reshuffle: follow the stream's index, shuffle with that
         // track in front, publish.
         let mut held = f.state.write().unwrap();
-        match f.rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(WebCommand::ShuffleQueue) => {}
-            other => panic!("expected ShuffleQueue after the queue wrapped, got {:?}", other),
-        }
         let front = *f.controller.current_track_index.lock().unwrap();
         let kept = held.queue.remove(front);
         held.queue.insert(0, kept);
     }
+    // A few of the stream's passes later, so none that copied the queue before the shuffle is
+    // still looking, and within the check's deadline, so t0 isn't passed over.
+    std::thread::sleep(Duration::from_millis(200));
+    hang.release();
     assert_eq!(
         f.run(2),
         (f.tracks[0].clone(), None),
@@ -1392,7 +1436,7 @@ fn test_continuous_reshuffle_follows_the_stream_index_first() {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     app.web_cmd_rx = Some(cmd_rx);
 
-    cmd_tx.send(WebCommand::ShuffleQueue).unwrap();
+    cmd_tx.send(WebCommand::StreamReshuffle).unwrap();
     app.handle_web_commands();
     assert_eq!(app.queue.current_index(), 0);
     assert_eq!(
@@ -1472,6 +1516,282 @@ fn test_shuffle_while_the_continuous_stream_plays_keeps_its_track_current() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Removing queue rows before the continuous stream's track (`d` in the queue pane, the web
+/// dashboard's remove) moves the stream's index with its track, so the event loop's sync, the
+/// web state's ▶ and a pending skip stay on the track playing, not the one after it (#136).
+#[test]
+fn test_removing_a_row_before_the_continuous_streams_track_keeps_it_current() {
+    common::isolate();
+    let dir = temp_dir("remove_before_stream_index");
+    let tracks: Vec<PathBuf> = (0..8).map(|i| dir.join(format!("t{}.wav", i))).collect();
+    let settings = SettingsManager::with_path(dir.join("config.json"));
+    let mut app = AppUI::new(Some(dir.clone()), settings);
+    app.queue.add_tracks(
+        tracks
+            .iter()
+            .enumerate()
+            .map(|(i, p)| track_meta(p, &format!("Track {}", i), 60.0))
+            .collect(),
+    );
+    app.queue.set_current_index(5);
+    let (tx, _web_rx) = mpsc::channel();
+    let handle = WebServer::start(0, app.web_state.clone(), tx).expect("start web server");
+    let controller = handle.stream_state().continuous.clone();
+    controller.is_active.store(true, Ordering::SeqCst);
+    *controller.current_track_index.lock().unwrap() = 5;
+    app.web_server = Some(handle);
+    app.update_web_state();
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    app.web_cmd_rx = Some(cmd_rx);
+    app.active_tab = 1;
+    app.queue_focus = true;
+
+    // Each round removes one row before the playing track: from the terminal, then the web.
+    for (round, row) in [2usize, 0, 1, 0].into_iter().enumerate() {
+        let expected = 4 - round;
+        if round % 2 == 0 {
+            app.queue_cursor = row;
+            app.handle_input_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('d'),
+                crossterm::event::KeyModifiers::NONE,
+            ))
+            .unwrap();
+        } else {
+            // A skip the stream hasn't acted on yet names a track by its row too.
+            controller.skip_to_index(expected + 1);
+            controller.skip_to_index(expected + 1);
+            cmd_tx.send(WebCommand::RemoveIndex(row)).unwrap();
+            app.handle_web_commands();
+            assert_eq!(
+                controller.pending_request().map(|r| r.index),
+                Some(expected),
+                "round {round}: the pending skip follows its track"
+            );
+        }
+        assert_eq!(app.queue.len(), 7 - round, "round {round}");
+        assert_eq!(
+            *controller.current_track_index.lock().unwrap(),
+            expected,
+            "round {round}"
+        );
+        app.sync_continuous_stream_index();
+        assert_eq!(app.queue.current_index(), expected, "round {round}");
+        assert_eq!(
+            app.queue.current_track().map(|t| t.filepath.clone()),
+            Some(tracks[5].clone()),
+            "round {round}: the playing track stays current"
+        );
+        let state = app.web_state.read().unwrap();
+        assert_eq!(state.queue_index, expected, "round {round}");
+        let marked: Vec<&str> = state
+            .queue
+            .iter()
+            .filter(|t| t.is_current)
+            .map(|t| t.filepath.as_str())
+            .collect();
+        assert_eq!(
+            marked,
+            vec![tracks[5].to_string_lossy().as_ref()],
+            "round {round}: the web ▶ stays on the playing track"
+        );
+    }
+
+    if let Some(handle) = app.web_server.take() {
+        handle.stream_state().close_active_streams();
+        handle.stop();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The terminal app with `names` queued (files in a fresh folder) and `first` current, and its
+/// web server's continuous stream decoding them through a [`FakeDecoder`] to a renderer that
+/// keeps reading: queue edits reach the stream the real way (`AppUI::remove_queue_track`,
+/// `update_web_state`), not hand-simulated.
+#[cfg(unix)]
+struct AppStream {
+    app: AppUI,
+    dir: PathBuf,
+    tracks: Vec<PathBuf>,
+    controller: Arc<ContinuousStreamController>,
+    /// What the web server sends the UI (the stream's `StreamReshuffle` on a wrap).
+    rx: mpsc::Receiver<WebCommand>,
+    /// Feeds the app's `handle_web_commands`, as the web dashboard's actions do.
+    cmd_tx: mpsc::Sender<WebCommand>,
+    decoder: FakeDecoder,
+    renderer: Option<Renderer>,
+}
+
+#[cfg(unix)]
+impl AppStream {
+    fn start(name: &str, names: &[&str], first: usize) -> Self {
+        let dir = temp_dir(name);
+        let decoder = FakeDecoder::new(&dir);
+        let tracks: Vec<PathBuf> = names.iter().map(|n| dir.join(n)).collect();
+        for track in &tracks {
+            std::fs::write(track, b"never opened: the fake decoder makes up its output").unwrap();
+        }
+        let settings = SettingsManager::with_path(dir.join("config.json"));
+        let mut app = AppUI::new(Some(dir.clone()), settings);
+        app.queue.add_tracks(
+            tracks
+                .iter()
+                .enumerate()
+                .map(|(i, p)| track_meta(p, &format!("Track {}", i), 60.0))
+                .collect(),
+        );
+        app.queue.set_current_index(first);
+        app.queue_cursor = first;
+        let (tx, rx) = mpsc::channel();
+        let handle = WebServer::start(0, app.web_state.clone(), tx).expect("start web server");
+        let controller = handle.stream_state().continuous.clone();
+        controller.set_decoder(&decoder.binary);
+        *controller.current_track_index.lock().unwrap() = first;
+        let path = handle.stream_state().arm_continuous_session();
+        let port = handle.port;
+        app.web_server = Some(handle);
+        app.update_web_state();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        app.web_cmd_rx = Some(cmd_rx);
+        let renderer = Some(Renderer::connect(port, &path));
+        assert!(app.continuous_stream_active());
+        Self {
+            app,
+            dir,
+            tracks,
+            controller,
+            rx,
+            cmd_tx,
+            decoder,
+            renderer,
+        }
+    }
+
+    /// Press `d` on queue row `row` in the queue pane.
+    fn remove_in_terminal(&mut self, row: usize) {
+        self.app.active_tab = 1;
+        self.app.queue_focus = true;
+        self.app.queue_cursor = row;
+        self.app
+            .handle_input_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('d'),
+                crossterm::event::KeyModifiers::NONE,
+            ))
+            .unwrap();
+    }
+
+    /// Remove queue row `row` from the web dashboard.
+    fn remove_from_web(&mut self, row: usize) {
+        self.cmd_tx.send(WebCommand::RemoveIndex(row)).unwrap();
+        self.app.handle_web_commands();
+    }
+
+    /// Whether the stream asks the UI for a reshuffle within `window`.
+    fn reshuffle_within(&self, window: Duration) -> bool {
+        let deadline = Instant::now() + window;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match self.rx.recv_timeout(left) {
+                Ok(WebCommand::StreamReshuffle) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+}
+
+#[cfg(unix)]
+impl Drop for AppStream {
+    fn drop(&mut self) {
+        if let Some(handle) = self.app.web_server.take() {
+            handle.stream_state().close_active_streams();
+            if let Some(renderer) = self.renderer.take() {
+                renderer.hang_up();
+            }
+            handle.stop();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A row removed before the playing track (`AppUI::remove_queue_track`): the stream goes on to
+/// the track after the one playing, not to the one two rows on (#136).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_goes_on_after_a_row_removed_before_its_track() {
+    common::isolate();
+    let mut f = AppStream::start(
+        "follow_removal",
+        &["t0.wav", "t1.wav", "t2.wav", "t3_long.wav", "t4.wav", "t5.wav"],
+        3,
+    );
+    assert_eq!(f.decoder.run(1), (f.tracks[3].clone(), None));
+    f.remove_in_terminal(1);
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 2);
+    f.app.sync_continuous_stream_index();
+    assert_eq!(
+        f.app.queue.current_track().map(|t| t.filepath.clone()),
+        Some(f.tracks[3].clone())
+    );
+    assert_eq!(
+        f.decoder.run(2),
+        (f.tracks[4].clone(), None),
+        "the track after the playing one"
+    );
+    assert!(
+        !f.reshuffle_within(Duration::from_millis(100)),
+        "the stream didn't wrap"
+    );
+}
+
+/// The stream's track is the last row when a row before it is removed (from the web
+/// dashboard): its end is the queue's end, so the stream reshuffles and starts over at the top,
+/// as at any wrap, rather than reading the end from the longer queue the track started with
+/// (PR #137 review).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_wraps_after_its_last_track_when_a_row_before_it_is_removed() {
+    common::isolate();
+    let mut f = AppStream::start("remove_before_last", &["t0.wav", "t1.wav", "t2_long.wav"], 2);
+    assert_eq!(f.decoder.run(1), (f.tracks[2].clone(), None));
+    f.remove_from_web(0);
+    assert_eq!(f.app.queue.len(), 2);
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 1);
+    assert!(
+        f.reshuffle_within(Duration::from_secs(10)),
+        "the last track's end asks for a reshuffle"
+    );
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 0);
+    assert_eq!(f.decoder.run(2), (f.tracks[1].clone(), None), "starts over at the top");
+}
+
+/// The row the stream is decoding is removed and no skip follows (the local player, which
+/// would restart on the track that took its place, isn't playing): at the end of the removed
+/// track the stream goes on to the track that took its row, not the one after it (PR #137
+/// review).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_goes_on_to_the_track_that_took_a_removed_tracks_row() {
+    common::isolate();
+    let mut f = AppStream::start(
+        "remove_decoded",
+        &["t0.wav", "t1.wav", "t2_long.wav", "t3.wav", "t4.wav"],
+        2,
+    );
+    assert_eq!(f.decoder.run(1), (f.tracks[2].clone(), None));
+    f.remove_in_terminal(2);
+    assert!(f.controller.pending_request().is_none(), "no skip followed the removal");
+    assert_eq!(f.app.queue_cursor, 2, "the cursor is on the track that took the row");
+    assert_eq!(
+        f.decoder.run(2),
+        (f.tracks[3].clone(), None),
+        "the track that took the removed track's row"
+    );
+    assert!(
+        !f.reshuffle_within(Duration::from_millis(100)),
+        "the stream didn't wrap"
+    );
+}
+
 /// After a shuffle in the UI, the track after the playing one is the one the shuffle put after
 /// it, not the one at the row after its old row; and a track that was last before the shuffle
 /// doesn't make the stream wrap and reshuffle again when it ends (PR #127 review).
@@ -1493,7 +1813,7 @@ fn test_continuous_stream_goes_on_in_the_order_a_shuffle_left() {
             s.queue[to] = old[from].clone();
             s.queue[to].index = to;
         }
-        f.controller.queue_reordered(&moved);
+        f.controller.queue_reordered(&RowMap::moved(moved.to_vec()));
     }
     assert_eq!(*f.controller.current_track_index.lock().unwrap(), 0);
     assert_eq!(
@@ -1502,7 +1822,7 @@ fn test_continuous_stream_goes_on_in_the_order_a_shuffle_left() {
         "the track the shuffle put after the playing one"
     );
     assert!(
-        !matches!(f.rx.try_recv(), Ok(WebCommand::ShuffleQueue)),
+        !matches!(f.rx.try_recv(), Ok(WebCommand::StreamReshuffle)),
         "the stream didn't wrap"
     );
 }
@@ -1518,7 +1838,7 @@ fn publish_reorder(f: &DecoderFixture, moved: &[usize], edit: impl FnOnce(&mut N
         s.queue[to] = old[from].clone();
         s.queue[to].index = to;
     }
-    f.controller.queue_reordered(moved);
+    f.controller.queue_reordered(&RowMap::moved(moved.to_vec()));
     edit(&mut s);
 }
 

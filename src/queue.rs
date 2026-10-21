@@ -52,6 +52,71 @@ pub struct RemovedTrack {
     /// The removed track was the current one. `current_index` now points at the track that
     /// followed it (or the new last track); the caller decides whether to start playing it.
     pub was_current: bool,
+    /// Where each row went: the rows after the removed one moved up one.
+    pub rows: RowMap,
+}
+
+/// Where each queue row went in a change to the queue (a shuffle, a removed row, or several),
+/// so whoever holds a row (the queue cursor, the continuous stream) can follow its track.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RowMap {
+    /// Entry `i`: the new row of the track that was at row `i`; for a removed track, the row of
+    /// the track that took its place (the queue's new length when none did).
+    to: Vec<usize>,
+    /// Entry `i`: the track that was at row `i` was removed.
+    removed: Vec<bool>,
+}
+
+impl RowMap {
+    /// A reorder in which the track at row `i` went to row `to[i]` (a shuffle).
+    pub fn moved(to: Vec<usize>) -> Self {
+        let removed = vec![false; to.len()];
+        Self { to, removed }
+    }
+
+    /// Row `index` of a queue of `len` rows removed: the rows after it move up one, and its
+    /// own names the track that took its place.
+    pub fn removal(len: usize, index: usize) -> Self {
+        Self {
+            to: (0..len).map(|row| if row > index { row - 1 } else { row }).collect(),
+            removed: (0..len).map(|row| row == index).collect(),
+        }
+    }
+
+    /// The new row of the track that was at `row` (the row of the track that took its place
+    /// when it was removed). A row the map doesn't name stays.
+    pub fn row(&self, row: usize) -> usize {
+        self.to.get(row).copied().unwrap_or(row)
+    }
+
+    /// Whether the track that was at `row` was removed.
+    pub fn was_removed(&self, row: usize) -> bool {
+        self.removed.get(row).copied().unwrap_or(false)
+    }
+
+    /// Where a walk that goes on `step` rows after `row` goes on after the change: from the
+    /// track's new row, the same step on; from a removed track's place, one step less, since the
+    /// track that took its place is the one that came after it.
+    pub fn follow_step(&self, row: usize, step: usize) -> (usize, usize) {
+        if self.was_removed(row) {
+            (self.row(row), step.saturating_sub(1))
+        } else {
+            (self.row(row), step)
+        }
+    }
+
+    /// This change, then `later` (on the rows this one left): where each track went in the end.
+    pub fn then(&self, later: &RowMap) -> RowMap {
+        RowMap {
+            to: self.to.iter().map(|&at| later.row(at)).collect(),
+            removed: self
+                .to
+                .iter()
+                .zip(&self.removed)
+                .map(|(&at, &removed)| removed || later.was_removed(at))
+                .collect(),
+        }
+    }
 }
 
 /// What happens once the tracks [`PlaybackQueue::upcoming`] lists have played. Published to the
@@ -64,11 +129,26 @@ pub enum QueueEnd {
     /// The current track plays again, and again (repeat-one mode); nothing else is next.
     RepeatOne,
     /// The queue loops: after the listed tracks (which already wrap past the end to the first
-    /// track) the current one plays again. With a single track it simply repeats.
+    /// track) the current one plays again. With a single track it simply repeats, in loop mode
+    /// and under the UPnP continuous stream alike (the stream doesn't reshuffle one track; if
+    /// that file is missing or won't decode, the stream sends silence instead).
     Loops,
     /// The UPnP continuous stream reshuffles the queue and starts over, so what follows the
-    /// listed tracks isn't known yet.
+    /// listed tracks isn't known yet. Only for a queue of two or more tracks
+    /// ([`reshuffles_on_wrap`]), and only when the queue gave audio: the stream skips the
+    /// reshuffle when nothing streamed since the last wrap (every file missing or undecodable;
+    /// it then sends silence) or when the connection doesn't own the session.
     Reshuffles,
+}
+
+/// Whether the UPnP continuous stream reshuffles a queue of `len` tracks when it wraps past the
+/// end: only two or more tracks have an order to change, so a single track just plays again.
+/// The stream also skips the reshuffle when nothing gave audio since the last wrap or the
+/// connection doesn't own the session; this is only the queue-length rule.
+/// The stream's wrap and [`Upcoming::after`] (Up Next's [`QueueEnd::Reshuffles`]) both ask this,
+/// so they can't disagree.
+pub fn reshuffles_on_wrap(len: usize) -> bool {
+    len > 1
 }
 
 /// The indices of the tracks that play after the current one, in play order, from
@@ -89,7 +169,9 @@ impl Upcoming {
     pub fn after(current: usize, len: usize, mode: &str, wrap: bool) -> Upcoming {
         let next = current + 1;
         let to_end = len.saturating_sub(next);
-        let (left, end) = if len <= 1 {
+        let (left, end) = if wrap && reshuffles_on_wrap(len) {
+            (to_end, QueueEnd::Reshuffles)
+        } else if len <= 1 {
             let end = if mode == "repeat_one" && !wrap {
                 QueueEnd::RepeatOne
             } else if mode == "loop" || wrap {
@@ -98,8 +180,6 @@ impl Upcoming {
                 QueueEnd::Stops
             };
             (0, end)
-        } else if wrap {
-            (to_end, QueueEnd::Reshuffles)
         } else {
             match mode {
                 "repeat_one" => (0, QueueEnd::RepeatOne),
@@ -232,7 +312,11 @@ impl PlaybackQueue {
             self.current_index = self.tracks.len().saturating_sub(1);
         }
         self.bump();
-        Some(RemovedTrack { track, was_current })
+        Some(RemovedTrack {
+            track,
+            was_current,
+            rows: RowMap::removal(self.tracks.len() + 1, index),
+        })
     }
 
     /// Drop every track after position `index`, keeping tracks `0..=index`.
@@ -326,7 +410,9 @@ impl PlaybackQueue {
 
     /// The tracks that play after the current one, as [`Self::next_track`] in `mode` will play
     /// them (`wrap: false`), or as the UPnP continuous stream does (`wrap: true`): it plays on to
-    /// the end of the queue whatever the mode, then reshuffles and starts over. Stop mode lists
+    /// the end of the queue whatever the mode, then starts over, reshuffled when the queue gave
+    /// audio (a single track has nothing to reshuffle and just repeats: [`QueueEnd::Loops`]).
+    /// Stop mode lists
     /// the tracks to the end of the queue; loop mode every other track, past the end to the
     /// first; repeat-one none, since the current track repeats.
     pub fn upcoming(&self, mode: &str, wrap: bool) -> Upcoming {

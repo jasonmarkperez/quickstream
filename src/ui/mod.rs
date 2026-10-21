@@ -322,9 +322,9 @@ pub struct AppUI {
     pub web_server: Option<crate::web::WebServerHandle>,
     pub web_state: std::sync::Arc<std::sync::RwLock<crate::web::NowPlayingState>>,
     pub web_cmd_rx: Option<std::sync::mpsc::Receiver<crate::web::WebCommand>>,
-    /// Where each queued track went in a reorder (a shuffle) the continuous stream hasn't been
-    /// told of yet: `update_web_state` tells it as it publishes the new order.
-    stream_reorder: Option<Vec<usize>>,
+    /// Where each queued track went in a reorder (a shuffle) or a removal the continuous stream
+    /// hasn't been told of yet: `update_web_state` tells it as it publishes the new queue.
+    stream_reorder: Option<crate::queue::RowMap>,
     /// Folder the browser opened at launch; one of the folders the web dashboard may reach.
     pub launch_dir: PathBuf,
     pub pending_seek_delta: f64,

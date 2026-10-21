@@ -892,12 +892,8 @@ fn test_now_playing_up_next_in_stop_mode_ends_where_playback_stops() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// With the UPnP continuous stream the queue plays on to its end whatever the mode, then the
-/// stream reshuffles it and starts over: UP NEXT never says playback stops.
-#[test]
-fn test_now_playing_up_next_follows_the_continuous_stream() {
-    common::isolate();
-    let (mut app, dir) = np_app("up_next_continuous");
+/// Give the app a web server whose UPnP continuous stream is playing.
+fn continuous_stream_plays(app: &mut AppUI) {
     let (tx, _rx) = std::sync::mpsc::channel();
     let state = Arc::new(std::sync::RwLock::new(quickstream::web::NowPlayingState::default()));
     let handle = quickstream::web::WebServer::start(0, state, tx).expect("web server");
@@ -907,6 +903,22 @@ fn test_now_playing_up_next_follows_the_continuous_stream() {
         .is_active
         .store(true, std::sync::atomic::Ordering::SeqCst);
     app.web_server = Some(handle);
+}
+
+/// Stop the web server [`continuous_stream_plays`] gave the app.
+fn stop_continuous_stream(app: &mut AppUI) {
+    if let Some(handle) = app.web_server.take() {
+        handle.stop();
+    }
+}
+
+/// With the UPnP continuous stream the queue plays on to its end whatever the mode, then the
+/// stream reshuffles it and starts over: UP NEXT never says playback stops.
+#[test]
+fn test_now_playing_up_next_follows_the_continuous_stream() {
+    common::isolate();
+    let (mut app, dir) = np_app("up_next_continuous");
+    continuous_stream_plays(&mut app);
 
     for mode in ["stop", "repeat_one", "loop"] {
         app.settings_mgr.settings.queue_mode = mode.to_string();
@@ -925,9 +937,33 @@ fn test_now_playing_up_next_follows_the_continuous_stream() {
             "{mode}: {lines:#?}"
         );
     }
-    if let Some(handle) = app.web_server.take() {
-        handle.stop();
+    stop_continuous_stream(&mut app);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A single track under the continuous stream: the stream has nothing to reshuffle and plays
+/// that track again, so UP NEXT says it repeats, whatever the mode (#134).
+#[test]
+fn test_now_playing_up_next_single_track_under_the_continuous_stream_repeats() {
+    common::isolate();
+    let (mut app, dir) = np_app("up_next_continuous_single");
+    continuous_stream_plays(&mut app);
+    app.queue.clear();
+    app.queue.add_track(track(&dir, "Halcyon Drift", "Mira Lenz", 352.0));
+    for mode in ["stop", "repeat_one", "loop"] {
+        app.settings_mgr.settings.queue_mode = mode.to_string();
+        for (w, h) in [(120, 40), (80, 24)] {
+            let lines = up_next_lines(&mut app, w, h);
+            assert!(lines[0].contains("0 REMAINING"), "{mode} {w}x{h}: {lines:#?}");
+            assert!(
+                line_with(&lines, "END OF QUEUE  ·  REPEATS THIS TRACK").is_some(),
+                "{mode} {w}x{h}: {lines:#?}"
+            );
+            assert!(line_with(&lines, "RESHUFFLES").is_none(), "{mode} {w}x{h}: {lines:#?}");
+            assert!(line_with(&lines, "STOPS").is_none(), "{mode} {w}x{h}: {lines:#?}");
+        }
     }
+    stop_continuous_stream(&mut app);
     let _ = fs::remove_dir_all(&dir);
 }
 
