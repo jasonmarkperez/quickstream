@@ -689,3 +689,222 @@ fn progress_counts_top_level_folders_of_every_root() {
     let db = AnalysisDatabase::open_at(&db_path).unwrap();
     assert!(db.index_dir(&a).unwrap().1 && db.index_dir(&b).unwrap().1);
 }
+
+// ---------- the indexer in the app (ui::library_index) ----------
+
+use quickstream::ui::library_index::{index_roots, LibraryIndexSource};
+use quickstream::ui::AppUI;
+
+/// The folders indexed: the startup home first, then the Music Homes; never `/`, the home folder
+/// or a folder above it, nor a relative path; each once (`..` resolved), none inside another.
+#[test]
+fn index_roots_are_the_startup_home_and_music_homes_without_overlap() {
+    common::isolate();
+    let home = Path::new("/Users/someone");
+    let homes: Vec<String> = [
+        "/Volumes/Music/Jazz",
+        "/Volumes/Music",
+        "/Volumes/Other/../Music",
+        "/",
+        "/Users",
+        "/Users/someone",
+        "relative/folder",
+        "/Users/someone/Music",
+        "/Volumes/Music2",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(
+        index_roots(Some("/Users/someone/Music/Live"), &homes, Some(home)),
+        [
+            PathBuf::from("/Volumes/Music"),
+            PathBuf::from("/Users/someone/Music"),
+            PathBuf::from("/Volumes/Music2"),
+        ],
+        "the startup home lies inside a Music Home"
+    );
+    assert_eq!(
+        index_roots(Some("/Data/Audio"), &[], Some(home)),
+        [PathBuf::from("/Data/Audio")]
+    );
+    assert!(index_roots(None, &[], Some(home)).is_empty());
+    assert!(index_roots(Some("/Users/someone"), &[], Some(home)).is_empty());
+}
+
+/// An app whose indexer runs on `db_path` with `reader`, starting at once, over `lib` (its only
+/// Music Home).
+fn index_app(lib: &Path, db_path: &Path, reader: IndexTagReader) -> AppUI {
+    let mut settings = quickstream::settings::SettingsManager::new();
+    settings.settings.web_server_enabled = false;
+    let mut app = AppUI::new(Some(lib.to_path_buf()), settings);
+    // Reading the folder the app opens at holds the indexer: let it finish first.
+    common::wait_for_dir_scan(&mut app);
+    app.bookmarks = vec![lib.to_string_lossy().into_owned()];
+    let path = db_path.to_path_buf();
+    app.set_library_index_source(LibraryIndexSource {
+        open_db: Arc::new(move || AnalysisDatabase::open_at(&path)),
+        reader,
+        config: IndexConfig {
+            start_delay: Duration::ZERO,
+            ..IndexConfig::default()
+        },
+    });
+    app
+}
+
+fn poll_until(app: &mut AppUI, what: &str, mut done: impl FnMut(&mut AppUI) -> bool) {
+    let start = Instant::now();
+    while !done(app) {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "timed out waiting for {what}"
+        );
+        app.poll_library_index();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// While a mix gathers (or a folder is read, or a search scans) the indexer holds; then it goes on.
+#[test]
+fn the_app_pauses_the_indexer_while_it_reads_the_library_itself() {
+    common::isolate();
+    let (lib, db_path) = scratch("app_pause");
+    library_tree(&lib, 3, 2);
+    let (gate_tx, gate_rx) = mpsc::channel::<()>();
+    let gate_rx = Mutex::new(gate_rx);
+    let first = Arc::new(AtomicUsize::new(0));
+    let reader: IndexTagReader = {
+        let (first, real) = (first.clone(), default_tag_reader());
+        // The first read waits for the test, so the pause lands mid-pass.
+        Arc::new(move |path: &Path, stamp| {
+            if first.fetch_add(1, Ordering::SeqCst) == 0 {
+                let _ = gate_rx.lock().unwrap().recv_timeout(Duration::from_secs(20));
+            }
+            real(path, stamp)
+        })
+    };
+    let mut app = index_app(&lib, &db_path, reader);
+    app.start_library_index();
+    poll_until(&mut app, "the first read", |_| first.load(Ordering::SeqCst) == 1);
+    app.is_autopilot_scanning = true;
+    app.poll_library_index();
+    drop(gate_tx);
+    let progress = app.library_index_progress();
+    poll_until(&mut app, "Paused", |_| progress.state() == IndexState::Paused);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(first.load(Ordering::SeqCst), 1, "no read while paused");
+    app.is_autopilot_scanning = false;
+    poll_until(&mut app, "Done", |_| progress.state() == IndexState::Done);
+    assert_eq!(progress.snapshot().read, 7);
+}
+
+/// A Music Home added while it runs restarts it over the new folders.
+#[test]
+fn a_new_music_home_restarts_the_indexer_over_it() {
+    common::isolate();
+    let (lib, db_path) = scratch("app_roots");
+    let a = lib.join("A");
+    let b = lib.join("B");
+    library_tree(&a, 2, 1);
+    library_tree(&b, 2, 1);
+    let mut app = index_app(&a, &db_path, default_tag_reader());
+    app.start_library_index();
+    let progress = app.library_index_progress();
+    poll_until(&mut app, "the first pass", |_| progress.state() == IndexState::Done);
+    assert_eq!(app.library_index_starts(), 1);
+    assert!(rows_under(&db_path, &b).is_empty());
+
+    app.bookmarks.push(b.to_string_lossy().into_owned());
+    poll_until(&mut app, "the restart", |app| app.library_index_starts() == 2);
+    poll_until(&mut app, "the second pass", |_| progress.state() == IndexState::Done);
+    assert_eq!(app.index_roots(), [a.clone(), b.clone()]);
+    assert_eq!(rows_under(&db_path, &b).len(), 3, "the new home is indexed");
+    assert_eq!(progress.snapshot().unchanged, 3, "the old one isn't read again");
+}
+
+/// With no folder to index it says so, and a Music Home added later starts it.
+#[test]
+fn no_folders_until_a_music_home_is_added() {
+    common::isolate();
+    let (lib, db_path) = scratch("app_none");
+    library_tree(&lib, 1, 1);
+    let mut app = index_app(&lib, &db_path, default_tag_reader());
+    app.bookmarks.clear();
+    app.start_library_index();
+    let progress = app.library_index_progress();
+    poll_until(&mut app, "NoFolders", |_| progress.state() == IndexState::NoFolders);
+    app.bookmarks.push(lib.to_string_lossy().into_owned());
+    poll_until(&mut app, "Done", |_| progress.state() == IndexState::Done);
+    assert_eq!(app.library_index_starts(), 2);
+}
+
+/// Turned off, it stops and the setting row reads OFF; it never starts while off.
+#[test]
+fn the_setting_off_stops_the_indexer_and_keeps_it_stopped() {
+    common::isolate();
+    let (lib, db_path) = scratch("app_off");
+    library_tree(&lib, 1, 1);
+    let mut app = index_app(&lib, &db_path, default_tag_reader());
+    app.settings_mgr.settings.library_index = false;
+    app.start_library_index();
+    assert_eq!(app.library_index_starts(), 0);
+    app.settings_mgr.settings.library_index = true;
+    app.start_library_index();
+    assert!(app.library_index_running());
+    app.settings_cursor = quickstream::settings::setting::LIBRARY_INDEX;
+    app.cycle_and_apply_setting(true);
+    assert!(!app.library_index_running());
+    app.bookmarks.push(lib.join("Artist 00").to_string_lossy().into_owned());
+    for _ in 0..20 {
+        app.poll_library_index();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        app.library_index_starts(),
+        1,
+        "a changed home doesn't start it while off"
+    );
+}
+
+/// A mix started under an index root makes the indexer walk the mix's folder next.
+#[test]
+fn a_mix_folder_is_indexed_first() {
+    common::isolate();
+    let (lib, db_path) = scratch("app_prioritise");
+    library_tree(&lib, 10, 2);
+    let (gate_tx, gate_rx) = mpsc::channel::<()>();
+    let gate_rx = Mutex::new(gate_rx);
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let reader: IndexTagReader = {
+        let (order, real) = (order.clone(), default_tag_reader());
+        // The first read (the root's loose track) waits until the mix has started.
+        Arc::new(move |path: &Path, stamp| {
+            let first = {
+                let mut order = order.lock().unwrap();
+                order.push(path.to_path_buf());
+                order.len() == 1
+            };
+            if first {
+                let _ = gate_rx.lock().unwrap().recv_timeout(Duration::from_secs(20));
+            }
+            real(path, stamp)
+        })
+    };
+    let mut app = index_app(&lib, &db_path, reader);
+    app.start_library_index();
+    poll_until(&mut app, "the first read", |_| order.lock().unwrap().len() == 1);
+
+    let wanted = lib.join("Artist 06");
+    app.start_autopilot(wanted.clone());
+    app.wait_for_autopilot_scan(Duration::from_secs(20));
+    drop(gate_tx);
+    let progress = app.library_index_progress();
+    poll_until(&mut app, "Done", |_| progress.state() == IndexState::Done);
+    let order = order.lock().unwrap();
+    assert_eq!(order.len(), 21);
+    assert!(
+        order[1].starts_with(&wanted) && order[2].starts_with(&wanted),
+        "{order:?}"
+    );
+}

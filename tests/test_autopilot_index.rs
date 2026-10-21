@@ -236,6 +236,60 @@ fn a_fully_indexed_chill_mix_reads_no_tags_and_walks_no_folders() {
     assert_eq!(unique.len(), run.tracks.len(), "no track is sent twice");
 }
 
+/// End to end with the background indexer (PR 2 of #41): a library the indexer has walked is
+/// mixed from its rows, with no tag read and no folder walked.
+#[test]
+fn a_library_the_indexer_walked_is_mixed_without_reading_tags() {
+    use lofty::config::WriteOptions;
+    use lofty::prelude::*;
+    use lofty::tag::{ItemKey, Tag, TagType};
+    use quickstream::analysis::index::{default_tag_reader, run_library_index, IndexConfig, IndexControl};
+    use quickstream::analysis::index::{IndexProgress, IndexState};
+
+    common::isolate();
+    let lib = library("indexer_end_to_end");
+    for a in 0..12 {
+        for path in tracks(&lib.join(format!("Artist {a:02}")).join("Album"), 3) {
+            let mut tag = Tag::new(TagType::Id3v2);
+            tag.set_artist(format!("Artist {a:02}"));
+            tag.insert_text(ItemKey::IntegerBpm, "120".to_string());
+            tag.save_to_path(&path, WriteOptions::default()).unwrap();
+        }
+    }
+    // A folder changed in the second it is listed reads as changed (the mix walks it): let the
+    // clock move past the tree's mtimes first.
+    std::thread::sleep(Duration::from_millis(1100));
+    let db_path = lib.with_extension("db");
+    let _ = fs::remove_file(&db_path);
+
+    let control = Arc::new(IndexControl::new());
+    let progress = Arc::new(IndexProgress::new());
+    let (c, p, path, root) = (control.clone(), progress.clone(), db_path.clone(), lib.clone());
+    let indexer = std::thread::spawn(move || {
+        let cfg = IndexConfig {
+            start_delay: Duration::ZERO,
+            ..IndexConfig::new(vec![root])
+        };
+        run_library_index(|| AnalysisDatabase::open_at(&path), cfg, &c, &p, default_tag_reader());
+    });
+    let start = std::time::Instant::now();
+    while progress.state() != IndexState::Done {
+        assert!(start.elapsed() < Duration::from_secs(20), "the pass didn't finish");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    control.stop();
+    indexer.join().unwrap();
+    assert_eq!(progress.snapshot().read, 36);
+
+    let db = AnalysisDatabase::open_at(&db_path).unwrap();
+    let run = run_mix(&lib, &db, bpm_flow(), ProfileScanLimits::default());
+    assert_eq!(counter(&run.gathered, "tag_reads"), 0, "{}", run.gathered);
+    assert_eq!(counter(&run.gathered, "folders"), 0, "{}", run.gathered);
+    assert_eq!(counter(&run.gathered, "index_folders"), 12, "{}", run.gathered);
+    assert_eq!(run.tracks.len(), 36, "{}", run.gathered);
+    assert!(run.candidates.is_empty(), "BPM-tagged rows need no analysis");
+}
+
 /// An indexed folder gives no more matches than a walked one would (`per_subdir`), however
 /// many of its rows match.
 #[test]
