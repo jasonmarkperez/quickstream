@@ -1851,16 +1851,22 @@ enum DecoderOutput {
 /// It is not joined: the stream kills the decoder as it leaves it, which ends the thread's read,
 /// but a decoder stuck in a read on a hung share may only die once that read returns, and the
 /// stream must not wait for it.
-fn spawn_decoder_reader(mut stdout: std::process::ChildStdout) -> std::io::Result<mpsc::Receiver<DecoderOutput>> {
+fn spawn_decoder_reader(mut stdout: impl Read + Send + 'static) -> std::io::Result<mpsc::Receiver<DecoderOutput>> {
     let (tx, rx) = mpsc::sync_channel(DECODER_CHUNKS_AHEAD);
     std::thread::Builder::new()
         .name("continuous-decoder-read".into())
         .spawn(move || {
-            let mut buf = vec![0u8; DECODER_CHUNK];
             loop {
+                // Read into a fresh buffer that is then handed over as it is, not copied.
+                let mut buf = vec![0u8; DECODER_CHUNK];
                 let output = match stdout.read(&mut buf) {
                     Ok(0) => DecoderOutput::End,
-                    Ok(n) => DecoderOutput::Pcm(buf[..n].to_vec()),
+                    Ok(n) => {
+                        buf.truncate(n);
+                        DecoderOutput::Pcm(buf)
+                    }
+                    // A read a signal interrupted is tried again.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(e) => DecoderOutput::Failed(e),
                 };
                 let last = !matches!(output, DecoderOutput::Pcm(_));
@@ -2463,4 +2469,43 @@ pub(super) fn serve_continuous_stream(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Gives `Interrupted` first, then `data`, then its end.
+    struct InterruptedOnce {
+        interrupted: bool,
+        data: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl Read for InterruptedOnce {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            self.data.read(buf)
+        }
+    }
+
+    /// A read the decoder's reader thread was interrupted in (a signal) is tried again, not taken
+    /// for the decoder failing.
+    #[test]
+    fn test_decoder_reader_retries_an_interrupted_read() {
+        let rx = spawn_decoder_reader(InterruptedOnce {
+            interrupted: false,
+            data: std::io::Cursor::new(vec![1u8; 100]),
+        })
+        .unwrap();
+        let next = || rx.recv_timeout(Duration::from_secs(5)).expect("the reader answers");
+        match next() {
+            DecoderOutput::Pcm(pcm) => assert_eq!(pcm, vec![1u8; 100]),
+            DecoderOutput::End => panic!("End instead of the PCM"),
+            DecoderOutput::Failed(e) => panic!("an interrupted read failed the decoder: {}", e),
+        }
+        assert!(matches!(next(), DecoderOutput::End));
+    }
 }
