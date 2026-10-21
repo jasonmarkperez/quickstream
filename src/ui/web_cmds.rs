@@ -172,9 +172,12 @@ impl AppUI {
                     self.status_message = format!("⚡ Mix Profile set to: {}", self.active_mix_profile.name());
                     self.update_web_state();
                 }
-                crate::web::WebCommand::SeedRadio(path) => {
-                    self.start_seed_radio(path);
-                }
+                // The web thread resolved the folder inside the allowed ones (issue #126).
+                crate::web::WebCommand::SeedRadio {
+                    seed,
+                    preferred,
+                    fallback,
+                } => self.start_seed_radio_in(seed, preferred, fallback),
                 crate::web::WebCommand::PathRejected(path) => {
                     self.status_message = format!(
                         "Ignored web request: {} is outside your home, bookmarks and launch folder",
@@ -261,7 +264,8 @@ impl AppUI {
             state.is_scanning = self.device_manager.is_scanning();
             state.home_dir = self.settings_mgr.settings.home_dir.clone();
             state.current_browser_dir = self.browser_dir.to_string_lossy().to_string();
-            state.terminal_dir = Some(self.browser_dir.clone());
+            state.terminal_dir = Some(self.autopilot_key_dir());
+            state.in_music_homes = self.in_bookmarks_view;
             state.allowed_roots = self.web_allowed_roots();
             state.bookmarks = self.bookmarks.clone();
             state.is_autopilot = self.autopilot_dir.is_some();

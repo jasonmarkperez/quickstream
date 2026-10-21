@@ -251,8 +251,9 @@ pub(super) fn finish_connection(reader: &mut BufReader<TcpStream>) {
 }
 
 /// Write a response: the status line, `headers`, `Content-Length` and `Connection: close`, then
-/// `body`; a HEAD request gets the head only (with the same `Content-Length`).
-pub(super) fn write_response(
+/// `body`; a HEAD request gets the head only (with the same `Content-Length`). Also writes the
+/// access checks' answers (`web_access::write_decision_response`).
+pub(crate) fn write_response(
     out: &mut impl Write,
     status: &str,
     headers: &[(&str, &str)],

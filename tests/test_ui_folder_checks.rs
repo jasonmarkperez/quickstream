@@ -644,19 +644,58 @@ fn test_seed_radio_starts_at_the_key_while_its_worker_checks_the_folder() {
     assert_eq!(app.autopilot_dir, Some(music.clone()));
     app.reset_playback_session();
 
-    // The web dashboard's `seed_radio` goes the same way.
+    // The web dashboard's `seed_radio` goes the same way, with the folders the web thread
+    // resolved inside the allowed ones (issue #126).
     queue_seed(&mut app, &seed);
     let (tx, rx) = mpsc::channel();
     app.web_cmd_rx = Some(rx);
-    let check = Gate::check(&mut app, &music);
-    tx.send(WebCommand::SeedRadio(seed.clone())).unwrap();
+    tx.send(WebCommand::SeedRadio {
+        seed: seed.clone(),
+        preferred: Some(music.clone()),
+        fallback: root.join("Other"),
+    })
+    .unwrap();
     app.handle_web_commands();
+    assert_eq!(app.active_mix_profile, MixProfile::SeedRadio(seed.clone()));
     assert_eq!(app.autopilot_dir, Some(music.clone()));
     assert!(app.is_autopilot_scanning);
     check.wait_entered();
     check.open();
     app.wait_for_autopilot_scan(Duration::from_secs(5));
     assert_eq!(app.autopilot_dir, Some(music));
+    app.reset_playback_session();
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Web Seed Radio's preferred folder (the terminal's, checked inside the allowed folders by the
+/// web thread) gone by the time the scan's worker checks it: the station falls back to the
+/// seed's folder, as the terminal's `r` does (issue #126 review).
+#[test]
+fn test_web_seed_radio_falls_back_to_the_seed_folder_when_the_terminal_folder_is_gone() {
+    common::isolate();
+    let (mut app, root) = setup("web_seed_gone", None);
+    let music = root.join("Music");
+    let other = root.join("Other");
+    let seed = other.join("seed.wav");
+    queue_seed(&mut app, &seed);
+    let check = Gate::check(&mut app, &music);
+    let (tx, rx) = mpsc::channel();
+    app.web_cmd_rx = Some(rx);
+
+    tx.send(WebCommand::SeedRadio {
+        seed: seed.clone(),
+        preferred: Some(music.clone()),
+        fallback: other.clone(),
+    })
+    .unwrap();
+    app.handle_web_commands();
+    assert_eq!(app.autopilot_dir, Some(music.clone()));
+    // Gone after the web thread checked it, before the worker does.
+    assert_eq!(check.wait_entered(), music);
+    fs::remove_dir_all(&music).unwrap();
+    check.open();
+    app.wait_for_autopilot_scan(Duration::from_secs(5));
+    assert_eq!(app.autopilot_dir, Some(other));
     app.reset_playback_session();
     let _ = fs::remove_dir_all(&root);
 }
