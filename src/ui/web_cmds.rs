@@ -71,9 +71,8 @@ impl AppUI {
                     }
                 }
                 crate::web::WebCommand::RemoveIndex(idx) => {
-                    if self.remove_queue_track(idx).is_some() {
-                        self.update_web_state();
-                    }
+                    // Publishes the shorter queue itself.
+                    let _ = self.remove_queue_track(idx);
                 }
                 crate::web::WebCommand::ClearQueue => {
                     self.supersede_playlist_queue();

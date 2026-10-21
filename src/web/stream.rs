@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use super::file_checks::{FileChecks, LookOutcome};
 use super::server::{write_not_found, write_server_error};
 use super::state::{NowPlayingState, WebCommand};
+use crate::queue::RowMap;
 
 /// An armed continuous stream: the renderer must request `/stream/continuous-<nonce>.wav`.
 #[derive(Debug)]
@@ -56,12 +57,6 @@ pub struct StreamRequest {
     pub position: f64,
 }
 
-/// Row `index` after a reorder in which the track at row `i` went to row `moved[i]` (a row the
-/// reorder doesn't name stays).
-fn follow_row(moved: &[usize], index: usize) -> usize {
-    moved.get(index).copied().unwrap_or(index)
-}
-
 /// Controls continuous PCM gapless streaming for DLNA renderers.
 #[derive(Debug, Default)]
 pub struct ContinuousStreamController {
@@ -91,11 +86,10 @@ pub struct ContinuousStreamController {
     /// Whether the queue's files are there, checked off the stream's write path (#117); see
     /// [`Self::set_path_check`].
     file_checks: FileChecks,
-    /// Where each queued track went in reorders the stream hasn't followed yet: entry `i` is the
-    /// new row of the track that was at row `i`. Set by [`Self::queue_reordered`], taken by the
-    /// stream wherever it holds a row of its own (lock order: the web state, then `request`,
-    /// then `current_track_index`, then this).
-    reorder: Mutex<Option<Vec<usize>>>,
+    /// Where each queued track went in reorders and removals the stream hasn't followed yet.
+    /// Set by [`Self::queue_reordered`], taken by the stream wherever it holds a row of its own
+    /// (lock order: the web state, then `request`, then `current_track_index`, then this).
+    reorder: Mutex<Option<RowMap>>,
 }
 
 impl ContinuousStreamController {
@@ -250,49 +244,51 @@ impl ContinuousStreamController {
         self.kill_active_decoder();
     }
 
-    /// The UI reordered the queue (a shuffle): `moved[i]` is the new row of the track that was at
-    /// row `i`. Called by whoever publishes the new order into the web state, with that lock
+    /// The UI reordered the queue (a shuffle) or removed rows from it: `rows` says where each
+    /// row went. Called by whoever publishes the new queue into the web state, with that lock
     /// held, so the stream reads the new queue and the new rows together. The track playing, a
-    /// pending skip or seek and the track the stream goes on from all follow their tracks, so the
-    /// event loop's sync keeps the queue on the track playing and the stream goes on in the new
-    /// order.
-    pub fn queue_reordered(&self, moved: &[usize]) {
+    /// pending skip or seek and the track the stream goes on from all follow their tracks (a
+    /// removed one's to the track that took its place), so the event loop's sync keeps the queue
+    /// on the track playing and the stream goes on in the new order.
+    pub fn queue_reordered(&self, rows: &RowMap) {
         if !self.is_active.load(Ordering::SeqCst) {
             return;
         }
         let mut request = self.request.lock().unwrap();
         if let Some(pending) = request.as_mut() {
-            pending.index = follow_row(moved, pending.index);
+            pending.index = rows.row(pending.index);
         }
         let mut current = self.current_track_index.lock().unwrap();
-        *current = follow_row(moved, *current);
+        *current = rows.row(*current);
         let mut reorder = self.reorder.lock().unwrap();
         *reorder = Some(match reorder.take() {
-            Some(earlier) => earlier.iter().map(|&at| follow_row(moved, at)).collect(),
-            None => moved.to_vec(),
+            Some(earlier) => earlier.then(rows),
+            None => rows.clone(),
         });
         drop(reorder);
         drop(current);
         drop(request);
         let _duration = self.current_duration.lock().unwrap();
         if let Some((index, _)) = self.decoding.lock().unwrap().as_mut() {
-            *index = follow_row(moved, *index);
+            *index = rows.row(*index);
         }
     }
 
-    /// Row `index` after the reorders the stream hasn't followed yet (taking them).
-    fn follow_reorder(&self, index: usize) -> usize {
+    /// Row `index` after the changes the stream hasn't followed yet (taking them), and whether
+    /// its track was removed (the row is then the track's that took its place).
+    fn follow_reorder(&self, index: usize) -> (usize, bool) {
         match self.reorder.lock().unwrap().take() {
-            Some(moved) => follow_row(&moved, index),
-            None => index,
+            Some(rows) => (rows.row(index), rows.was_removed(index)),
+            None => (index, false),
         }
     }
 
-    /// Where the stream goes on (`next`: a row and how many rows after it), after the reorders it
-    /// hasn't followed yet (taking them): the row moves with its track, the step stays.
+    /// Where the stream goes on (`next`: a row and how many rows after it), after the changes it
+    /// hasn't followed yet (taking them): the row moves with its track and the step stays; from
+    /// a removed track's place one step less, as the track that took it came after it.
     fn follow_next(&self, next: Option<(usize, usize)>) -> Option<(usize, usize)> {
-        let moved = self.reorder.lock().unwrap().take();
-        next.map(|(row, step)| (moved.as_deref().map_or(row, |moved| follow_row(moved, row)), step))
+        let rows = self.reorder.lock().unwrap().take();
+        next.map(|(row, step)| rows.as_ref().map_or((row, step), |rows| rows.follow_step(row, step)))
     }
 
     /// The skip or seek the stream hasn't acted on yet, if any.
@@ -350,7 +346,8 @@ impl ContinuousStreamController {
 
     /// Show the track the stream has started: its index (unless a skip or seek has come since,
     /// or the connection or session is no longer the stream's), length and start position, and
-    /// in `state` as now playing. Returns its index, which a reorder since it was picked moves.
+    /// in `state` as now playing. Returns its index, which a reorder since it was picked moves,
+    /// and whether it was removed since (the index is then the track's that took its place).
     #[allow(clippy::too_many_arguments)]
     fn publish_track(
         &self,
@@ -361,17 +358,17 @@ impl ContinuousStreamController {
         path: &Path,
         duration: f64,
         position: f64,
-    ) -> usize {
+    ) -> (usize, bool) {
         let Ok(mut s) = state.write() else {
-            return index;
+            return (index, false);
         };
-        let index = {
+        let (index, removed) = {
             let request = self.request.lock().unwrap();
-            let index = self.follow_reorder(index);
+            let followed = self.follow_reorder(index);
             if request.is_none() && self.owns(cid) && self.is_session(session) {
-                *self.current_track_index.lock().unwrap() = index;
+                *self.current_track_index.lock().unwrap() = followed.0;
             }
-            index
+            followed
         };
         self.start_track(index, path, duration);
         *self.current_position.lock().unwrap() = position;
@@ -391,7 +388,7 @@ impl ContinuousStreamController {
         // and mode, through the function the UI's tick uses (which then republishes the same
         // values), so the track now playing is never also listed as the next one.
         s.publish_up_next(true);
-        index
+        (index, removed)
     }
 
     /// Run `binary` as the stream's ffmpeg instead of `ffmpeg` on `PATH` (the test seam for a
@@ -2027,10 +2024,13 @@ pub(super) fn serve_continuous_stream(
         };
         let queue_len = tracks.len();
         next_index = None;
+        // Whether the UI removed the track since it was picked (`track_index` then names the
+        // track that took its place).
+        let mut track_removed = false;
 
         // A file tried while nothing gives audio is shown once it gives some (below).
         if !tentative {
-            track_index =
+            (track_index, track_removed) =
                 controller.publish_track(state, cid, session, track_index, &track_path, track_duration, start_pos);
         }
 
@@ -2139,7 +2139,8 @@ pub(super) fn serve_continuous_stream(
                         spawn_failure_logged = false;
                         silence = None;
                         if tentative {
-                            track_index = controller.publish_track(
+                            let removed;
+                            (track_index, removed) = controller.publish_track(
                                 state,
                                 cid,
                                 session,
@@ -2148,6 +2149,7 @@ pub(super) fn serve_continuous_stream(
                                 track_duration,
                                 start_pos,
                             );
+                            track_removed |= removed;
                         }
                     }
                     if let Err(e) = stream.write_all(&buf[..n]) {
@@ -2184,13 +2186,28 @@ pub(super) fn serve_continuous_stream(
         }
         // A skip or seek kills the decoder, which also ends its output: only an end with no
         // request pending is the end of the track. Decided under the request lock, so a request
-        // that arrives later is for whatever this end decides.
+        // that arrives later is for whatever this end decides. The queue is read as it is now,
+        // under the web state's lock, together with the changes the UI made while the track
+        // played (a shuffle, a removed row), which it hands over under that lock: a removal
+        // shortens the queue, so the end that counts is the end of the queue now, not of the one
+        // the track started with (lock order: the web state, then the request).
+        let s = state.read().unwrap();
         let pending = controller.request.lock().unwrap();
-        // The UI may have reordered the queue while the track played.
-        let track_index = controller.follow_reorder(track_index);
+        let (track_index, removed_now) = controller.follow_reorder(track_index);
+        let removed = track_removed || removed_now;
+        let tracks: Vec<(String, f64)> = s
+            .queue
+            .iter()
+            .map(|t| (t.filepath.clone(), t.duration_seconds))
+            .collect();
+        drop(s);
+        let queue_len = tracks.len();
         if ended && pending.is_none() {
             let seq = controller.request_seq.load(Ordering::SeqCst);
-            let wraps = track_index + 1 >= queue_len;
+            // The track after the one that ended, or for a removed one the track that took its
+            // place.
+            let next_row = if removed { track_index } else { track_index + 1 };
+            let wraps = next_row >= queue_len;
             // Reshuffle once per wrap that played something, and only from the current
             // connection of the armed session.
             let owns_session = controller.is_session(session) && controller.owns(cid);
@@ -2208,12 +2225,21 @@ pub(super) fn serve_continuous_stream(
             }
             // Otherwise `current_track_index` moves when the next track starts, so a seek that
             // arrives before then is still for this one.
-            next_index = Some(if wraps { (0, 0) } else { (track_index, 1) });
+            next_index = Some(if wraps {
+                (0, 0)
+            } else if removed {
+                (track_index, 0)
+            } else {
+                (track_index, 1)
+            });
 
             if !streamed {
                 silent_runs += 1;
             }
-            if silent_runs >= queue_len {
+            if queue_len == 0 {
+                // The next pass idles on the empty queue.
+                nothing_playable = None;
+            } else if silent_runs >= queue_len {
                 if silent_runs == queue_len {
                     crate::log_warn!(
                         "web",
@@ -2227,7 +2253,7 @@ pub(super) fn serve_continuous_stream(
                 // The next look takes the answer to the check made as this track started when it
                 // found the file. A missing one is asked again, even one that came late: the
                 // track may have played for minutes, long enough for the share to come back.
-                let next = Path::new(&tracks[(track_index + 1) % queue_len].0);
+                let next = Path::new(&tracks[next_row % queue_len].0);
                 let since = controller.file_checks.since_for_track_end(next, decoder_started);
                 look = Some((since, seq));
             }

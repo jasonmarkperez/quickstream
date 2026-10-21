@@ -52,6 +52,71 @@ pub struct RemovedTrack {
     /// The removed track was the current one. `current_index` now points at the track that
     /// followed it (or the new last track); the caller decides whether to start playing it.
     pub was_current: bool,
+    /// Where each row went: the rows after the removed one moved up one.
+    pub rows: RowMap,
+}
+
+/// Where each queue row went in a change to the queue (a shuffle, a removed row, or several),
+/// so whoever holds a row (the queue cursor, the continuous stream) can follow its track.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RowMap {
+    /// Entry `i`: the new row of the track that was at row `i`; for a removed track, the row of
+    /// the track that took its place (the queue's new length when none did).
+    to: Vec<usize>,
+    /// Entry `i`: the track that was at row `i` was removed.
+    removed: Vec<bool>,
+}
+
+impl RowMap {
+    /// A reorder in which the track at row `i` went to row `to[i]` (a shuffle).
+    pub fn moved(to: Vec<usize>) -> Self {
+        let removed = vec![false; to.len()];
+        Self { to, removed }
+    }
+
+    /// Row `index` of a queue of `len` rows removed: the rows after it move up one, and its
+    /// own names the track that took its place.
+    pub fn removal(len: usize, index: usize) -> Self {
+        Self {
+            to: (0..len).map(|row| if row > index { row - 1 } else { row }).collect(),
+            removed: (0..len).map(|row| row == index).collect(),
+        }
+    }
+
+    /// The new row of the track that was at `row` (the row of the track that took its place
+    /// when it was removed). A row the map doesn't name stays.
+    pub fn row(&self, row: usize) -> usize {
+        self.to.get(row).copied().unwrap_or(row)
+    }
+
+    /// Whether the track that was at `row` was removed.
+    pub fn was_removed(&self, row: usize) -> bool {
+        self.removed.get(row).copied().unwrap_or(false)
+    }
+
+    /// Where a walk that goes on `step` rows after `row` goes on after the change: from the
+    /// track's new row, the same step on; from a removed track's place, one step less, since the
+    /// track that took its place is the one that came after it.
+    pub fn follow_step(&self, row: usize, step: usize) -> (usize, usize) {
+        if self.was_removed(row) {
+            (self.row(row), step.saturating_sub(1))
+        } else {
+            (self.row(row), step)
+        }
+    }
+
+    /// This change, then `later` (on the rows this one left): where each track went in the end.
+    pub fn then(&self, later: &RowMap) -> RowMap {
+        RowMap {
+            to: self.to.iter().map(|&at| later.row(at)).collect(),
+            removed: self
+                .to
+                .iter()
+                .zip(&self.removed)
+                .map(|(&at, &removed)| removed || later.was_removed(at))
+                .collect(),
+        }
+    }
 }
 
 /// What happens once the tracks [`PlaybackQueue::upcoming`] lists have played. Published to the
@@ -232,7 +297,11 @@ impl PlaybackQueue {
             self.current_index = self.tracks.len().saturating_sub(1);
         }
         self.bump();
-        Some(RemovedTrack { track, was_current })
+        Some(RemovedTrack {
+            track,
+            was_current,
+            rows: RowMap::removal(self.tracks.len() + 1, index),
+        })
     }
 
     /// Drop every track after position `index`, keeping tracks `0..=index`.

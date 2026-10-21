@@ -1718,3 +1718,29 @@ fn test_publish_up_next_comes_from_the_published_queue() {
     assert_eq!(state.up_next_end, None);
     assert_eq!(state.next_track_title, None);
 }
+
+/// A row the web dashboard removes moves the queue cursor with its track: one before it leaves
+/// the cursor on the same track, the cursor's own row leaves it on the track that took its
+/// place, and the last row moves it up to the new last one (PR #137 review).
+#[test]
+fn test_web_remove_keeps_the_queue_cursor_on_its_track() {
+    common::isolate();
+    let mut app = up_next_app_with(&[200.0, 201.0, 202.0, 203.0, 204.0]);
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    app.web_cmd_rx = Some(cmd_rx);
+    app.queue_cursor = 3;
+    let cursor_title = |app: &quickstream::ui::AppUI| {
+        app.queue
+            .tracks()
+            .get(app.queue_cursor)
+            .map(|t| t.title.clone())
+            .unwrap_or_default()
+    };
+    for (row, want) in [(1, "T3"), (2, "T4"), (2, "T2")] {
+        cmd_tx.send(WebCommand::RemoveIndex(row)).unwrap();
+        app.handle_web_commands();
+        assert_eq!(cursor_title(&app), want, "after removing row {row}");
+    }
+    assert_eq!(app.queue_cursor, 1);
+    stop_up_next_app(app);
+}
