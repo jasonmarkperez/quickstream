@@ -285,8 +285,9 @@ impl NowPlayingState {
     /// `next_track_title`) from the published `queue`, `queue_index` and `queue_mode`, through
     /// [`crate::queue::Upcoming::after`] as tab [1]'s UP NEXT lists them (`wrap` while the
     /// continuous stream plays). Everything comes from that one snapshot, so the indices, count,
-    /// titles and end always agree; nothing is listed when `queue_index` names no track. Only the
-    /// UI thread publishes it (`AppUI::update_web_state`), once it has published the queue. At
+    /// titles and end always agree; nothing is listed when `queue_index` names no track. The UI
+    /// thread publishes it (`AppUI::update_web_state`) once it has published the queue, and the
+    /// continuous stream with each track it starts, in the write that publishes the track. At
     /// most [`WEB_UP_NEXT_LIMIT`] items are built, however long the queue.
     pub fn publish_up_next(&mut self, wrap: bool) {
         use crate::queue::{QueueEnd, Upcoming};

@@ -312,8 +312,10 @@ impl ContinuousStreamController {
             s.is_playing = true;
             s.is_paused = false;
         }
-        // Up Next is the UI thread's to publish (`NowPlayingState::publish_up_next`), from the
-        // queue it publishes and this track index, which it reads at its next tick.
+        // Up Next for this track, in the same write and from the same published queue, index
+        // and mode, through the function the UI's tick uses (which then republishes the same
+        // values), so the track now playing is never also listed as the next one.
+        s.publish_up_next(true);
     }
 
     /// Run `binary` as the stream's ffmpeg instead of `ffmpeg` on `PATH` (the test seam for a
