@@ -146,11 +146,11 @@ impl AppUI {
         });
     }
 
-    /// Shuffle the queue (`z` / `Z`, the web dashboard's Shuffle, the continuous stream's
-    /// reshuffle on a wrap): the current track goes in front and the cursor stays on the entry it
-    /// was on (issue #123), as does the continuous stream. While the rest of a playlist `Enter`
-    /// started is still being checked, that rest is shuffled in when it arrives (issue #122).
-    /// `source` ends the status (`" (web)"`).
+    /// Shuffle the queue (the continuous stream's reshuffle on a wrap; the user's shuffles go
+    /// through [`Self::shuffle_queue_by_user`]): the current track goes in front and the cursor stays on the entry it was on (issue #123), as
+    /// does the continuous stream. While the rest of a playlist `Enter` started is still being
+    /// checked, that rest is shuffled in when it arrives (issue #122). `source` ends the status
+    /// (`" (web)"`).
     pub(super) fn shuffle_queue(&mut self, source: &str) {
         if self.queue.is_empty() {
             return;
@@ -164,20 +164,45 @@ impl AppUI {
         self.update_web_state();
     }
 
+    /// A shuffle the user asked for (`z` / `Z`, the web dashboard's Shuffle): as
+    /// [`Self::shuffle_queue`], and while a playlist play waits for its first track to start, the
+    /// shuffle is kept for that play, even with an empty queue, where nothing is shuffled yet
+    /// (issue #135).
+    pub(super) fn shuffle_queue_by_user(&mut self, source: &str) {
+        let Some(note) = self.shuffle_playlist_at_start() else {
+            self.shuffle_queue(source);
+            return;
+        };
+        if self.queue.is_empty() {
+            self.status_message = note;
+        } else {
+            let moved = self.queue.shuffle();
+            self.follow_queue_reorder(moved);
+            self.status_message = format!("🔀 Queue shuffled{source}; {note}");
+        }
+        self.update_web_state();
+    }
+
     /// The queue was reordered: `moved[i]` is the new position of the track that was at `i`.
     /// The cursor moves with its entry, and while the continuous stream plays, the stream is told
     /// where its tracks went when the new order is published (`update_web_state`), so it goes on
     /// in that order.
     fn follow_queue_reorder(&mut self, moved: Vec<usize>) {
-        match moved.get(self.queue_cursor) {
-            Some(&to) => self.queue_cursor = to,
-            None => self.clamp_queue_cursor(),
-        }
+        self.follow_queue_rows(crate::queue::RowMap::moved(moved));
+    }
+
+    /// The queue's rows moved (`rows`: a reorder or a removed row). The cursor moves with its
+    /// entry (a removed one's to the entry that took its place), and while the continuous stream
+    /// plays, the change is kept for the next publish of the queue (`update_web_state`) to hand
+    /// the stream with the new queue.
+    fn follow_queue_rows(&mut self, rows: crate::queue::RowMap) {
+        self.queue_cursor = rows.row(self.queue_cursor);
+        self.clamp_queue_cursor();
         if self.continuous_stream_active() {
             self.stream_reorder = Some(match self.stream_reorder.take() {
-                // Reordered twice before a publish: where each track went in the end.
-                Some(earlier) => earlier.iter().map(|&at| moved.get(at).copied().unwrap_or(at)).collect(),
-                None => moved,
+                // Changed twice before a publish: where each track went in the end.
+                Some(earlier) => earlier.then(&rows),
+                None => rows,
             });
         }
     }
@@ -189,16 +214,26 @@ impl AppUI {
 
     /// Remove a queue row (TUI `d` or the web dashboard). Removing the track that is playing or
     /// paused moves playback on to the track that took its place; emptying the queue stops it.
+    /// The cursor stays on its entry (on the one that took its place when it is the one
+    /// removed). While the continuous stream plays, the rows after the removed one move up one
+    /// for the stream too, and the removed row names the track that took its place, so the event
+    /// loop's sync and the web state stay on the track it plays and it goes on from there (#136).
+    /// The new queue is published once, before the stream is asked to skip.
     pub fn remove_queue_track(&mut self, index: usize) -> Option<crate::metadata::AudioMetadata> {
         let removed = self.queue.remove(index)?;
         self.playlist_fill_row_removed(index);
-        self.clamp_queue_cursor();
-        if removed.was_current {
-            if self.queue.is_empty() {
-                let _ = self.player.stop();
-            } else if self.player.is_playing() || self.player.is_paused() {
-                self.play_current_track();
-            }
+        self.follow_queue_rows(removed.rows);
+        let restart =
+            removed.was_current && !self.queue.is_empty() && (self.player.is_playing() || self.player.is_paused());
+        // On the continuous stream, `play_current_track` publishes the queue itself before it
+        // asks the stream to skip.
+        if !(restart && self.continuous_stream_active()) {
+            self.update_web_state();
+        }
+        if removed.was_current && self.queue.is_empty() {
+            let _ = self.player.stop();
+        } else if restart {
+            self.play_current_track();
         }
         Some(removed.track)
     }

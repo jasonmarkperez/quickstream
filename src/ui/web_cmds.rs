@@ -71,9 +71,8 @@ impl AppUI {
                     }
                 }
                 crate::web::WebCommand::RemoveIndex(idx) => {
-                    if self.remove_queue_track(idx).is_some() {
-                        self.update_web_state();
-                    }
+                    // Publishes the shorter queue itself.
+                    let _ = self.remove_queue_track(idx);
                 }
                 crate::web::WebCommand::ClearQueue => {
                     self.supersede_playlist_queue();
@@ -144,6 +143,10 @@ impl AppUI {
                 crate::web::WebCommand::Autopilot(target) => self.start_autopilot(target),
                 crate::web::WebCommand::AutopilotReshuffle(target) => self.reshuffle_autopilot(target),
                 crate::web::WebCommand::ShuffleQueue => {
+                    self.sync_continuous_stream_index();
+                    self.shuffle_queue_by_user(" (web)");
+                }
+                crate::web::WebCommand::StreamReshuffle => {
                     // The shuffle keeps the current track in front: for the continuous stream's
                     // wrap that is the track it plays next, which it may have named since this
                     // tick's sync.
@@ -260,9 +263,19 @@ impl AppUI {
         if self.web_server.is_none() {
             return;
         }
-        // Read before the web state's lock, which the stream takes before its own.
-        let playing = self.web_playing_index();
         if let Ok(mut state) = self.web_state.write() {
+            if let Some(ws) = &self.web_server {
+                // A reorder (a shuffle, a removed row) reaches the stream with the order it made,
+                // under this lock, so the stream never picks a track by its old row from the new
+                // queue, or the other way round; and before the stream's index is read below, so
+                // this publish already marks the track it plays at its new row (#136).
+                if let Some(moved) = self.stream_reorder.take() {
+                    ws.stream_state().continuous.queue_reordered(&moved);
+                }
+            }
+            // Read under the web state's lock, which the stream takes before its own (lock
+            // order: the web state, then `current_track_index`).
+            let playing = self.web_playing_index();
             state.is_playing = self.player.is_playing();
             state.is_paused = self.player.is_paused();
             state.position_seconds = self.player.position_seconds();
@@ -303,11 +316,6 @@ impl AppUI {
                 })
                 .collect();
             if let Some(ws) = &self.web_server {
-                // A reorder reaches the stream with the order it made, so the stream never picks
-                // a track by its old row from the new queue, or the other way round.
-                if let Some(moved) = self.stream_reorder.take() {
-                    ws.stream_state().continuous.queue_reordered(&moved);
-                }
                 // A track the continuous stream started with an unknown length takes it from the
                 // queue as soon as it is published here, not only when the stream next writes.
                 ws.stream_state().continuous.learn_published_duration(&mut state);
