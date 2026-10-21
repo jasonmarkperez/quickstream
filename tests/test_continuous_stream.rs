@@ -547,9 +547,9 @@ fn test_upnp_continuous_seek_is_clamped_to_the_known_length() {
 /// `bad` gets nothing and an exit at once (a file ffmpeg can't decode); `ones` gets 0.5 s of
 /// `0x01` bytes at about real time (`longones` 3 s) and `burst` 1 s of them at once, then an exit
 /// (a track that ends); `twos` gets 0.1 s of `0x02` bytes, then nothing until killed; `waking` gets
-/// nothing for 2 s (a share that hangs as ffmpeg opens the file), then `0x01` bytes at about real
+/// nothing for 5 s (a share that hangs as ffmpeg opens the file), then `0x01` bytes at about real
 /// time until it is killed; `stall` gets 0.5 s of `0x01` bytes at about real time, then nothing
-/// for 2.5 s (a share that hangs as ffmpeg reads the file), then `0x01` bytes at about real time
+/// for 5 s (a share that hangs as ffmpeg reads the file), then `0x01` bytes at about real time
 /// until it is killed; `flood` gets 5 s of `0x01` bytes at once, then an exit; `surge` gets 6 s of
 /// them at once, nothing for 1.2 s, then 5 s of them at about real time, then an exit; `sleepy` gets
 /// nothing for 1 s, then `0x02` bytes at about real time until it is killed; `lone` gets a lone
@@ -569,7 +569,7 @@ impl FakeDecoder {
         let log = dir.join("ffmpeg.log");
         let pids = dir.join("ffmpeg.pids");
         let text = format!(
-            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"${{in##*/}}\" in\n  *lone*) while :; do head -c 32768 /dev/zero | tr '\\000' '\\001'; sleep 1.2; done ;;\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *longones*) for i in $(seq 30); do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *long*) head -c 17640 /dev/zero; exec sleep 3 ;;\n  *endless*) exec cat /dev/zero ;;\n  *live*) while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *late*) sleep 1; while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *bad*) exit 1 ;;\n  *ones*) for i in 1 2 3 4 5; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *burst*) head -c 176400 /dev/zero | tr '\\000' '\\001'; exit 0 ;;\n  *twos*) head -c 17640 /dev/zero | tr '\\000' '\\002'; exec sleep 30 ;;\n  *waking*) sleep 2; while :; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done ;;\n  *stall*) for i in 1 2 3 4 5; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; sleep 2.5; while :; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done ;;\n  *surge*) head -c 1058400 /dev/zero | tr '\\000' '\\001'; sleep 1.2; for i in $(seq 50); do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *flood*) head -c 882000 /dev/zero | tr '\\000' '\\001'; exit 0 ;;\n  *sleepy*) sleep 1; while :; do head -c 17640 /dev/zero | tr '\\000' '\\002'; sleep 0.1; done ;;\nesac\nexec sleep 30\n",
+            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"${{in##*/}}\" in\n  *lone*) while :; do head -c 32768 /dev/zero | tr '\\000' '\\001'; sleep 1.2; done ;;\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *longones*) for i in $(seq 30); do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *long*) head -c 17640 /dev/zero; exec sleep 3 ;;\n  *endless*) exec cat /dev/zero ;;\n  *live*) while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *late*) sleep 1; while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *bad*) exit 1 ;;\n  *ones*) for i in 1 2 3 4 5; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *burst*) head -c 176400 /dev/zero | tr '\\000' '\\001'; exit 0 ;;\n  *twos*) head -c 17640 /dev/zero | tr '\\000' '\\002'; exec sleep 30 ;;\n  *waking*) sleep 5; while :; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done ;;\n  *stall*) for i in 1 2 3 4 5; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; sleep 5; while :; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done ;;\n  *surge*) head -c 1058400 /dev/zero | tr '\\000' '\\001'; sleep 1.2; for i in $(seq 50); do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *flood*) head -c 882000 /dev/zero | tr '\\000' '\\001'; exit 0 ;;\n  *sleepy*) sleep 1; while :; do head -c 17640 /dev/zero | tr '\\000' '\\002'; sleep 0.1; done ;;\nesac\nexec sleep 30\n",
             pids = pids.display(),
             log = log.display()
         );
@@ -2227,6 +2227,30 @@ fn test_continuous_stream_sends_silence_while_a_file_check_hangs() {
     assert_eq!(*f.controller.current_track_index.lock().unwrap(), 0);
 }
 
+/// How long `waking` gives nothing as it starts, and `stall` in the middle of its track.
+#[cfg(unix)]
+const DECODER_HANG: Duration = Duration::from_secs(5);
+
+/// Measure the rate and bytes of the 1 s of stream from 0.3 s after byte `from` arrived, which
+/// must end at least 1 s before a hang of `hang` that began after `before` is over. Returns the
+/// bytes and the rate.
+#[cfg(unix)]
+fn window_after(renderer: &RecordingRenderer, from: usize, before: Instant, hang: Duration) -> (Vec<u8>, f64) {
+    std::thread::sleep(
+        (renderer.arrival_of(from) + Duration::from_millis(300)).saturating_duration_since(Instant::now()),
+    );
+    let (start, first) = (Instant::now(), renderer.bytes.lock().unwrap().len());
+    std::thread::sleep(Duration::from_secs(1));
+    let window = renderer.bytes.lock().unwrap()[first..].to_vec();
+    let rate = window.len() as f64 / start.elapsed().as_secs_f64();
+    assert!(
+        before.elapsed() + Duration::from_secs(1) < hang,
+        "the window ended {:?} after the hang could have begun, the machine is too slow for this test",
+        before.elapsed()
+    );
+    (window, rate)
+}
+
 /// While the decoder gives nothing for seconds after it starts (the share hangs as ffmpeg opens
 /// or reads the file), the renderer still gets silence at real time, no more than the lead ahead;
 /// once the decoder gives audio, it plays and is shown as playing (#133).
@@ -2235,15 +2259,16 @@ fn test_continuous_stream_sends_silence_while_a_file_check_hangs() {
 fn test_continuous_stream_sends_silence_while_the_decoder_gives_nothing() {
     common::isolate();
     let f = DecoderFixture::armed("hung_decoder", &["t0_waking.wav", "t1_live.wav"], 0, |_, _| {});
+    // Before the decoder can start, so its hang began after this.
+    let connecting = Instant::now();
     let renderer = RecordingRenderer::connect(f.port, &f.path);
     let connected = Instant::now();
     assert_eq!(f.run(1), (f.tracks[0].clone(), None));
-    // The decoder waits 2 s from its log line: measured from 0.7 s to 1.7 s into its wait.
-    std::thread::sleep(Duration::from_millis(700));
-    let (from, before) = (Instant::now(), renderer.bytes.lock().unwrap().len());
-    std::thread::sleep(Duration::from_millis(1000));
-    let window = renderer.bytes.lock().unwrap()[before..].to_vec();
-    let rate = window.len() as f64 / from.elapsed().as_secs_f64();
+    // The first bytes are the silence covering for it, once its grace is out.
+    wait_until("no silence while the decoder gives nothing", || {
+        !renderer.bytes.lock().unwrap().is_empty()
+    });
+    let (window, rate) = window_after(&renderer, 0, connecting, DECODER_HANG);
     assert!(
         window.iter().all(|&b| b == 0),
         "silence while the decoder gives nothing"
@@ -2258,9 +2283,11 @@ fn test_continuous_stream_sends_silence_while_the_decoder_gives_nothing() {
         connected.elapsed()
     );
 
-    wait_until("the decoder's audio never reached the renderer", || {
-        renderer.bytes.lock().unwrap().contains(&1)
-    });
+    wait_within(
+        Duration::from_secs(20),
+        "the decoder's audio never reached the renderer",
+        || renderer.bytes.lock().unwrap().contains(&1),
+    );
     wait_until("the track was never shown as playing", || {
         f.state.read().unwrap().title == "Track 0"
     });
@@ -2278,22 +2305,18 @@ fn test_continuous_stream_sends_silence_while_the_decoder_gives_nothing() {
 fn test_continuous_stream_sends_silence_while_the_decoder_stalls_mid_track() {
     common::isolate();
     let f = DecoderFixture::armed("stalled_decoder", &["t0_stall.wav"], 0, |_, _| {});
+    // Before the decoder can start, so its stall began after this.
+    let connecting = Instant::now();
     let renderer = RecordingRenderer::connect(f.port, &f.path);
     let connected = Instant::now();
-    wait_until("the decoder's audio never reached the renderer", || {
-        renderer.bytes.lock().unwrap().contains(&1)
-    });
-    let audio_from = Instant::now();
-    // 0.5 s of audio, then 2.5 s of nothing: measured from 0.9 s to 1.9 s into the stall.
-    std::thread::sleep(Duration::from_millis(1400));
-    let (from, before) = (Instant::now(), renderer.bytes.lock().unwrap().len());
-    std::thread::sleep(Duration::from_millis(1000));
-    let window = renderer.bytes.lock().unwrap()[before..].to_vec();
-    let rate = window.len() as f64 / from.elapsed().as_secs_f64();
-    assert!(
-        audio_from.elapsed() < Duration::from_millis(2900),
-        "the window ran past the stall, the machine is too slow for this test"
-    );
+    // 0.5 s of audio, then the silence covering the stall.
+    let first_silence = || {
+        let bytes = renderer.bytes.lock().unwrap();
+        let audio = bytes.iter().position(|&b| b == 1)?;
+        bytes[audio..].iter().position(|&b| b == 0).map(|i| audio + i)
+    };
+    wait_until("no silence while the decoder stalls", || first_silence().is_some());
+    let (window, rate) = window_after(&renderer, first_silence().unwrap(), connecting, DECODER_HANG);
     assert!(window.iter().all(|&b| b == 0), "silence while the decoder stalls");
     assert_about_real_time(rate, "while the decoder stalls");
     let received = renderer.bytes.lock().unwrap().len() as f64;
@@ -2306,7 +2329,7 @@ fn test_continuous_stream_sends_silence_while_the_decoder_stalls_mid_track() {
     );
 
     let silent_until = renderer.bytes.lock().unwrap().len();
-    wait_until("the decoder's audio never came back", || {
+    wait_within(Duration::from_secs(20), "the decoder's audio never came back", || {
         renderer.bytes.lock().unwrap()[silent_until..].contains(&1)
     });
     assert_eq!(f.decoder.calls().len(), 1, "the same decoder run, not a restart");
