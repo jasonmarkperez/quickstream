@@ -119,6 +119,26 @@ fn metadata_updates_bump_revision_only_when_a_track_matches() {
     });
 }
 
+/// A size found for an unreadable file fills in only an unknown one, and keeps the rest.
+#[test]
+fn file_size_updates_bump_revision_only_when_a_size_was_unknown() {
+    common::isolate();
+    let mut q = queue_of(3);
+    let path = track(2).filepath;
+    assert_bumps(&mut q, "set_file_size on an unknown size", |q| {
+        assert!(q.set_file_size(&path, 4_000));
+    });
+    assert_eq!(q.tracks()[1].file_size, 4_000);
+    assert_eq!(q.tracks()[1].title, "Song 2");
+    assert_keeps(&mut q, "set_file_size on a known size", |q| {
+        assert!(!q.set_file_size(&path, 5_000));
+    });
+    assert_eq!(q.tracks()[1].file_size, 4_000);
+    assert_keeps(&mut q, "set_file_size on a path not in the queue", |q| {
+        assert!(!q.set_file_size(&track(9).filepath, 1));
+    });
+}
+
 #[test]
 fn mutable_track_access_bumps_revision() {
     common::isolate();

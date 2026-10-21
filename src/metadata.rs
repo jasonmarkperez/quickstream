@@ -218,13 +218,37 @@ pub fn audio_properties(properties: &lofty::properties::FileProperties, file_siz
     }
 }
 
+/// The error [`extract_metadata`] returns for a file it found (its size read) but couldn't read
+/// the tags of (issue #124): it carries that size, so a failed read still tells the UI how big
+/// the file is without a second stat. A file that couldn't be found returns another error.
+#[derive(Debug)]
+pub struct UnreadableTags {
+    pub file_size: u64,
+    pub source: anyhow::Error,
+}
+
+impl std::fmt::Display for UnreadableTags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl std::error::Error for UnreadableTags {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Read a file's tags and audio properties. A file whose size was read but whose tags couldn't
+/// be fails with [`UnreadableTags`].
 pub fn extract_metadata(path: &Path) -> anyhow::Result<AudioMetadata> {
     let filename = path
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| "Unknown".to_string());
 
-    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let stat_size = std::fs::metadata(path).map(|m| m.len()).ok();
+    let file_size = stat_size.unwrap_or(0);
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -236,7 +260,13 @@ pub fn extract_metadata(path: &Path) -> anyhow::Result<AudioMetadata> {
 
     // Probe and parse with lofty, skipping cover art to avoid multi-megabyte image reads
     let parse_opts = ParseOptions::new().read_cover_art(false);
-    let tagged_file = Probe::open(path)?.options(parse_opts).guess_file_type()?.read()?;
+    let read = || -> anyhow::Result<lofty::file::TaggedFile> {
+        Ok(Probe::open(path)?.options(parse_opts).guess_file_type()?.read()?)
+    };
+    let tagged_file = read().map_err(|source| match stat_size {
+        Some(file_size) => UnreadableTags { file_size, source }.into(),
+        None => source,
+    })?;
     let AudioProperties {
         duration_seconds,
         bitrate_kbps,
@@ -286,10 +316,21 @@ pub fn extract_metadata(path: &Path) -> anyhow::Result<AudioMetadata> {
     })
 }
 
-/// Create fast fallback metadata directly from filepath and file size without reading tags.
-/// The audio properties (length, bitrate, sample rate, channels) stay 0, meaning unknown: they
-/// are shown and stored only once the tags are read, never guessed.
+/// [`path_metadata`] plus the file size, without reading tags. The audio properties (length,
+/// bitrate, sample rate, channels) stay 0, meaning unknown: they are shown and stored only once
+/// the tags are read, never guessed. Stats the file: call it on a worker thread, never on the UI
+/// thread.
 pub fn fallback_metadata(path: &Path) -> AudioMetadata {
+    AudioMetadata {
+        file_size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        ..path_metadata(path)
+    }
+}
+
+/// Placeholder metadata from the path alone: file name, title (the file stem) and format. Never
+/// touches the disk, so the UI thread can build it for a whole folder (issue #124). The size and
+/// the audio properties stay 0, meaning unknown, until the queue's tag read fills them in.
+pub fn path_metadata(path: &Path) -> AudioMetadata {
     let filename = path
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
@@ -303,17 +344,12 @@ pub fn fallback_metadata(path: &Path) -> AudioMetadata {
         .and_then(|e| e.to_str())
         .unwrap_or("UNKNOWN")
         .to_uppercase();
-    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
     AudioMetadata {
         filepath: path.to_path_buf(),
         filename,
         title,
-        artist: String::new(),
-        album: String::new(),
-        genre: String::new(),
         format_name: ext,
-        file_size,
         ..Default::default()
     }
 }
