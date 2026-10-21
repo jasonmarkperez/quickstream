@@ -2262,6 +2262,11 @@ pub(super) fn serve_continuous_stream(
         // When the decoder last gave PCM (or started): silence covers for it only once it has
         // given none for `DECODER_GRACE`.
         let mut last_output = decoder_started;
+        // Whether silence has covered for this decoder run (or ran on into it): from then on it
+        // covers as soon as the renderer runs out of what it was sent, without a fresh grace
+        // after each chunk, so a decoder that gives a lone chunk now and then never lets the
+        // renderer run dry for the rest of a grace after each.
+        let mut covered = silence.is_some();
 
         while let Some(output) = output.as_ref() {
             if !controller.is_active.load(Ordering::SeqCst) {
@@ -2348,11 +2353,13 @@ pub(super) fn serve_continuous_stream(
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // No PCM: the decoder is starting, or stuck opening or reading the file on a
                     // share that hangs, before its first PCM or in the middle of the track
-                    // (#133). Once it has given none for `DECODER_GRACE` and the renderer is
-                    // running out of what it was sent, silence at real time keeps it fed (and
-                    // goes on, paced, from silence the stream was already sending) until the
-                    // decoder gives PCM again.
-                    let covers = silence.is_some() || (last_output.elapsed() >= DECODER_GRACE && lead.running_dry());
+                    // (#133). Once it has given none for `DECODER_GRACE` (or silence has covered
+                    // for it before) and the renderer is running out of what it was sent,
+                    // silence at real time keeps it fed (and goes on, paced, from silence the
+                    // stream was already sending) until the decoder gives PCM again.
+                    let covers = silence.is_some()
+                        || ((covered || last_output.elapsed() >= DECODER_GRACE) && lead.running_dry());
+                    covered |= covers;
                     if covers
                         && !send_silence(
                             &mut silence,

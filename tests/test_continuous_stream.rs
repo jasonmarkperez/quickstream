@@ -552,7 +552,8 @@ fn test_upnp_continuous_seek_is_clamped_to_the_known_length() {
 /// for 2.5 s (a share that hangs as ffmpeg reads the file), then `0x01` bytes at about real time
 /// until it is killed; `flood` gets 5 s of `0x01` bytes at once, then an exit; `surge` gets 6 s of
 /// them at once, nothing for 1.2 s, then 5 s of them at about real time, then an exit; `sleepy` gets
-/// nothing for 1 s, then `0x02` bytes at about real time until it is killed; any other input gets
+/// nothing for 1 s, then `0x02` bytes at about real time until it is killed; `lone` gets a lone
+/// 32 KiB chunk of `0x01` bytes (0.19 s) every 1.2 s until it is killed; any other input gets
 /// nothing, as while the real one opens a file on a slow share, until it is killed.
 #[cfg(unix)]
 struct FakeDecoder {
@@ -568,7 +569,7 @@ impl FakeDecoder {
         let log = dir.join("ffmpeg.log");
         let pids = dir.join("ffmpeg.pids");
         let text = format!(
-            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"${{in##*/}}\" in\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *longones*) for i in $(seq 30); do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *long*) head -c 17640 /dev/zero; exec sleep 3 ;;\n  *endless*) exec cat /dev/zero ;;\n  *live*) while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *late*) sleep 1; while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *bad*) exit 1 ;;\n  *ones*) for i in 1 2 3 4 5; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *burst*) head -c 176400 /dev/zero | tr '\\000' '\\001'; exit 0 ;;\n  *twos*) head -c 17640 /dev/zero | tr '\\000' '\\002'; exec sleep 30 ;;\n  *waking*) sleep 2; while :; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done ;;\n  *stall*) for i in 1 2 3 4 5; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; sleep 2.5; while :; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done ;;\n  *surge*) head -c 1058400 /dev/zero | tr '\\000' '\\001'; sleep 1.2; for i in $(seq 50); do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *flood*) head -c 882000 /dev/zero | tr '\\000' '\\001'; exit 0 ;;\n  *sleepy*) sleep 1; while :; do head -c 17640 /dev/zero | tr '\\000' '\\002'; sleep 0.1; done ;;\nesac\nexec sleep 30\n",
+            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"${{in##*/}}\" in\n  *lone*) while :; do head -c 32768 /dev/zero | tr '\\000' '\\001'; sleep 1.2; done ;;\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *longones*) for i in $(seq 30); do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *long*) head -c 17640 /dev/zero; exec sleep 3 ;;\n  *endless*) exec cat /dev/zero ;;\n  *live*) while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *late*) sleep 1; while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *bad*) exit 1 ;;\n  *ones*) for i in 1 2 3 4 5; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *burst*) head -c 176400 /dev/zero | tr '\\000' '\\001'; exit 0 ;;\n  *twos*) head -c 17640 /dev/zero | tr '\\000' '\\002'; exec sleep 30 ;;\n  *waking*) sleep 2; while :; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done ;;\n  *stall*) for i in 1 2 3 4 5; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; sleep 2.5; while :; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done ;;\n  *surge*) head -c 1058400 /dev/zero | tr '\\000' '\\001'; sleep 1.2; for i in $(seq 50); do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *flood*) head -c 882000 /dev/zero | tr '\\000' '\\001'; exit 0 ;;\n  *sleepy*) sleep 1; while :; do head -c 17640 /dev/zero | tr '\\000' '\\002'; sleep 0.1; done ;;\nesac\nexec sleep 30\n",
             pids = pids.display(),
             log = log.display()
         );
@@ -2313,6 +2314,31 @@ fn test_continuous_stream_sends_silence_while_the_decoder_stalls_mid_track() {
     renderer.hang_up();
 }
 
+/// A decoder that, after a stall silence covered, gives a lone chunk of PCM now and then (a share
+/// that answers a read every second or so) keeps the renderer fed: silence follows each chunk as
+/// the renderer runs out of it, not only after a fresh `DECODER_GRACE` (#133).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_keeps_covering_a_decoder_that_gives_lone_chunks() {
+    common::isolate();
+    let f = DecoderFixture::armed("lone_chunks", &["t0_lone.wav"], 0, |_, _| {});
+    let renderer = RecordingRenderer::connect(f.port, &f.path);
+    // The first chunk, the stall after it covered, then four lone chunks.
+    wait_within(Duration::from_secs(30), "the lone chunks never came", || {
+        audio_runs(&renderer.bytes.lock().unwrap()).len() >= 5
+    });
+    let runs = audio_runs(&renderer.bytes.lock().unwrap());
+    let dry = renderer.dry_after(renderer.arrival_of(runs[1]));
+    assert!(
+        dry < Duration::from_millis(250),
+        "the renderer ran dry for {:?} over the three lone chunks after a covered stall",
+        dry
+    );
+    assert_eq!(f.decoder.calls().len(), 1, "the same decoder run, not a restart");
+    f.handle.as_ref().unwrap().stream_state().close_active_streams();
+    renderer.hang_up();
+}
+
 /// A renderer that was paused for seconds (it stopped reading, so the stream's writes blocked)
 /// still holds what it was sent before: a next track whose decoder takes a second to start
 /// follows the one before with no silence between them (#133).
@@ -2622,9 +2648,11 @@ impl SlowPathCheck {
     }
 }
 
-/// A renderer that keeps every byte of the stream after the WAV header.
+/// A renderer that keeps every byte of the stream after the WAV header, and when each read got
+/// its bytes (`arrivals`: the time and the bytes got so far).
 struct RecordingRenderer {
     bytes: Arc<Mutex<Vec<u8>>>,
+    arrivals: Arc<Mutex<Vec<(Instant, usize)>>>,
     reading: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -2640,19 +2668,26 @@ impl RecordingRenderer {
             .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
         let bytes = Arc::new(Mutex::new(Vec::new()));
+        let arrivals = Arc::new(Mutex::new(Vec::new()));
         let reading = Arc::new(AtomicBool::new(true));
-        let (bytes_t, reading_t) = (bytes.clone(), reading.clone());
+        let (bytes_t, arrivals_t, reading_t) = (bytes.clone(), arrivals.clone(), reading.clone());
         let thread = std::thread::spawn(move || {
             let mut buf = [0u8; 65536];
             while reading_t.load(Ordering::SeqCst) {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => bytes_t.lock().unwrap().extend_from_slice(&buf[..n]),
+                    Ok(n) => {
+                        let at = Instant::now();
+                        let mut bytes = bytes_t.lock().unwrap();
+                        bytes.extend_from_slice(&buf[..n]);
+                        arrivals_t.lock().unwrap().push((at, bytes.len()));
+                    }
                 }
             }
         });
         Self {
             bytes,
+            arrivals,
             reading,
             thread: Some(thread),
         }
@@ -2664,6 +2699,47 @@ impl RecordingRenderer {
             let _ = thread.join();
         }
     }
+
+    /// When the read that got byte `index` (from 0) arrived.
+    fn arrival_of(&self, index: usize) -> Instant {
+        let arrivals = self.arrivals.lock().unwrap();
+        arrivals
+            .iter()
+            .find(|&&(_, got)| got > index)
+            .unwrap_or_else(|| panic!("byte {} never arrived", index))
+            .0
+    }
+
+    /// How long a renderer playing at real time from the first byte it got, each byte from when
+    /// it arrived, had nothing to play after `since`.
+    fn dry_after(&self, since: Instant) -> Duration {
+        let arrivals = self.arrivals.lock().unwrap();
+        let Some(&(mut clock, _)) = arrivals.first() else {
+            return Duration::ZERO;
+        };
+        let secs = |bytes: usize| Duration::from_secs_f64(bytes as f64 / REAL_TIME_BYTES_PER_SEC);
+        let (mut played, mut got, mut dry) = (Duration::ZERO, 0, Duration::ZERO);
+        for &(at, total) in arrivals.iter() {
+            let held = secs(got) - played;
+            if at - clock > held {
+                // It ran dry `held` after `clock`, until these bytes came.
+                let from = (clock + held).max(since);
+                dry += at.saturating_duration_since(from);
+                played = secs(got);
+            } else {
+                played += at - clock;
+            }
+            (clock, got) = (at, total);
+        }
+        dry
+    }
+}
+
+/// Where each run of `0x01` bytes starts in `bytes` (the first, and each after other bytes).
+fn audio_runs(bytes: &[u8]) -> Vec<usize> {
+    (0..bytes.len())
+        .filter(|&i| bytes[i] == 1 && (i == 0 || bytes[i - 1] != 1))
+        .collect()
 }
 
 /// A connection to 127.0.0.1:`port` whose receive buffer is set small before it connects, so a
