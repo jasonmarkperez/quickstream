@@ -42,8 +42,9 @@ fn spawn_queue_metadata_workers(
 
 impl AppUI {
     /// Resolve tags for queue tracks that still have placeholder metadata. Each path is read at
-    /// most once per session by a persistent pool of 4 workers (once more after a read that
-    /// couldn't find the file); results arrive via `metadata_rx`.
+    /// most once per session by a persistent pool of 4 workers (a read that couldn't find the
+    /// file leaves it to be read again by the next add, play, next or previous); results arrive
+    /// via `metadata_rx`.
     /// A zero sample rate marks a placeholder that has an artist and duration (a playlist's
     /// `#EXTINF`) but no album or audio properties yet.
     pub fn start_queue_metadata_fetch(&mut self) {
@@ -154,7 +155,7 @@ impl AppUI {
                 TagUpdate::Tags(meta) => meta,
                 // The tags couldn't be read: the queued rows get the size alone (issue #124),
                 // keeping the rest of their placeholder. A file that wasn't found at all (a
-                // share gone for a moment) is read again by the next add.
+                // share gone for a moment) is read again by the next add, play, next or previous.
                 TagUpdate::Unreadable { path, file_size } => {
                     match file_size {
                         Some(size) => queue_updated |= self.queue.set_file_size(&path, size),
