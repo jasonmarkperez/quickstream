@@ -539,7 +539,9 @@ fn test_upnp_continuous_seek_is_clamped_to_the_known_length() {
 /// gets 100 ms of PCM and ends 0.5 s later; one with `endless` gets PCM as fast as it is read
 /// until it is killed (for a renderer that stops reading); one with `live` gets PCM at about real
 /// time until it is killed (for one that keeps reading, so it doesn't load the machine); one with
-/// `bad` gets nothing and an exit at once (a file ffmpeg can't decode); any other input gets
+/// `bad` gets nothing and an exit at once (a file ffmpeg can't decode); `ones` gets 0.5 s of
+/// `0x01` bytes at about real time and `burst` 1 s of them at once, then an exit (a track that
+/// ends); `twos` gets 0.1 s of `0x02` bytes, then nothing until killed; any other input gets
 /// nothing, as while the real one opens a file on a slow share, until it is killed.
 #[cfg(unix)]
 struct FakeDecoder {
@@ -555,7 +557,7 @@ impl FakeDecoder {
         let log = dir.join("ffmpeg.log");
         let pids = dir.join("ffmpeg.pids");
         let text = format!(
-            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$in\" in\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *endless*) exec cat /dev/zero ;;\n  *live*) while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *bad*) exit 1 ;;\nesac\nexec sleep 30\n",
+            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$in\" in\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *endless*) exec cat /dev/zero ;;\n  *live*) while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *bad*) exit 1 ;;\n  *ones*) for i in 1 2 3 4 5; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *burst*) head -c 176400 /dev/zero | tr '\\000' '\\001'; exit 0 ;;\n  *twos*) head -c 17640 /dev/zero | tr '\\000' '\\002'; exec sleep 30 ;;\nesac\nexec sleep 30\n",
             pids = pids.display(),
             log = log.display()
         );
@@ -754,6 +756,18 @@ impl DecoderFixture {
         first: usize,
         setup: impl FnOnce(&ContinuousStreamController, &[PathBuf]),
     ) -> Self {
+        let mut f = Self::armed(name, names, first, setup);
+        f.renderer = Some(Renderer::connect(f.port, &f.path));
+        f
+    }
+
+    /// As [`Self::start_with`], with no renderer connected yet.
+    fn armed(
+        name: &str,
+        names: &[&str],
+        first: usize,
+        setup: impl FnOnce(&ContinuousStreamController, &[PathBuf]),
+    ) -> Self {
         let dir = temp_dir(name);
         let decoder = FakeDecoder::new(&dir);
         let tracks: Vec<PathBuf> = names.iter().map(|n| dir.join(n)).collect();
@@ -768,7 +782,6 @@ impl DecoderFixture {
         setup(&controller, &tracks);
         *controller.current_track_index.lock().unwrap() = first;
         let path = handle.stream_state().arm_continuous_session();
-        let renderer = Renderer::connect(handle.port, &path);
         Self {
             dir,
             tracks,
@@ -777,7 +790,7 @@ impl DecoderFixture {
             controller,
             port: handle.port,
             path,
-            renderer: Some(renderer),
+            renderer: None,
             handle: Some(handle),
             decoder,
         }
@@ -1558,9 +1571,10 @@ fn test_continuous_stream_sends_silence_while_a_file_check_hangs() {
 fn test_continuous_requests_made_while_a_file_check_hangs_are_kept() {
     common::isolate();
     let hang = HeldPathCheck::default();
-    let f = DecoderFixture::start_with("hung_request", &["t0_live.wav", "t1.wav", "t2.wav"], 0, |c, tracks| {
-        hang.install(c, &tracks[..1])
-    });
+    // Four tracks, so the check of the file after the one skipped to (made as it starts) is not
+    // of the first.
+    let names = ["t0_live.wav", "t1.wav", "t2.wav", "t3.wav"];
+    let f = DecoderFixture::start_with("hung_request", &names, 0, |c, tracks| hang.install(c, &tracks[..1]));
     let _release = hang.release_on_drop();
     wait_until("the file was never checked", || hang.calls(&f.tracks[0]) == 1);
     f.controller.seek_to(12.0);
@@ -1683,4 +1697,268 @@ fn test_continuous_missing_file_rechecks_reuse_their_threads() {
     handle.stop();
     drop(decoder);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A file check that takes `delay` for the paths it slows (a slow but working share), and
+/// answers from the disk at once for the others. Every check is counted per path, as it starts
+/// and as it answers.
+#[derive(Clone, Default)]
+struct SlowPathCheck {
+    started: Arc<Mutex<std::collections::HashMap<PathBuf, usize>>>,
+    answered: Arc<Mutex<std::collections::HashMap<PathBuf, usize>>>,
+}
+
+impl SlowPathCheck {
+    fn install(&self, controller: &ContinuousStreamController, slow: &[PathBuf], delay: Duration) {
+        let (started, answered, slow) = (self.started.clone(), self.answered.clone(), slow.to_vec());
+        controller.set_path_check(move |path: &Path| {
+            *started.lock().unwrap().entry(path.to_path_buf()).or_default() += 1;
+            if slow.iter().any(|s| s == path) {
+                std::thread::sleep(delay);
+            }
+            let exists = path.exists();
+            *answered.lock().unwrap().entry(path.to_path_buf()).or_default() += 1;
+            exists
+        });
+    }
+
+    fn started(&self, path: &Path) -> usize {
+        self.started.lock().unwrap().get(path).copied().unwrap_or(0)
+    }
+
+    fn answered(&self, path: &Path) -> usize {
+        self.answered.lock().unwrap().get(path).copied().unwrap_or(0)
+    }
+}
+
+/// A renderer that keeps every byte of the stream after the WAV header.
+struct RecordingRenderer {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    reading: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RecordingRenderer {
+    fn connect(port: u16, path: &str) -> Self {
+        let (status, mut reader) = open(port, path);
+        assert_eq!(status, 200);
+        let mut wav_hdr = [0u8; 44];
+        reader.read_exact(&mut wav_hdr).unwrap();
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let reading = Arc::new(AtomicBool::new(true));
+        let (bytes_t, reading_t) = (bytes.clone(), reading.clone());
+        let thread = std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            while reading_t.load(Ordering::SeqCst) {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => bytes_t.lock().unwrap().extend_from_slice(&buf[..n]),
+                }
+            }
+        });
+        Self {
+            bytes,
+            reading,
+            thread: Some(thread),
+        }
+    }
+
+    fn hang_up(mut self) {
+        self.reading.store(false, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Stream `first` (`ones` or `burst`: `0x01` bytes, then its end) and then `second` (`twos`:
+/// `0x02` bytes), the second's check taking 150 ms; return the run of bytes the renderer got
+/// right before the first `0x02` byte, which must all be the first track's.
+#[cfg(unix)]
+fn bytes_before_the_second_track(name: &str, first: &str, second: &str) -> (usize, usize) {
+    let slow = SlowPathCheck::default();
+    let f = DecoderFixture::armed(name, &[first, second], 0, |c, tracks| {
+        slow.install(c, &tracks[1..], Duration::from_millis(150))
+    });
+    let renderer = RecordingRenderer::connect(f.port, &f.path);
+    wait_until("the second track never played", || {
+        renderer.bytes.lock().unwrap().contains(&2)
+    });
+    let bytes = renderer.bytes.lock().unwrap().clone();
+    // The second track sends nothing more, so the stream is closed for the reader to finish.
+    f.handle.as_ref().unwrap().stream_state().close_active_streams();
+    renderer.hang_up();
+    let calls = f.decoder.calls();
+    assert!(
+        calls.iter().any(|c| c.contains(second)),
+        "the second track was decoded: {:?}",
+        calls
+    );
+    let at = bytes.iter().position(|&b| b == 2).unwrap();
+    let ones = bytes[..at].iter().rev().take_while(|&&b| b == 1).count();
+    (ones, at)
+}
+
+/// The next file is checked as soon as the track before it starts, so a slow but working share
+/// (a check that takes 150 ms) has answered by the time the track ends, and the next track's PCM
+/// follows the last byte of the one before with no silence between them (#117).
+#[cfg(unix)]
+#[test]
+fn test_continuous_next_file_is_checked_while_the_track_before_plays() {
+    common::isolate();
+    let (ones, at) = bytes_before_the_second_track("check_ahead", "a_ones.wav", "b_twos.wav");
+    assert_eq!(
+        ones,
+        5 * 17640,
+        "the first track's bytes, then the second's at once (nothing between them, {} bytes before)",
+        at
+    );
+}
+
+/// A file check still answering as a track ends (150 ms on a slow share) writes no silence while
+/// the renderer is still well ahead of real time on the track before: the next track's PCM
+/// follows its last byte (#117).
+#[cfg(unix)]
+#[test]
+fn test_continuous_slow_check_at_a_track_end_writes_no_silence_while_the_renderer_is_ahead() {
+    common::isolate();
+    let (ones, at) = bytes_before_the_second_track("check_lead", "a_burst.wav", "b_twos.wav");
+    assert_eq!(
+        ones, 176_400,
+        "the first track's bytes, then the second's at once (nothing between them, {} bytes before)",
+        at
+    );
+}
+
+/// A check that answers after its deadline (2.5 s on a slow but working share) still counts: the
+/// file is passed over while it is unanswered, and played when it is asked for again, rather than
+/// checked again only to miss the deadline once more (#117).
+#[cfg(unix)]
+#[test]
+fn test_continuous_late_file_check_answer_counts_for_the_next_look() {
+    common::isolate();
+    let slow = SlowPathCheck::default();
+    let f = DecoderFixture::start_with(
+        "late_answer",
+        &["t0_live.wav", "t1_live.wav", "t2_live.wav"],
+        0,
+        |c, t| slow.install(c, &t[2..], Duration::from_millis(2500)),
+    );
+    assert_eq!(f.run(1), (f.tracks[0].clone(), None));
+    f.controller.skip_to_index(2);
+    assert_eq!(f.run(2), (f.tracks[0].clone(), None), "passed over while unanswered");
+    wait_until("the slow check never answered", || slow.answered(&f.tracks[2]) == 1);
+    f.controller.skip_to_index(2);
+    assert_eq!(f.run(3), (f.tracks[2].clone(), None), "played on its late answer");
+    assert_eq!(slow.started(&f.tracks[2]), 1, "not checked again");
+}
+
+/// Files whose checks hang are checked at the same time, not one deadline after another, so a
+/// file that answers later in the queue plays within about one deadline (#117).
+#[cfg(unix)]
+#[test]
+fn test_continuous_files_after_hung_checks_are_checked_ahead() {
+    common::isolate();
+    let hang = HeldPathCheck::default();
+    let mut names: Vec<String> = (0..12).map(|i| format!("h{i:02}_live.wav")).collect();
+    names.push("z_live.wav".to_string());
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let f = DecoderFixture::start_with("hung_many", &names, 0, |c, tracks| hang.install(c, &tracks[..12]));
+    let _release = hang.release_on_drop();
+    assert_eq!(f.run(1), (f.tracks[12].clone(), None), "the file that answers plays");
+}
+
+/// Checks that never answer hold at most a few helper threads, however long the queue: a file
+/// past them waits for a free helper (and is passed over meanwhile), and is checked once one
+/// frees (#117).
+#[cfg(unix)]
+#[test]
+fn test_continuous_hung_file_checks_hold_a_bounded_number_of_threads() {
+    common::isolate();
+    let hang = HeldPathCheck::default();
+    let names: Vec<String> = (0..40).map(|i| format!("h{i:02}_live.wav")).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let f = DecoderFixture::start_with("hung_cap", &names, 0, |c, tracks| hang.install(c, tracks));
+    let _release = hang.release_on_drop();
+    let total = || f.tracks.iter().map(|t| hang.calls(t)).sum::<usize>();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_about_real_time(
+        f.renderer.as_ref().unwrap().rate_over(Duration::from_millis(1200)),
+        "every check hangs",
+    );
+    // Long past the deadlines of a whole queue's worth of checks ahead.
+    std::thread::sleep(Duration::from_millis(6000));
+    let held = total();
+    assert!(
+        (1..=16).contains(&held),
+        "{} checks hung at once, one helper thread each",
+        held
+    );
+    assert_about_real_time(
+        f.renderer.as_ref().unwrap().rate_over(Duration::from_millis(1000)),
+        "still every check hangs",
+    );
+    hang.release();
+    wait_until("the files past the hung checks were never checked", || {
+        hang.calls(&f.tracks[39]) >= 1
+    });
+}
+
+/// A seek to a position that isn't a number starts the track from 0, and the stream doesn't spin
+/// on it (a NaN never equals itself) (#117).
+#[cfg(unix)]
+#[test]
+fn test_continuous_nan_seek_starts_from_zero() {
+    common::isolate();
+    let hang = HeldPathCheck::default();
+    let f = DecoderFixture::start_with("nan_seek", &["t0_live.wav", "t1_live.wav"], 0, |c, tracks| {
+        hang.install(c, &tracks[..1])
+    });
+    let _release = hang.release_on_drop();
+    wait_until("the file was never checked", || hang.calls(&f.tracks[0]) == 1);
+    f.controller.seek_to(f64::NAN);
+    assert_eq!(
+        f.controller.pending_request(),
+        Some(StreamRequest {
+            index: 0,
+            position: 0.0
+        })
+    );
+    hang.release();
+    assert_eq!(f.run(1), (f.tracks[0].clone(), None));
+    wait_until("the seek was never taken", || f.controller.pending_request().is_none());
+    f.controller.seek_to(-3.0);
+    assert_eq!(f.run(2), (f.tracks[0].clone(), None), "a negative seek starts from 0");
+}
+
+/// A request made while a look through the queue waits on a hung check starts a fresh look: a
+/// file found missing for the request before (the share remounted since) is checked again and
+/// plays (#117).
+#[cfg(unix)]
+#[test]
+fn test_continuous_new_request_during_a_look_checks_files_afresh() {
+    common::isolate();
+    let hang = HeldPathCheck::default();
+    let f = DecoderFixture::start_with(
+        "fresh_look",
+        &["t0_live.wav", "t1_live.wav", "t2_live.wav"],
+        0,
+        |c, t| {
+            std::fs::remove_file(&t[1]).unwrap();
+            hang.install(c, &t[2..])
+        },
+    );
+    let _release = hang.release_on_drop();
+    assert_eq!(f.run(1), (f.tracks[0].clone(), None));
+    f.controller.skip_to_index(1);
+    wait_until("the look never reached the hung file", || hang.calls(&f.tracks[2]) == 1);
+    std::fs::write(&f.tracks[1], b"back").unwrap();
+    f.controller.skip_to_index(1);
+    wait_until("the file back on the share never played", || {
+        f.decoder.calls().iter().any(|c| c.contains("t1_live"))
+    });
 }
