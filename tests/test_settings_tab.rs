@@ -1210,6 +1210,10 @@ fn library_index_row_names_each_state_and_leaves_out_what_is_unknown_or_zero() {
     set_progress(&app, IndexState::Done, [40, 40, 0, 1200, 1]);
     app.settings_mgr.settings.library_index = false;
     assert_eq!(value(&mut app), "OFF");
+    // Turned on again while the old thread finishes (a restart waiting for it): WAITING, not OFF.
+    app.settings_mgr.settings.library_index = true;
+    set_progress(&app, IndexState::Off, [40, 40, 0, 1200, 1]);
+    assert_eq!(value(&mut app), "WAITING");
 }
 
 /// The cursor never lands on the read-only rows: down from the Library Index setting is WEB.

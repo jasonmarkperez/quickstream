@@ -1091,6 +1091,8 @@ fn index_roots_are_the_startup_home_and_music_homes_without_overlap() {
 fn index_app(lib: &Path, db_path: &Path, reader: IndexTagReader) -> AppUI {
     let mut settings = quickstream::settings::SettingsManager::new();
     settings.settings.web_server_enabled = false;
+    // On whatever a test that toggled it saved to the shared config file.
+    settings.settings.library_index = true;
     let mut app = AppUI::new(Some(lib.to_path_buf()), settings);
     // Reading the folder the app opens at holds the indexer: let it finish first.
     common::wait_for_dir_scan(&mut app);
@@ -1219,6 +1221,64 @@ fn the_setting_off_stops_the_indexer_and_keeps_it_stopped() {
         1,
         "a changed home doesn't start it while off"
     );
+}
+
+/// Turned off and on again while the old thread is still busy (a read on a slow share), the
+/// restart waits for it, and the row reads WAITING meanwhile, not OFF (#146 review).
+#[test]
+fn turned_on_again_while_the_old_thread_finishes_it_reads_waiting() {
+    common::isolate();
+    let (lib, db_path) = scratch("app_waiting");
+    library_tree(&lib, 1, 1);
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let entered = Arc::new(AtomicUsize::new(0));
+    let reader: IndexTagReader = {
+        let (entered, release_rx, real) = (entered.clone(), Mutex::new(release_rx), default_tag_reader());
+        Arc::new(move |path: &Path, stamp| {
+            if entered.fetch_add(1, Ordering::SeqCst) == 0 {
+                let _ = release_rx.lock().unwrap().recv_timeout(Duration::from_secs(20));
+            }
+            real(path, stamp)
+        })
+    };
+    let mut app = index_app(&lib, &db_path, reader);
+    app.start_library_index();
+    poll_until(&mut app, "the first read", |_| entered.load(Ordering::SeqCst) == 1);
+    app.settings_cursor = quickstream::settings::setting::LIBRARY_INDEX;
+    app.cycle_and_apply_setting(true);
+    let progress = app.library_index_progress();
+    assert_eq!(progress.state(), IndexState::Off);
+    app.cycle_and_apply_setting(true);
+    assert!(app.settings_mgr.settings.library_index);
+    assert_eq!(app.library_index_starts(), 1, "the old thread is still busy");
+    assert_eq!(progress.state(), IndexState::Waiting);
+    drop(release_tx);
+    poll_until(&mut app, "the restart", |app| app.library_index_starts() == 2);
+    poll_until(&mut app, "Done", |_| progress.state() == IndexState::Done);
+}
+
+/// The folders to index are worked out again only when the Music Homes or the startup home
+/// change, not on every tick (#146 review).
+#[test]
+fn the_index_roots_are_worked_out_only_when_their_folders_change() {
+    common::isolate();
+    let (lib, db_path) = scratch("app_roots_cache");
+    library_tree(&lib, 1, 1);
+    let mut app = index_app(&lib, &db_path, default_tag_reader());
+    app.start_library_index();
+    let builds = app.library_index_root_builds();
+    for _ in 0..50 {
+        app.poll_library_index();
+    }
+    assert_eq!(app.library_index_root_builds(), builds, "no work on an unchanged tick");
+    app.bookmarks.push(lib.join("Artist 00").to_string_lossy().into_owned());
+    app.poll_library_index();
+    app.poll_library_index();
+    assert_eq!(app.library_index_root_builds(), builds + 1);
+    app.settings_mgr.settings.home_dir = Some("/Data/Other".to_string());
+    app.poll_library_index();
+    assert_eq!(app.library_index_root_builds(), builds + 2);
+    assert_eq!(app.index_roots(), [PathBuf::from("/Data/Other"), lib.clone()]);
 }
 
 /// A mix started under an index root makes the indexer walk the mix's folder next.

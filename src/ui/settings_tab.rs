@@ -108,14 +108,15 @@ fn analysis_value(progress: AnalysisProgress) -> String {
 }
 
 /// `READING  ·  412 / 5,981 FOLDERS  ·  18,330 READ  ·  40,112 UNCHANGED  ·  2 FAILED`: what
-/// the library indexer is doing (`OFF` while the setting is off). The folder count shows once the
+/// the library indexer is doing (`OFF` while the setting is off, `WAITING` before it starts or
+/// while a restart waits for the old thread to finish). The folder count shows once the
 /// total is known, and the file counts at zero are left out. The state comes first, as the value
 /// is cut from its end.
 fn index_value(progress: IndexSnapshot, on: bool) -> String {
     let state = match progress.state {
         _ if !on => return "OFF".to_string(),
-        IndexState::Off => return "OFF".to_string(),
-        IndexState::Waiting => return "WAITING".to_string(),
+        // On again, its restart waiting for the old thread to finish.
+        IndexState::Off | IndexState::Waiting => return "WAITING".to_string(),
         IndexState::NoFolders => return "NO FOLDERS".to_string(),
         IndexState::Unavailable => return "UNAVAILABLE".to_string(),
         IndexState::Reading => "READING",
