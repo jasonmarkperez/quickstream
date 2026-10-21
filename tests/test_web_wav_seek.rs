@@ -500,8 +500,7 @@ fn test_rf64_seek_sends_riff_header_when_it_fits() {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // A small RF64 may keep its real 32-bit data size; one without a ds64 chunk has an unknown
-    // data size, which runs to the end of the file as in a RIFF.
+    // A small RF64 may keep its real 32-bit data size.
     let mut real_size = rf64(b"RF64", &fmt, &audio, Some(audio.len() as u64), &[list_chunk()]);
     let data_at = real_size.windows(4).position(|w| w == b"data").unwrap();
     real_size[data_at + 4..data_at + 8].copy_from_slice(&(audio.len() as u32).to_le_bytes());
@@ -509,14 +508,141 @@ fn test_rf64_seek_sends_riff_header_when_it_fits() {
     assert_seeked(handle.port, "rf64_real.wav", "0.5", &fmt, &audio);
     handle.stop();
     let _ = fs::remove_dir_all(&dir);
+}
 
-    let no_ds64 = rf64(b"RF64", &fmt, &audio, None, &[]);
-    let (handle, dir) = serve("rf64_no_ds64", "no_ds64.wav", &no_ds64);
-    let (status, headers, body) = get(handle.port, "/stream/no_ds64.wav?pos=1.0001", None);
-    assert_eq!(status, 200, "{}", headers);
+#[test]
+fn test_rf64_seek_without_data_size_serves_whole_file() {
+    common::isolate();
+    // An RF64 whose data size is unknown (no ds64 chunk, or a ds64 data size of 0 or all ones)
+    // has no end for its data chunk, so a seek would send the trailing chunks as audio: the server
+    // serves the whole file, and the player is told it can't seek it.
+    let fmt = pcm_fmt(2, 16);
+    let audio = pcm(RATE as usize * 4 * 2);
+    for (name, ds64) in [
+        ("no_ds64.wav", None),
+        ("ds64_zero.wav", Some(0)),
+        ("ds64_ones.wav", Some(u64::MAX)),
+    ] {
+        let file = rf64(b"RF64", &fmt, &audio, ds64, &[list_chunk()]);
+        let (handle, dir) = serve(name, name, &file);
+        for pos in ["1.0001", "0.5"] {
+            let (status, headers, body) = get(handle.port, &format!("/stream/{}?pos={}", name, pos), None);
+            assert_eq!(status, 200, "{}?pos={}: {}", name, pos, headers);
+            assert!(body == file, "{}?pos={}: the whole file, unchanged", name, pos);
+        }
+        assert!(
+            matches!(
+                quickstream::web::check_stream_seek(&dir.join(name), 1.0),
+                Err(quickstream::web::StreamSeekError::Unseekable(_))
+            ),
+            "{}: the player is told",
+            name
+        );
+        handle.stop();
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn test_riff_seek_near_4gib_keeps_riff_header() {
+    common::isolate();
+    // A plain RIFF whose known audio leaves no room for the RIFF size (issue #112): RIFF with both
+    // sizes 0xFFFFFFFF, as before, never an RF64 header a renderer may not read.
+    let fmt = pcm_fmt(2, 16);
+    let data_size: u32 = 0xFFFF_FFF0;
+    let pattern = pcm(64 * 1024);
+    let mut head = riff(&[chunk(b"fmt ", 16, &fmt)]);
+    head.extend_from_slice(b"data");
+    head.extend_from_slice(&data_size.to_le_bytes());
+    let audio_at = head.len();
+    head.extend_from_slice(&pattern);
+    let dir = common::isolate().join("wav_seek_riff_big");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("big_riff.wav");
+    {
+        let mut f = fs::File::create(&path).unwrap();
+        f.write_all(&head).unwrap();
+        f.set_len(audio_at as u64 + u64::from(data_size)).unwrap();
+    }
+    let state = Arc::new(RwLock::new(NowPlayingState::default()));
+    let (tx, _rx) = mpsc::channel();
+    let handle = WebServer::start(0, state, tx).expect("start web server");
+    handle.register_stream_file(&path);
+
+    let (status, headers, body) = get(handle.port, "/stream/big_riff.wav?pos=0.0001", Some("bytes=0-1023"));
+    assert_eq!(status, 206, "{}", headers);
     let wav = parse_wav(&body);
-    assert_eq!((wav.riff_size, wav.data_size), (u32::MAX, u32::MAX), "length unknown");
-    assert!(body[wav.data_offset..] == audio[32_000..]);
+    assert_eq!(
+        (wav.riff_size, wav.data_size),
+        (u32::MAX, u32::MAX),
+        "RIFF, sizes unknown"
+    );
+    assert_eq!(wav.fmt, fmt);
+    assert_eq!(wav.data_offset, 44);
+    assert_eq!(&body[44..], &pattern[..1024 - 44]);
+
+    handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_wav_seek_check_read_error_is_not_unseekable() {
+    common::isolate();
+    // A path that opens but can't be read (a directory named like a WAV) or that is gone is an
+    // I/O error, which the player's check reports as it is, not as a file it can't seek.
+    let dir = common::isolate().join("wav_seek_read_error");
+    let not_a_file = dir.join("folder.wav");
+    fs::create_dir_all(not_a_file.join("inner")).unwrap();
+    let missing = dir.join("missing.wav");
+    for path in [&not_a_file, &missing] {
+        assert!(
+            matches!(
+                quickstream::web::check_stream_seek(path, 1.0),
+                Err(quickstream::web::StreamSeekError::Io(_))
+            ),
+            "{}",
+            path.display()
+        );
+    }
+    // A file cut short inside its header is a layout error, not an I/O one.
+    let short = dir.join("short.wav");
+    fs::write(&short, b"RIFF\x24\x00").unwrap();
+    assert!(matches!(
+        quickstream::web::check_stream_seek(&short, 1.0),
+        Err(quickstream::web::StreamSeekError::Unseekable(_))
+    ));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_wav_seek_failure_logged_again_for_a_new_reason() {
+    common::isolate();
+    // Logged once per file and reason: a file that breaks another way is logged again.
+    let audio = pcm(RATE as usize * 4);
+    let short_fmt = riff(&[
+        chunk(b"fmt ", 14, &pcm_fmt(2, 16)[..14]),
+        chunk(b"data", audio.len() as u32, &audio),
+    ]);
+    let (handle, dir) = serve("relog", "relog.wav", &short_fmt);
+    let path = dir.join("relog.wav");
+    let log_path = quickstream::logger::init();
+    let warned = format!("Can't seek '{}'", path.display());
+    let count = || {
+        assert!(quickstream::logger::flush(), "the log was flushed");
+        fs::read_to_string(&log_path)
+            .unwrap_or_default()
+            .matches(&warned)
+            .count()
+    };
+    for _ in 0..2 {
+        assert_eq!(get(handle.port, "/stream/relog.wav?pos=1.0", None).0, 200);
+    }
+    assert_eq!(count(), 1, "logged once");
+    fs::write(&path, riff(&[chunk(b"fmt ", 16, &pcm_fmt(2, 16)), list_chunk()])).unwrap();
+    for _ in 0..2 {
+        assert_eq!(get(handle.port, "/stream/relog.wav?pos=1.0", None).0, 200);
+    }
+    assert_eq!(count(), 2, "the new reason is logged, once");
     handle.stop();
     let _ = fs::remove_dir_all(&dir);
 }

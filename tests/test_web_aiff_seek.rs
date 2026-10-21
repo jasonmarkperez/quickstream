@@ -335,6 +335,11 @@ fn test_aiff_seek_unseekable_serves_whole_file() {
     zero_rate[8..18].copy_from_slice(&[0; 10]);
     let mut zero_channels = good.clone();
     zero_channels[0..2].copy_from_slice(&0u16.to_be_bytes());
+    // Rates no audio has: half a hertz (exponent one under the bias) and 20 MHz.
+    let mut half_hz = good.clone();
+    half_hz[8..10].copy_from_slice(&16382u16.to_be_bytes());
+    half_hz[10..18].copy_from_slice(&(1u64 << 63).to_be_bytes());
+    let huge_rate = comm(2, 8000, 16, 20_000_000);
     let ima4 = comm_aifc(2, 8000, 16, 8000, b"ima4", "IMA 4:1");
     let cases: Vec<(&str, Vec<u8>)> = vec![
         ("no_comm.aiff", form(b"AIFF", &[ssnd(0, &sound)])),
@@ -350,6 +355,14 @@ fn test_aiff_seek_unseekable_serves_whole_file() {
         (
             "zero_channels.aiff",
             form(b"AIFF", &[chunk(b"COMM", 18, &zero_channels), ssnd(0, &sound)]),
+        ),
+        (
+            "half_hz.aiff",
+            form(b"AIFF", &[chunk(b"COMM", 18, &half_hz), ssnd(0, &sound)]),
+        ),
+        (
+            "huge_rate.aiff",
+            form(b"AIFF", &[chunk(b"COMM", 18, &huge_rate), ssnd(0, &sound)]),
         ),
         // A compressed AIFC has no fixed frame size to seek by.
         (

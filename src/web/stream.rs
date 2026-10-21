@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use super::server::write_not_found;
+use super::server::{write_not_found, write_server_error};
 use super::state::{NowPlayingState, WebCommand};
 
 /// An armed continuous stream: the renderer must request `/stream/continuous-<nonce>.wav`.
@@ -347,8 +347,9 @@ pub struct StreamServerState {
     pub file_registry: RwLock<HashMap<String, PathBuf>>,
     pub continuous: Arc<ContinuousStreamController>,
     next_conn_id: AtomicU64,
-    /// Files whose `?pos=` seek failed and was logged, so it is logged once per file.
-    seek_failures: Mutex<HashSet<PathBuf>>,
+    /// Files whose `?pos=` seek failed and was logged, with the reason, so each failure is logged
+    /// once.
+    seek_failures: Mutex<HashSet<(PathBuf, &'static str)>>,
 }
 
 impl Default for StreamServerState {
@@ -402,9 +403,10 @@ impl StreamServerState {
         }
     }
 
-    /// Note that a `?pos=` seek of `path` failed: true the first time for that file.
-    fn first_seek_failure(&self, path: &Path) -> bool {
-        self.seek_failures.lock().unwrap().insert(path.to_path_buf())
+    /// Note that a `?pos=` seek of `path` failed because of `why`: true the first time for that
+    /// file and reason.
+    fn first_seek_failure(&self, path: &Path, why: &'static str) -> bool {
+        self.seek_failures.lock().unwrap().insert((path.to_path_buf(), why))
     }
 
     /// Untrack an active streaming socket when the request finishes.
@@ -523,32 +525,86 @@ const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 /// (64 bits each), and the table's entry count.
 const DS64_BODY: u32 = 28;
 
+/// Why a `?pos=` seek of a WAV or AIFF can't start where it asks.
+#[derive(Debug)]
+pub enum StreamSeekError {
+    /// The file couldn't be opened or read (gone, or a share that failed): nothing is known about
+    /// its layout, so this says nothing about whether it can be seeked.
+    Io(std::io::Error),
+    /// Its header can't be used (corrupt, compressed AIFC, an RF64 without a data size): the
+    /// server serves the whole file from 0:00 instead.
+    Unseekable(&'static str),
+}
+
+use StreamSeekError::Unseekable;
+
+impl From<std::io::Error> for StreamSeekError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl std::fmt::Display for StreamSeekError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "{}", e),
+            Self::Unseekable(why) => write!(f, "{}", why),
+        }
+    }
+}
+
+/// Fill `buf` from `file`: a file that ends first is unseekable (`why`), any other failure an I/O
+/// error.
+fn read_field(file: &mut std::fs::File, buf: &mut [u8], why: &'static str) -> Result<(), StreamSeekError> {
+    use std::io::Read;
+    match file.read_exact(buf) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Err(Unseekable(why)),
+        Err(e) => Err(StreamSeekError::Io(e)),
+    }
+}
+
+/// Read a chunk header at `pos`: `None` when the file ends first.
+fn read_chunk_header(file: &mut std::fs::File, pos: u64) -> Result<Option<[u8; 8]>, StreamSeekError> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(pos))?;
+    let mut chunk_hdr = [0u8; 8];
+    match file.read_exact(&mut chunk_hdr) {
+        Ok(()) => Ok(Some(chunk_hdr)),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(StreamSeekError::Io(e)),
+    }
+}
+
 /// The chunks of a WAV file that a seek needs.
 struct WavLayout {
+    /// An RF64 / BW64, whose sizes may need 64 bits.
+    rf64: bool,
     /// The `fmt ` chunk's body, as it is in the file.
     fmt: Vec<u8>,
     /// Where the `data` chunk's audio starts and ends in the file (clamped to the file).
     data_start: u64,
     data_end: u64,
-    /// The `data` size was 0 or `0xFFFFFFFF` (with no `ds64` size for it): the audio runs to the
-    /// end of the file.
+    /// A RIFF's `data` size was 0 or `0xFFFFFFFF`: the audio runs to the end of the file. (An
+    /// RF64 without a `ds64` size for it is unseekable: its trailing chunks would be sent as audio.)
     size_unknown: bool,
 }
 
 /// Walk the chunks of a WAV file of `file_len` bytes, with every size bounded by the file: a
 /// RIFF/WAVE, or an RF64 / BW64 (EBU Tech 3306 / ITU-R BS.2088), whose `ds64` chunk holds the
 /// real data size behind a 32-bit `0xFFFFFFFF`.
-fn read_wav_layout(file: &mut std::fs::File, file_len: u64) -> Result<WavLayout, &'static str> {
-    use std::io::{Read, Seek, SeekFrom};
+fn read_wav_layout(file: &mut std::fs::File, file_len: u64) -> Result<WavLayout, StreamSeekError> {
+    use std::io::{Seek, SeekFrom};
     let mut riff_hdr = [0u8; 12];
-    file.seek(SeekFrom::Start(0)).map_err(|_| "can't read the file")?;
-    if file.read_exact(&mut riff_hdr).is_err() || &riff_hdr[8..12] != b"WAVE" {
-        return Err("not a RIFF/WAVE file");
+    file.seek(SeekFrom::Start(0))?;
+    read_field(file, &mut riff_hdr, "not a RIFF/WAVE file")?;
+    if &riff_hdr[8..12] != b"WAVE" {
+        return Err(Unseekable("not a RIFF/WAVE file"));
     }
     let rf64 = match &riff_hdr[0..4] {
         b"RIFF" => false,
         b"RF64" | b"BW64" => true,
-        _ => return Err("not a RIFF/WAVE file"),
+        _ => return Err(Unseekable("not a RIFF/WAVE file")),
     };
     let mut fmt: Option<Vec<u8>> = None;
     let mut data: Option<(u64, u64, bool)> = None;
@@ -556,10 +612,9 @@ fn read_wav_layout(file: &mut std::fs::File, file_len: u64) -> Result<WavLayout,
     let mut ds64_data: Option<u64> = None;
     let mut pos = 12u64;
     while pos.saturating_add(8) <= file_len {
-        let mut chunk_hdr = [0u8; 8];
-        if file.seek(SeekFrom::Start(pos)).is_err() || file.read_exact(&mut chunk_hdr).is_err() {
+        let Some(chunk_hdr) = read_chunk_header(file, pos)? else {
             break;
-        }
+        };
         let size = u32::from_le_bytes(chunk_hdr[4..8].try_into().unwrap());
         let body = pos + 8;
         let available = file_len - body;
@@ -568,22 +623,22 @@ fn read_wav_layout(file: &mut std::fs::File, file_len: u64) -> Result<WavLayout,
         match &chunk_hdr[0..4] {
             b"ds64" if rf64 && ds64_data.is_none() => {
                 if size < DS64_BODY || u64::from(size) > available {
-                    return Err("ds64 chunk shorter than 28 bytes or larger than the file");
+                    return Err(Unseekable("ds64 chunk shorter than 28 bytes or larger than the file"));
                 }
                 let mut bytes = [0u8; 16];
-                file.read_exact(&mut bytes).map_err(|_| "can't read the ds64 chunk")?;
+                read_field(file, &mut bytes, "can't read the ds64 chunk")?;
                 let data_size = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
                 ds64_data = Some(data_size).filter(|&s| s != 0 && s != u64::MAX);
             }
             b"fmt " if fmt.is_none() => {
                 if size < 16 {
-                    return Err("fmt chunk shorter than 16 bytes");
+                    return Err(Unseekable("fmt chunk shorter than 16 bytes"));
                 }
                 if u64::from(size) > MAX_WAV_FMT_CHUNK.min(available) {
-                    return Err("fmt chunk larger than 64 KiB or the file");
+                    return Err(Unseekable("fmt chunk larger than 64 KiB or the file"));
                 }
                 let mut bytes = vec![0u8; size as usize];
-                file.read_exact(&mut bytes).map_err(|_| "can't read the fmt chunk")?;
+                read_field(file, &mut bytes, "can't read the fmt chunk")?;
                 fmt = Some(bytes);
             }
             b"data" if data.is_none() => {
@@ -592,6 +647,9 @@ fn read_wav_layout(file: &mut std::fs::File, file_len: u64) -> Result<WavLayout,
                     _ if size == 0 || size == WAV_UNKNOWN_SIZE => None,
                     _ => Some(u64::from(size)),
                 };
+                if rf64 && real_size.is_none() {
+                    return Err(Unseekable("RF64 without a ds64 data size"));
+                }
                 let size_unknown = real_size.is_none();
                 len = real_size.unwrap_or(available);
                 data = Some((body, body + len.min(available), size_unknown));
@@ -608,9 +666,10 @@ fn read_wav_layout(file: &mut std::fs::File, file_len: u64) -> Result<WavLayout,
         // Chunks are padded to an even length.
         pos = body.saturating_add(len).saturating_add(len & 1);
     }
-    let fmt = fmt.ok_or("no fmt chunk before the audio")?;
-    let (data_start, data_end, size_unknown) = data.ok_or("no data chunk")?;
+    let fmt = fmt.ok_or(Unseekable("no fmt chunk before the audio"))?;
+    let (data_start, data_end, size_unknown) = data.ok_or(Unseekable("no data chunk"))?;
     Ok(WavLayout {
+        rf64,
         fmt,
         data_start,
         data_end,
@@ -632,16 +691,15 @@ pub fn wav_header_sizes(fmt_len: u64, audio_len: u64, size_unknown: bool) -> (u3
     }
 }
 
-/// Seek a WAV file of `file_len` bytes to `offset_seconds`: the audio from the block at or before
-/// that time to the last whole block of the `data` chunk, behind a new RIFF header with the file's
-/// own `fmt ` chunk (so WAVE_FORMAT_EXTENSIBLE and 24-bit files stay decodable) and sizes that
-/// match it. Known audio too long for 32-bit sizes (an RF64 over 4 GiB) gets an RF64 header with
-/// its sizes in a `ds64` chunk instead.
-fn find_wav_pcm_offset(
-    file: &mut std::fs::File,
-    offset_seconds: f64,
-    file_len: u64,
-) -> Result<StreamOffset, &'static str> {
+/// A WAV's layout and the numbers its seek goes by, checked.
+struct WavSeek {
+    layout: WavLayout,
+    byte_rate: u64,
+    block_align: u64,
+}
+
+/// Read and check what a seek in a WAV file of `file_len` bytes needs, without building a header.
+fn wav_seek(file: &mut std::fs::File, file_len: u64) -> Result<WavSeek, StreamSeekError> {
     let layout = read_wav_layout(file, file_len)?;
     let fmt = &layout.fmt;
     let format_tag = u16::from_le_bytes(fmt[0..2].try_into().unwrap());
@@ -654,8 +712,32 @@ fn find_wav_pcm_offset(
         _ => u64::from(u32::from_le_bytes(fmt[8..12].try_into().unwrap())),
     };
     if byte_rate == 0 || block_align == 0 {
-        return Err("zero byte rate or block align");
+        return Err(Unseekable("zero byte rate or block align"));
     }
+    Ok(WavSeek {
+        layout,
+        byte_rate,
+        block_align,
+    })
+}
+
+/// Seek a WAV file of `file_len` bytes to `offset_seconds`: the audio from the block at or before
+/// that time to the last whole block of the `data` chunk, behind a new RIFF header with the file's
+/// own `fmt ` chunk (so WAVE_FORMAT_EXTENSIBLE and 24-bit files stay decodable) and sizes that
+/// match it. An RF64 source whose known audio is too long for 32-bit sizes gets an RF64 header
+/// with its sizes in a `ds64` chunk instead; a plain RIFF keeps a RIFF header (both sizes
+/// `0xFFFFFFFF` when they don't fit, issue #112), which every renderer reads.
+fn find_wav_pcm_offset(
+    file: &mut std::fs::File,
+    offset_seconds: f64,
+    file_len: u64,
+) -> Result<StreamOffset, StreamSeekError> {
+    let WavSeek {
+        layout,
+        byte_rate,
+        block_align,
+    } = wav_seek(file, file_len)?;
+    let fmt = &layout.fmt;
 
     // Whole blocks only, at both ends: a truncated file or an odd data size ends in a partial
     // frame, which is left out of the audio and the header's size.
@@ -671,7 +753,7 @@ fn find_wav_pcm_offset(
     let fmt_len = fmt.len() as u64;
     let fmt_pad = fmt_len & 1;
     let (riff_size, data_size) = wav_header_sizes(fmt_len, remaining, layout.size_unknown);
-    let rf64 = !layout.size_unknown && data_size == WAV_UNKNOWN_SIZE;
+    let rf64 = layout.rf64 && data_size == WAV_UNKNOWN_SIZE;
 
     let mut hdr = Vec::with_capacity(28 + 8 + DS64_BODY as usize + fmt.len() + 1);
     if rf64 {
@@ -726,51 +808,52 @@ struct AiffLayout {
 
 /// Walk the big-endian chunks of an AIFF or AIFC file of `file_len` bytes, with every size
 /// bounded by the file.
-fn read_aiff_layout(file: &mut std::fs::File, file_len: u64) -> Result<AiffLayout, &'static str> {
-    use std::io::{Read, Seek, SeekFrom};
+fn read_aiff_layout(file: &mut std::fs::File, file_len: u64) -> Result<AiffLayout, StreamSeekError> {
+    use std::io::{Seek, SeekFrom};
     let mut form_hdr = [0u8; 12];
-    file.seek(SeekFrom::Start(0)).map_err(|_| "can't read the file")?;
-    if file.read_exact(&mut form_hdr).is_err() || &form_hdr[0..4] != b"FORM" {
-        return Err("not an AIFF file");
+    file.seek(SeekFrom::Start(0))?;
+    read_field(file, &mut form_hdr, "not an AIFF file")?;
+    if &form_hdr[0..4] != b"FORM" {
+        return Err(Unseekable("not an AIFF file"));
     }
     let aifc = match &form_hdr[8..12] {
         b"AIFF" => false,
         b"AIFC" => true,
-        _ => return Err("not an AIFF file"),
+        _ => return Err(Unseekable("not an AIFF file")),
     };
     let mut comm: Option<Vec<u8>> = None;
     let mut data: Option<(u64, u64)> = None;
     let mut pos = 12u64;
     while pos.saturating_add(8) <= file_len {
-        let mut chunk_hdr = [0u8; 8];
-        if file.seek(SeekFrom::Start(pos)).is_err() || file.read_exact(&mut chunk_hdr).is_err() {
+        let Some(chunk_hdr) = read_chunk_header(file, pos)? else {
             break;
-        }
+        };
         let size = u64::from(u32::from_be_bytes(chunk_hdr[4..8].try_into().unwrap()));
         let body = pos + 8;
         let available = file_len - body;
         match &chunk_hdr[0..4] {
             b"COMM" if comm.is_none() => {
                 if size < 18 {
-                    return Err("COMM chunk shorter than 18 bytes");
+                    return Err(Unseekable("COMM chunk shorter than 18 bytes"));
                 }
                 if size > MAX_AIFF_COMM_CHUNK.min(available) {
-                    return Err("COMM chunk larger than 64 KiB or the file");
+                    return Err(Unseekable("COMM chunk larger than 64 KiB or the file"));
                 }
                 let mut bytes = vec![0u8; size as usize];
-                file.read_exact(&mut bytes).map_err(|_| "can't read the COMM chunk")?;
+                read_field(file, &mut bytes, "can't read the COMM chunk")?;
                 comm = Some(bytes);
             }
             b"SSND" if data.is_none() => {
                 // A truncated file's SSND chunk ends with the file.
                 let len = size.min(available);
                 let mut fields = [0u8; 8];
-                if len < 8 || file.read_exact(&mut fields).is_err() {
-                    return Err("SSND chunk shorter than 8 bytes");
+                if len < 8 {
+                    return Err(Unseekable("SSND chunk shorter than 8 bytes"));
                 }
+                read_field(file, &mut fields, "SSND chunk shorter than 8 bytes")?;
                 let offset = u64::from(u32::from_be_bytes(fields[0..4].try_into().unwrap()));
                 if offset > len - 8 {
-                    return Err("SSND offset past the chunk's end");
+                    return Err(Unseekable("SSND offset past the chunk's end"));
                 }
                 data = Some((body + 8 + offset, body + len));
             }
@@ -782,8 +865,8 @@ fn read_aiff_layout(file: &mut std::fs::File, file_len: u64) -> Result<AiffLayou
         // Chunks are padded to an even length.
         pos = body + size + (size & 1);
     }
-    let comm = comm.ok_or("no COMM chunk")?;
-    let (data_start, data_end) = data.ok_or("no SSND chunk")?;
+    let comm = comm.ok_or(Unseekable("no COMM chunk"))?;
+    let (data_start, data_end) = data.ok_or(Unseekable("no SSND chunk"))?;
     Ok(AiffLayout {
         aifc,
         comm,
@@ -809,15 +892,21 @@ fn extended_to_f64(bytes: &[u8]) -> f64 {
     }
 }
 
-/// Seek an AIFF or AIFC file of `file_len` bytes to `offset_seconds`: the sound data from the
-/// frame at or before that time to the last whole frame, behind a new `FORM` header with the
-/// file's own `COMM` chunk (its frame count set to what is sent) and an `SSND` chunk with offset
-/// and block size 0. Compressed AIFC types, which have no fixed frame size, are refused.
-fn find_aiff_offset(
-    file: &mut std::fs::File,
-    offset_seconds: f64,
-    file_len: u64,
-) -> Result<StreamOffset, &'static str> {
+/// The sample rates an AIFF seek takes: a `COMM` rate outside them is corrupt, and seeking by it
+/// would land nowhere near the time asked for.
+const AIFF_RATES: std::ops::RangeInclusive<f64> = 1.0..=10_000_000.0;
+
+/// An AIFF's layout and the numbers its seek goes by, checked.
+struct AiffSeek {
+    layout: AiffLayout,
+    /// Bytes per sample frame.
+    frame: u64,
+    sample_rate: f64,
+}
+
+/// Read and check what a seek in an AIFF or AIFC file of `file_len` bytes needs. Compressed AIFC
+/// types, which have no fixed frame size, are refused.
+fn aiff_seek(file: &mut std::fs::File, file_len: u64) -> Result<AiffSeek, StreamSeekError> {
     let layout = read_aiff_layout(file, file_len)?;
     let comm = &layout.comm;
     let channels = u64::from(u16::from_be_bytes([comm[0], comm[1]]));
@@ -825,26 +914,51 @@ fn find_aiff_offset(
     let sample_rate = extended_to_f64(&comm[8..18]);
     let bytes_per_sample = if layout.aifc {
         if comm.len() < 22 {
-            return Err("AIFC COMM chunk without a compression type");
+            return Err(Unseekable("AIFC COMM chunk without a compression type"));
         }
         match &comm[18..22] {
             b"NONE" | b"twos" | b"sowt" | b"raw " | b"in24" | b"42ni" | b"in32" | b"23ni" => sample_bits.div_ceil(8),
             b"fl32" | b"FL32" => 4,
             b"fl64" | b"FL64" => 8,
             b"ulaw" | b"ULAW" | b"alaw" | b"ALAW" => 1,
-            _ => return Err("compressed AIFC audio"),
+            _ => return Err(Unseekable("compressed AIFC audio")),
         }
     } else {
         sample_bits.div_ceil(8)
     };
     let frame = channels * bytes_per_sample;
     if frame == 0 {
-        return Err("zero channels or sample size");
+        return Err(Unseekable("zero channels or sample size"));
     }
-    if !(sample_rate.is_finite() && sample_rate > 0.0) {
-        return Err("zero or invalid sample rate");
+    if !AIFF_RATES.contains(&sample_rate) {
+        return Err(Unseekable("sample rate zero, invalid or outside 1 Hz to 10 MHz"));
     }
+    Ok(AiffSeek {
+        layout,
+        frame,
+        sample_rate,
+    })
+}
 
+/// What an AIFF seek to a time sends: the file's bytes `start..end` and the sizes its header
+/// gives them.
+struct AiffSpan {
+    start: u64,
+    end: u64,
+    form_size: u32,
+    ssnd_size: u32,
+    frames: u32,
+}
+
+/// The sound data from the frame at or before `offset_seconds` to the last whole frame, and its
+/// header's sizes, which must fit in 32 bits.
+fn aiff_span(seek: &AiffSeek, offset_seconds: f64) -> Result<AiffSpan, StreamSeekError> {
+    let AiffSeek {
+        layout,
+        frame,
+        sample_rate,
+    } = seek;
+    let frame = *frame;
     // Whole frames only, at both ends, as for a WAV.
     let data_len = (layout.data_end - layout.data_start) / frame * frame;
     // The casts saturate, so a `pos` past the end lands at the end of the last whole frame.
@@ -854,19 +968,48 @@ fn find_aiff_offset(
     let end = layout.data_start + data_len;
     let remaining = end - start;
 
-    let comm_len = comm.len() as u64;
+    let comm_len = layout.comm.len() as u64;
     let fver_len = if layout.aifc { AIFC_FVER.len() as u64 } else { 0 };
     // The SSND chunk: its offset and block size fields, then the audio and a pad byte when odd.
     let ssnd_size = 8 + remaining;
-    let pad = remaining & 1;
-    let form_size = 4 + fver_len + 8 + comm_len + (comm_len & 1) + 8 + ssnd_size + pad;
+    let form_size = 4 + fver_len + 8 + comm_len + (comm_len & 1) + 8 + ssnd_size + (remaining & 1);
     let (Ok(form_size), Ok(ssnd_size), Ok(frames)) = (
         u32::try_from(form_size),
         u32::try_from(ssnd_size),
         u32::try_from(remaining / frame),
     ) else {
-        return Err("audio too long for an AIFF header");
+        return Err(Unseekable("audio too long for an AIFF header"));
     };
+    Ok(AiffSpan {
+        start,
+        end,
+        form_size,
+        ssnd_size,
+        frames,
+    })
+}
+
+/// Seek an AIFF or AIFC file of `file_len` bytes to `offset_seconds`: the sound data from the
+/// frame at or before that time to the last whole frame, behind a new `FORM` header with the
+/// file's own `COMM` chunk (its frame count set to what is sent) and an `SSND` chunk with offset
+/// and block size 0.
+fn find_aiff_offset(
+    file: &mut std::fs::File,
+    offset_seconds: f64,
+    file_len: u64,
+) -> Result<StreamOffset, StreamSeekError> {
+    let seek = aiff_seek(file, file_len)?;
+    let AiffSpan {
+        start,
+        end,
+        form_size,
+        ssnd_size,
+        frames,
+    } = aiff_span(&seek, offset_seconds)?;
+    let layout = &seek.layout;
+    let comm = &layout.comm;
+    let comm_len = comm.len() as u64;
+    let pad = (end - start) & 1;
 
     let mut hdr = Vec::with_capacity(12 + AIFC_FVER.len() + 8 + comm.len() + 1 + 16);
     hdr.extend_from_slice(b"FORM");
@@ -909,6 +1052,11 @@ pub(super) struct StreamOffset {
     pub(super) trailer: Option<Vec<u8>>,
 }
 
+/// `path`'s extension in lowercase, which picks how a seek finds its offset.
+fn lowercase_extension(path: &Path) -> String {
+    path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase()
+}
+
 /// A container whose seek sends a new header before the audio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SeekContainer {
@@ -917,37 +1065,58 @@ enum SeekContainer {
 }
 
 impl SeekContainer {
-    fn of(path: &Path) -> Option<Self> {
-        let ext = path.extension()?.to_str()?.to_lowercase();
-        match ext.as_str() {
+    /// The container a file with the lowercase extension `ext` is.
+    fn of(ext: &str) -> Option<Self> {
+        match ext {
             "wav" | "wave" => Some(Self::Wav),
             "aif" | "aiff" | "aifc" => Some(Self::Aiff),
             _ => None,
         }
     }
 
-    fn seek(self, file: &mut std::fs::File, offset_seconds: f64, file_len: u64) -> Result<StreamOffset, &'static str> {
+    fn seek(
+        self,
+        file: &mut std::fs::File,
+        offset_seconds: f64,
+        file_len: u64,
+    ) -> Result<StreamOffset, StreamSeekError> {
         match self {
             Self::Wav => find_wav_pcm_offset(file, offset_seconds, file_len),
             Self::Aiff => find_aiff_offset(file, offset_seconds, file_len),
         }
     }
+
+    /// Whether [`seek`](Self::seek) would work, read and checked the same way but without
+    /// building the header.
+    fn check(self, file: &mut std::fs::File, offset_seconds: f64, file_len: u64) -> Result<(), StreamSeekError> {
+        match self {
+            Self::Wav => wav_seek(file, file_len).map(|_| ()),
+            Self::Aiff => aiff_seek(file, file_len).and_then(|seek| aiff_span(&seek, offset_seconds).map(|_| ())),
+        }
+    }
 }
 
-/// Whether a `/stream/<name>?pos=` request for `path` starts where it asks. `Err` with the reason
-/// when `path` is a WAV or AIFF whose header the seek can't use (corrupt, or compressed AIFC),
-/// which the server answers with the whole file from 0:00, so the player can start from 0 and
-/// say why instead of showing a position the audio isn't at (issue #116). Reads the file's
+/// Whether a `/stream/<name>?pos=<offset_seconds>` request for `path` starts where it asks.
+/// `Unseekable` when `path` is a WAV or AIFF whose header the seek can't use (corrupt, compressed
+/// AIFC, an RF64 without a data size), which the server answers with the whole file from 0:00, so
+/// the player can say so instead of showing a position the audio isn't at (issue #116). `Io` when
+/// the file couldn't be opened or read, which says nothing about its header. Reads the file's
 /// header: call it off the UI thread.
-pub fn check_stream_seek(path: &Path) -> Result<(), String> {
-    let Some(container) = SeekContainer::of(path) else {
+pub fn check_stream_seek(path: &Path, offset_seconds: f64) -> Result<(), StreamSeekError> {
+    if offset_seconds <= 0.0 {
+        return Ok(());
+    }
+    let Some(container) = SeekContainer::of(&lowercase_extension(path)) else {
         return Ok(());
     };
-    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let len = file.metadata().map_err(|e| e.to_string())?.len();
-    container.seek(&mut file, 0.0, len).map(|_| ()).map_err(str::to_string)
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    container.check(&mut file, offset_seconds, len)
 }
 
+/// Where a `?pos=` response for `filepath` starts. A WAV or AIFF the seek can't use is served
+/// whole from 0:00 (logged once per file and reason); an I/O error reading its header is returned,
+/// so the response fails instead of playing the file from a time the player didn't ask for.
 pub(super) fn calculate_stream_offset(
     filepath: &std::path::Path,
     file: &mut std::fs::File,
@@ -955,7 +1124,7 @@ pub(super) fn calculate_stream_offset(
     total_size: u64,
     duration_hint: f64,
     stream_state: &StreamServerState,
-) -> StreamOffset {
+) -> std::io::Result<StreamOffset> {
     let from_start = StreamOffset {
         start: 0,
         end: total_size,
@@ -963,22 +1132,19 @@ pub(super) fn calculate_stream_offset(
         trailer: None,
     };
     if offset_seconds <= 0.0 || total_size == 0 {
-        return from_start;
+        return Ok(from_start);
     }
-    let ext = filepath
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
+    let ext = lowercase_extension(filepath);
 
-    if let Some(container) = SeekContainer::of(filepath) {
+    if let Some(container) = SeekContainer::of(&ext) {
         return match container.seek(file, offset_seconds, total_size) {
-            Ok(offset) => offset,
-            Err(why) => {
+            Ok(offset) => Ok(offset),
+            Err(StreamSeekError::Io(e)) => Err(e),
+            Err(Unseekable(why)) => {
                 // UPnPPlayer checks first (`check_stream_seek`) and asks for the start instead;
                 // a renderer still retries a URL with HEAD and Range requests, so say it once
-                // per file.
-                if stream_state.first_seek_failure(filepath) {
+                // per file and reason.
+                if stream_state.first_seek_failure(filepath, why) {
                     crate::log_warn!(
                         "web",
                         "Can't seek '{}' to {:.2}s ({}); serving it from the start",
@@ -987,7 +1153,7 @@ pub(super) fn calculate_stream_offset(
                         why
                     );
                 }
-                from_start
+                Ok(from_start)
             }
         };
     }
@@ -1006,12 +1172,12 @@ pub(super) fn calculate_stream_offset(
         let ratio = (offset_seconds / dur).clamp(0.0, 0.995);
         (total_size as f64 * ratio) as u64
     };
-    StreamOffset {
+    Ok(StreamOffset {
         start,
         end: total_size,
         header: None,
         trailer: None,
-    }
+    })
 }
 
 /// Resolve a `/stream/<name>` request to a file the player has explicitly exposed.
@@ -1182,12 +1348,7 @@ pub(super) fn serve_audio_stream(
     // 2. Calculate base byte offset for seek queries (e.g. ?pos=12.5)
     //    A seeked WAV or AIFF sends a new header, then only its audio from the seek point (and an
     //    AIFF's pad byte).
-    let StreamOffset {
-        start: base_offset,
-        end: body_end,
-        header: synthesized_hdr,
-        trailer,
-    } = calculate_stream_offset(
+    let offset = calculate_stream_offset(
         &filepath,
         &mut file,
         offset_seconds,
@@ -1195,6 +1356,24 @@ pub(super) fn serve_audio_stream(
         current_duration,
         stream_state,
     );
+    let StreamOffset {
+        start: base_offset,
+        end: body_end,
+        header: synthesized_hdr,
+        trailer,
+    } = match offset {
+        Ok(offset) => offset,
+        Err(e) => {
+            crate::log_warn!(
+                "web",
+                "Stream 500: Couldn't read '{}' to seek it to {:.2}s: {}",
+                filepath.display(),
+                offset_seconds,
+                e
+            );
+            return write_server_error(&mut stream, route, head_only);
+        }
+    };
 
     let header = synthesized_hdr.unwrap_or_default();
     let trailer = trailer.unwrap_or_default();

@@ -17,5 +17,5 @@ pub use state::{
 };
 pub use stream::{
     check_stream_seek, make_continuous_wav_header, parse_byte_range, wav_header_sizes, ByteRange, ContinuousAdmission,
-    ContinuousStreamController, StreamRequest, StreamServerState,
+    ContinuousStreamController, StreamRequest, StreamSeekError, StreamServerState,
 };

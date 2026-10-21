@@ -1,6 +1,8 @@
-//! A DLNA seek in a file the web server can't seek (a WAV or AIFF whose header it can't read,
-//! which it serves whole from 0:00) plays from the start, and the player says so: its position
-//! is 0, not the target, and the reason reaches the status line (issue #116).
+//! A file the web server can't seek (a WAV or AIFF whose header it can't use, which it serves
+//! whole from 0:00, issue #116): a seek while it plays is refused, so playback and the position
+//! stay as they are, and a start at a position (resume, output switch) loads it from 0:00 with
+//! the position at 0. Either way the reason reaches the status line through `take_error`, and only
+//! once the load worked; a file the check can't read is not reported as unseekable.
 
 mod common;
 
@@ -20,6 +22,11 @@ type Uris = Arc<Mutex<Vec<String>>>;
 
 /// A mock renderer that answers every SOAP action and records each `SetAVTransportURI` URI.
 fn spawn_renderer() -> (u16, Arc<AtomicBool>, Uris, std::thread::JoinHandle<()>) {
+    spawn_renderer_failing_uri(Arc::new(AtomicBool::new(false)))
+}
+
+/// As [`spawn_renderer`], but `SetAVTransportURI` answers with a UPnP fault while `fail_uri` is set.
+fn spawn_renderer_failing_uri(fail_uri: Arc<AtomicBool>) -> (u16, Arc<AtomicBool>, Uris, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock renderer");
     let port = listener.local_addr().unwrap().port();
     listener.set_nonblocking(true).expect("set nonblocking");
@@ -62,10 +69,21 @@ fn spawn_renderer() -> (u16, Arc<AtomicBool>, Uris, std::thread::JoinHandle<()>)
             if let (Some(start), Some(end)) = (body.find("<CurrentURI>"), body.find("</CurrentURI>")) {
                 uris_thread.lock().unwrap().push(body[start + 12..end].to_string());
             }
-            let resp = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:SuccessResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1" /></s:Body></s:Envelope>"#;
+            let (status, resp) = if fail_uri.load(Ordering::SeqCst) && body.contains("SetAVTransportURI") {
+                (
+                    "500 Internal Server Error",
+                    r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><detail><UPnPError><errorCode>714</errorCode><errorDescription>Illegal MIME-type</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
+                )
+            } else {
+                (
+                    "200 OK",
+                    r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:SuccessResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1" /></s:Body></s:Envelope>"#,
+                )
+            };
             let _ = stream.write_all(
                 format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/xml; charset=\"utf-8\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {}\r\nContent-Type: text/xml; charset=\"utf-8\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
                     resp.len(),
                     resp
                 )
@@ -117,41 +135,54 @@ fn last_uri(uris: &Mutex<Vec<String>>) -> String {
     uris.lock().unwrap().last().cloned().unwrap_or_default()
 }
 
-/// Seeking `path` to 45 s and starting it at 30 s both play it from the start, with position 0
-/// and a reason from `take_error`.
+/// Seeking `path` to 45 s while it plays is refused (no reload, position and playback kept) and
+/// says why; starting it at 30 s plays it from the start, with position 0, and says so.
 fn assert_plays_from_start(player: &mut UPnPPlayer, uris: &Mutex<Vec<String>>, path: &Path) {
     let name = path.file_name().unwrap().to_string_lossy().to_string();
     player.play(path).expect("play");
     assert_eq!(player.take_error(), None, "{}: nothing to report before a seek", name);
 
+    let loads = uris.lock().unwrap().len();
     player.seek_to(45.0).expect("seek");
-    let uri = last_uri(uris);
-    assert!(
-        uri.contains(&name) && !uri.contains("pos="),
-        "{}: reloaded from the start: {}",
-        name,
-        uri
-    );
     assert_eq!(
-        player.position_seconds(),
-        0.0,
-        "{}: the position is where the audio is",
+        uris.lock().unwrap().len(),
+        loads,
+        "{}: a refused seek doesn't reload the track",
         name
     );
+    assert_eq!(player.position_seconds(), 0.0, "{}: the position stays", name);
+    assert!(player.is_playing(), "{}: playback goes on", name);
     let err = player
         .take_error()
-        .unwrap_or_else(|| panic!("{}: the fallback is reported", name));
-    assert!(err.contains("Can't seek") && err.contains(&name), "{}: {}", name, err);
+        .unwrap_or_else(|| panic!("{}: the refusal is reported", name));
+    assert!(
+        err.starts_with(&format!("Can't seek {} (", name)) && !err.contains("from the start"),
+        "{}: {}",
+        name,
+        err
+    );
     assert_eq!(player.take_error(), None, "{}: reported once", name);
+    player.seek(10.0).expect("relative seek");
+    assert_eq!(uris.lock().unwrap().len(), loads, "{}: `]` doesn't reload either", name);
+    assert!(player.take_error().is_some_and(|e| e.contains("Can't seek")));
 
     player.play_at(path, 30.0).expect("play_at");
     let uri = last_uri(uris);
-    assert!(!uri.contains("pos="), "{}: started from the start: {}", name, uri);
-    assert_eq!(player.position_seconds(), 0.0);
     assert!(
-        player.take_error().is_some_and(|e| e.contains("Can't seek")),
-        "{}: play_at reports it",
-        name
+        uri.contains(&name) && !uri.contains("pos="),
+        "{}: started from the start: {}",
+        name,
+        uri
+    );
+    assert_eq!(player.position_seconds(), 0.0);
+    let err = player
+        .take_error()
+        .unwrap_or_else(|| panic!("{}: play_at reports it", name));
+    assert!(
+        err.contains(&format!("Can't seek {} (", name)) && err.ends_with("; playing it from the start"),
+        "{}: {}",
+        name,
+        err
     );
 }
 
@@ -193,6 +224,80 @@ fn test_upnp_seek_in_unseekable_file_plays_from_start_and_says_so() {
     assert!(last_uri(&uris).contains("?pos=30.00"), "{}", last_uri(&uris));
     assert_eq!(player.position_seconds(), 30.0);
     assert_eq!(player.take_error(), None);
+
+    let _ = player.stop();
+    drop(player);
+    stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(("127.0.0.1", port));
+    let _ = handle.join();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_upnp_start_from_zero_reports_nothing_when_the_load_fails() {
+    common::isolate();
+    let dir = common::isolate().join("upnp_seek_fallback_load_fails");
+    std::fs::create_dir_all(&dir).unwrap();
+    let fail_uri = Arc::new(AtomicBool::new(false));
+    let (port, stop, uris, handle) = spawn_renderer_failing_uri(fail_uri.clone());
+    let mut player = UPnPPlayer::new(device(port), 8080);
+    let mut short_fmt = wav(2);
+    short_fmt[16..20].copy_from_slice(&14u32.to_le_bytes());
+    let path = dir.join("short_fmt.wav");
+    std::fs::write(&path, short_fmt).unwrap();
+
+    // The renderer refuses the URI: the transport error is what fails, and nothing claims the
+    // track plays from the start or leaves the position at the target.
+    fail_uri.store(true, Ordering::SeqCst);
+    let err = player.play_at(&path, 30.0).expect_err("the load fails");
+    assert!(err.to_string().contains("Illegal MIME-type"), "{}", err);
+    assert_eq!(player.take_error(), None, "no fallback note over the transport error");
+    assert_eq!(player.position_seconds(), 0.0, "not left at the target");
+    assert!(!last_uri(&uris).contains("pos="));
+
+    let _ = player.stop();
+    drop(player);
+    stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(("127.0.0.1", port));
+    let _ = handle.join();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_upnp_seek_check_read_error_is_not_unseekable() {
+    common::isolate();
+    let dir = common::isolate().join("upnp_seek_fallback_read_error");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (port, stop, uris, handle) = spawn_renderer();
+    let mut player = UPnPPlayer::new(device(port), 8080);
+    let path = dir.join("gone.wav");
+    std::fs::write(&path, wav(60)).unwrap();
+    player.play_at(&path, 20.0).expect("play_at");
+    assert!(last_uri(&uris).contains("?pos=20.00"));
+    assert_eq!(player.take_error(), None);
+
+    // The file can't be read (a share that went away): a seek while it plays is refused with the
+    // read error, not a claim that the file can't be seeked.
+    std::fs::remove_file(&path).unwrap();
+    let loads = uris.lock().unwrap().len();
+    player.seek_to(45.0).expect("seek");
+    assert_eq!(uris.lock().unwrap().len(), loads, "no reload");
+    assert_eq!(player.position_seconds(), 20.0, "the position stays");
+    let err = player.take_error().expect("the read error is reported");
+    assert!(
+        err.starts_with("Couldn't read gone.wav (") && !err.contains("Can't seek"),
+        "{}",
+        err
+    );
+
+    // Nothing plays to keep at a start: the URL asks for the position and the server answers.
+    player.play_at(&path, 30.0).expect("play_at");
+    assert!(last_uri(&uris).contains("?pos=30.00"), "{}", last_uri(&uris));
+    assert_eq!(player.position_seconds(), 30.0);
+    assert!(
+        player.take_error().is_none_or(|e| !e.contains("Can't seek")),
+        "not reported as unseekable"
+    );
 
     let _ = player.stop();
     drop(player);
