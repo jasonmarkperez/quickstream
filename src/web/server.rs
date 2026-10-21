@@ -251,8 +251,9 @@ pub(super) fn finish_connection(reader: &mut BufReader<TcpStream>) {
 }
 
 /// Write a response: the status line, `headers`, `Content-Length` and `Connection: close`, then
-/// `body`; a HEAD request gets the head only (with the same `Content-Length`).
-pub(super) fn write_response(
+/// `body`; a HEAD request gets the head only (with the same `Content-Length`). Also writes the
+/// access checks' answers (`web_access::write_decision_response`).
+pub(crate) fn write_response(
     out: &mut impl Write,
     status: &str,
     headers: &[(&str, &str)],
@@ -343,6 +344,18 @@ fn write_route_error(
 /// Write a `404 Not Found` for `route`.
 pub(super) fn write_not_found(out: &mut impl Write, route: &str, is_head: bool) -> std::io::Result<()> {
     write_route_error(out, route, "404 Not Found", &[], "Not found", is_head)
+}
+
+/// Write a `500 Internal Server Error` for `route` (a stream whose file couldn't be read).
+pub(super) fn write_server_error(out: &mut impl Write, route: &str, is_head: bool) -> std::io::Result<()> {
+    write_route_error(
+        out,
+        route,
+        "500 Internal Server Error",
+        &[],
+        "Internal server error",
+        is_head,
+    )
 }
 
 /// Write a `405 Method Not Allowed` for `route`, naming the methods it takes (`allow`).

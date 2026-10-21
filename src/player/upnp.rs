@@ -660,6 +660,8 @@ pub struct UPnPPlayer {
     playback_stream_offset: Arc<Mutex<f64>>,
     last_seek_time: Arc<Mutex<Instant>>,
     poll_control: Arc<Mutex<PollControl>>,
+    /// Why the last seek was refused or played from the start, for [`AudioPlayer::take_error`].
+    seek_error: Option<String>,
 }
 
 impl UPnPPlayer {
@@ -690,6 +692,7 @@ impl UPnPPlayer {
             playback_stream_offset: Arc::new(Mutex::new(0.0)),
             last_seek_time: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(10))),
             poll_control: Arc::new(Mutex::new(PollControl::default())),
+            seek_error: None,
         }
     }
 
@@ -705,6 +708,41 @@ impl UPnPPlayer {
 
     pub fn set_stream_state(&mut self, stream_state: Option<Arc<crate::web::StreamServerState>>) {
         self.stream_state = stream_state;
+    }
+
+    /// Where a load of `path` at `target` starts, and what to report once it has worked: `target`,
+    /// or 0 with the reason when the web server can't seek the file (a WAV or AIFF whose header it
+    /// can't use, which it serves whole from 0:00), so the position stays where the audio is
+    /// (issue #116). A file the check can't read keeps `target`: nothing plays to keep, so the URL
+    /// asks for it and the server answers. Reads the file's header, as `extract_metadata` does.
+    fn start_point(path: &Path, target: f64) -> (f64, Option<String>) {
+        if is_continuous_placeholder(path) {
+            return (target, None);
+        }
+        match crate::web::check_stream_seek(path, target) {
+            Ok(()) => (target, None),
+            Err(crate::web::StreamSeekError::Unseekable(why)) => {
+                crate::log_warn!(
+                    "player",
+                    "Can't seek '{}' to {:.2}s ({}); playing it from the start",
+                    path.display(),
+                    target,
+                    why
+                );
+                let note = format!("Can't seek {} ({}); playing it from the start", file_label(path), why);
+                (0.0, Some(note))
+            }
+            Err(crate::web::StreamSeekError::Io(e)) => {
+                crate::log_warn!(
+                    "player",
+                    "Couldn't read '{}' to check a seek to {:.2}s ({}); asking the server for it",
+                    path.display(),
+                    target,
+                    e
+                );
+                (target, None)
+            }
+        }
     }
 
     fn start_polling_loop(&mut self) {
@@ -916,7 +954,9 @@ impl UPnPPlayer {
         });
     }
 
-    fn seek_via_stream_offset(&mut self, target: f64) -> anyhow::Result<()> {
+    /// Reload the current track at `target` (`?pos=`), and once it plays report `note` (why it
+    /// starts at 0:00 instead of where it was asked to) through `take_error`.
+    fn seek_via_stream_offset(&mut self, target: f64, note: Option<String>) -> anyhow::Result<()> {
         if let Some(ref ss) = self.stream_state {
             if ss.continuous.is_active.load(Ordering::SeqCst) {
                 ss.continuous.seek_to(target);
@@ -953,10 +993,14 @@ impl UPnPPlayer {
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| "track".to_string());
         let encoded_name = url_encode(&file_name);
-        let stream_url = format!(
-            "http://{}:{}/stream/{}?pos={:.2}",
-            host_ip, self.web_port, encoded_name, target
-        );
+        let stream_url = if target > 0.0 {
+            format!(
+                "http://{}:{}/stream/{}?pos={:.2}",
+                host_ip, self.web_port, encoded_name, target
+            )
+        } else {
+            format!("http://{}:{}/stream/{}", host_ip, self.web_port, encoded_name)
+        };
         crate::log_info!(
             "player",
             "Reloading UPnP transport URI with seek offset: {}",
@@ -992,6 +1036,10 @@ impl UPnPPlayer {
         *self.last_seek_time.lock().unwrap() = Instant::now();
         self.is_playing.store(true, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);
+        // Only now: had the load failed, its transport error is what the status shows.
+        if note.is_some() {
+            self.seek_error = note;
+        }
 
         crate::log_info!(
             "player",
@@ -1000,6 +1048,16 @@ impl UPnPPlayer {
         );
         Ok(())
     }
+}
+
+/// `__continuous__.wav`, the placeholder path that selects the gapless continuous stream.
+fn is_continuous_placeholder(path: &Path) -> bool {
+    path.file_name().is_some_and(|f| f == "__continuous__.wav")
+}
+
+/// A file's name as the status line shows it.
+fn file_label(path: &Path) -> std::borrow::Cow<'_, str> {
+    path.file_name().unwrap_or(path.as_os_str()).to_string_lossy()
 }
 
 impl Drop for UPnPPlayer {
@@ -1036,7 +1094,8 @@ impl AudioPlayer for UPnPPlayer {
         // The old thread is not joined (it may be inside a multi-second SOAP call); the
         // command epoch bumped above makes it drop whatever it observes from now on.
         // `__continuous__.wav` is a placeholder that selects the gapless continuous stream.
-        let is_continuous = filepath.file_name().is_some_and(|f| f == "__continuous__.wav");
+        let is_continuous = is_continuous_placeholder(filepath);
+        let (position_seconds, note) = Self::start_point(filepath, position_seconds);
         self.poll_stop_flag.store(true, Ordering::SeqCst);
         if let Some(ref ss) = self.stream_state {
             // Also ends any previous continuous session.
@@ -1137,6 +1196,10 @@ impl AudioPlayer for UPnPPlayer {
 
         self.is_playing.store(true, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);
+        // Only now: had the load failed, its transport error is what the status shows.
+        if note.is_some() {
+            self.seek_error = note;
+        }
 
         // 6. Spawn polling loop to track playback state
         self.start_polling_loop();
@@ -1202,8 +1265,14 @@ impl AudioPlayer for UPnPPlayer {
             );
         }
 
-        // Seamless resume: reload stream with ?pos=current_pos
-        self.seek_via_stream_offset(current_pos)
+        // Seamless resume: reload stream with ?pos=current_pos (from 0:00 if the server can't seek
+        // the file, as for `play_at`).
+        let current_file = self.current_filepath.lock().unwrap().clone();
+        let (target, note) = match current_file {
+            Some(path) => Self::start_point(&path, current_pos),
+            None => (current_pos, None),
+        };
+        self.seek_via_stream_offset(target, note)
     }
 
     fn toggle_pause(&mut self) -> anyhow::Result<bool> {
@@ -1258,6 +1327,30 @@ impl AudioPlayer for UPnPPlayer {
             position_seconds.max(0.0)
         };
 
+        // A seek while the track plays is refused when the server can't seek the file (it would
+        // serve it whole, restarting it at 0:00 on every press) or the check can't read it:
+        // playback and the position stay as they are, and the status says why (issue #116).
+        let current_file = self.current_filepath.lock().unwrap().clone();
+        if let Some(path) = current_file.filter(|p| !is_continuous_placeholder(p)) {
+            if let Err(e) = crate::web::check_stream_seek(&path, target) {
+                let refusal = match e {
+                    crate::web::StreamSeekError::Unseekable(why) => {
+                        format!("Can't seek {} ({})", file_label(&path), why)
+                    }
+                    crate::web::StreamSeekError::Io(e) => format!("Couldn't read {} ({})", file_label(&path), e),
+                };
+                crate::log_warn!(
+                    "player",
+                    "Seek of '{}' to {:.2}s refused: {}",
+                    path.display(),
+                    target,
+                    refusal
+                );
+                self.seek_error = Some(refusal);
+                return Ok(());
+            }
+        }
+
         crate::log_info!(
             "player",
             "UPnPPlayer::seek_to target={:.2}s (current={:.2}s) on '{}'",
@@ -1270,7 +1363,7 @@ impl AudioPlayer for UPnPPlayer {
 
         // DLNA/UPnP HTTP progressive streams must be sought via stream offset reloading (?pos=),
         // because network stereos either reject SOAP REL_TIME Seek or silently ignore it (returning 200 OK without seeking).
-        self.seek_via_stream_offset(target)
+        self.seek_via_stream_offset(target, None)
     }
 
     fn set_volume(&mut self, volume: u8) -> anyhow::Result<()> {
@@ -1312,6 +1405,10 @@ impl AudioPlayer for UPnPPlayer {
 
     fn is_track_finished(&mut self) -> bool {
         self.track_finished.load(Ordering::SeqCst)
+    }
+
+    fn take_error(&mut self) -> Option<String> {
+        self.seek_error.take()
     }
 
     fn reset_finished(&mut self) {

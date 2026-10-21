@@ -294,8 +294,8 @@ pub struct AppUI {
     pub settings_mgr: SettingsManager,
     /// Shared with background scanners; clone the handle, never the map (issue #4).
     pub metadata_cache: crate::library::MetadataCache,
-    pub metadata_tx: std::sync::mpsc::Sender<crate::metadata::AudioMetadata>,
-    pub metadata_rx: std::sync::mpsc::Receiver<crate::metadata::AudioMetadata>,
+    pub metadata_tx: std::sync::mpsc::Sender<tag_reads::TagUpdate>,
+    pub metadata_rx: std::sync::mpsc::Receiver<tag_reads::TagUpdate>,
     pub queue_add_tx: std::sync::mpsc::Sender<Vec<crate::metadata::AudioMetadata>>,
     pub queue_add_rx: std::sync::mpsc::Receiver<Vec<crate::metadata::AudioMetadata>>,
     pub metadata_worker_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -303,7 +303,8 @@ pub struct AppUI {
     pub queue_metadata_tx: Option<std::sync::mpsc::Sender<PathBuf>>,
     /// Tells the queue metadata pool to stop reading tags (set on shutdown).
     pub queue_metadata_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Paths already sent to the queue metadata workers this session.
+    /// Paths already sent to the queue metadata workers this session (a read that couldn't find
+    /// the file takes its path out again, so a later add reads it once more).
     pub queue_metadata_attempted: std::collections::HashSet<PathBuf>,
     /// Tag reads shared by the browser, queue and folder-add workers, so no two of them read
     /// the same file at once (issue #52).
@@ -321,6 +322,9 @@ pub struct AppUI {
     pub web_server: Option<crate::web::WebServerHandle>,
     pub web_state: std::sync::Arc<std::sync::RwLock<crate::web::NowPlayingState>>,
     pub web_cmd_rx: Option<std::sync::mpsc::Receiver<crate::web::WebCommand>>,
+    /// Where each queued track went in a reorder (a shuffle) the continuous stream hasn't been
+    /// told of yet: `update_web_state` tells it as it publishes the new order.
+    stream_reorder: Option<Vec<usize>>,
     /// Folder the browser opened at launch; one of the folders the web dashboard may reach.
     pub launch_dir: PathBuf,
     pub pending_seek_delta: f64,
@@ -509,6 +513,7 @@ impl AppUI {
             web_cmd_rx,
             player_track: None,
             output_player_factory: None,
+            stream_reorder: None,
             pending_seek_delta: 0.0,
             pending_seek_target: None,
             last_seek_key_time: None,

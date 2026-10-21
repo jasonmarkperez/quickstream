@@ -366,35 +366,13 @@ impl AppUI {
                     self.open_fuzzy_search();
                 }
             }
-            (KeyCode::Char('z' | 'Z'), KeyModifiers::NONE) => {
-                if !self.queue.is_empty() {
-                    self.queue.shuffle();
-                    self.status_message = "🔀 Queue shuffled".to_string();
-                    self.update_web_state();
-                }
-            }
+            (KeyCode::Char('z' | 'Z'), KeyModifiers::NONE) => self.shuffle_queue(""),
             (KeyCode::Char('p'), KeyModifiers::NONE) => {
-                let target_dir = if self.in_bookmarks_view {
-                    if self.browser_cursor > 0 && self.browser_cursor < self.browser_entries.len() {
-                        self.browser_entries[self.browser_cursor].1.clone()
-                    } else {
-                        self.browser_dir.clone()
-                    }
-                } else {
-                    self.browser_dir.clone()
-                };
+                let target_dir = self.autopilot_key_dir();
                 self.start_autopilot(target_dir);
             }
             (KeyCode::Char('P'), KeyModifiers::NONE) => {
-                let target_dir = if self.in_bookmarks_view {
-                    if self.browser_cursor > 0 && self.browser_cursor < self.browser_entries.len() {
-                        self.browser_entries[self.browser_cursor].1.clone()
-                    } else {
-                        self.browser_dir.clone()
-                    }
-                } else {
-                    self.browser_dir.clone()
-                };
+                let target_dir = self.autopilot_key_dir();
                 self.reshuffle_autopilot(target_dir);
             }
             (KeyCode::Char('M'), KeyModifiers::NONE) => {

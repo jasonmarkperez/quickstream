@@ -70,9 +70,14 @@ fn reordering_and_shuffling_bump_revision() {
     assert_bumps(&mut q, "reorder_track", |q| {
         assert!(q.reorder_track(0, 3));
     });
-    assert_bumps(&mut q, "shuffle", |q| q.shuffle());
+    assert_bumps(&mut q, "shuffle", |q| {
+        q.shuffle();
+    });
     q.set_current_index(1);
     assert_bumps(&mut q, "shuffle_from_next", |q| q.shuffle_from_next());
+    assert_bumps(&mut q, "shuffle_in", |q| {
+        q.shuffle_in(vec![track(7), track(8)], usize::MAX);
+    });
 }
 
 #[test]
@@ -116,6 +121,26 @@ fn metadata_updates_bump_revision_only_when_a_track_matches() {
     assert_eq!(q.tracks()[1].title, "Tagged");
     assert_keeps(&mut q, "update_metadata on a path not in the queue", |q| {
         assert!(!q.update_metadata(&track(9)));
+    });
+}
+
+/// A size found for an unreadable file fills in only an unknown one, and keeps the rest.
+#[test]
+fn file_size_updates_bump_revision_only_when_a_size_was_unknown() {
+    common::isolate();
+    let mut q = queue_of(3);
+    let path = track(2).filepath;
+    assert_bumps(&mut q, "set_file_size on an unknown size", |q| {
+        assert!(q.set_file_size(&path, 4_000));
+    });
+    assert_eq!(q.tracks()[1].file_size, 4_000);
+    assert_eq!(q.tracks()[1].title, "Song 2");
+    assert_keeps(&mut q, "set_file_size on a known size", |q| {
+        assert!(!q.set_file_size(&path, 5_000));
+    });
+    assert_eq!(q.tracks()[1].file_size, 4_000);
+    assert_keeps(&mut q, "set_file_size on a path not in the queue", |q| {
+        assert!(!q.set_file_size(&track(9).filepath, 1));
     });
 }
 
@@ -176,7 +201,12 @@ fn calls_that_change_nothing_do_not_bump_revision() {
 
     let mut empty = PlaybackQueue::new();
     assert_keeps(&mut empty, "clear on an empty queue", |q| q.clear());
-    assert_keeps(&mut empty, "shuffle on an empty queue", |q| q.shuffle());
+    assert_keeps(&mut empty, "shuffle on an empty queue", |q| {
+        q.shuffle();
+    });
+    assert_keeps(&mut empty, "shuffle_in of no tracks", |q| {
+        q.shuffle_in(Vec::new(), 0);
+    });
     assert_keeps(&mut empty, "next_track on an empty queue", |q| {
         assert!(q.next_track("loop").is_none());
     });

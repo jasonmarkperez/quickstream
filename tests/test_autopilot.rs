@@ -324,7 +324,7 @@ fn test_queue_background_metadata_update() {
     let mut updated_meta = app.queue.tracks()[0].clone();
     updated_meta.artist = "Ludovico Einaudi (Official)".to_string();
     updated_meta.duration_seconds = 234.0;
-    app.metadata_tx.send(updated_meta).unwrap();
+    app.metadata_tx.send(updated_meta.into()).unwrap();
 
     // Poll background metadata - must update queue tracks in-place
     app.poll_background_metadata();
@@ -825,7 +825,12 @@ fn test_web_mix_profile_and_seed_radio_commands() {
     );
 
     // 2. SeedRadio
-    tx.send(WebCommand::SeedRadio(seed_track.clone())).unwrap();
+    tx.send(WebCommand::SeedRadio {
+        seed: seed_track.clone(),
+        preferred: None,
+        fallback: temp_dir.clone(),
+    })
+    .unwrap();
     app.handle_web_commands();
     assert_eq!(
         app.active_mix_profile,
