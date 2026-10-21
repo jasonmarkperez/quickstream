@@ -16,6 +16,6 @@ pub use state::{
     WebPlaylist, WebPlaylistEntry, WebPlaylists, WebPlaylistsState, WebQueueItem, WebReply, PLAYLISTS_CHANGED,
 };
 pub use stream::{
-    make_continuous_wav_header, parse_byte_range, wav_header_sizes, ByteRange, ContinuousAdmission,
-    ContinuousStreamController, StreamRequest, StreamServerState,
+    check_stream_seek, make_continuous_wav_header, parse_byte_range, wav_header_sizes, ByteRange, ContinuousAdmission,
+    ContinuousStreamController, StreamRequest, StreamSeekError, StreamServerState,
 };
