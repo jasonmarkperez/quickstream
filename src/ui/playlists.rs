@@ -2130,17 +2130,22 @@ impl AppUI {
     /// skip and do it once the rest arrives (`apply_playlist_queue`), instead of stopping at the
     /// end of a one-track queue or playing the started track again. Returns true when held.
     ///
-    /// After a shuffle the started track is first and the rest goes after it, so Previous has
-    /// no track to go back to: pressed then, it restarts the started track at once (and one held
-    /// from before the shuffle restarts it once the rest is in).
+    /// After a shuffle the rest goes after the current track, so the tracks before the started
+    /// one are all queued: Previous isn't held then. With the started track first (it was
+    /// current at the shuffle) there is none, and Previous restarts it at once; with it further
+    /// down (another track was current at the shuffle), Previous goes back as usual.
     pub(super) fn hold_skip_for_playlist_fill(&mut self, skip: PlaylistSkip) -> bool {
         if !self.started_track_is_current() {
             return false;
         }
+        let first = self.queue.current_index() == 0;
         let Some(started) = self.playlists.checks.started.as_mut() else {
             return false;
         };
         if skip == PlaylistSkip::Previous && started.shuffled_len.is_some() {
+            if !first {
+                return false;
+            }
             started.pending_skip = None;
             self.play_current_track();
             return true;
@@ -2159,7 +2164,10 @@ impl AppUI {
         Some(match started.pending_skip? {
             PlaylistSkip::Ended => format!("Waiting for the rest of {}…", name),
             PlaylistSkip::Next => format!("Next track plays once {} is checked…", name),
-            PlaylistSkip::Previous if started.shuffled_len.is_some() => {
+            // The started track first after a shuffle: nothing comes before it.
+            PlaylistSkip::Previous
+                if started.shuffled_len.is_some() && self.started_queue_position(started) == Some(0) =>
+            {
                 format!("Previous restarts this track once {} is checked…", name)
             }
             PlaylistSkip::Previous => format!("Previous track plays once {} is checked…", name),
@@ -2349,7 +2357,7 @@ impl AppUI {
                 match skip {
                     PlaylistSkip::Ended | PlaylistSkip::Next => self.play_next_track(),
                     // The shuffle left the started track first: nothing comes before it.
-                    PlaylistSkip::Previous if shuffled => {
+                    PlaylistSkip::Previous if shuffled && self.queue.current_index() == 0 => {
                         self.play_current_track();
                     }
                     PlaylistSkip::Previous => self.play_prev_track(),

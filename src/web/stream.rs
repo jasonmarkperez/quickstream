@@ -150,16 +150,6 @@ impl ContinuousStreamController {
         self.session.lock().unwrap().as_ref().is_some_and(|s| s.nonce == nonce)
     }
 
-    /// If the length of the track being decoded (`path`, at `index` in the queue) was unknown
-    /// when it started (placeholder metadata, tags not read yet), take it from `state`'s queue
-    /// once the UI has published it there. Called while streaming, so the length (and the seek
-    /// clamp that needs it) shows without waiting for the next track. Returns whether it was
-    /// learned now.
-    pub fn learn_duration(&self, state: &mut NowPlayingState, index: usize, path: &Path) -> bool {
-        let current = self.current_duration.lock().unwrap();
-        Self::learn_duration_locked(current, state, index, path)
-    }
-
     /// The stream has started `index` (`path`) with `duration` (0 when unknown): set both
     /// together, so a length learned from the published queue is always the one of the track
     /// being decoded.
@@ -170,10 +160,12 @@ impl ContinuousStreamController {
     }
 
     /// Whoever publishes the queue into `state` (the UI's `update_web_state`) offers the stream
-    /// the lengths it now knows: if the track being decoded started with an unknown length and
-    /// `state`'s queue has it at the same index and path, it is learned now, whatever the stream's
-    /// socket is doing (a renderer reading at real time can keep the stream's writer blocked
-    /// for seconds). Never blocks on the socket. Returns whether it was learned now.
+    /// the lengths it now knows: if the track being decoded started with an unknown length
+    /// (placeholder metadata, tags not read yet) and `state`'s queue has it at the same index and
+    /// path, it is learned now, whatever the stream's socket is doing (a renderer reading at real
+    /// time can keep the stream's writer blocked for seconds). Never blocks on the socket. The
+    /// stream's write loop calls it too, after its writes. The index is the decoded track's
+    /// (`decoding`), which follows a reorder at once. Returns whether it was learned now.
     pub fn learn_published_duration(&self, state: &mut NowPlayingState) -> bool {
         if !self.is_active.load(Ordering::SeqCst) {
             return false;
@@ -1580,7 +1572,9 @@ pub(super) fn serve_continuous_stream(
                         *controller.current_position.lock().unwrap() = pos;
                         if let Ok(mut s) = state.write() {
                             s.position_seconds = pos;
-                            controller.learn_duration(&mut s, track_index, &track_path);
+                            // The decoded track's row, which a shuffle moves at once; this
+                            // loop's `track_index` follows it only when the track ends.
+                            controller.learn_published_duration(&mut s);
                         }
                     }
                 }

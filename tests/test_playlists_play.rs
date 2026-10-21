@@ -1516,6 +1516,28 @@ fn test_tracks_queued_after_a_shuffle_stay_after_the_shuffled_in_rest() {
 }
 
 #[test]
+fn test_a_row_removed_after_a_shuffle_leaves_later_tracks_after_the_rest() {
+    common::isolate();
+    // A shuffled row removed before the rest arrives: the rows the shuffle mixed are one fewer,
+    // so a track queued after the shuffle still stays after the shuffled-in rest.
+    for round in 0..4 {
+        let (mut app, dir, paths, gate_tx) = eight_track_play(&format!("shuffle_remove_{round}"));
+        app.queue.add_track(queued_meta(&dir, "before.mp3"));
+        press(&mut app, crossterm::event::KeyCode::Char('z'));
+        assert_eq!(queue_paths(&app), vec![paths[3].clone(), dir.join("before.mp3")]);
+        app.remove_queue_track(1);
+        app.queue.add_track(queued_meta(&dir, "after.mp3"));
+        drop(gate_tx);
+        assert!(poll_until(&mut app, |app| !app.playlists.queue_check_pending()));
+        let queued = queue_paths(&app);
+        assert_eq!(queued.len(), 9, "round {round}: {queued:?}");
+        assert_eq!(queued[0], paths[3], "round {round}");
+        assert_eq!(queued[8], dir.join("after.mp3"), "round {round}: {queued:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
 fn test_previous_after_a_shuffle_restarts_the_started_track() {
     common::isolate();
     // After a shuffle the started track is first in the queue and the rest goes after it, so
@@ -1571,6 +1593,69 @@ fn test_previous_after_a_shuffle_restarts_the_started_track() {
             vec![format!("play {}", paths[1].display()); 2],
             "held {held}: the started track restarted once, nothing else played"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn test_previous_after_a_shuffle_goes_back_when_the_started_track_is_not_first() {
+    common::isolate();
+    // Another track was current at the shuffle, so it went in front and the started track
+    // after it: Previous goes back to that track, as it does in any queue, rather than restart
+    // the started one (PR #127 review). Pressed before the shuffle, it is held and goes back to
+    // it once the rest is in; pressed after, it goes back at once.
+    for held in [true, false] {
+        let SlowShare {
+            mut app,
+            dir,
+            paths,
+            calls,
+            gate_tx,
+        } = slow_share_app(if held { "prev_held_not_first" } else { "prev_not_first" }, 1);
+        app.queue_selected_playlist(Some(1));
+        assert!(poll_until(&mut app, |_| !play_calls(&calls).is_empty()));
+        if held {
+            press(&mut app, crossterm::event::KeyCode::Left);
+            assert_eq!(app.status_message, "Previous track plays once Road Trip is checked…");
+        }
+        let x = dir.join("x.mp3");
+        app.queue.add_track(queued_meta(&dir, "x.mp3"));
+        app.queue.set_current_index(1);
+        app.play_current_track();
+        press(&mut app, crossterm::event::KeyCode::Char('z'));
+        assert_eq!(queue_paths(&app), vec![x.clone(), paths[1].clone()], "held {held}");
+        if held {
+            assert!(
+                app.status_message
+                    .ends_with("Previous track plays once Road Trip is checked…"),
+                "the started track won't be first: {}",
+                app.status_message
+            );
+        }
+        app.queue.set_current_index(1);
+        app.play_current_track();
+        let plays = play_calls(&calls).len();
+        if !held {
+            press(&mut app, crossterm::event::KeyCode::Left);
+            assert_eq!(app.queue.current_index(), 0, "went back at once");
+            assert_eq!(app.queue.current_track().unwrap().filepath, x);
+            assert_eq!(play_calls(&calls).len(), plays, "the started track was not restarted");
+        }
+
+        drop(gate_tx);
+        assert!(poll_until(&mut app, |app| !app.playlists.queue_check_pending()));
+        assert_eq!(app.queue.len(), 4, "held {held}: {:?}", queue_paths(&app));
+        assert_eq!(app.queue.current_index(), 0, "held {held}");
+        assert_eq!(app.queue.current_track().unwrap().filepath, x, "held {held}");
+        if held {
+            assert_eq!(
+                play_calls(&calls)[plays..],
+                [format!("play {}", x.display())],
+                "the held Previous went back to the track before"
+            );
+        } else {
+            assert_eq!(play_calls(&calls).len(), plays, "the fill plays nothing");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
