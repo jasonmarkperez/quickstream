@@ -2211,13 +2211,13 @@ pub(super) fn serve_continuous_stream(
             // Reshuffle once per wrap that played something, and only from the current
             // connection of the armed session.
             let owns_session = controller.is_session(session) && controller.owns(cid);
-            if wraps && queue_len > 1 && owns_session && streamed_since_wrap {
+            if wraps && crate::queue::reshuffles_on_wrap(queue_len) && owns_session && streamed_since_wrap {
                 // The UI's shuffle keeps the track `current_track_index` names in front, so it
                 // names the first track before the UI is asked: never the one that just ended,
                 // which would play again. A seek from here on is for that first track, since
                 // after the reshuffle no index names the track that ended.
                 *controller.current_track_index.lock().unwrap() = 0;
-                let _ = cmd_tx.send(WebCommand::ShuffleQueue);
+                let _ = cmd_tx.send(WebCommand::StreamReshuffle);
             }
             drop(pending);
             if wraps {

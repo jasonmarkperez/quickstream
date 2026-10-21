@@ -255,8 +255,8 @@ fn test_armed_continuous_stream_plays_queue_gaplessly_and_shuffles_on_wrap() {
 
     // Both tracks are decoded into the one connection, then the wrap asks for a reshuffle.
     match rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(WebCommand::ShuffleQueue) => {}
-        other => panic!("expected ShuffleQueue after the queue wrapped, got {:?}", other),
+        Ok(WebCommand::StreamReshuffle) => {}
+        other => panic!("expected StreamReshuffle after the queue wrapped, got {:?}", other),
     }
     assert!(state.read().unwrap().title.starts_with("Track "));
 
@@ -268,7 +268,7 @@ fn test_armed_continuous_stream_plays_queue_gaplessly_and_shuffles_on_wrap() {
     while Instant::now() < deadline {
         if let Ok(cmd) = rx.recv_timeout(Duration::from_millis(50)) {
             // A wrap that completed just before the close may still be in flight.
-            assert_eq!(cmd, WebCommand::ShuffleQueue);
+            assert_eq!(cmd, WebCommand::StreamReshuffle);
         }
     }
     assert!(
@@ -1022,6 +1022,28 @@ fn test_continuous_track_end_without_a_request_moves_on() {
     assert!(f.rx.try_recv().is_err(), "not the last track: no reshuffle");
 }
 
+/// A queue of one track: at its end the stream plays that track again from its start and asks
+/// for no reshuffle (there is nothing to reorder), and Up Next says it repeats, as tab [1] and
+/// the dashboard do (#134).
+#[cfg(unix)]
+#[test]
+fn test_continuous_single_track_repeats_without_a_reshuffle() {
+    common::isolate();
+    use quickstream::queue::QueueEnd;
+    let f = DecoderFixture::start("single_track", &["t0_short.wav"], 0);
+    assert_eq!(f.run(1), (f.tracks[0].clone(), None));
+    assert_eq!(f.run(2), (f.tracks[0].clone(), None));
+    assert_eq!(f.run(3), (f.tracks[0].clone(), None));
+    if let Ok(cmd) = f.rx.recv_timeout(Duration::from_millis(300)) {
+        panic!("a one-track queue's wrap sent {:?}", cmd);
+    }
+    assert_eq!(*f.controller.current_track_index.lock().unwrap(), 0);
+    assert_eq!(
+        published_up_next(&f.state.read().unwrap()),
+        (vec![], 0, Some(QueueEnd::Loops), Some("Track 0".to_string()))
+    );
+}
+
 /// A skip and seek still pending when the session ends (the stream was blocked writing to a
 /// renderer that stopped reading) are dropped with it: the next session starts where the UI
 /// rewound it, not on the stale track or offset.
@@ -1350,8 +1372,8 @@ fn test_continuous_wrap_reshuffle_keeps_the_next_track_in_front() {
     assert_eq!(f.run(1), (f.tracks[1].clone(), None));
 
     match f.rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(WebCommand::ShuffleQueue) => {}
-        other => panic!("expected ShuffleQueue after the queue wrapped, got {:?}", other),
+        Ok(WebCommand::StreamReshuffle) => {}
+        other => panic!("expected StreamReshuffle after the queue wrapped, got {:?}", other),
     }
     {
         // What one UI tick does with the reshuffle: follow the stream's index, shuffle with that
@@ -1399,7 +1421,7 @@ fn test_continuous_reshuffle_follows_the_stream_index_first() {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     app.web_cmd_rx = Some(cmd_rx);
 
-    cmd_tx.send(WebCommand::ShuffleQueue).unwrap();
+    cmd_tx.send(WebCommand::StreamReshuffle).unwrap();
     app.handle_web_commands();
     assert_eq!(app.queue.current_index(), 0);
     assert_eq!(
@@ -1576,7 +1598,7 @@ struct AppStream {
     dir: PathBuf,
     tracks: Vec<PathBuf>,
     controller: Arc<ContinuousStreamController>,
-    /// What the web server sends the UI (the stream's `ShuffleQueue` on a wrap).
+    /// What the web server sends the UI (the stream's `StreamReshuffle` on a wrap).
     rx: mpsc::Receiver<WebCommand>,
     /// Feeds the app's `handle_web_commands`, as the web dashboard's actions do.
     cmd_tx: mpsc::Sender<WebCommand>,
@@ -1653,7 +1675,7 @@ impl AppStream {
         let deadline = Instant::now() + window;
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
             match self.rx.recv_timeout(left) {
-                Ok(WebCommand::ShuffleQueue) => return true,
+                Ok(WebCommand::StreamReshuffle) => return true,
                 Ok(_) => {}
                 Err(_) => return false,
             }
@@ -1785,7 +1807,7 @@ fn test_continuous_stream_goes_on_in_the_order_a_shuffle_left() {
         "the track the shuffle put after the playing one"
     );
     assert!(
-        !matches!(f.rx.try_recv(), Ok(WebCommand::ShuffleQueue)),
+        !matches!(f.rx.try_recv(), Ok(WebCommand::StreamReshuffle)),
         "the stream didn't wrap"
     );
 }

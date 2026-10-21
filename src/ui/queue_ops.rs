@@ -146,11 +146,11 @@ impl AppUI {
         });
     }
 
-    /// Shuffle the queue (`z` / `Z`, the web dashboard's Shuffle, the continuous stream's
-    /// reshuffle on a wrap): the current track goes in front and the cursor stays on the entry it
-    /// was on (issue #123), as does the continuous stream. While the rest of a playlist `Enter`
-    /// started is still being checked, that rest is shuffled in when it arrives (issue #122).
-    /// `source` ends the status (`" (web)"`).
+    /// Shuffle the queue (the continuous stream's reshuffle on a wrap; the user's shuffles go
+    /// through [`Self::shuffle_queue_by_user`]): the current track goes in front and the cursor stays on the entry it was on (issue #123), as
+    /// does the continuous stream. While the rest of a playlist `Enter` started is still being
+    /// checked, that rest is shuffled in when it arrives (issue #122). `source` ends the status
+    /// (`" (web)"`).
     pub(super) fn shuffle_queue(&mut self, source: &str) {
         if self.queue.is_empty() {
             return;
@@ -161,6 +161,25 @@ impl AppUI {
             Some(note) => format!("🔀 Queue shuffled{source}; {note}"),
             None => format!("🔀 Queue shuffled{source}"),
         };
+        self.update_web_state();
+    }
+
+    /// A shuffle the user asked for (`z` / `Z`, the web dashboard's Shuffle): as
+    /// [`Self::shuffle_queue`], and while a playlist play waits for its first track to start, the
+    /// shuffle is kept for that play, even with an empty queue, where nothing is shuffled yet
+    /// (issue #135).
+    pub(super) fn shuffle_queue_by_user(&mut self, source: &str) {
+        let Some(note) = self.shuffle_playlist_at_start() else {
+            self.shuffle_queue(source);
+            return;
+        };
+        if self.queue.is_empty() {
+            self.status_message = note;
+        } else {
+            let moved = self.queue.shuffle();
+            self.follow_queue_reorder(moved);
+            self.status_message = format!("🔀 Queue shuffled{source}; {note}");
+        }
         self.update_web_state();
     }
 
