@@ -161,8 +161,9 @@ impl Default for TrackFeatures {
 }
 
 /// A folder the library index has walked: how many audio files sit directly inside it, and
-/// whether every one of them has a current row (`complete`). Written by
-/// [`AnalysisDatabase::write_index_batch`] together with the folder's rows.
+/// whether every one of them has a current row (`complete`; a file that failed again for the
+/// same stamp as on an earlier pass, recorded in `library_index_failures`, doesn't count against
+/// it). Written by [`AnalysisDatabase::write_index_batch`] together with the folder's rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexedDir {
     pub dirpath: PathBuf,
