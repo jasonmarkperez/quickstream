@@ -674,9 +674,9 @@ fn a_folder_changed_since_it_was_indexed_is_walked() {
 /// (PR #145 review: 500 folders of checks over SMB would spend most of the 20 s budget).
 #[test]
 fn index_rows_are_checked_on_several_threads() {
+    common::isolate();
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Instant;
-    common::isolate();
     let lib = library("parallel");
     let db = AnalysisDatabase::open_in_memory().unwrap();
     for a in 0..8 {
