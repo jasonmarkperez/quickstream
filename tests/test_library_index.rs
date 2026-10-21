@@ -479,7 +479,9 @@ fn rows_take_the_path_heuristics_or_the_bpm_tag() {
     assert!(!row.needs_acoustic, "a BPM tag needs no acoustic pass");
 }
 
-/// Hidden folders and files, recycle bins and symlinks are skipped, as the mix's walk skips them.
+/// Hidden folders and files, recycle bins and symlinked folders are skipped, as the mix's walk
+/// skips them. A symlinked audio file is indexed under its own path (its stat and tag read follow
+/// the link), as the walk offers it; a link to nothing has no file to index.
 #[cfg(unix)]
 #[test]
 fn hidden_folders_recycle_bins_and_symlinks_are_skipped() {
@@ -499,16 +501,49 @@ fn hidden_folders_recycle_bins_and_symlinks_are_skipped() {
         silent_wav(&skipped);
     }
     std::os::unix::fs::symlink(&outside, lib.join("Linked Folder")).unwrap();
-    std::os::unix::fs::symlink(outside.join("elsewhere.wav"), lib.join("Artist").join("link.wav")).unwrap();
+    let link = lib.join("Artist").join("link.wav");
+    std::os::unix::fs::symlink(outside.join("elsewhere.wav"), &link).unwrap();
+    std::os::unix::fs::symlink(outside.join("gone.wav"), lib.join("Artist").join("dangling.wav")).unwrap();
 
     let snap = one_pass(&db_path, vec![lib.clone()], default_tag_reader());
-    assert_eq!(snap.read, 1, "{snap:?}");
+    assert_eq!((snap.read, snap.failed), (2, 0), "{snap:?}");
     let db = AnalysisDatabase::open_at(&db_path).unwrap();
     let paths: Vec<PathBuf> = db.tracks_under(&lib, 64).into_iter().map(|r| r.filepath).collect();
-    assert_eq!(paths, vec![kept]);
+    assert_eq!(paths, vec![kept, link]);
     assert!(db.get_track(&outside.join("elsewhere.wav")).is_none());
     assert!(db.get_track(&lib.join(".hidden").join("a.wav")).is_none());
     assert!(db.get_track(&lib.join("#recycle").join("b.wav")).is_none());
+    assert!(db.index_dir(&lib).unwrap().1, "the tree is whole");
+}
+
+/// A name that isn't UTF-8 can't be keyed in the index, so a folder holding such a subfolder or
+/// audio file is recorded incomplete (the mix walks it, and finds the file); other names in it
+/// are indexed. Where the file system refuses such names (APFS, HFS+) there is nothing to test.
+#[cfg(unix)]
+#[test]
+fn a_name_that_is_not_utf8_leaves_its_folder_incomplete() {
+    use std::os::unix::ffi::OsStrExt;
+    common::isolate();
+    let (lib, db_path) = scratch("not_utf8");
+    library_tree(&lib, 2, 1);
+    let odd = lib.join("Artist 00").join(std::ffi::OsStr::from_bytes(b"caf\xe9.wav"));
+    if fs::write(&odd, b"").is_err() {
+        return;
+    }
+    silent_wav(&odd);
+    let quiet = lib
+        .join("Artist 01")
+        .join(std::ffi::OsStr::from_bytes(b"notes \xff.txt"));
+    fs::write(&quiet, b"not audio").unwrap();
+    one_pass(&db_path, vec![lib.clone()], default_tag_reader());
+    let db = AnalysisDatabase::open_at(&db_path).unwrap();
+    let (record, whole) = db.index_dir(&lib.join("Artist 00")).unwrap();
+    assert!(!record.complete && !whole);
+    assert!(!db.index_dir(&lib).unwrap().1);
+    assert!(
+        db.index_dir(&lib.join("Artist 01")).unwrap().1,
+        "a name that isn't audio doesn't matter"
+    );
 }
 
 // ---------- order ----------
@@ -968,6 +1003,45 @@ fn progress_counts_top_level_folders_of_every_root() {
     assert_eq!((snap.top_done, snap.top_total, snap.read), (5, 5, 7));
     let db = AnalysisDatabase::open_at(&db_path).unwrap();
     assert!(db.index_dir(&a).unwrap().1 && db.index_dir(&b).unwrap().1);
+}
+
+/// The folder total shows only once every root has been listed (#146 review): while the second
+/// root is being listed it is still 0, never the first root's count alone.
+#[test]
+fn the_folder_total_shows_once_every_root_is_listed() {
+    common::isolate();
+    let (lib, db_path) = scratch("total");
+    let a = lib.join("A");
+    let b = lib.join("B");
+    library_tree(&a, 3, 1);
+    library_tree(&b, 2, 1);
+    let (entered_tx, entered_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let reader: IndexTagReader = {
+        let (gate, entered_tx, release_rx, real) = (
+            b.join("loose.wav"),
+            Mutex::new(entered_tx),
+            Mutex::new(release_rx),
+            default_tag_reader(),
+        );
+        Arc::new(move |path: &Path, stamp| {
+            if path == gate {
+                let _ = entered_tx.lock().unwrap().send(());
+                let _ = release_rx.lock().unwrap().recv_timeout(Duration::from_secs(20));
+            }
+            real(path, stamp)
+        })
+    };
+    let run = spawn(&db_path, config(vec![a, b]), reader);
+    entered_rx.recv_timeout(Duration::from_secs(20)).expect("B is listed");
+    assert_eq!(
+        run.progress.snapshot().top_total,
+        0,
+        "A's folders alone aren't the total"
+    );
+    drop(release_tx);
+    run.wait_state(IndexState::Done);
+    assert_eq!(run.finish().top_total, 5);
 }
 
 // ---------- the indexer in the app (ui::library_index) ----------

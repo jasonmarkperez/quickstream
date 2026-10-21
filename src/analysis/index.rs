@@ -370,6 +370,9 @@ pub fn folder_mtime(dir: &Path) -> Option<i64> {
 struct Listing {
     files: Vec<PathBuf>,
     dirs: Vec<PathBuf>,
+    /// A subfolder or audio file the walk would find but the index can't key (a name that isn't
+    /// UTF-8): the folder can't be complete.
+    unindexable: bool,
 }
 
 /// One root of a pass: whether its own files and every top-level folder under it came out whole,
@@ -437,9 +440,11 @@ impl Indexer<'_> {
         out
     }
 
-    /// The folder's audio files and subfolders, with the scanner's filter: names the walks skip
-    /// (`db::walk_skips`), names that are not UTF-8, symlinks, duplicate entries (#35), files
-    /// that are not audio.
+    /// The folder's audio files and subfolders, with the mix walk's filter: names the walks skip
+    /// (`db::walk_skips`), symlinked folders, duplicate entries (#35), files that are not audio.
+    /// A symlinked audio file is listed (the walk offers it: its stat follows the link); a
+    /// subfolder or audio file whose name is not UTF-8 is not, and marks the listing
+    /// [`Listing::unindexable`].
     fn list(&self, dir: &Path) -> std::io::Result<Listing> {
         self.timed("listing", dir, || {
             let mut listing = Listing::default();
@@ -450,10 +455,7 @@ impl Indexer<'_> {
                 }
                 let entry = entry?;
                 let name = entry.file_name();
-                let Some(name) = name.to_str() else {
-                    continue;
-                };
-                if walk_skips(name) {
+                if walk_skips(&name.to_string_lossy()) {
                     continue;
                 }
                 let path = entry.path();
@@ -463,9 +465,15 @@ impl Indexer<'_> {
                 let Ok(kind) = entry.file_type() else {
                     continue;
                 };
-                if kind.is_dir() {
+                let wanted = kind.is_dir() || ((kind.is_file() || kind.is_symlink()) && is_supported_audio_file(&path));
+                if !wanted {
+                    continue;
+                }
+                if name.to_str().is_none() {
+                    listing.unindexable = true;
+                } else if kind.is_dir() {
                     listing.dirs.push(path);
-                } else if kind.is_file() && is_supported_audio_file(&path) {
+                } else {
                     listing.files.push(path);
                 }
             }
@@ -614,7 +622,14 @@ impl Indexer<'_> {
         if self.control.is_stopped() {
             return None;
         }
-        let own = self.index_files(dir, &listing.files, listed_at, ok)?;
+        if listing.unindexable {
+            crate::log_info!(
+                "index",
+                "'{}' holds a name that isn't UTF-8: left incomplete",
+                dir.display()
+            );
+        }
+        let own = self.index_files(dir, &listing.files, listed_at, ok && !listing.unindexable)?;
         Some((listing, own && mtime.is_some(), mtime))
     }
 
@@ -654,7 +669,8 @@ impl Indexer<'_> {
         self.walked.clear();
         let mut rng = crate::queue::FastRng::new();
 
-        // List every root first (its own files indexed), so the folder total is known.
+        // List every root first (its own files indexed), so the folder total is known; it is
+        // shown once every root has been listed.
         let mut plans = Vec::new();
         let mut queue: VecDeque<(usize, PathBuf)> = VecDeque::new();
         for root in self.cfg.roots.clone() {
@@ -662,7 +678,6 @@ impl Indexer<'_> {
                 return false;
             };
             rng.shuffle(&mut listing.dirs);
-            self.progress.top_total.fetch_add(listing.dirs.len(), Ordering::SeqCst);
             let at = plans.len();
             plans.push(RootPlan {
                 root,
@@ -671,6 +686,7 @@ impl Indexer<'_> {
             });
             queue.extend(listing.dirs.into_iter().map(|dir| (at, dir)));
         }
+        self.progress.top_total.store(queue.len(), Ordering::SeqCst);
 
         // Then each root's top-level folders, a prioritised one first.
         loop {
