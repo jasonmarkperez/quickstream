@@ -1674,6 +1674,13 @@ const FILE_CHECK_WAIT: Duration = Duration::from_millis(20);
 // before the lead runs out.
 const _: () = assert!(FILE_CHECK_WAIT.as_millis() < SILENCE_TICK.as_millis());
 const _: () = assert!(SILENCE_TICK.as_millis() < SILENCE_LEAD.as_millis());
+/// How long a decoder that has given no PCM yet is left to start before silence covers for it
+/// (#133): a decoder that is merely starting adds no silence between two tracks.
+const DECODER_START_GRACE: Duration = Duration::from_millis(500);
+/// How many chunks of PCM the decoder's reader thread holds for the stream.
+const DECODER_CHUNKS_AHEAD: usize = 2;
+/// The most PCM one read from the decoder takes.
+const DECODER_CHUNK: usize = 32768;
 
 /// The PCM bytes in `duration`, whole 4-byte frames.
 fn pcm_bytes(duration: Duration) -> u64 {
@@ -1719,6 +1726,45 @@ impl SilencePacer {
 /// Sleep until one `SILENCE_TICK` after `pass_started`.
 fn wait_out_tick(pass_started: Instant) {
     std::thread::sleep((pass_started + SILENCE_TICK).saturating_duration_since(Instant::now()));
+}
+
+/// Whether a renderer that has played at real time since `connected` is about to run out of the
+/// `written` bytes of PCM sent to it, so the stream must send silence rather than wait.
+fn renderer_running_dry(connected: Instant, written: u64) -> bool {
+    renderer_lead(connected, written) <= SILENCE_LEAD + SILENCE_TICK
+}
+
+/// What the decoder's reader thread hands the continuous stream.
+enum DecoderOutput {
+    Pcm(Vec<u8>),
+    /// The decoder's output ended: it exited, or was killed.
+    End,
+    Failed(std::io::Error),
+}
+
+/// Read the decoder's `stdout` on a helper thread, so the stream never blocks on a decoder stuck
+/// opening or reading a file on a share that hangs and can send silence meanwhile (#133). The
+/// thread ends with the decoder's output (it exits or is killed) or once the receiver is dropped.
+fn spawn_decoder_reader(mut stdout: std::process::ChildStdout) -> std::io::Result<mpsc::Receiver<DecoderOutput>> {
+    let (tx, rx) = mpsc::sync_channel(DECODER_CHUNKS_AHEAD);
+    std::thread::Builder::new()
+        .name("continuous-decoder-read".into())
+        .spawn(move || loop {
+            let mut buf = vec![0u8; DECODER_CHUNK];
+            let output = match stdout.read(&mut buf) {
+                Ok(0) => DecoderOutput::End,
+                Ok(n) => {
+                    buf.truncate(n);
+                    DecoderOutput::Pcm(buf)
+                }
+                Err(e) => DecoderOutput::Failed(e),
+            };
+            let last = !matches!(output, DecoderOutput::Pcm(_));
+            if tx.send(output).is_err() || last {
+                return;
+            }
+        })?;
+    Ok(rx)
 }
 
 /// How far the PCM written since `connected` (`written` bytes, audio and silence) runs ahead of
@@ -2009,7 +2055,7 @@ pub(super) fn serve_continuous_stream(
             // A check that is merely slow (a track's end on a slow share) writes no silence while
             // the renderer still has the audio before it to play: silence only as that runs out,
             // so the next track follows gaplessly once the check answers.
-            if waiting_on_checks && renderer_lead(connected, written) > SILENCE_LEAD + SILENCE_TICK {
+            if waiting_on_checks && !renderer_running_dry(connected, written) {
                 wait_out_tick(pass_started);
                 continue;
             }
@@ -2069,7 +2115,7 @@ pub(super) fn serve_continuous_stream(
         // When the next file's check was asked for: answers given since then are used as this
         // track ends.
         let decoder_started = Instant::now();
-        let mut stdout = match cmd.spawn() {
+        let stdout = match cmd.spawn() {
             Ok(mut child) => match child.stdout.take() {
                 Some(stdout) => {
                     // Registered before the first request check below, so a request that arrived
@@ -2106,12 +2152,21 @@ pub(super) fn serve_continuous_stream(
             }
         };
 
-        // 3. Stream PCM chunks
-        let mut buf = [0u8; 32768];
+        // 3. Stream PCM chunks, read from the decoder on a helper thread so the stream goes on
+        // sending silence while the decoder gives nothing (#133).
+        let output = match stdout.map(spawn_decoder_reader) {
+            Some(Ok(output)) => Some(output),
+            Some(Err(e)) => {
+                crate::log_warn!("web", "Couldn't start reading the continuous stream's decoder: {}", e);
+                ended = true;
+                None
+            }
+            None => None,
+        };
         let mut bytes_streamed: u64 = (start_pos * PCM_BYTES_PER_SEC) as u64;
         let mut last_pos_update = std::time::Instant::now();
 
-        while let Some(stdout) = stdout.as_mut() {
+        while let Some(output) = output.as_ref() {
             if !controller.is_active.load(Ordering::SeqCst) {
                 controller.kill_active_decoder();
                 return Ok(());
@@ -2127,12 +2182,14 @@ pub(super) fn serve_continuous_stream(
                 break;
             }
 
-            match stdout.read(&mut buf) {
-                Ok(0) => {
+            let waited_from = Instant::now();
+            match output.recv_timeout(SILENCE_TICK) {
+                Ok(DecoderOutput::End) => {
                     ended = true;
                     break;
                 }
-                Ok(n) => {
+                Ok(DecoderOutput::Pcm(chunk)) => {
+                    let n = chunk.len();
                     if !streamed {
                         streamed = true;
                         streamed_since_wrap = true;
@@ -2150,7 +2207,7 @@ pub(super) fn serve_continuous_stream(
                             );
                         }
                     }
-                    if let Err(e) = stream.write_all(&buf[..n]) {
+                    if let Err(e) = stream.write_all(&chunk) {
                         crate::log_info!("web", "Continuous stream socket closed: {}", e);
                         controller.kill_decoder_of(cid);
                         return Ok(());
@@ -2170,9 +2227,39 @@ pub(super) fn serve_continuous_stream(
                         }
                     }
                 }
-                Err(e) => {
+                Ok(DecoderOutput::Failed(e)) => {
                     crate::log_warn!("web", "Continuous stream read error: {}", e);
                     break;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    crate::log_warn!("web", "Continuous stream decoder reader stopped");
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // No PCM yet: the decoder is starting, or stuck opening or reading the file on
+                    // a share that hangs (#133). Once it has had its start and the renderer is
+                    // running out of what it was sent, silence at real time keeps it fed (and
+                    // goes on, paced, from silence the stream was already sending).
+                    let covers = silence.is_some()
+                        || (decoder_started.elapsed() >= DECODER_START_GRACE
+                            && renderer_running_dry(connected, written));
+                    if !streamed && covers {
+                        match silence
+                            .get_or_insert_with(SilencePacer::new)
+                            .send(&mut stream, waited_from)
+                        {
+                            Ok(n) => written += n,
+                            Err(e) => {
+                                crate::log_info!(
+                                    "web",
+                                    "Continuous stream socket closed while the decoder starts: {}",
+                                    e
+                                );
+                                controller.kill_decoder_of(cid);
+                                return Ok(());
+                            }
+                        }
+                    }
                 }
             }
         }
