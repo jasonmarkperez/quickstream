@@ -1,0 +1,691 @@
+//! The background library indexer (#41, `analysis::index`): it walks a library tree in a temp
+//! folder, reads the tags of files that changed into tag-only rows, records each folder, and
+//! never touches the library. Every test runs it on its own database in a scratch folder.
+
+mod common;
+
+use std::collections::{BTreeMap, HashSet};
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
+
+use quickstream::analysis::db::TrackFeatures;
+use quickstream::analysis::index::{
+    default_tag_reader, run_library_index, IndexConfig, IndexControl, IndexProgress, IndexSnapshot, IndexState,
+    IndexTagReader,
+};
+use quickstream::analysis::worker::TagReadError;
+use quickstream::analysis::AnalysisDatabase;
+use quickstream::ui::workers::WorkerRegistry;
+
+/// A scratch folder for one test: `lib` (the library) and `db` (the analysis database) side by
+/// side, so nothing the indexer writes can land in the library.
+fn scratch(name: &str) -> (PathBuf, PathBuf) {
+    let dir = common::isolate().join(format!("index-{name}"));
+    let _ = fs::remove_dir_all(&dir);
+    let lib = dir.join("lib");
+    fs::create_dir_all(&lib).unwrap();
+    fs::create_dir_all(dir.join("db")).unwrap();
+    (lib, dir.join("db").join("track_analysis.db"))
+}
+
+fn silent_wav(path: &Path) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let data_len = 800u32;
+    let mut b = Vec::new();
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(36 + data_len).to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    b.extend_from_slice(&16u32.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&8000u32.to_le_bytes());
+    b.extend_from_slice(&16000u32.to_le_bytes());
+    b.extend_from_slice(&2u16.to_le_bytes());
+    b.extend_from_slice(&16u16.to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&data_len.to_le_bytes());
+    b.resize(b.len() + data_len as usize, 0);
+    fs::write(path, b).unwrap();
+}
+
+/// A silent WAV with an ID3v2 title, artist and BPM tag.
+fn tagged_wav(path: &Path, title: &str, bpm: &str) {
+    use lofty::config::WriteOptions;
+    use lofty::prelude::*;
+    use lofty::tag::{ItemKey, Tag, TagType};
+
+    silent_wav(path);
+    let mut tag = Tag::new(TagType::Id3v2);
+    tag.set_title(title.to_string());
+    tag.set_artist("Tag Artist".to_string());
+    tag.insert_text(ItemKey::IntegerBpm, bpm.to_string());
+    tag.save_to_path(path, WriteOptions::default()).unwrap();
+}
+
+/// `artists` artist folders with an album of `per_album` tracks each, and a loose track.
+fn library_tree(lib: &Path, artists: usize, per_album: usize) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for a in 0..artists {
+        for t in 0..per_album {
+            let path = lib
+                .join(format!("Artist {a:02}"))
+                .join("Album")
+                .join(format!("{t:02} Song.wav"));
+            silent_wav(&path);
+            files.push(path);
+        }
+    }
+    let loose = lib.join("loose.wav");
+    silent_wav(&loose);
+    files.push(loose);
+    files
+}
+
+fn config(roots: Vec<PathBuf>) -> IndexConfig {
+    IndexConfig {
+        start_delay: Duration::ZERO,
+        rescan_interval: Duration::from_secs(3600),
+        ..IndexConfig::new(roots)
+    }
+}
+
+/// A reader that counts its reads (and records their order) and then reads as the app does.
+fn counting_reader(count: Arc<AtomicUsize>, order: Arc<Mutex<Vec<PathBuf>>>) -> IndexTagReader {
+    let real = default_tag_reader();
+    Arc::new(move |path: &Path, stamp| {
+        count.fetch_add(1, Ordering::SeqCst);
+        order.lock().unwrap().push(path.to_path_buf());
+        real(path, stamp)
+    })
+}
+
+struct Running {
+    control: Arc<IndexControl>,
+    progress: Arc<IndexProgress>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+fn spawn(db_path: &Path, cfg: IndexConfig, reader: IndexTagReader) -> Running {
+    let control = Arc::new(IndexControl::new());
+    let progress = Arc::new(IndexProgress::new());
+    let (c, p, path) = (control.clone(), progress.clone(), db_path.to_path_buf());
+    let handle = std::thread::spawn(move || {
+        run_library_index(|| AnalysisDatabase::open_at(&path), cfg, &c, &p, reader);
+    });
+    Running {
+        control,
+        progress,
+        handle,
+    }
+}
+
+fn wait_for(what: &str, timeout: Duration, mut done: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !done() {
+        assert!(start.elapsed() < timeout, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+impl Running {
+    fn wait_state(&self, state: IndexState) {
+        wait_for(&format!("{state:?}"), Duration::from_secs(20), || {
+            self.progress.state() == state
+        });
+    }
+
+    fn finish(self) -> IndexSnapshot {
+        let snapshot = self.progress.snapshot();
+        self.control.stop();
+        self.handle.join().unwrap();
+        snapshot
+    }
+}
+
+/// One whole pass with `reader`; the snapshot when it is done.
+fn one_pass(db_path: &Path, roots: Vec<PathBuf>, reader: IndexTagReader) -> IndexSnapshot {
+    let run = spawn(db_path, config(roots), reader);
+    run.wait_state(IndexState::Done);
+    run.finish()
+}
+
+fn rows_under(db_path: &Path, dir: &Path) -> Vec<TrackFeatures> {
+    AnalysisDatabase::open_at(db_path).unwrap().tracks_under(dir, 64)
+}
+
+/// Every entry under `dir` (folders included): its kind, size, mtime and a hash of its contents.
+fn tree_snapshot(dir: &Path) -> BTreeMap<PathBuf, (bool, u64, SystemTime, u64)> {
+    let mut out = BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in fs::read_dir(&d).unwrap() {
+            let entry = entry.unwrap();
+            let md = fs::symlink_metadata(entry.path()).unwrap();
+            let hash = if md.is_file() {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                fs::read(entry.path()).unwrap().hash(&mut h);
+                h.finish()
+            } else {
+                0
+            };
+            if md.is_dir() {
+                stack.push(entry.path());
+            }
+            out.insert(entry.path(), (md.is_dir(), md.len(), md.modified().unwrap(), hash));
+        }
+    }
+    out.insert(
+        dir.to_path_buf(),
+        (true, 0, fs::metadata(dir).unwrap().modified().unwrap(), 0),
+    );
+    out
+}
+
+// ---------- zero-touch ----------
+
+/// A pass reads the library and writes only the analysis database: every name, size, mtime and
+/// content hash in the tree is the same afterwards, and no file appears in it.
+#[test]
+fn a_pass_leaves_the_library_unchanged() {
+    common::isolate();
+    let (lib, db_path) = scratch("zero_touch");
+    library_tree(&lib, 3, 3);
+    tagged_wav(&lib.join("Artist 00").join("Tagged.wav"), "Tagged", "124");
+    fs::write(lib.join("Artist 01").join("cover.jpg"), b"not audio").unwrap();
+    fs::write(lib.join("Artist 02").join("broken.mp3"), b"not really an mp3").unwrap();
+    let before = tree_snapshot(&lib);
+
+    let snap = one_pass(&db_path, vec![lib.clone()], default_tag_reader());
+    assert_eq!(snap.read, 12, "{snap:?}");
+    assert_eq!(snap.failed, 0, "{snap:?}");
+    assert_eq!(tree_snapshot(&lib), before, "the library changed");
+    // And a second pass, which reads nothing, leaves it as it is too.
+    one_pass(&db_path, vec![lib.clone()], default_tag_reader());
+    assert_eq!(tree_snapshot(&lib), before, "the library changed");
+}
+
+// ---------- incremental ----------
+
+/// A second pass reads no tags; a file touched since is read once.
+#[test]
+fn a_second_pass_reads_only_what_changed() {
+    common::isolate();
+    let (lib, db_path) = scratch("incremental");
+    let files = library_tree(&lib, 3, 4);
+    let count = Arc::new(AtomicUsize::new(0));
+    let order = Arc::new(Mutex::new(Vec::new()));
+
+    let first = one_pass(
+        &db_path,
+        vec![lib.clone()],
+        counting_reader(count.clone(), order.clone()),
+    );
+    assert_eq!(count.load(Ordering::SeqCst), files.len());
+    assert_eq!(
+        (first.read, first.unchanged, first.top_done, first.top_total),
+        (13, 0, 3, 3)
+    );
+    assert_eq!(rows_under(&db_path, &lib).len(), files.len());
+
+    let second = one_pass(
+        &db_path,
+        vec![lib.clone()],
+        counting_reader(count.clone(), order.clone()),
+    );
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        files.len(),
+        "no tag read on an unchanged library"
+    );
+    assert_eq!((second.read, second.unchanged), (0, 13));
+
+    // Touch one file (a new mtime): it alone is read again.
+    let touched = &files[5];
+    let file = fs::File::options().write(true).open(touched).unwrap();
+    file.set_modified(SystemTime::now() + Duration::from_secs(120)).unwrap();
+    drop(file);
+    order.lock().unwrap().clear();
+    let third = one_pass(
+        &db_path,
+        vec![lib.clone()],
+        counting_reader(count.clone(), order.clone()),
+    );
+    assert_eq!((third.read, third.unchanged), (1, 12));
+    assert_eq!(*order.lock().unwrap(), vec![touched.clone()]);
+}
+
+/// Folders are recorded with their audio file count, whole folders and subtrees as complete.
+#[test]
+fn folders_are_recorded_and_whole_subtrees_marked() {
+    common::isolate();
+    let (lib, db_path) = scratch("records");
+    library_tree(&lib, 2, 3);
+    one_pass(&db_path, vec![lib.clone()], default_tag_reader());
+
+    let db = AnalysisDatabase::open_at(&db_path).unwrap();
+    let (root, root_whole) = db.index_dir(&lib).expect("the root is recorded");
+    assert_eq!((root.audio_files, root.complete, root_whole), (1, true, true));
+    let album = lib.join("Artist 01").join("Album");
+    let (record, whole) = db.index_dir(&album).expect("the album is recorded");
+    assert_eq!((record.audio_files, record.complete, whole), (3, true, true));
+    let artists = [lib.join("Artist 00"), lib.join("Artist 01")];
+    assert_eq!(db.indexed_subtrees(&artists).len(), 2);
+}
+
+/// Stopping part-way keeps the rows read so far; the next pass reads only the rest.
+#[test]
+fn a_stopped_pass_keeps_its_rows_and_the_next_one_resumes() {
+    common::isolate();
+    let (lib, db_path) = scratch("resume");
+    let files = library_tree(&lib, 4, 5);
+    let control = Arc::new(IndexControl::new());
+    let progress = Arc::new(IndexProgress::new());
+    let reads = Arc::new(AtomicUsize::new(0));
+    let reader: IndexTagReader = {
+        let (control, reads, real) = (control.clone(), reads.clone(), default_tag_reader());
+        Arc::new(move |path: &Path, stamp| {
+            if reads.fetch_add(1, Ordering::SeqCst) + 1 == 7 {
+                control.stop();
+            }
+            real(path, stamp)
+        })
+    };
+    let path = db_path.clone();
+    let cfg = IndexConfig {
+        write_every: 3,
+        ..config(vec![lib.clone()])
+    };
+    run_library_index(|| AnalysisDatabase::open_at(&path), cfg, &control, &progress, reader);
+    assert_eq!(reads.load(Ordering::SeqCst), 7);
+    assert_eq!(
+        rows_under(&db_path, &lib).len(),
+        7,
+        "every row read before the stop is kept"
+    );
+    let db = AnalysisDatabase::open_at(&db_path).unwrap();
+    let partial: Vec<_> = [lib.clone()]
+        .into_iter()
+        .chain((0..4).map(|a| lib.join(format!("Artist {a:02}"))))
+        .collect();
+    assert!(
+        db.indexed_subtrees(&partial).len() < 4,
+        "a folder stopped part-way is not complete"
+    );
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let next = one_pass(
+        &db_path,
+        vec![lib.clone()],
+        counting_reader(count.clone(), Default::default()),
+    );
+    assert_eq!(count.load(Ordering::SeqCst), files.len() - 7);
+    assert_eq!((next.read, next.unchanged), (files.len() - 7, 7));
+    assert_eq!(rows_under(&db_path, &lib).len(), files.len());
+}
+
+// ---------- what a row holds ----------
+
+/// An I/O error stores no row and leaves the folder, and every folder above it, incomplete.
+#[test]
+fn an_io_error_writes_no_row_and_leaves_the_folder_incomplete() {
+    common::isolate();
+    let (lib, db_path) = scratch("io_error");
+    library_tree(&lib, 2, 3);
+    let bad = lib.join("Artist 01").join("Album").join("01 Song.wav");
+    let reader: IndexTagReader = {
+        let (bad, real) = (bad.clone(), default_tag_reader());
+        Arc::new(move |path: &Path, stamp| {
+            if path == bad {
+                return Err(TagReadError::Io(std::io::Error::from_raw_os_error(5)));
+            }
+            real(path, stamp)
+        })
+    };
+    let snap = one_pass(&db_path, vec![lib.clone()], reader);
+    assert_eq!((snap.read, snap.failed), (6, 1));
+
+    let db = AnalysisDatabase::open_at(&db_path).unwrap();
+    assert!(db.get_track(&bad).is_none(), "no row for a file that couldn't be read");
+    let album = lib.join("Artist 01").join("Album");
+    let (record, whole) = db.index_dir(&album).unwrap();
+    assert!(!record.complete && !whole);
+    let artists = [lib.join("Artist 00"), lib.join("Artist 01")];
+    let indexed = db.indexed_subtrees(&artists);
+    assert!(indexed.contains_key(&artists[0]) && !indexed.contains_key(&artists[1]));
+    assert!(!db.index_dir(&lib).unwrap().1, "the root's subtree isn't whole either");
+}
+
+/// An untagged file gets a row from its path, waiting for its acoustic pass; a BPM-tagged one
+/// needs none.
+#[test]
+fn rows_take_the_path_heuristics_or_the_bpm_tag() {
+    common::isolate();
+    let (lib, db_path) = scratch("rows");
+    let untagged = lib
+        .join("Some Artist")
+        .join("Some Album")
+        .join("Some Artist - Some Song.wav");
+    silent_wav(&untagged);
+    let tagged = lib.join("Some Artist").join("Some Album").join("tagged.wav");
+    tagged_wav(&tagged, "Tagged Title", "124");
+    one_pass(&db_path, vec![lib.clone()], default_tag_reader());
+
+    let db = AnalysisDatabase::open_at(&db_path).unwrap();
+    let row = db.get_track(&untagged).expect("an untagged file gets a row");
+    let (title, artist, album) = quickstream::metadata::parse_path_heuristics(&untagged);
+    assert_eq!((row.title, row.artist, row.album), (title, artist, album));
+    assert!(row.needs_acoustic, "no BPM tag: it waits for the acoustic pass");
+    assert_eq!((row.bpm, row.energy), (None, None));
+
+    let row = db.get_track(&tagged).expect("a tagged file gets a row");
+    assert_eq!(row.title, "Tagged Title");
+    assert_eq!(row.bpm, Some(124.0));
+    assert!(!row.needs_acoustic, "a BPM tag needs no acoustic pass");
+}
+
+/// Hidden folders and files, recycle bins and symlinks are skipped, as the mix's walk skips them.
+#[cfg(unix)]
+#[test]
+fn hidden_folders_recycle_bins_and_symlinks_are_skipped() {
+    common::isolate();
+    let (lib, db_path) = scratch("skips");
+    let outside = lib.parent().unwrap().join("outside");
+    silent_wav(&outside.join("elsewhere.wav"));
+    let kept = lib.join("Artist").join("kept.wav");
+    silent_wav(&kept);
+    for skipped in [
+        lib.join(".hidden").join("a.wav"),
+        lib.join("#recycle").join("b.wav"),
+        lib.join("$RECYCLE.BIN").join("c.wav"),
+        lib.join("Artist").join("._kept.wav"),
+        lib.join("Artist").join(".d.wav"),
+    ] {
+        silent_wav(&skipped);
+    }
+    std::os::unix::fs::symlink(&outside, lib.join("Linked Folder")).unwrap();
+    std::os::unix::fs::symlink(outside.join("elsewhere.wav"), lib.join("Artist").join("link.wav")).unwrap();
+
+    let snap = one_pass(&db_path, vec![lib.clone()], default_tag_reader());
+    assert_eq!(snap.read, 1, "{snap:?}");
+    let db = AnalysisDatabase::open_at(&db_path).unwrap();
+    let paths: Vec<PathBuf> = db.tracks_under(&lib, 64).into_iter().map(|r| r.filepath).collect();
+    assert_eq!(paths, vec![kept]);
+    assert!(db.get_track(&outside.join("elsewhere.wav")).is_none());
+    assert!(db.get_track(&lib.join(".hidden").join("a.wav")).is_none());
+    assert!(db.get_track(&lib.join("#recycle").join("b.wav")).is_none());
+}
+
+// ---------- order ----------
+
+/// A prioritised top-level folder is walked before the others.
+#[test]
+fn a_prioritised_folder_is_walked_first() {
+    common::isolate();
+    let (lib, db_path) = scratch("prioritise");
+    library_tree(&lib, 12, 2);
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let reader = counting_reader(Arc::new(AtomicUsize::new(0)), order.clone());
+    let control = Arc::new(IndexControl::new());
+    let progress = Arc::new(IndexProgress::new());
+    let wanted = lib.join("Artist 07");
+    control.prioritise(wanted.clone());
+    let path = db_path.clone();
+    let c = control.clone();
+    let p = progress.clone();
+    let handle = std::thread::spawn(move || {
+        run_library_index(|| AnalysisDatabase::open_at(&path), config(vec![lib]), &c, &p, reader)
+    });
+    wait_for("the pass", Duration::from_secs(20), || {
+        progress.state() == IndexState::Done
+    });
+    control.stop();
+    handle.join().unwrap();
+    let order = order.lock().unwrap();
+    // The root's own loose track comes first (it is read as the root is listed), then Artist 07.
+    assert_eq!(order.len(), 25);
+    assert!(order[0].ends_with("loose.wav"), "{order:?}");
+    assert!(
+        order[1].starts_with(&wanted) && order[2].starts_with(&wanted),
+        "{order:?}"
+    );
+}
+
+/// A prioritised folder deeper down is walked at once, and not again when the walk gets there.
+#[test]
+fn a_prioritised_folder_deeper_down_is_walked_once() {
+    common::isolate();
+    let (lib, db_path) = scratch("prioritise_deep");
+    library_tree(&lib, 6, 3);
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let reader = counting_reader(Arc::new(AtomicUsize::new(0)), order.clone());
+    let control = Arc::new(IndexControl::new());
+    let progress = Arc::new(IndexProgress::new());
+    let wanted = lib.join("Artist 03").join("Album");
+    control.prioritise(wanted.clone());
+    let (path, c, p) = (db_path.clone(), control.clone(), progress.clone());
+    let root = lib.clone();
+    let handle = std::thread::spawn(move || {
+        run_library_index(|| AnalysisDatabase::open_at(&path), config(vec![root]), &c, &p, reader)
+    });
+    wait_for("the pass", Duration::from_secs(20), || {
+        progress.state() == IndexState::Done
+    });
+    control.stop();
+    handle.join().unwrap();
+    let order = order.lock().unwrap();
+    assert_eq!(order.len(), 19, "every file read once: {order:?}");
+    assert!(order[1..4].iter().all(|p| p.starts_with(&wanted)), "{order:?}");
+    let unique: HashSet<_> = order.iter().collect();
+    assert_eq!(unique.len(), order.len());
+    let db = AnalysisDatabase::open_at(&db_path).unwrap();
+    assert!(db.index_dir(&lib).unwrap().1, "the whole tree is indexed");
+}
+
+// ---------- pacing ----------
+
+/// While paused it reads nothing and says so; unpaused it goes on.
+#[test]
+fn a_paused_indexer_reads_nothing_until_resumed() {
+    common::isolate();
+    let (lib, db_path) = scratch("pause");
+    library_tree(&lib, 2, 2);
+    let count = Arc::new(AtomicUsize::new(0));
+    let reader = counting_reader(count.clone(), Default::default());
+    let control = Arc::new(IndexControl::new());
+    control.set_paused(true);
+    let progress = Arc::new(IndexProgress::new());
+    let (path, c, p) = (db_path.clone(), control.clone(), progress.clone());
+    let root = lib.clone();
+    let handle = std::thread::spawn(move || {
+        run_library_index(|| AnalysisDatabase::open_at(&path), config(vec![root]), &c, &p, reader)
+    });
+    wait_for("Paused", Duration::from_secs(10), || {
+        progress.state() == IndexState::Paused
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    control.set_paused(false);
+    wait_for("Done", Duration::from_secs(20), || progress.state() == IndexState::Done);
+    assert_eq!(count.load(Ordering::SeqCst), 5);
+    control.stop();
+    handle.join().unwrap();
+}
+
+/// A slow operation makes it back off before the next one; stop ends the backoff at once.
+#[test]
+fn a_slow_read_backs_off_and_stop_ends_the_backoff() {
+    common::isolate();
+    let (lib, db_path) = scratch("backoff");
+    library_tree(&lib, 1, 2);
+    let slow: IndexTagReader = {
+        let real = default_tag_reader();
+        Arc::new(move |path: &Path, stamp| {
+            if path.ends_with("00 Song.wav") {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            real(path, stamp)
+        })
+    };
+    let cfg = IndexConfig {
+        slow_op: Duration::from_millis(200),
+        backoff: Duration::from_millis(300),
+        ..config(vec![lib.clone()])
+    };
+    let start = Instant::now();
+    let run = spawn(&db_path, cfg, slow.clone());
+    run.wait_state(IndexState::Done);
+    assert!(start.elapsed() >= Duration::from_millis(600), "{:?}", start.elapsed());
+    let snap = run.finish();
+    assert_eq!((snap.backoffs, snap.read), (1, 3));
+
+    // A long backoff ends as soon as stop is raised.
+    let (lib2, db2) = scratch("backoff_stop");
+    library_tree(&lib2, 1, 2);
+    let cfg = IndexConfig {
+        slow_op: Duration::from_millis(200),
+        backoff: Duration::from_secs(60),
+        ..config(vec![lib2])
+    };
+    let run = spawn(&db2, cfg, slow);
+    wait_for("the backoff", Duration::from_secs(10), || {
+        run.progress.backoffs.load(Ordering::SeqCst) == 1
+    });
+    let stop = Instant::now();
+    run.finish();
+    assert!(stop.elapsed() < Duration::from_secs(2), "{:?}", stop.elapsed());
+}
+
+/// A reader stuck on a hung share neither keeps quitting waiting (the thread is detached after
+/// the registry's deadline) nor holds a lock on the database.
+#[test]
+fn a_hung_reader_blocks_neither_shutdown_nor_the_database() {
+    common::isolate();
+    let (lib, db_path) = scratch("hung");
+    library_tree(&lib, 2, 2);
+    let (entered_tx, entered_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let reader: IndexTagReader = {
+        let entered_tx = Mutex::new(entered_tx);
+        Arc::new(move |_path: &Path, _stamp| {
+            let _ = entered_tx.lock().unwrap().send(());
+            let _ = release_rx.lock().unwrap().recv_timeout(Duration::from_secs(30));
+            Err(TagReadError::Io(std::io::Error::from_raw_os_error(60)))
+        })
+    };
+    let control = Arc::new(IndexControl::new());
+    let progress = Arc::new(IndexProgress::new());
+    let mut workers = WorkerRegistry::new();
+    {
+        let (path, c, p, root) = (db_path.clone(), control.clone(), progress.clone(), lib.clone());
+        workers.spawn("library-index", move || {
+            run_library_index(|| AnalysisDatabase::open_at(&path), config(vec![root]), &c, &p, reader)
+        });
+    }
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the reader is called");
+
+    // Another connection writes at once: no transaction is open across the read.
+    let other = AnalysisDatabase::open_at(&db_path).unwrap();
+    let start = Instant::now();
+    other
+        .upsert_track(&TrackFeatures {
+            filepath: lib.join("elsewhere.wav"),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+
+    control.stop();
+    let start = Instant::now();
+    assert_eq!(
+        workers.join_all(Duration::from_millis(100)),
+        1,
+        "the stuck thread is detached"
+    );
+    assert!(start.elapsed() < Duration::from_secs(1));
+    drop(release_tx);
+}
+
+// ---------- states ----------
+
+#[test]
+fn a_database_that_wont_open_reports_unavailable() {
+    common::isolate();
+    let (lib, _) = scratch("unavailable");
+    library_tree(&lib, 1, 1);
+    let control = IndexControl::new();
+    let progress = IndexProgress::new();
+    run_library_index(
+        || Err(anyhow::anyhow!("in memory")),
+        config(vec![lib]),
+        &control,
+        &progress,
+        default_tag_reader(),
+    );
+    assert_eq!(progress.state(), IndexState::Unavailable);
+}
+
+#[test]
+fn no_roots_reports_no_folders_at_once() {
+    common::isolate();
+    let control = IndexControl::new();
+    let progress = IndexProgress::new();
+    let start = Instant::now();
+    run_library_index(
+        || panic!("no database is opened without a folder"),
+        IndexConfig::new(Vec::new()),
+        &control,
+        &progress,
+        default_tag_reader(),
+    );
+    assert_eq!(progress.state(), IndexState::NoFolders);
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "no start delay without a folder"
+    );
+}
+
+/// Stop during the start delay returns at once, without opening the database.
+#[test]
+fn stop_during_the_start_delay_returns_without_opening_the_database() {
+    common::isolate();
+    let (lib, _) = scratch("delay");
+    let control = Arc::new(IndexControl::new());
+    let progress = Arc::new(IndexProgress::new());
+    let cfg = IndexConfig {
+        start_delay: Duration::from_secs(60),
+        ..IndexConfig::new(vec![lib])
+    };
+    let (c, p) = (control.clone(), progress.clone());
+    let handle = std::thread::spawn(move || {
+        run_library_index(|| panic!("opened during the delay"), cfg, &c, &p, default_tag_reader())
+    });
+    wait_for("Waiting", Duration::from_secs(5), || {
+        progress.state() == IndexState::Waiting
+    });
+    let start = Instant::now();
+    control.stop();
+    handle.join().unwrap();
+    assert!(start.elapsed() < Duration::from_secs(1));
+}
+
+/// The folder total is known once the roots are listed, and counts every root's top folders.
+#[test]
+fn progress_counts_top_level_folders_of_every_root() {
+    common::isolate();
+    let (lib, db_path) = scratch("roots");
+    let a = lib.join("A");
+    let b = lib.join("B");
+    library_tree(&a, 3, 1);
+    library_tree(&b, 2, 1);
+    let snap = one_pass(&db_path, vec![a.clone(), b.clone()], default_tag_reader());
+    assert_eq!((snap.top_done, snap.top_total, snap.read), (5, 5, 7));
+    let db = AnalysisDatabase::open_at(&db_path).unwrap();
+    assert!(db.index_dir(&a).unwrap().1 && db.index_dir(&b).unwrap().1);
+}

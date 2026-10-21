@@ -3,6 +3,7 @@
 pub mod bpm;
 pub mod db;
 pub mod harmonic;
+pub mod index;
 pub mod mixer;
 pub mod online;
 pub mod worker;
