@@ -17,10 +17,10 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use super::db::{mtime_nanos, walk_skips, AnalysisDatabase, IndexedDir, TrackFeatures};
-use super::worker::{stamp_of, tag_features, TagReadError};
+use super::db::{mtime_nanos, walk_skips, AnalysisDatabase, IndexFailure, IndexedDir, TrackFeatures};
+use super::worker::{now_secs, stamp_of, tag_features, TagReadError};
 use crate::library::SeenPaths;
 use crate::metadata::is_supported_audio_file;
 
@@ -150,7 +150,9 @@ pub struct IndexProgress {
     pub read: AtomicUsize,
     /// Files whose row already matched their stamp (no tag read).
     pub unchanged: AtomicUsize,
-    /// Files that couldn't be stat'ed or read (retried next pass).
+    /// Files that couldn't be stat'ed or read, or whose read panicked. Each is retried next pass
+    /// (a panicked one only once it has changed), and one that fails again for the same stamp no
+    /// longer keeps its folder incomplete.
     pub failed: AtomicUsize,
     /// Slow operations it backed off after.
     pub backoffs: AtomicUsize,
@@ -292,13 +294,6 @@ fn wait(control: &IndexControl, d: Duration) -> bool {
     false
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// A folder's own mtime as the index records it with a subtree mark ([`mtime_nanos`]): what a
 /// mix compares with the recorded one (`!=`) to tell whether the folder changed since its
 /// subtree was walked. `None` when it can't be read.
@@ -415,10 +410,26 @@ impl Indexer<'_> {
         }
     }
 
+    /// Remember that `path` failed (`failure`), and say whether it failed the same way, for the
+    /// same stamp, on an earlier pass (`before`): such a file no longer keeps its folder
+    /// incomplete. A walk would only offer it with the tags its path gives, as its tag read fails
+    /// again; an indexed folder's mix leaves it out (it has no row).
+    fn note_failure(&self, path: &Path, failure: IndexFailure, before: Option<&IndexFailure>) -> bool {
+        self.progress.failed.fetch_add(1, Ordering::SeqCst);
+        if let Err(e) = self.db.record_index_failure(path, failure, now_secs()) {
+            crate::log_warn!("index", "Couldn't record the failure of '{}': {e}", path.display());
+        }
+        before.is_some_and(|b| b.stamp == failure.stamp)
+    }
+
     /// Read the tags of `files` (a folder's own audio files) that changed and record the folder.
     /// `listed_ok` is false when the listing failed (the folder can't be complete). Returns
-    /// whether every file has a current row, `None` when stopped part-way (the rows read so far
-    /// are kept and the folder recorded as incomplete).
+    /// whether every file has a current row (or failed the same way on an earlier pass), `None`
+    /// when stopped part-way (the rows read so far are kept and the folder recorded as
+    /// incomplete).
+    ///
+    /// A tag read that panics (lofty on a malformed file) costs that file only: it counts as
+    /// failed and isn't read again while its stamp stays the same.
     fn index_files(&self, dir: &Path, files: &[PathBuf], listed_at: u64, listed_ok: bool) -> Option<bool> {
         let record = |complete: bool| IndexedDir {
             dirpath: dir.to_path_buf(),
@@ -427,6 +438,8 @@ impl Indexer<'_> {
             walked_at: listed_at,
         };
         let mut complete = listed_ok;
+        let failures = self.db.index_failures(files);
+        let failure_of = |path: &Path| failures.get(path.to_string_lossy().as_ref());
         let mut stamped = Vec::with_capacity(files.len());
         for path in files {
             if !self.hold() {
@@ -440,8 +453,11 @@ impl Indexer<'_> {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     crate::log_info!("index", "Couldn't stat '{}': {e}", path.display());
-                    self.progress.failed.fetch_add(1, Ordering::SeqCst);
-                    complete = false;
+                    let failure = IndexFailure {
+                        stamp: None,
+                        panicked: false,
+                    };
+                    complete &= self.note_failure(path, failure, failure_of(path));
                 }
             }
         }
@@ -457,15 +473,35 @@ impl Indexer<'_> {
                 self.progress.unchanged.fetch_add(1, Ordering::SeqCst);
                 continue;
             }
-            match self.timed("tag read", &path, || (self.reader)(&path, stamp)) {
-                Ok(row) => {
+            let before = failure_of(&path);
+            if before.is_some_and(|b| b.panicked && b.stamp == Some(stamp)) {
+                // Its read panicked for this very file: not again.
+                self.progress.failed.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+            let read = self.timed("tag read", &path, || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.reader)(&path, stamp)))
+            });
+            match read {
+                Ok(Ok(row)) => {
                     self.progress.read.fetch_add(1, Ordering::SeqCst);
                     batch.push(row);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     crate::log_info!("index", "Couldn't read the tags of '{}': {e}", path.display());
-                    self.progress.failed.fetch_add(1, Ordering::SeqCst);
-                    complete = false;
+                    let failure = IndexFailure {
+                        stamp: Some(stamp),
+                        panicked: false,
+                    };
+                    complete &= self.note_failure(&path, failure, before);
+                }
+                Err(_) => {
+                    crate::log_info!("index", "Reading the tags of '{}' panicked; skipped", path.display());
+                    let failure = IndexFailure {
+                        stamp: Some(stamp),
+                        panicked: true,
+                    };
+                    complete &= self.note_failure(&path, failure, before);
                 }
             }
             if batch.len() >= self.cfg.write_every.max(1) {

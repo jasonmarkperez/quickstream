@@ -359,6 +359,93 @@ fn an_io_error_writes_no_row_and_leaves_the_folder_incomplete() {
     assert!(!db.index_dir(&lib).unwrap().1, "the root's subtree isn't whole either");
 }
 
+/// A tag read that panics (lofty on a malformed file) costs that file only (#146 review): the
+/// pass goes on and finishes, the file counts as failed, and a later pass doesn't read it again
+/// while its stamp is the same, nor lets it keep its folder incomplete.
+#[test]
+fn a_panicking_tag_read_costs_that_file_only() {
+    common::isolate();
+    let (lib, db_path) = scratch("panic");
+    library_tree(&lib, 2, 3);
+    let bad = lib.join("Artist 01").join("Album").join("01 Song.wav");
+    let bad_reads = Arc::new(AtomicUsize::new(0));
+    let reader: IndexTagReader = {
+        let (bad, bad_reads, real) = (bad.clone(), bad_reads.clone(), default_tag_reader());
+        Arc::new(move |path: &Path, stamp| {
+            if path == bad {
+                bad_reads.fetch_add(1, Ordering::SeqCst);
+                panic!("malformed file");
+            }
+            real(path, stamp)
+        })
+    };
+    let first = one_pass(&db_path, vec![lib.clone()], reader.clone());
+    assert_eq!((first.read, first.failed), (6, 1), "{first:?}");
+    let album = lib.join("Artist 01").join("Album");
+    {
+        let db = AnalysisDatabase::open_at(&db_path).unwrap();
+        assert!(db.get_track(&bad).is_none());
+        assert!(!db.index_dir(&album).unwrap().1, "first failure: not whole yet");
+    }
+
+    let second = one_pass(&db_path, vec![lib.clone()], reader);
+    assert_eq!((second.read, second.unchanged, second.failed), (0, 6, 1), "{second:?}");
+    assert_eq!(bad_reads.load(Ordering::SeqCst), 1, "not read again for the same stamp");
+    let db = AnalysisDatabase::open_at(&db_path).unwrap();
+    assert!(trusted(&db, &album) && trusted(&db, &lib.join("Artist 01")) && trusted(&db, &lib));
+}
+
+/// A file that always fails (EACCES) keeps its folder incomplete for one pass only (#146
+/// review): failing again with the same stamp, it no longer stops the folder, its top-level
+/// folder and the root from being marked whole (a walk would only offer it untagged). It is still
+/// tried every pass, and once it reads its row is written and the failure forgotten.
+#[test]
+fn a_file_that_always_fails_stops_blocking_its_folder() {
+    common::isolate();
+    let (lib, db_path) = scratch("always_fails");
+    library_tree(&lib, 2, 3);
+    let bad = lib.join("Artist 01").join("Album").join("01 Song.wav");
+    let readable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let reader: IndexTagReader = {
+        let (bad, readable, attempts, real) = (bad.clone(), readable.clone(), attempts.clone(), default_tag_reader());
+        Arc::new(move |path: &Path, stamp| {
+            if path == bad {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                if !readable.load(Ordering::SeqCst) {
+                    return Err(TagReadError::Io(std::io::Error::from_raw_os_error(13)));
+                }
+            }
+            real(path, stamp)
+        })
+    };
+    let album = lib.join("Artist 01").join("Album");
+    one_pass(&db_path, vec![lib.clone()], reader.clone());
+    {
+        let db = AnalysisDatabase::open_at(&db_path).unwrap();
+        assert!(!trusted(&db, &album) && !trusted(&db, &lib.join("Artist 01")) && !trusted(&db, &lib));
+    }
+    let second = one_pass(&db_path, vec![lib.clone()], reader.clone());
+    assert_eq!(second.failed, 1, "{second:?}");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "tried again");
+    {
+        let db = AnalysisDatabase::open_at(&db_path).unwrap();
+        assert!(trusted(&db, &album) && trusted(&db, &lib.join("Artist 01")) && trusted(&db, &lib));
+        assert!(db.get_track(&bad).is_none(), "still no row");
+        assert_eq!(db.index_failures(std::slice::from_ref(&bad)).len(), 1);
+    }
+
+    readable.store(true, Ordering::SeqCst);
+    let third = one_pass(&db_path, vec![lib.clone()], reader);
+    assert_eq!((third.read, third.failed), (1, 0), "{third:?}");
+    let db = AnalysisDatabase::open_at(&db_path).unwrap();
+    assert!(db.get_track(&bad).is_some());
+    assert!(
+        db.index_failures(std::slice::from_ref(&bad)).is_empty(),
+        "forgotten once read"
+    );
+}
+
 /// An untagged file gets a row from its path, waiting for its acoustic pass; a BPM-tagged one
 /// needs none.
 #[test]
