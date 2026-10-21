@@ -69,7 +69,11 @@ fn start(state: Arc<RwLock<NowPlayingState>>) -> (WebServerHandle, mpsc::Receive
 
 /// Send a GET and return the status with the reader positioned after the response head.
 fn open(port: u16, path: &str) -> (u16, BufReader<TcpStream>) {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    open_on(TcpStream::connect(("127.0.0.1", port)).unwrap(), port, path)
+}
+
+/// As [`open`], on a connection already made to the web server at `port`.
+fn open_on(mut stream: TcpStream, port: u16, path: &str) -> (u16, BufReader<TcpStream>) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     stream
         .write_all(format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", path, port).as_bytes())
@@ -543,8 +547,12 @@ fn test_upnp_continuous_seek_is_clamped_to_the_known_length() {
 /// `0x01` bytes at about real time (`longones` 3 s) and `burst` 1 s of them at once, then an exit
 /// (a track that ends); `twos` gets 0.1 s of `0x02` bytes, then nothing until killed; `waking` gets
 /// nothing for 2 s (a share that hangs as ffmpeg opens the file), then `0x01` bytes at about real
-/// time until it is killed; any other input gets nothing, as while the real one opens a file on a
-/// slow share, until it is killed.
+/// time until it is killed; `stall` gets 0.5 s of `0x01` bytes at about real time, then nothing
+/// for 2.5 s (a share that hangs as ffmpeg reads the file), then `0x01` bytes at about real time
+/// until it is killed; `flood` gets 5 s of `0x01` bytes at once, then an exit; `surge` gets 6 s of
+/// them at once, nothing for 1.2 s, then 5 s of them at about real time, then an exit; `sleepy` gets
+/// nothing for 1 s, then `0x02` bytes at about real time until it is killed; any other input gets
+/// nothing, as while the real one opens a file on a slow share, until it is killed.
 #[cfg(unix)]
 struct FakeDecoder {
     binary: PathBuf,
@@ -559,7 +567,7 @@ impl FakeDecoder {
         let log = dir.join("ffmpeg.log");
         let pids = dir.join("ffmpeg.pids");
         let text = format!(
-            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"${{in##*/}}\" in\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *longones*) for i in $(seq 30); do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *long*) head -c 17640 /dev/zero; exec sleep 3 ;;\n  *endless*) exec cat /dev/zero ;;\n  *live*) while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *late*) sleep 1; while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *bad*) exit 1 ;;\n  *ones*) for i in 1 2 3 4 5; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *burst*) head -c 176400 /dev/zero | tr '\\000' '\\001'; exit 0 ;;\n  *twos*) head -c 17640 /dev/zero | tr '\\000' '\\002'; exec sleep 30 ;;\n  *waking*) sleep 2; while :; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done ;;\nesac\nexec sleep 30\n",
+            "#!/bin/sh\necho $$ >> '{pids}'\nin=''\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = '-i' ] && in=\"$a\"; prev=\"$a\"; done\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"${{in##*/}}\" in\n  *short*) head -c 17640 /dev/zero; exec sleep 0.5 ;;\n  *longones*) for i in $(seq 30); do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *long*) head -c 17640 /dev/zero; exec sleep 3 ;;\n  *endless*) exec cat /dev/zero ;;\n  *live*) while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *late*) sleep 1; while :; do head -c 17640 /dev/zero; sleep 0.1; done ;;\n  *bad*) exit 1 ;;\n  *ones*) for i in 1 2 3 4 5; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *burst*) head -c 176400 /dev/zero | tr '\\000' '\\001'; exit 0 ;;\n  *twos*) head -c 17640 /dev/zero | tr '\\000' '\\002'; exec sleep 30 ;;\n  *waking*) sleep 2; while :; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done ;;\n  *stall*) for i in 1 2 3 4 5; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; sleep 2.5; while :; do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done ;;\n  *surge*) head -c 1058400 /dev/zero | tr '\\000' '\\001'; sleep 1.2; for i in $(seq 50); do head -c 17640 /dev/zero | tr '\\000' '\\001'; sleep 0.1; done; exit 0 ;;\n  *flood*) head -c 882000 /dev/zero | tr '\\000' '\\001'; exit 0 ;;\n  *sleepy*) sleep 1; while :; do head -c 17640 /dev/zero | tr '\\000' '\\002'; sleep 0.1; done ;;\nesac\nexec sleep 30\n",
             pids = pids.display(),
             log = log.display()
         );
@@ -623,8 +631,13 @@ fn pid_alive(pid: &str) -> bool {
 }
 
 /// Wait up to 10 s for `done`.
-fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+fn wait_until(what: &str, done: impl FnMut() -> bool) {
+    wait_within(Duration::from_secs(10), what, done)
+}
+
+/// Wait up to `timeout` for `done`.
+fn wait_within(timeout: Duration, what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
     while !done() {
         assert!(Instant::now() < deadline, "{}", what);
         std::thread::sleep(Duration::from_millis(10));
@@ -1936,6 +1949,164 @@ fn test_continuous_stream_sends_silence_while_the_decoder_gives_nothing() {
     renderer.hang_up();
 }
 
+/// A decoder that stops giving PCM in the middle of a track (the share hangs as ffmpeg reads the
+/// file) is covered by silence at real time as well, once the renderer runs out of what it was
+/// sent; when the decoder goes on, its audio follows in the same run (#133).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_sends_silence_while_the_decoder_stalls_mid_track() {
+    common::isolate();
+    let f = DecoderFixture::armed("stalled_decoder", &["t0_stall.wav"], 0, |_, _| {});
+    let renderer = RecordingRenderer::connect(f.port, &f.path);
+    let connected = Instant::now();
+    wait_until("the decoder's audio never reached the renderer", || {
+        renderer.bytes.lock().unwrap().contains(&1)
+    });
+    let audio_from = Instant::now();
+    // 0.5 s of audio, then 2.5 s of nothing: measured from 0.9 s to 1.9 s into the stall.
+    std::thread::sleep(Duration::from_millis(1400));
+    let (from, before) = (Instant::now(), renderer.bytes.lock().unwrap().len());
+    std::thread::sleep(Duration::from_millis(1000));
+    let window = renderer.bytes.lock().unwrap()[before..].to_vec();
+    let rate = window.len() as f64 / from.elapsed().as_secs_f64();
+    assert!(
+        audio_from.elapsed() < Duration::from_millis(2900),
+        "the window ran past the stall, the machine is too slow for this test"
+    );
+    assert!(window.iter().all(|&b| b == 0), "silence while the decoder stalls");
+    assert_about_real_time(rate, "while the decoder stalls");
+    let received = renderer.bytes.lock().unwrap().len() as f64;
+    let lead = 0.1 * REAL_TIME_BYTES_PER_SEC;
+    assert!(
+        received <= (connected.elapsed().as_secs_f64() + 0.1) * REAL_TIME_BYTES_PER_SEC + lead,
+        "silence runs at most the lead ahead of real time: {:.0} bytes after {:?}",
+        received,
+        connected.elapsed()
+    );
+
+    let silent_until = renderer.bytes.lock().unwrap().len();
+    wait_until("the decoder's audio never came back", || {
+        renderer.bytes.lock().unwrap()[silent_until..].contains(&1)
+    });
+    assert_eq!(f.decoder.calls().len(), 1, "the same decoder run, not a restart");
+    f.handle.as_ref().unwrap().stream_state().close_active_streams();
+    renderer.hang_up();
+}
+
+/// A renderer that was paused for seconds (it stopped reading, so the stream's writes blocked)
+/// still holds what it was sent before: a next track whose decoder takes a second to start
+/// follows the one before with no silence between them (#133).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_adds_no_silence_after_a_renderer_pause() {
+    common::isolate();
+    // 0.3 s of its own buffer, besides what the sockets hold.
+    let (silence, first_track) = silence_after_a_renderer_pause("paused_renderer", "t0_flood.wav", 0.3);
+    assert_eq!(
+        silence, 0,
+        "{} bytes of silence between the tracks, although the renderer held seconds of audio",
+        silence
+    );
+    assert_eq!(first_track, 882_000, "the whole first track, then the second");
+}
+
+/// A renderer pause stays counted while the decoder, after it, gives its audio no faster than
+/// real time (a slow share): those writes don't go faster than their audio because the renderer
+/// read ahead, so they don't take back the time it was paused. A next track whose decoder takes a
+/// second to start then still follows with no silence (#133).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_keeps_a_renderer_pause_through_audio_at_real_time() {
+    common::isolate();
+    let (silence, first_track) = silence_after_a_renderer_pause("paused_then_paced", "t0_surge.wav", 1.0);
+    assert_eq!(
+        silence, 0,
+        "{} bytes of silence between the tracks, although the renderer held seconds of audio",
+        silence
+    );
+    assert_eq!(first_track, 1_940_400, "the whole first track, then the second");
+}
+
+/// Stream `first` (`0x01` bytes) and then `sleepy` (`0x02` bytes after 1 s) to a renderer playing
+/// out of `buffer_secs` of its own buffer, paused for 4 s 0.5 s into the first track. Returns the
+/// silence bytes the renderer got between the first track's audio and the second's, and the bytes
+/// from the first track's first byte to the second's.
+#[cfg(unix)]
+fn silence_after_a_renderer_pause(name: &str, first: &str, buffer_secs: f64) -> (usize, usize) {
+    let f = DecoderFixture::armed(name, &[first, "t1_sleepy.wav"], 0, |_, _| {});
+    let capacity = (buffer_secs * REAL_TIME_BYTES_PER_SEC) as u64 / 4 * 4;
+    let renderer = PlayingRenderer::connect(f.port, &f.path, capacity);
+    wait_until("the first track never reached the renderer", || {
+        renderer.bytes.lock().unwrap().contains(&1)
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    renderer.paused.store(true, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_secs(4));
+    renderer.paused.store(false, Ordering::SeqCst);
+    wait_within(
+        Duration::from_secs(20),
+        "the second track never reached the renderer",
+        || renderer.bytes.lock().unwrap().contains(&2),
+    );
+    let bytes = renderer.bytes.lock().unwrap().clone();
+    let first_one = bytes.iter().position(|&b| b == 1).unwrap();
+    let first_two = bytes.iter().position(|&b| b == 2).unwrap();
+    let silence = bytes[first_one..first_two].iter().filter(|&&b| b == 0).count();
+    f.handle.as_ref().unwrap().stream_state().close_active_streams();
+    renderer.hang_up();
+    (silence, first_two - first_one)
+}
+
+/// A renderer that reads in bursts (it blocks the stream's writes while it plays from its own
+/// buffer, then takes a second of audio at once) is not taken for one that paused: when the next
+/// track's decoder then hangs, silence starts before the renderer runs out of audio (#117, #133).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_renderer_reading_in_bursts_never_runs_dry() {
+    common::isolate();
+    let f = DecoderFixture::armed("bursty_renderer", &["t0_flood.wav", "t1_hang.wav"], 0, |_, _| {});
+    let bytes_for = |secs: f64| (secs * REAL_TIME_BYTES_PER_SEC) as u64 / 4 * 4;
+    let renderer = PlayingRenderer::connect_bursty(f.port, &f.path, bytes_for(1.2), bytes_for(0.1));
+    wait_until("the first track never reached the renderer", || {
+        renderer.bytes.lock().unwrap().contains(&1)
+    });
+    // All of the first track gets through, then the hung decoder's silence for a while.
+    wait_within(Duration::from_secs(20), "the first track never got through", || {
+        let bytes = renderer.bytes.lock().unwrap();
+        bytes.iter().filter(|&&b| b == 1).count() == 882_000 && bytes.ends_with(&[0u8; 176_400])
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    let dry = *renderer.dry.lock().unwrap();
+    assert!(dry < Duration::from_millis(300), "the renderer ran dry for {:?}", dry);
+    f.handle.as_ref().unwrap().stream_state().close_active_streams();
+    renderer.hang_up();
+}
+
+/// Re-arming the session while a decoder gives nothing ends the old session's connection: it
+/// stops sending silence and closes, and its decoder is stopped (#133).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_rearmed_session_ends_a_hung_decoders_silence() {
+    common::isolate();
+    let mut f = DecoderFixture::armed("rearm_hung_decoder", &["t0_hang.wav"], 0, |_, _| {});
+    f.renderer = Some(Renderer::connect(f.port, &f.path));
+    assert_eq!(f.run(1), (f.tracks[0].clone(), None));
+    // Past the decoder's start grace: the stream sends silence for it.
+    std::thread::sleep(Duration::from_millis(1000));
+    let renderer = f.renderer.as_ref().unwrap();
+    assert_about_real_time(
+        renderer.rate_over(Duration::from_millis(500)),
+        "silence while the decoder hangs",
+    );
+    let _next = f.handle.as_ref().unwrap().stream_state().arm_continuous_session();
+    assert!(
+        renderer.closed_within(Duration::from_secs(2)),
+        "the old session's connection kept sending silence"
+    );
+    let pid = f.decoder.pid(1);
+    wait_until("the old session's decoder was left running", || !pid_alive(&pid));
+}
+
 /// A seek asked while the stream waits on a file check stays pending, and is applied to that
 /// file once its check answers; a skip asked then plays the track skipped to (#117).
 #[cfg(unix)]
@@ -2162,6 +2333,144 @@ impl RecordingRenderer {
         });
         Self {
             bytes,
+            reading,
+            thread: Some(thread),
+        }
+    }
+
+    fn hang_up(mut self) {
+        self.reading.store(false, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A connection to 127.0.0.1:`port` whose receive buffer is set small before it connects, so a
+/// writer to it blocks soon after its reader stops reading (the kernel would otherwise take
+/// seconds of PCM).
+#[cfg(unix)]
+fn connect_small_receive_buffer(port: u16) -> TcpStream {
+    use std::os::unix::io::FromRawFd;
+    // SAFETY: plain socket calls on a descriptor this function owns; it is handed to the
+    // `TcpStream` (which closes it) once connected, or closed here on failure.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        assert!(fd >= 0, "socket");
+        let size: libc::c_int = 16384;
+        let set = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &size as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        assert_eq!(set, 0, "SO_RCVBUF");
+        let mut addr: libc::sockaddr_in = std::mem::zeroed();
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+        {
+            addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+        }
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_port = port.to_be();
+        addr.sin_addr = libc::in_addr {
+            s_addr: u32::from(Ipv4Addr::LOCALHOST).to_be(),
+        };
+        let connected = libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        );
+        if connected != 0 {
+            libc::close(fd);
+            panic!("connect to 127.0.0.1:{}", port);
+        }
+        TcpStream::from_raw_fd(fd)
+    }
+}
+
+/// A renderer that plays at real time out of a buffer holding `capacity` bytes and that can be
+/// paused: while `paused` it neither plays nor reads, as when its user presses pause. It reads
+/// only while it has room (so the stream's writes block at real time once it is full) and, once
+/// full, not again until it holds `low_water` bytes or less: with `low_water` well under
+/// `capacity` it reads in bursts, as renderers with a large buffer do. Records the bytes it got
+/// after the WAV header, and `dry`, how long it had nothing to play while not paused once audio
+/// had started.
+#[cfg(unix)]
+struct PlayingRenderer {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    paused: Arc<AtomicBool>,
+    dry: Arc<Mutex<Duration>>,
+    reading: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl PlayingRenderer {
+    fn connect(port: u16, path: &str, capacity: u64) -> Self {
+        Self::connect_bursty(port, path, capacity, capacity)
+    }
+
+    fn connect_bursty(port: u16, path: &str, capacity: u64, low_water: u64) -> Self {
+        let (status, mut reader) = open_on(connect_small_receive_buffer(port), port, path);
+        assert_eq!(status, 200);
+        let mut wav_hdr = [0u8; 44];
+        reader.read_exact(&mut wav_hdr).unwrap();
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let paused = Arc::new(AtomicBool::new(false));
+        let dry = Arc::new(Mutex::new(Duration::ZERO));
+        let reading = Arc::new(AtomicBool::new(true));
+        let (bytes_t, paused_t, dry_t, reading_t) = (bytes.clone(), paused.clone(), dry.clone(), reading.clone());
+        let thread = std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            // What it has played (time spent playing) and got.
+            let mut played = Duration::ZERO;
+            let mut got: u64 = 0;
+            let mut last = Instant::now();
+            let mut filling = true;
+            while reading_t.load(Ordering::SeqCst) {
+                let now = Instant::now();
+                let paused = paused_t.load(Ordering::SeqCst);
+                if !paused {
+                    played += now - last;
+                }
+                last = now;
+                // It can't play what it hasn't got: it runs dry instead.
+                let got_time = Duration::from_secs_f64(got as f64 / REAL_TIME_BYTES_PER_SEC);
+                if played > got_time {
+                    if got > 0 {
+                        *dry_t.lock().unwrap() += played - got_time;
+                    }
+                    played = got_time;
+                }
+                let held = got - (played.as_secs_f64() * REAL_TIME_BYTES_PER_SEC) as u64;
+                if held >= capacity {
+                    filling = false;
+                } else if held <= low_water {
+                    filling = true;
+                }
+                if paused || !filling {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                let room = ((capacity - held) as usize).min(buf.len());
+                match reader.read(&mut buf[..room]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        got += n as u64;
+                        bytes_t.lock().unwrap().extend_from_slice(&buf[..n]);
+                    }
+                }
+            }
+        });
+        Self {
+            bytes,
+            paused,
+            dry,
             reading,
             thread: Some(thread),
         }
