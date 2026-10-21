@@ -83,7 +83,9 @@ impl AppUI {
                     self.update_web_state();
                 }
                 crate::web::WebCommand::AddFile(path) => {
-                    if path.exists() && crate::metadata::is_supported_audio_file(&path) {
+                    // The web thread has resolved the path inside the allowed folders, so it was
+                    // there; looking it up again here would stat the share on the UI thread.
+                    if crate::metadata::is_supported_audio_file(&path) {
                         let meta = self.quick_metadata(&path);
                         let title = meta.display_title().to_string();
                         self.enqueue_tracks(vec![meta]);

@@ -7,8 +7,11 @@
 //! read to end. Every read publishes its tags the same way (the on-disk index, the shared
 //! [`MetadataCache`], then `metadata_tx`) before its path leaves the set, so a request that
 //! skipped or waited still gets them: the UI refreshes browser labels and queue rows from
-//! `metadata_tx`, and the folder add takes them from the cache. A path leaves the set when its
-//! read ends, also when the read fails or panics.
+//! `metadata_tx`, and the folder add takes them from the cache. A read that fails publishes the
+//! file's size if the reader found it ([`crate::metadata::UnreadableTags`]), so a file queued
+//! with no size (issue #124) gets it from whichever worker read it, or that the file wasn't
+//! found, so the queue can read it again later. A path leaves the set when its read ends, also
+//! when the read fails or panics.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -24,6 +27,22 @@ use crate::metadata::AudioMetadata;
 /// counting or blocking stand-in for the share.
 pub type TagReader = Arc<dyn Fn(&Path) -> anyhow::Result<AudioMetadata> + Send + Sync>;
 
+/// What a tag read publishes on `metadata_tx`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TagUpdate {
+    /// The file's tags (also in the [`MetadataCache`] entries by then).
+    Tags(AudioMetadata),
+    /// The tags couldn't be read. `file_size` is the size the reader found (also in the cache,
+    /// [`MetadataCache::unreadable_size`]), `None` when it couldn't find the file at all.
+    Unreadable { path: PathBuf, file_size: Option<u64> },
+}
+
+impl From<AudioMetadata> for TagUpdate {
+    fn from(meta: AudioMetadata) -> Self {
+        TagUpdate::Tags(meta)
+    }
+}
+
 /// How often a waiting folder add checks its stop flag.
 const WAIT_POLL: Duration = Duration::from_millis(50);
 
@@ -32,7 +51,7 @@ const WAIT_POLL: Duration = Duration::from_millis(50);
 pub enum TagRead {
     /// This worker read the file and published its tags.
     Read,
-    /// This worker read the file and the read failed; nothing was published.
+    /// This worker read the file and the read failed; it published the size it found, if any.
     Failed,
     /// Another worker is reading the file and publishes its tags; this one skipped it.
     Busy,
@@ -62,7 +81,7 @@ pub struct SharedTagReads {
     reader: TagReader,
     reading: Arc<Reading>,
     cache: MetadataCache,
-    metadata_tx: Sender<AudioMetadata>,
+    metadata_tx: Sender<TagUpdate>,
 }
 
 /// One path marked as being read. Dropping it (also while a panic unwinds) clears the mark and
@@ -80,8 +99,8 @@ impl Drop for Claim<'_> {
 }
 
 impl SharedTagReads {
-    /// Reads publish their tags to `cache` and `metadata_tx`.
-    pub fn new(cache: MetadataCache, metadata_tx: Sender<AudioMetadata>) -> Self {
+    /// Reads publish their tags (or, failing, the file's size) to `cache` and `metadata_tx`.
+    pub fn new(cache: MetadataCache, metadata_tx: Sender<TagUpdate>) -> Self {
         Self {
             reader: Arc::new(|path: &Path| crate::metadata::extract_metadata(path)),
             reading: Arc::default(),
@@ -147,17 +166,30 @@ impl SharedTagReads {
         }
     }
 
-    /// Read the claimed path and publish its tags; the claim ends after publishing, so a
-    /// worker that waited finds them in the cache.
+    /// Read the claimed path and publish its tags, or the size a failed read found; the claim
+    /// ends after publishing, so a worker that waited finds them in the cache. A failed read's
+    /// size stays out of the on-disk index, so the next session reads the file again.
     fn read_claimed(&self, claim: Claim<'_>) -> TagRead {
         match (self.reader)(&claim.path) {
             Ok(meta) => {
                 crate::library::LibraryManager::append_to_cache(&meta);
                 self.cache.insert(meta.clone());
-                let _ = self.metadata_tx.send(meta);
+                let _ = self.metadata_tx.send(TagUpdate::Tags(meta));
                 TagRead::Read
             }
-            Err(_) => TagRead::Failed,
+            Err(err) => {
+                let file_size = err
+                    .downcast_ref::<crate::metadata::UnreadableTags>()
+                    .map(|e| e.file_size);
+                if let Some(size) = file_size {
+                    self.cache.insert_unreadable(&claim.path, size);
+                }
+                let _ = self.metadata_tx.send(TagUpdate::Unreadable {
+                    path: claim.path.clone(),
+                    file_size,
+                });
+                TagRead::Failed
+            }
         }
     }
 }

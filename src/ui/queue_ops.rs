@@ -4,14 +4,14 @@
 
 use std::path::PathBuf;
 
-use super::tag_reads::SharedTagReads;
+use super::tag_reads::{SharedTagReads, TagUpdate};
 use super::workers::WorkerRegistry;
 use super::AppUI;
 
 /// Start 4 threads that read tags for paths sent to the returned inbox through `tag_reads`, which
-/// reports results on `metadata_tx`. A path another worker is reading right now is skipped: that
-/// read reports it. The threads exit once the inbox sender is dropped or `stop` is set (paths
-/// still queued in the inbox are then skipped).
+/// reports results on `metadata_tx` (a failed read the file's size, issue #124). A path another
+/// worker is reading right now is skipped: that read reports it. The threads exit once the inbox
+/// sender is dropped or `stop` is set (paths still queued in the inbox are then skipped).
 fn spawn_queue_metadata_workers(
     workers: &mut WorkerRegistry,
     tag_reads: SharedTagReads,
@@ -42,7 +42,9 @@ fn spawn_queue_metadata_workers(
 
 impl AppUI {
     /// Resolve tags for queue tracks that still have placeholder metadata. Each path is read at
-    /// most once per session by a persistent pool of 4 workers; results arrive via `metadata_rx`.
+    /// most once per session by a persistent pool of 4 workers (a read that couldn't find the
+    /// file leaves it to be read again by the next add, play, next or previous); results arrive
+    /// via `metadata_rx`.
     /// A zero sample rate marks a placeholder that has an artist and duration (a playlist's
     /// `#EXTINF`) but no album or audio properties yet.
     pub fn start_queue_metadata_fetch(&mut self) {
@@ -83,11 +85,16 @@ impl AppUI {
         }
     }
 
-    /// Cached metadata for `path`, or a path-derived placeholder. Never reads the audio file.
+    /// Cached metadata for `path`, or a placeholder built from the path alone, with the size a
+    /// failed tag read found for it earlier this session, if any. Never touches the disk, not
+    /// even to stat the file (issue #124): the queue's tag read fills in the size.
     pub(super) fn quick_metadata(&self, path: &std::path::Path) -> crate::metadata::AudioMetadata {
         self.metadata_cache
             .get(path)
-            .unwrap_or_else(|| crate::metadata::fallback_metadata(path))
+            .unwrap_or_else(|| crate::metadata::AudioMetadata {
+                file_size: self.metadata_cache.unreadable_size(path).unwrap_or(0),
+                ..crate::metadata::path_metadata(path)
+            })
     }
 
     /// Append tracks to the queue and resolve missing tags on background workers.
@@ -143,7 +150,22 @@ impl AppUI {
 
     pub fn poll_background_metadata(&mut self) {
         let mut queue_updated = false;
-        while let Ok(meta) = self.metadata_rx.try_recv() {
+        while let Ok(update) = self.metadata_rx.try_recv() {
+            let meta = match update {
+                TagUpdate::Tags(meta) => meta,
+                // The tags couldn't be read: the queued rows get the size alone (issue #124),
+                // keeping the rest of their placeholder. A file that wasn't found at all (a
+                // share gone for a moment) is read again by the next add, play, next or previous.
+                TagUpdate::Unreadable { path, file_size } => {
+                    match file_size {
+                        Some(size) => queue_updated |= self.queue.set_file_size(&path, size),
+                        None => {
+                            self.queue_metadata_attempted.remove(&path);
+                        }
+                    }
+                    continue;
+                }
+            };
             let path = meta.filepath.clone();
             self.metadata_cache.insert(meta.clone());
 

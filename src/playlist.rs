@@ -369,30 +369,17 @@ pub fn playlist_file_path(dir: &Path, name: &str) -> Option<PathBuf> {
     (path.parent() == Some(dir)).then_some(path)
 }
 
-/// Queue metadata built from a playlist entry alone. Unlike `metadata::fallback_metadata` it does
-/// not `stat` the file, so it never waits on a slow or unmounted share. Fields the entry does not
-/// know stay empty or zero; the queue's background tag fetch resolves tracks that have no artist
-/// or duration.
+/// Queue metadata built from a playlist entry alone: [`crate::metadata::path_metadata`] (file
+/// name and format from the path) with the entry's title, artist and length. Never touches the
+/// disk, not even to stat the file, so it never waits on a slow or unmounted share. Fields the
+/// entry does not know stay empty or zero (the size too); the queue's background tag fetch
+/// resolves tracks that have no artist or duration.
 pub fn placeholder_metadata(entry: &PlaylistEntry) -> AudioMetadata {
-    let filename = entry
-        .path
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "Unknown".to_string());
-    let format_name = entry
-        .path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("UNKNOWN")
-        .to_uppercase();
     AudioMetadata {
-        filepath: entry.path.clone(),
-        filename,
         title: entry.title.clone(),
         artist: entry.artist.clone(),
-        format_name,
         duration_seconds: entry.duration_secs.max(0) as f64,
-        ..Default::default()
+        ..crate::metadata::path_metadata(&entry.path)
     }
 }
 

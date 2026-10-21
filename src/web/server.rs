@@ -346,6 +346,18 @@ pub(super) fn write_not_found(out: &mut impl Write, route: &str, is_head: bool) 
     write_route_error(out, route, "404 Not Found", &[], "Not found", is_head)
 }
 
+/// Write a `500 Internal Server Error` for `route` (a stream whose file couldn't be read).
+pub(super) fn write_server_error(out: &mut impl Write, route: &str, is_head: bool) -> std::io::Result<()> {
+    write_route_error(
+        out,
+        route,
+        "500 Internal Server Error",
+        &[],
+        "Internal server error",
+        is_head,
+    )
+}
+
 /// Write a `405 Method Not Allowed` for `route`, naming the methods it takes (`allow`).
 pub(super) fn write_method_not_allowed(
     out: &mut impl Write,
