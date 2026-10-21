@@ -531,6 +531,92 @@ fn test_tracks_under_takes_only_the_folders_own_rows() {
     assert!(under("/m/Nothing", 3).is_empty());
 }
 
+/// `tracks_under` leaves out the rows the mix's walk would skip: any name below the folder that
+/// starts with `.` (hidden folders, AppleDouble `._` files), `#recycle` and `$RECYCLE.BIN`, so a
+/// mix never queues a recycled or hidden file from the index (PR #145 review).
+#[test]
+fn test_tracks_under_skips_what_the_walk_skips() {
+    common::isolate();
+    let db = AnalysisDatabase::open_in_memory().unwrap();
+    let paths = [
+        "/m/Jazz/Album/a.flac",
+        "/m/Jazz/.hidden/b.flac",
+        "/m/Jazz/Album/._a.flac",
+        "/m/Jazz/#recycle/c.flac",
+        "/m/Jazz/Album/#recycle/d.flac",
+        "/m/Jazz/$RECYCLE.BIN/e.flac",
+        "/m/Jazz/Album.v2/f.flac",
+        "/m/Jazz/recycle/g.flac",
+    ];
+    let rows: Vec<TrackFeatures> = paths.iter().map(|p| index_row(p, 1, 2, None)).collect();
+    db.write_index_batch(&rows, None).unwrap();
+    let mut found: Vec<String> = db
+        .tracks_under(Path::new("/m/Jazz"), 3)
+        .into_iter()
+        .map(|t| t.filepath.to_string_lossy().to_string())
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            "/m/Jazz/Album.v2/f.flac",
+            "/m/Jazz/Album/a.flac",
+            "/m/Jazz/recycle/g.flac"
+        ]
+    );
+    // The folder asked for may itself be hidden: only the names below it are checked.
+    db.write_index_batch(&[index_row("/m/.Jazz/h.flac", 1, 2, None)], None)
+        .unwrap();
+    assert_eq!(db.tracks_under(Path::new("/m/.Jazz"), 3).len(), 1);
+}
+
+/// Over a stale row, an index write also clears what only the acoustic pass or tag enrichment
+/// measured for the old file (loudness, mood) and takes the new row's tags list, so a mood
+/// never matches a changed file on the old file's tags (PR #145 review).
+#[test]
+fn test_index_write_over_a_stale_row_clears_the_old_files_mood_and_tags() {
+    common::isolate();
+    let db = AnalysisDatabase::open_in_memory().unwrap();
+    let old = TrackFeatures {
+        filepath: PathBuf::from("/music/a.flac"),
+        mtime: 5,
+        file_size: 6,
+        title: "Old".to_string(),
+        bpm: Some(101.0),
+        energy: Some(0.4),
+        loudness_lufs: Some(-9.5),
+        mood: Some("chill".to_string()),
+        tags_json: r#"["chill","ambient"]"#.to_string(),
+        analyzed_at: 9,
+        ..Default::default()
+    };
+    db.upsert_track(&old).unwrap();
+    db.upsert_track(&TrackFeatures {
+        filepath: PathBuf::from("/music/b.flac"),
+        ..old.clone()
+    })
+    .unwrap();
+
+    let mut tagged = index_row("/music/b.flac", 7, 6, Some(128.0));
+    tagged.tags_json = r#"["house"]"#.to_string();
+    db.write_index_batch(&[index_row("/music/a.flac", 7, 6, None), tagged], None)
+        .unwrap();
+
+    let a = db.get_track(Path::new("/music/a.flac")).unwrap();
+    assert_eq!((a.loudness_lufs, a.mood.as_deref()), (None, None));
+    assert_eq!(a.tags_json, "[]");
+    assert_eq!(a.bpm, Some(101.0), "the BPM is still kept provisionally");
+    let b = db.get_track(Path::new("/music/b.flac")).unwrap();
+    assert_eq!((b.loudness_lufs, b.mood.as_deref()), (None, None));
+    assert_eq!(b.tags_json, r#"["house"]"#);
+
+    // A current row keeps all of it.
+    db.upsert_track(&old).unwrap();
+    db.write_index_batch(&[index_row("/music/a.flac", 5, 6, None)], None)
+        .unwrap();
+    assert_eq!(db.get_track(Path::new("/music/a.flac")).unwrap(), old);
+}
+
 /// A folder's record commits in the same transaction as its rows: when the batch fails, neither
 /// the rows nor the record are written, so a folder is never marked complete without its rows.
 #[test]

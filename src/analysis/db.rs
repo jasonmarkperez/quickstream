@@ -194,6 +194,14 @@ fn dir_key(dir: &Path) -> String {
     }
 }
 
+/// Whether the library walks skip an entry named `name` (and everything under it): hidden names
+/// (`.` first, AppleDouble `._` files included), `#recycle` and `$RECYCLE.BIN`. The autopilot
+/// walk filters with it, and [`AnalysisDatabase::tracks_under`] applies it to index rows, so the
+/// index never offers a file the walk would not find.
+pub fn walk_skips(name: &str) -> bool {
+    name.starts_with('.') || name == "#recycle" || name == "$RECYCLE.BIN"
+}
+
 impl TrackFeatures {
     pub fn display_key(&self) -> Option<String> {
         match (&self.camelot_key, &self.initial_key) {
@@ -364,8 +372,9 @@ impl AnalysisDatabase {
     /// A row already current for the file's stamp (mtime and size) is never touched, whoever
     /// wrote it. Over a stale row the tags, stamp and `needs_acoustic` are replaced; a missing
     /// BPM tag keeps the old BPM and energy provisionally (the row is flagged for re-analysis),
-    /// while a BPM tag replaces the BPM and drops the energy measured for the old file. Unknown
-    /// values are stored as NULL; loudness, mood and tags are never written here.
+    /// while a BPM tag replaces the BPM and drops the energy measured for the old file. Loudness
+    /// and mood, which a tag read doesn't give, are cleared (they were measured or looked up for
+    /// the old file), and `tags_json` is the new row's. Unknown values are stored as NULL.
     pub fn write_index_batch(&self, rows: &[TrackFeatures], dir: Option<&IndexedDir>) -> Result<usize> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -378,7 +387,7 @@ impl AnalysisDatabase {
                     year, bpm, initial_key, camelot_key, energy, loudness_lufs,
                     mood, tags_json, analyzed_at, needs_acoustic
                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, NULL, '[]', ?12, ?13
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, NULL, ?14, ?12, ?13
                 )
                 ON CONFLICT(filepath) DO UPDATE SET
                     mtime = excluded.mtime,
@@ -392,6 +401,9 @@ impl AnalysisDatabase {
                     camelot_key = excluded.camelot_key,
                     bpm = COALESCE(excluded.bpm, track_features.bpm),
                     energy = CASE WHEN excluded.bpm IS NULL THEN track_features.energy ELSE NULL END,
+                    loudness_lufs = NULL,
+                    mood = NULL,
+                    tags_json = excluded.tags_json,
                     needs_acoustic = excluded.needs_acoustic,
                     analyzed_at = excluded.analyzed_at
                 WHERE track_features.mtime IS NOT excluded.mtime
@@ -413,6 +425,7 @@ impl AnalysisDatabase {
                     row.camelot_key,
                     row.analyzed_at as i64,
                     row.needs_acoustic as i64,
+                    row.tags_json,
                 ])?;
             }
         }
@@ -517,7 +530,8 @@ impl AnalysisDatabase {
     /// The rows of files under `dir`, at most `max_depth` levels down (1 = directly inside, as
     /// `WalkDir::max_depth` counts). A byte range on the primary key (`dir/` up to `dir0`, `0`
     /// being the byte after `/`), never LIKE, so a sibling that shares the name as a prefix
-    /// (`Jazz Fusion` for `Jazz`) is never included.
+    /// (`Jazz Fusion` for `Jazz`) is never included. A row with a name below `dir` that the
+    /// mix's walk skips ([`walk_skips`]: hidden, `#recycle`, `$RECYCLE.BIN`) is left out too.
     pub fn tracks_under(&self, dir: &Path, max_depth: usize) -> Vec<TrackFeatures> {
         let key = dir_key(dir);
         let base = key.trim_end_matches('/');
@@ -533,9 +547,16 @@ impl AnalysisDatabase {
         rows.filter_map(|r| r.ok())
             .filter(|t| {
                 let path = t.filepath.to_string_lossy();
-                let depth = path
-                    .get(low.len()..)
-                    .map_or(usize::MAX, |rest| rest.split('/').filter(|c| !c.is_empty()).count());
+                let Some(rest) = path.get(low.len()..) else {
+                    return false;
+                };
+                let mut depth = 0;
+                for name in rest.split('/').filter(|c| !c.is_empty()) {
+                    if walk_skips(name) {
+                        return false;
+                    }
+                    depth += 1;
+                }
                 depth <= max_depth
             })
             .collect()

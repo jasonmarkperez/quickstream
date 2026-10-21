@@ -33,8 +33,9 @@ pub struct AnalysisProgress {
     pub analyzed: usize,
     /// Tracks skipped because the database already had an up-to-date row.
     pub skipped: usize,
-    /// Tracks whose acoustic analysis failed (ffmpeg missing / error / timeout / no audio) or
-    /// panicked. Nothing is stored for them, so they are retried in a later session.
+    /// Tracks whose acoustic analysis failed (ffmpeg missing / error / timeout / no audio), whose
+    /// tags couldn't be read (an I/O error) or that went away, or whose analysis panicked.
+    /// Nothing is stored for them, so they are retried in a later session.
     pub failed: usize,
     /// Tracks queued but not yet processed.
     pub pending: usize,
@@ -358,7 +359,13 @@ fn process_track(path: &Path, shared: &Shared, db: &AnalysisDatabase) {
             );
             return;
         }
-        Err(AnalysisError::Unreadable | AnalysisError::Cancelled) => return,
+        Err(AnalysisError::Unreadable) => {
+            // The file went away, or its tags couldn't be read (an I/O error, logged by the
+            // analysis). Nothing is stored, so a later session tries it again.
+            shared.failed.fetch_add(1, Ordering::SeqCst);
+            return;
+        }
+        Err(AnalysisError::Cancelled) => return,
     };
     match db.upsert_track(&features) {
         Ok(()) => {

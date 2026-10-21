@@ -1102,7 +1102,12 @@ fn test_worker_keeps_an_index_row_when_the_tag_read_fails_with_an_io_error() {
     );
     assert_eq!(row.camelot_key.as_deref(), Some("8A"));
     assert!(row.needs_acoustic, "still waiting for a full analysis");
-    assert_eq!(worker.progress().analyzed, 0);
+    let progress = worker.progress();
+    assert_eq!(progress.analyzed, 0);
+    assert_eq!(
+        progress.failed, 1,
+        "a tag read that failed counts as failed, to be retried"
+    );
     let _ = fs::remove_dir_all(&music);
     let _ = fs::remove_dir_all(&cache);
 }
