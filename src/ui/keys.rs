@@ -366,7 +366,7 @@ impl AppUI {
                     self.open_fuzzy_search();
                 }
             }
-            (KeyCode::Char('z' | 'Z'), KeyModifiers::NONE) => self.shuffle_queue(""),
+            (KeyCode::Char('z' | 'Z'), KeyModifiers::NONE) => self.shuffle_queue_by_user(""),
             (KeyCode::Char('p'), KeyModifiers::NONE) => {
                 let target_dir = self.autopilot_key_dir();
                 self.start_autopilot(target_dir);

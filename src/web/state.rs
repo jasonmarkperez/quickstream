@@ -368,7 +368,12 @@ pub enum WebCommand {
     /// (issue #102).
     Autopilot(PathBuf),
     AutopilotReshuffle(PathBuf),
+    /// The web dashboard's Shuffle.
     ShuffleQueue,
+    /// The continuous stream wrapped and starts the queue over reshuffled: a shuffle nobody
+    /// asked for, so it is never kept for a playlist play still looking for its first track
+    /// (PR #143 review).
+    StreamReshuffle,
     SetMixProfile(String),
     /// Start Seed Radio from `seed` (an audio file inside the allowed folders), scanning
     /// `preferred` if it is there, else `fallback`, as the terminal's `r` does: `preferred` is

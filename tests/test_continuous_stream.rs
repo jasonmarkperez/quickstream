@@ -254,8 +254,8 @@ fn test_armed_continuous_stream_plays_queue_gaplessly_and_shuffles_on_wrap() {
 
     // Both tracks are decoded into the one connection, then the wrap asks for a reshuffle.
     match rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(WebCommand::ShuffleQueue) => {}
-        other => panic!("expected ShuffleQueue after the queue wrapped, got {:?}", other),
+        Ok(WebCommand::StreamReshuffle) => {}
+        other => panic!("expected StreamReshuffle after the queue wrapped, got {:?}", other),
     }
     assert!(state.read().unwrap().title.starts_with("Track "));
 
@@ -267,7 +267,7 @@ fn test_armed_continuous_stream_plays_queue_gaplessly_and_shuffles_on_wrap() {
     while Instant::now() < deadline {
         if let Ok(cmd) = rx.recv_timeout(Duration::from_millis(50)) {
             // A wrap that completed just before the close may still be in flight.
-            assert_eq!(cmd, WebCommand::ShuffleQueue);
+            assert_eq!(cmd, WebCommand::StreamReshuffle);
         }
     }
     assert!(
@@ -1358,8 +1358,8 @@ fn test_continuous_wrap_reshuffle_keeps_the_next_track_in_front() {
         // track in front, publish.
         let mut held = f.state.write().unwrap();
         match f.rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(WebCommand::ShuffleQueue) => {}
-            other => panic!("expected ShuffleQueue after the queue wrapped, got {:?}", other),
+            Ok(WebCommand::StreamReshuffle) => {}
+            other => panic!("expected StreamReshuffle after the queue wrapped, got {:?}", other),
         }
         let front = *f.controller.current_track_index.lock().unwrap();
         let kept = held.queue.remove(front);
@@ -1399,7 +1399,7 @@ fn test_continuous_reshuffle_follows_the_stream_index_first() {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     app.web_cmd_rx = Some(cmd_rx);
 
-    cmd_tx.send(WebCommand::ShuffleQueue).unwrap();
+    cmd_tx.send(WebCommand::StreamReshuffle).unwrap();
     app.handle_web_commands();
     assert_eq!(app.queue.current_index(), 0);
     assert_eq!(
@@ -1509,7 +1509,7 @@ fn test_continuous_stream_goes_on_in_the_order_a_shuffle_left() {
         "the track the shuffle put after the playing one"
     );
     assert!(
-        !matches!(f.rx.try_recv(), Ok(WebCommand::ShuffleQueue)),
+        !matches!(f.rx.try_recv(), Ok(WebCommand::StreamReshuffle)),
         "the stream didn't wrap"
     );
 }

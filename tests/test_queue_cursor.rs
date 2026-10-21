@@ -195,7 +195,13 @@ fn test_web_shuffle_keeps_the_cursor_on_its_track() {
     app.queue_cursor = 9;
     let mut on = titles(&app)[9].clone();
     for round in 0..8 {
-        tx.send(quickstream::web::WebCommand::ShuffleQueue).unwrap();
+        // Odd rounds: the stream's reshuffle, which has a command of its own.
+        let cmd = if round % 2 == 0 {
+            quickstream::web::WebCommand::ShuffleQueue
+        } else {
+            quickstream::web::WebCommand::StreamReshuffle
+        };
+        tx.send(cmd).unwrap();
         app.handle_web_commands();
         assert!(
             app.status_message.contains("Queue shuffled (web)"),
