@@ -305,6 +305,29 @@ impl ContinuousStreamController {
         cid == 0 || self.active_conn_id.load(Ordering::SeqCst) == cid
     }
 
+    /// Whether connection `cid` still serves `session`: the session is still the armed one and
+    /// no newer connection has taken over. Logs why not, as the connection then closes.
+    fn still_serves(&self, cid: u64, session: &str) -> bool {
+        if !self.is_session(session) {
+            crate::log_info!(
+                "web",
+                "Continuous stream connection {} outlived its session, closing",
+                cid
+            );
+            return false;
+        }
+        if !self.owns(cid) {
+            crate::log_info!(
+                "web",
+                "Continuous stream connection {} superseded by newer connection {}, closing older stream",
+                cid,
+                self.active_conn_id.load(Ordering::SeqCst)
+            );
+            return false;
+        }
+        true
+    }
+
     /// Register `child` as connection `cid`'s decoder. A decoder of a connection `cid` has
     /// superseded is stopped first, never left running. If `cid` has been superseded itself,
     /// `child` is stopped instead, `taken` (the request this pass took) is handed back for the
@@ -1671,15 +1694,115 @@ const FILE_CHECK_WAIT: Duration = Duration::from_millis(20);
 // before the lead runs out.
 const _: () = assert!(FILE_CHECK_WAIT.as_millis() < SILENCE_TICK.as_millis());
 const _: () = assert!(SILENCE_TICK.as_millis() < SILENCE_LEAD.as_millis());
+/// How long a decoder is left to give PCM, as it starts or after it has given some, before
+/// silence covers for it (#133): a decoder that is merely starting adds no silence between two
+/// tracks, and one that gives PCM at about real time adds none between its chunks.
+const DECODER_GRACE: Duration = Duration::from_millis(500);
+/// How many chunks of PCM the decoder's reader thread holds for the stream.
+const DECODER_CHUNKS_AHEAD: usize = 2;
+/// The most PCM one read from the decoder takes.
+const DECODER_CHUNK: usize = 32768;
 
 /// The PCM bytes in `duration`, whole 4-byte frames.
 fn pcm_bytes(duration: Duration) -> u64 {
     (duration.as_secs_f64() * PCM_BYTES_PER_SEC) as u64 / 4 * 4
 }
 
+/// How long `bytes` of PCM play.
+fn pcm_duration(bytes: u64) -> Duration {
+    Duration::from_secs_f64(bytes as f64 / PCM_BYTES_PER_SEC)
+}
+
+/// What the renderer still holds of the PCM sent to it (audio and silence): how far the stream
+/// runs ahead of a renderer playing at real time since the connection began (#117, #133), with
+/// two corrections, so the estimate doesn't fall behind what the renderer really holds.
+///
+/// It can't play what it wasn't sent: when it runs dry, it plays on from there, so a stall leaves
+/// no debt the stream's later writes must make up.
+///
+/// And a write that blocks longer than its audio takes to play (by more than a tick) means the
+/// renderer stopped reading for the rest of that time (a pause), during which it played nothing
+/// either. A renderer that reads in bursts blocks a write in the same way while it plays from its
+/// own buffer, then takes the next few at once: such a pause is taken back by the writes that go
+/// at least twice as fast as their audio right after it, with no wait between them, so that
+/// renderer is not credited with audio it never held. The first write after it that goes slower,
+/// or comes after a wait (the decoder gives its audio at real time or stalls), ends that, and the
+/// pause stays counted.
+struct RendererLead {
+    /// When a renderer playing at real time would have started the PCM sent: the connection's
+    /// start, moved on by what it didn't play.
+    reference: Instant,
+    /// The PCM bytes sent since the connection began.
+    written: u64,
+    /// How much of the last pause the writes right after it may still take back.
+    takeback: Duration,
+    /// When the last write ended.
+    last_write: Instant,
+}
+
+impl RendererLead {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            reference: now,
+            written: 0,
+            takeback: Duration::ZERO,
+            last_write: now,
+        }
+    }
+
+    /// What the renderer still holds.
+    fn lead(&mut self) -> Duration {
+        let sent = pcm_duration(self.written);
+        let played = self.reference.elapsed();
+        if played > sent {
+            self.reference += played - sent;
+            Duration::ZERO
+        } else {
+            sent - played
+        }
+    }
+
+    /// Whether the renderer is about to run out of what it was sent, so the stream must send
+    /// silence rather than wait.
+    fn running_dry(&mut self) -> bool {
+        self.lead() <= SILENCE_LEAD + SILENCE_TICK
+    }
+
+    /// Write `pcm` to the renderer, counting it and how long the write blocked.
+    fn write(&mut self, stream: &mut impl Write, pcm: &[u8]) -> std::io::Result<()> {
+        // A renderer that ran dry before this write played nothing more meanwhile.
+        self.lead();
+        let started = Instant::now();
+        if started.duration_since(self.last_write) > SILENCE_TICK {
+            self.takeback = Duration::ZERO;
+        }
+        let result = stream.write_all(pcm);
+        self.last_write = Instant::now();
+        result?;
+        let took = self.last_write.duration_since(started);
+        let audio = pcm_duration(pcm.len() as u64);
+        self.written += pcm.len() as u64;
+        if took > audio + SILENCE_TICK {
+            let stopped = took - audio;
+            self.reference += stopped;
+            self.takeback += stopped;
+        } else if took * 2 < audio {
+            // `reference` was moved on by at least `takeback`, so this never goes before the
+            // connection's start.
+            let back = (audio - took).min(self.takeback);
+            self.takeback -= back;
+            self.reference -= back;
+        } else {
+            self.takeback = Duration::ZERO;
+        }
+        Ok(())
+    }
+}
+
 /// Sends silence at the stream's real-time byte rate while there is nothing to decode (empty
-/// queue, every file missing, a file check not answered yet). Measured from when it started, so
-/// sleep overshoot doesn't add up.
+/// queue, every file missing, a file check not answered yet, a decoder that gives nothing).
+/// Measured from when it started, so sleep overshoot doesn't add up.
 struct SilencePacer {
     started: Instant,
     sent: u64,
@@ -1693,23 +1816,51 @@ impl SilencePacer {
         }
     }
 
-    /// Write the silence due by now (plus `SILENCE_LEAD`), then wait until one tick after
-    /// `pass_started`, so time the pass spent waiting on file checks doesn't add to the gap
-    /// between writes. Returns the bytes written, or the write error, which means the renderer
-    /// has gone.
-    fn send(&mut self, stream: &mut impl Write, pass_started: Instant) -> std::io::Result<u64> {
+    /// Write the silence due by now (plus `SILENCE_LEAD`), counted in `lead`, then wait until one
+    /// tick after `pass_started`, so time the pass spent waiting on file checks or the decoder
+    /// doesn't add to the gap between writes. A write error means the renderer has gone.
+    fn send(&mut self, stream: &mut impl Write, lead: &mut RendererLead, pass_started: Instant) -> std::io::Result<()> {
         let due = pcm_bytes(self.started.elapsed() + SILENCE_LEAD);
         let mut owed = due.saturating_sub(self.sent).min(pcm_bytes(SILENCE_MAX_BURST));
-        let written = owed;
         self.sent = due;
         let chunk = [0u8; 8820];
         while owed > 0 {
             let n = owed.min(chunk.len() as u64) as usize;
-            stream.write_all(&chunk[..n])?;
+            lead.write(stream, &chunk[..n])?;
             owed -= n as u64;
         }
         wait_out_tick(pass_started);
-        Ok(written)
+        Ok(())
+    }
+}
+
+/// Whether a pass with nothing to decode skips its silence: only while it `waits` (on a file
+/// check, or to try a decoder again), no silence runs yet and the renderer still has the audio
+/// before it to play. Silence that runs goes on every tick, paced from its own start: `lead`
+/// forgives the time a renderer ran dry, so after a pass that ran late (a loaded machine) it
+/// would hold silence off for about as long, then send it all at once (#139).
+fn holds_off_silence(waits: bool, silence: &Option<SilencePacer>, lead: &mut RendererLead) -> bool {
+    waits && silence.is_none() && !lead.running_dry()
+}
+
+/// Send the silence due now through `silence`, started if it wasn't running. Returns false, and
+/// logs it with `doing`, when the write failed: the renderer has gone.
+fn send_silence(
+    silence: &mut Option<SilencePacer>,
+    stream: &mut impl Write,
+    lead: &mut RendererLead,
+    pass_started: Instant,
+    doing: &str,
+) -> bool {
+    match silence
+        .get_or_insert_with(SilencePacer::new)
+        .send(stream, lead, pass_started)
+    {
+        Ok(()) => true,
+        Err(e) => {
+            crate::log_info!("web", "Continuous stream socket closed {}: {}", doing, e);
+            false
+        }
     }
 }
 
@@ -1718,10 +1869,45 @@ fn wait_out_tick(pass_started: Instant) {
     std::thread::sleep((pass_started + SILENCE_TICK).saturating_duration_since(Instant::now()));
 }
 
-/// How far the PCM written since `connected` (`written` bytes, audio and silence) runs ahead of
-/// a renderer that has played it at real time since then: what its buffers still hold.
-fn renderer_lead(connected: Instant, written: u64) -> Duration {
-    Duration::from_secs_f64(written as f64 / PCM_BYTES_PER_SEC).saturating_sub(connected.elapsed())
+/// What the decoder's reader thread hands the continuous stream.
+enum DecoderOutput {
+    Pcm(Vec<u8>),
+    /// The decoder's output ended: it exited, or was killed.
+    End,
+    Failed(std::io::Error),
+}
+
+/// Read the decoder's `stdout` on a helper thread, so the stream never blocks on a decoder stuck
+/// opening or reading a file on a share that hangs and can send silence meanwhile (#133). The
+/// thread ends with the decoder's output (it exits or is killed) or once the receiver is dropped.
+/// It is not joined: the stream kills the decoder as it leaves it, which ends the thread's read,
+/// but a decoder stuck in a read on a hung share may only die once that read returns, and the
+/// stream must not wait for it.
+fn spawn_decoder_reader(mut stdout: impl Read + Send + 'static) -> std::io::Result<mpsc::Receiver<DecoderOutput>> {
+    let (tx, rx) = mpsc::sync_channel(DECODER_CHUNKS_AHEAD);
+    std::thread::Builder::new()
+        .name("continuous-decoder-read".into())
+        .spawn(move || {
+            loop {
+                // Read into a fresh buffer that is then handed over as it is, not copied.
+                let mut buf = vec![0u8; DECODER_CHUNK];
+                let output = match stdout.read(&mut buf) {
+                    Ok(0) => DecoderOutput::End,
+                    Ok(n) => {
+                        buf.truncate(n);
+                        DecoderOutput::Pcm(buf)
+                    }
+                    // A read a signal interrupted is tried again.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => DecoderOutput::Failed(e),
+                };
+                let last = !matches!(output, DecoderOutput::Pcm(_));
+                if tx.send(output).is_err() || last {
+                    return;
+                }
+            }
+        })?;
+    Ok(rx)
 }
 
 /// Serve a continuous 16-bit 44.1kHz PCM WAV stream to DLNA renderers.
@@ -1808,9 +1994,8 @@ pub(super) fn serve_continuous_stream(
     let wav_hdr = make_continuous_wav_header();
     stream.write_all(&wav_hdr)?;
     stream.flush()?;
-    // The PCM written since the connection began (audio and silence), for `renderer_lead`.
-    let connected = Instant::now();
-    let mut written: u64 = 0;
+    // What the renderer still holds of the PCM sent since the connection began.
+    let mut lead = RendererLead::new();
 
     // Silence paced at real time while there is nothing to decode; `None` while audio plays.
     let mut silence: Option<SilencePacer> = None;
@@ -1831,7 +2016,8 @@ pub(super) fn serve_continuous_stream(
     // Whether audio went out since the stream last wrapped: a wrap without any asks for no
     // reshuffle, so a queue that gives no audio is not reshuffled on every pass.
     let mut streamed_since_wrap = false;
-    // Whether a decoder that couldn't start (no ffmpeg) was logged since audio last went out.
+    // Whether a decoder that couldn't start (no ffmpeg), or a reader thread for it, was logged
+    // since audio last went out.
     let mut spawn_failure_logged = false;
     // The look through the queue still waiting on a file check: answers given since its
     // `Instant` are used as the stream looks again on the next passes, until a request newer than
@@ -1844,21 +2030,7 @@ pub(super) fn serve_continuous_stream(
         let pass_started = Instant::now();
         // Whether this pass's look is still waiting on a file check.
         let mut waiting_on_checks = false;
-        if !controller.is_session(session) {
-            crate::log_info!(
-                "web",
-                "Continuous stream connection {} outlived its session, closing",
-                cid
-            );
-            return Ok(());
-        }
-        if !controller.owns(cid) {
-            crate::log_info!(
-                "web",
-                "Continuous stream connection {} superseded by newer connection {}, closing older stream",
-                cid,
-                controller.active_conn_id.load(Ordering::SeqCst)
-            );
+        if !controller.still_serves(cid, session) {
             return Ok(());
         }
 
@@ -2006,19 +2178,12 @@ pub(super) fn serve_continuous_stream(
             // A check that is merely slow (a track's end on a slow share) writes no silence while
             // the renderer still has the audio before it to play: silence only as that runs out,
             // so the next track follows gaplessly once the check answers.
-            if waiting_on_checks && renderer_lead(connected, written) > SILENCE_LEAD + SILENCE_TICK {
+            if holds_off_silence(waiting_on_checks, &silence, &mut lead) {
                 wait_out_tick(pass_started);
                 continue;
             }
-            match silence
-                .get_or_insert_with(SilencePacer::new)
-                .send(&mut stream, pass_started)
-            {
-                Ok(n) => written += n,
-                Err(e) => {
-                    crate::log_info!("web", "Continuous stream socket closed while idle: {}", e);
-                    return Ok(());
-                }
+            if !send_silence(&mut silence, &mut stream, &mut lead, pass_started, "while idle") {
+                return Ok(());
             }
             continue;
         };
@@ -2069,7 +2234,7 @@ pub(super) fn serve_continuous_stream(
         // When the next file's check was asked for: answers given since then are used as this
         // track ends.
         let decoder_started = Instant::now();
-        let mut stdout = match cmd.spawn() {
+        let stdout = match cmd.spawn() {
             Ok(mut child) => match child.stdout.take() {
                 Some(stdout) => {
                     // Registered before the first request check below, so a request that arrived
@@ -2106,18 +2271,57 @@ pub(super) fn serve_continuous_stream(
             }
         };
 
-        // 3. Stream PCM chunks
-        let mut buf = [0u8; 32768];
+        // 3. Stream PCM chunks, read from the decoder on a helper thread so the stream goes on
+        // sending silence while the decoder gives nothing (#133).
+        let output = match stdout.map(spawn_decoder_reader) {
+            Some(Ok(output)) => Some(output),
+            Some(Err(e)) => {
+                // No thread to read it (the system is short of them): the decoder may well decode
+                // the file, so the track is tried again (below, as after a read error), not
+                // counted as one that gave no audio. Once a tick has passed, with silence if the
+                // renderer is running out or silence already runs, so the tries are paced.
+                if !spawn_failure_logged {
+                    crate::log_warn!(
+                        "web",
+                        "Couldn't start reading the continuous stream's decoder, trying again: {}",
+                        e
+                    );
+                    spawn_failure_logged = true;
+                }
+                if holds_off_silence(true, &silence, &mut lead) {
+                    wait_out_tick(pass_started);
+                } else if !send_silence(
+                    &mut silence,
+                    &mut stream,
+                    &mut lead,
+                    pass_started,
+                    "while the decoder can't be read",
+                ) {
+                    controller.kill_decoder_of(cid);
+                    return Ok(());
+                }
+                None
+            }
+            None => None,
+        };
         let mut bytes_streamed: u64 = (start_pos * PCM_BYTES_PER_SEC) as u64;
         let mut last_pos_update = std::time::Instant::now();
+        // When the decoder last gave PCM (or started): silence covers for it only once it has
+        // given none for `DECODER_GRACE`.
+        let mut last_output = decoder_started;
+        // Whether silence has covered for this decoder run (or ran on into it): from then on it
+        // covers as soon as the renderer runs out of what it was sent, without a fresh grace
+        // after each chunk, so a decoder that gives a lone chunk now and then never lets the
+        // renderer run dry for the rest of a grace after each.
+        let mut covered = silence.is_some();
 
-        while let Some(stdout) = stdout.as_mut() {
+        while let Some(output) = output.as_ref() {
             if !controller.is_active.load(Ordering::SeqCst) {
                 controller.kill_active_decoder();
                 return Ok(());
             }
 
-            if !controller.owns(cid) {
+            if !controller.still_serves(cid, session) {
                 controller.kill_decoder_of(cid);
                 return Ok(());
             }
@@ -2127,17 +2331,18 @@ pub(super) fn serve_continuous_stream(
                 break;
             }
 
-            match stdout.read(&mut buf) {
-                Ok(0) => {
+            let waited_from = Instant::now();
+            match output.recv_timeout(SILENCE_TICK) {
+                Ok(DecoderOutput::End) => {
                     ended = true;
                     break;
                 }
-                Ok(n) => {
+                Ok(DecoderOutput::Pcm(chunk)) => {
+                    let n = chunk.len();
                     if !streamed {
                         streamed = true;
                         streamed_since_wrap = true;
                         spawn_failure_logged = false;
-                        silence = None;
                         if tentative {
                             let removed;
                             (track_index, removed) = controller.publish_track(
@@ -2152,13 +2357,15 @@ pub(super) fn serve_continuous_stream(
                             track_removed |= removed;
                         }
                     }
-                    if let Err(e) = stream.write_all(&buf[..n]) {
+                    // Audio again: silence covering for the decoder stops.
+                    silence = None;
+                    if let Err(e) = lead.write(&mut stream, &chunk) {
                         crate::log_info!("web", "Continuous stream socket closed: {}", e);
                         controller.kill_decoder_of(cid);
                         return Ok(());
                     }
+                    last_output = Instant::now();
                     bytes_streamed += n as u64;
-                    written += n as u64;
 
                     if last_pos_update.elapsed() >= Duration::from_millis(250) {
                         last_pos_update = std::time::Instant::now();
@@ -2172,9 +2379,36 @@ pub(super) fn serve_continuous_stream(
                         }
                     }
                 }
-                Err(e) => {
+                Ok(DecoderOutput::Failed(e)) => {
                     crate::log_warn!("web", "Continuous stream read error: {}", e);
                     break;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    crate::log_warn!("web", "Continuous stream decoder reader stopped");
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // No PCM: the decoder is starting, or stuck opening or reading the file on a
+                    // share that hangs, before its first PCM or in the middle of the track
+                    // (#133). Once it has given none for `DECODER_GRACE` (or silence has covered
+                    // for it before) and the renderer is running out of what it was sent,
+                    // silence at real time keeps it fed (and goes on, paced, from silence the
+                    // stream was already sending) until the decoder gives PCM again.
+                    let covers = silence.is_some()
+                        || ((covered || last_output.elapsed() >= DECODER_GRACE) && lead.running_dry());
+                    covered |= covers;
+                    if covers
+                        && !send_silence(
+                            &mut silence,
+                            &mut stream,
+                            &mut lead,
+                            waited_from,
+                            "while the decoder gives nothing",
+                        )
+                    {
+                        controller.kill_decoder_of(cid);
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -2259,11 +2493,107 @@ pub(super) fn serve_continuous_stream(
             }
         } else {
             drop(pending);
-            // The next pass takes the request, or after a read error tries the track again.
+            // The next pass takes the request, or after a read error (or a reader that couldn't
+            // start) tries the track again.
             next_index = Some((track_index, 0));
             nothing_playable = None;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Gives `Interrupted` first, then `data`, then its end.
+    struct InterruptedOnce {
+        interrupted: bool,
+        data: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl Read for InterruptedOnce {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            self.data.read(buf)
+        }
+    }
+
+    /// A read the decoder's reader thread was interrupted in (a signal) is tried again, not taken
+    /// for the decoder failing.
+    #[test]
+    fn test_decoder_reader_retries_an_interrupted_read() {
+        let rx = spawn_decoder_reader(InterruptedOnce {
+            interrupted: false,
+            data: std::io::Cursor::new(vec![1u8; 100]),
+        })
+        .unwrap();
+        let next = || rx.recv_timeout(Duration::from_secs(5)).expect("the reader answers");
+        match next() {
+            DecoderOutput::Pcm(pcm) => assert_eq!(pcm, vec![1u8; 100]),
+            DecoderOutput::End => panic!("End instead of the PCM"),
+            DecoderOutput::Failed(e) => panic!("an interrupted read failed the decoder: {}", e),
+        }
+        assert!(matches!(next(), DecoderOutput::End));
+    }
+
+    /// One pass of the stream with nothing to decode while it waits on a file check, writing to
+    /// `sink`. Returns whether it sent silence.
+    fn check_wait_pass(sink: &mut Vec<u8>, silence: &mut Option<SilencePacer>, lead: &mut RendererLead) -> bool {
+        let pass_started = Instant::now();
+        if holds_off_silence(true, silence, lead) {
+            wait_out_tick(pass_started);
+            return false;
+        }
+        assert!(send_silence(silence, sink, lead, pass_started, "in the test"));
+        true
+    }
+
+    /// Silence sent while a file check hangs goes on every tick after a pass that ran late (a
+    /// loaded machine), as before #133: the renderer's estimated lead, which forgives the time it
+    /// ran dry, never holds it off once it runs, so it isn't sent in bursts that leave the
+    /// renderer waiting (#139 CI).
+    #[test]
+    fn test_silence_waiting_on_a_file_check_goes_on_every_tick_after_a_late_pass() {
+        let (mut sink, mut silence, mut lead) = (Vec::new(), None, RendererLead::new());
+        assert!(
+            check_wait_pass(&mut sink, &mut silence, &mut lead),
+            "silence as the wait begins"
+        );
+        for _ in 0..3 {
+            check_wait_pass(&mut sink, &mut silence, &mut lead);
+        }
+        // The stream runs late: a renderer playing at real time ran dry meanwhile.
+        std::thread::sleep(Duration::from_millis(400));
+        for pass in 0..20 {
+            let before = sink.len();
+            assert!(
+                check_wait_pass(&mut sink, &mut silence, &mut lead) && sink.len() > before,
+                "pass {} after the late one sent no silence",
+                pass
+            );
+        }
+    }
+
+    /// Before any silence runs, a pass waiting on a file check holds it off while the renderer
+    /// still has the audio before it, so the next track follows gaplessly.
+    #[test]
+    fn test_a_file_check_holds_off_silence_while_the_renderer_has_audio() {
+        let mut lead = RendererLead::new();
+        lead.write(&mut Vec::new(), &vec![0u8; pcm_bytes(Duration::from_secs(2)) as usize])
+            .unwrap();
+        assert!(holds_off_silence(true, &None, &mut lead));
+        assert!(
+            !holds_off_silence(false, &None, &mut lead),
+            "only while waiting on a check"
+        );
+        assert!(
+            !holds_off_silence(true, &Some(SilencePacer::new()), &mut lead),
+            "not once silence runs"
+        );
+    }
 }
