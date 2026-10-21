@@ -13,6 +13,7 @@ mod devices_tab;
 pub mod features;
 mod help;
 pub mod kit;
+pub mod library_index;
 mod mix_picker;
 mod now_playing;
 pub mod playlists;
@@ -372,6 +373,8 @@ pub struct AppUI {
     /// The status message the web server row set while its pairing link was not known yet
     /// (`show_setting_status`); `poll_settings_status` adds the link once the LAN address is in.
     web_link_status: Option<String>,
+    /// The background library indexer (#41): started from `run()`, never from `new`.
+    library_index: library_index::LibraryIndexUi,
 }
 
 impl Drop for AppUI {
@@ -543,6 +546,7 @@ impl AppUI {
             ui_epoch: Instant::now(),
             music_dir: Default::default(),
             web_link_status: None,
+            library_index: library_index::LibraryIndexUi::new(),
         };
         // On Linux the music folder lookup reads user-dirs.dirs: never on the UI thread.
         app.set_music_dir_lookup(crate::settings::lookup_music_dir);
@@ -630,6 +634,8 @@ impl AppUI {
             self.update_web_state();
         } else if self.settings_cursor == setting::HOME_DIR {
             self.update_web_state();
+        } else if self.settings_cursor == setting::LIBRARY_INDEX {
+            self.apply_library_index_setting();
         }
         self.show_setting_status(self.settings_cursor);
     }

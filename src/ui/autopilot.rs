@@ -365,6 +365,9 @@ impl AppUI {
         let profile = self.active_mix_profile.clone();
         let db = self.analysis_db.clone();
         let checks = self.folder_checks.clone();
+        // The library index walks the folder a mix starts in next, so the next mix there finds
+        // it indexed (#41).
+        let index_hint = self.library_index_hint();
         self.workers.spawn("autopilot", move || {
             let scan_dir = match (preferred, folder_tx) {
                 (Some(preferred), Some(folder_tx)) => {
@@ -380,6 +383,11 @@ impl AppUI {
                 }
                 _ => fallback,
             };
+            if let Some((control, roots)) = &index_hint {
+                if roots.iter().any(|root| scan_dir.starts_with(root)) {
+                    control.prioritise(scan_dir.clone());
+                }
+            }
             // The browser's listing is of the folder the start named.
             let known_subdirs = if scan_dir == dir { known_subdirs } else { Vec::new() };
             crate::library::LibraryManager::scan_directory_autopilot_with_profile(

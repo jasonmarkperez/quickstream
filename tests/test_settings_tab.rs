@@ -13,10 +13,13 @@ use ratatui::style::Modifier;
 
 use common::fake_player::FakePlayer;
 use common::tui;
+use std::sync::atomic::Ordering;
+
 use quickstream::analysis::bpm::FfmpegConfig;
+use quickstream::analysis::index::IndexState;
 use quickstream::analysis::worker::AnalysisWorker;
 use quickstream::analysis::{AnalysisDatabase, TrackFeatures};
-use quickstream::settings::{SettingGroup, SettingsManager, SETTING_DEFINITIONS, SETTING_DISPLAY_ORDER};
+use quickstream::settings::{setting, SettingGroup, SettingsManager, SETTING_DEFINITIONS, SETTING_DISPLAY_ORDER};
 use quickstream::ui::theme::Palette;
 use quickstream::ui::{kit, AppUI};
 
@@ -163,9 +166,10 @@ fn settings_list_is_grouped_in_display_order() {
         }
         want.push(kit::upper(def.label));
     }
-    // The LIBRARY group ends with the read-only TRACK ANALYSIS row (#30).
+    // The LIBRARY group ends with the read-only TRACK ANALYSIS (#30) and INDEX PROGRESS (#41) rows.
     let web = want.iter().position(|row| row == "WEB").unwrap();
     want.insert(web - 1, "TRACK ANALYSIS".to_string());
+    want.insert(web, "INDEX PROGRESS".to_string());
     let got: Vec<String> = (first..first + want.len() as u16)
         .map(|y| span(&buf, y, LABEL_X, VALUE_X))
         .collect();
@@ -258,7 +262,7 @@ fn option_panel_at_120_lists_the_choices_and_describes_the_setting() {
     assert_eq!(span(&buf, top, OPTION_X, 118), "QUEUE PLAYBACK MODE");
     assert!(bold(&buf, OPTION_X, top));
     assert_eq!(span(&buf, top + 1, OPTION_X, 120), format!("{} ▪", "─".repeat(38)));
-    assert_eq!(span(&buf, top + 2, OPTION_X, 118), "04 / 12", "display position");
+    assert_eq!(span(&buf, top + 2, OPTION_X, 118), "04 / 13", "display position");
     assert_eq!(tui::cell_style(&buf, OPTION_X, top + 2).fg, Some(P.dim));
 
     let first = top + 4;
@@ -350,7 +354,7 @@ fn under_110_columns_there_is_no_option_panel_and_the_position_joins_the_footnot
     assert!(!text.contains('●') && !text.contains('○'), "{text}");
     let foot = label_row(&buf) + 2;
     let line = span(&buf, foot, 0, 100);
-    assert!(line.contains("Config.JSON") && line.ends_with("04 / 12"), "{line:?}");
+    assert!(line.contains("Config.JSON") && line.ends_with("04 / 13"), "{line:?}");
     let queue = must_row(&buf, QUEUE_MODE);
     assert_eq!(span(&buf, queue, VALUE_X, 100), "◂ CONTINUOUS (LOOP) ▸");
     // The bar spans the whole list: 100 - 2 gutters, one column past the text on each side.
@@ -640,7 +644,7 @@ fn settings_render_at_120x40_100x30_and_80x24() {
     let buf = tui::render(&mut app, 80, 24);
     let top = label_row(&buf);
     assert!(
-        tui::row(&buf, top).trim_end().ends_with("04 / 12"),
+        tui::row(&buf, top).trim_end().ends_with("04 / 13"),
         "{}",
         tui::row(&buf, top)
     );
@@ -1106,4 +1110,116 @@ fn track_analysis_value_is_cut_from_its_end_keeping_pending() {
 
     drop(app);
     let _ = fs::remove_dir_all(&dir);
+}
+
+// ---------- library index (#41) ----------
+
+const INDEX: &str = "INDEX PROGRESS";
+
+/// The value of the INDEX PROGRESS row and the row, if it is on screen.
+fn index_row(buf: &Buffer) -> Option<(u16, String)> {
+    let y = (0..buf.area.height).find(|&y| span(buf, y, LABEL_X, VALUE_X) == INDEX)?;
+    Some((y, span(buf, y, VALUE_X, buf.area.width)))
+}
+
+/// Set the app's indexer progress as a pass would.
+fn set_progress(app: &AppUI, state: IndexState, counts: [usize; 5]) {
+    let progress = app.library_index_progress();
+    progress.set_state(state);
+    let [top_done, top_total, read, unchanged, failed] = counts;
+    progress.top_done.store(top_done, Ordering::SeqCst);
+    progress.top_total.store(top_total, Ordering::SeqCst);
+    progress.read.store(read, Ordering::SeqCst);
+    progress.unchanged.store(unchanged, Ordering::SeqCst);
+    progress.failed.store(failed, Ordering::SeqCst);
+}
+
+/// The row after TRACK ANALYSIS reads the indexer's progress (atomics only), in MID, never under
+/// the cursor, at every size; where the list scrolls, the LIBRARY group's last setting brings both
+/// read-only rows into view.
+#[test]
+fn library_index_row_shows_the_indexers_progress_at_every_size() {
+    common::isolate();
+    let mut app = settings_app("index_sizes");
+    set_progress(&app, IndexState::Reading, [412, 5981, 18330, 40112, 2]);
+    let last_library = SETTING_DISPLAY_ORDER
+        .iter()
+        .rev()
+        .find(|&&i| SETTING_DEFINITIONS[i].group == SettingGroup::Library)
+        .copied()
+        .unwrap();
+    for (w, h) in [(120, 40), (100, 30), (80, 24), (80, 20), (80, 16)] {
+        app.settings_cursor = SETTING_DISPLAY_ORDER[0];
+        tui::render(&mut app, w, h);
+        while app.settings_cursor != last_library {
+            press(&mut app, KeyCode::Char('j'));
+            tui::render(&mut app, w, h);
+        }
+        let buf = tui::render(&mut app, w, h);
+        let (y, value) = index_row(&buf).unwrap_or_else(|| panic!("{w}x{h}: no {INDEX} row:\n{}", dump(&buf)));
+        let full = "READING  ·  412 / 5,981 FOLDERS  ·  18,330 READ  ·  40,112 UNCHANGED  ·  2 FAILED";
+        // Cut from its end where the list is narrower than the value (as at 120, beside the
+        // option panel): the state and the folders come first.
+        let shown = value.strip_suffix('…').unwrap_or(&value);
+        assert!(full.starts_with(shown), "{w}x{h}: {value:?}\n{}", dump(&buf));
+        assert!(value == full || value.ends_with('…'), "{w}x{h}: {value:?}");
+        assert!(
+            value.starts_with("READING  ·  412 / 5,981 FOLDERS"),
+            "{w}x{h}: {value:?}"
+        );
+        let (analysis, _) = analysis_row(&buf).unwrap_or_else(|| panic!("{w}x{h}: no {ANALYSIS}:\n{}", dump(&buf)));
+        assert_eq!(analysis + 1, y, "{w}x{h}: right after TRACK ANALYSIS");
+        assert_eq!(must_row(&buf, last_library) + 2, y, "{w}x{h}:\n{}", dump(&buf));
+        assert!(is_cursor(&buf, LABEL_X, y - 2), "{w}x{h}: the cursor stays on its row");
+        assert_eq!(tui::cell_style(&buf, LABEL_X, y).fg, Some(P.mid), "{w}x{h}");
+        assert_eq!(tui::cell_style(&buf, VALUE_X, y).fg, Some(P.mid), "{w}x{h}");
+        assert!(!is_cursor(&buf, LABEL_X, y), "{w}x{h}");
+    }
+}
+
+#[test]
+fn library_index_row_names_each_state_and_leaves_out_what_is_unknown_or_zero() {
+    common::isolate();
+    let mut app = settings_app("index_states");
+    let mut value = |app: &mut AppUI| {
+        // Wide enough for every value whole beside the option panel.
+        let buf = tui::render(app, 200, 40);
+        index_row(&buf)
+            .map(|r| r.1)
+            .unwrap_or_else(|| panic!("no {INDEX} row:\n{}", dump(&buf)))
+    };
+    // Before it starts.
+    assert_eq!(value(&mut app), "WAITING");
+    // The folder total is not known yet, nothing read: the state alone.
+    set_progress(&app, IndexState::Reading, [0, 0, 0, 0, 0]);
+    assert_eq!(value(&mut app), "READING");
+    set_progress(&app, IndexState::Reading, [0, 40, 3, 0, 0]);
+    assert_eq!(value(&mut app), "READING  ·  0 / 40 FOLDERS  ·  3 READ");
+    set_progress(&app, IndexState::Paused, [12, 40, 3, 7, 0]);
+    assert_eq!(value(&mut app), "PAUSED  ·  12 / 40 FOLDERS  ·  3 READ  ·  7 UNCHANGED");
+    set_progress(&app, IndexState::Done, [40, 40, 0, 1200, 1]);
+    assert_eq!(
+        value(&mut app),
+        "DONE  ·  40 / 40 FOLDERS  ·  1,200 UNCHANGED  ·  1 FAILED"
+    );
+    set_progress(&app, IndexState::NoFolders, [0, 0, 0, 0, 0]);
+    assert_eq!(value(&mut app), "NO FOLDERS");
+    set_progress(&app, IndexState::Unavailable, [0, 0, 0, 0, 0]);
+    assert_eq!(value(&mut app), "UNAVAILABLE");
+    // Turned off: OFF whatever the last pass left.
+    set_progress(&app, IndexState::Done, [40, 40, 0, 1200, 1]);
+    app.settings_mgr.settings.library_index = false;
+    assert_eq!(value(&mut app), "OFF");
+}
+
+/// The cursor never lands on the read-only rows: down from the Library Index setting is WEB.
+#[test]
+fn the_cursor_skips_the_read_only_rows() {
+    common::isolate();
+    let mut app = settings_app("index_cursor");
+    app.settings_cursor = setting::LIBRARY_INDEX;
+    press(&mut app, KeyCode::Char('j'));
+    assert_eq!(SETTING_DEFINITIONS[app.settings_cursor].group, SettingGroup::Web);
+    press(&mut app, KeyCode::Char('k'));
+    assert_eq!(app.settings_cursor, setting::LIBRARY_INDEX);
 }
