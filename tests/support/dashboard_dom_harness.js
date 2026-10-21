@@ -228,6 +228,7 @@ function assertNoMarkupFromData() {
     }
   }
   for (const el of walk(document.getElementById('queueList'))
+    .concat(walk(document.getElementById('upNextList')))
     .concat(walk(document.getElementById('browserList')))
     .concat(walk(document.getElementById('bookmarksRow')))
     .concat(walk(document.getElementById('devicesList')))
@@ -260,7 +261,13 @@ const status = {
   filepath: H.backslash,
   queue_index: 0,
   queue_total: all.length,
-  next_track_title: H.entity,
+  next_track_title: all[1],
+  up_next: all.slice(1, 4).map((v, i) => ({ index: i + 1, title: v, artist: v, duration_seconds: 60 })),
+  up_next_remaining: all.length - 1,
+  up_next_end: 'loops',
+  up_next_wraps_before: null,
+  up_next_shows_end: false,
+  up_next_total_seconds: 60 * (all.length - 1),
   queue_mode: 'loop',
   is_scanning: false,
   is_autopilot: true,
@@ -288,7 +295,10 @@ assert.deepStrictEqual(artists, all, 'queue artists not rendered verbatim as tex
 assert.strictEqual(document.getElementById('title').textContent, H.scriptTag);
 assert.strictEqual(document.getElementById('artist').textContent, H.img);
 assert.strictEqual(document.getElementById('album').textContent, H.entity);
-assert.strictEqual(document.getElementById('upNextTitle').textContent, H.entity);
+const upNextList = document.getElementById('upNextList');
+assert.deepStrictEqual(byClass(upNextList, 'up-next-title').map(n => n.textContent), all.slice(1, 4),
+  'Up Next titles not rendered verbatim as text');
+assert.deepStrictEqual(byClass(upNextList, 'up-next-artist').map(n => n.textContent), all.slice(1, 4));
 assert.strictEqual(document.getElementById('outputBadge').textContent, H.img);
 
 const items = byClass(queueList, 'queue-item');
@@ -527,6 +537,74 @@ assertNoMarkupFromData();
 // Not loaded: the app's message is shown as text.
 sandbox.renderPlaylists({ state: 'failed', message: H.scriptTag, revision: 0, last_playlist: null, playlists: [] });
 assert.strictEqual(playlistsList.textContent, H.scriptTag);
+assertNoMarkupFromData();
+
+// ---------------------------------------------------------------------------
+// 4. Up Next (issue #104): the tracks /api/status lists and its end note, in tab [1]'s words
+// ---------------------------------------------------------------------------
+function upNextRows(over) {
+  sandbox.renderStatus(Object.assign({}, status, over));
+  return upNextList.childNodes.map(n => {
+    if (n.classList.contains('up-next-note')) return `note ${n.dataset.end}: ${n.textContent}`;
+    const len = byClass(n, 'up-next-len');
+    return `${n.dataset.index}: ${byClass(n, 'up-next-title')[0].textContent}` + (len.length ? ` ${len[0].textContent}` : '');
+  });
+}
+const upNextItem = (index, seconds = 60) => ({ index, title: 'T' + index, artist: 'A', duration_seconds: seconds });
+// The fields the server sends with every Up Next; each case overrides some.
+const upNext = (over) => Object.assign({
+  up_next: [], up_next_remaining: 0, up_next_wraps_before: null, up_next_shows_end: true, up_next_total_seconds: null,
+}, over);
+const upNextCount = () => document.getElementById('upNextCount').textContent;
+
+// Repeat-one: nothing else is next, the current track repeats.
+assert.deepStrictEqual(upNextRows(upNext({ up_next_end: 'repeat_one' })),
+  ['note repeat_one: Repeat one · this track repeats']);
+assert.strictEqual(document.getElementById('upNextRow').style.display, 'flex');
+assert.strictEqual(upNextCount(), '');
+// Continuous stream on the last track: it reshuffles, so no next track is named.
+assert.deepStrictEqual(upNextRows(upNext({ up_next_end: 'reshuffles' })),
+  ['note reshuffles: End of queue · reshuffles and starts over']);
+// Continuous stream earlier on: the tracks to the end of the queue with their lengths, then the
+// reshuffle; the count with the total length.
+assert.deepStrictEqual(upNextRows(upNext({
+  up_next: [upNextItem(3, 245)], up_next_remaining: 1, up_next_end: 'reshuffles', up_next_total_seconds: 245,
+})), ['3: T3 04:05', 'note reshuffles: End of queue · reshuffles and starts over']);
+assert.strictEqual(upNextCount(), '1 remaining · 04:05');
+// Stop mode: on the last track, and with every track listed.
+assert.deepStrictEqual(upNextRows(upNext({ up_next_end: 'stops' })),
+  ['note stops: End of queue · playback stops after this track']);
+assert.deepStrictEqual(upNextRows(upNext({
+  up_next: [upNextItem(2), upNextItem(3)], up_next_remaining: 2, up_next_end: 'stops', up_next_total_seconds: 4000,
+})), ['2: T2 01:00', '3: T3 01:00', 'note stops: End of queue · playback stops']);
+assert.strictEqual(upNextCount(), '2 remaining · 1:06:40');
+// More tracks than listed: the server says the end isn't shown yet; an unknown total and an
+// unknown length are left out.
+assert.deepStrictEqual(upNextRows(upNext({
+  up_next: [upNextItem(1), upNextItem(2, 0), upNextItem(3)], up_next_remaining: 5, up_next_end: 'stops',
+  up_next_shows_end: false,
+})), ['1: T1 01:00', '2: T2', '3: T3 01:00']);
+assert.strictEqual(upNextCount(), '5 remaining');
+// The notes are where the server puts them, not worked out from the indices or the count.
+assert.deepStrictEqual(upNextRows(upNext({
+  up_next: [upNextItem(0), upNextItem(1)], up_next_remaining: 2, up_next_end: 'stops', up_next_shows_end: false,
+})), ['0: T0 01:00', '1: T1 01:00']);
+// Loop mode runs past the end to the first track where the server says; a single track repeats.
+assert.deepStrictEqual(upNextRows(upNext({
+  up_next: [upNextItem(3), upNextItem(0), upNextItem(1)], up_next_remaining: 3, up_next_end: 'loops',
+  up_next_wraps_before: 1,
+})), ['3: T3 01:00', 'note wraps: End of queue · loops to 1', '0: T0 01:00', '1: T1 01:00']);
+assert.deepStrictEqual(upNextRows(upNext({
+  up_next: [upNextItem(0), upNextItem(1), upNextItem(2)], up_next_remaining: 3, up_next_end: 'loops',
+  up_next_wraps_before: 0,
+})), ['note wraps: End of queue · loops to 1', '0: T0 01:00', '1: T1 01:00', '2: T2 01:00']);
+assert.deepStrictEqual(upNextRows(upNext({ up_next_end: 'loops' })),
+  ['note loops: End of queue · repeats this track']);
+// Nothing loaded: no Up Next.
+upNextRows(upNext({ up_next_end: null, up_next_shows_end: false }));
+assert.strictEqual(document.getElementById('upNextRow').style.display, 'none');
+// An unknown end kind gets no note.
+assert.deepStrictEqual(upNextRows(upNext({ up_next_end: '__proto__' })), []);
 assertNoMarkupFromData();
 
 // Status poll: remote access turned off reads as that, not as OFFLINE; a lost connection is OFFLINE.

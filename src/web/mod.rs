@@ -14,7 +14,8 @@ pub(crate) use server::write_response;
 pub use server::{ServerLimits, WebBind, WebServer, WebServerHandle};
 pub use state::{
     NowPlayingState, PlaylistEdit, PlaylistReply, WebBrowserEntry, WebBrowserResponse, WebCommand, WebDeviceItem,
-    WebPlaylist, WebPlaylistEntry, WebPlaylists, WebPlaylistsState, WebQueueItem, WebReply, PLAYLISTS_CHANGED,
+    WebPlaylist, WebPlaylistEntry, WebPlaylists, WebPlaylistsState, WebQueueItem, WebReply, WebUpNextItem,
+    PLAYLISTS_CHANGED, WEB_UP_NEXT_LIMIT,
 };
 pub use stream::{
     check_stream_seek, make_continuous_wav_header, parse_byte_range, wav_header_sizes, ByteRange, ContinuousAdmission,

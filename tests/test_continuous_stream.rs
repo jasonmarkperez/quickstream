@@ -869,6 +869,73 @@ fn test_continuous_seek_on_the_last_track_sends_no_shuffle() {
     assert_eq!(*f.controller.current_track_index.lock().unwrap(), 1);
 }
 
+/// `up_next` indices, `up_next_remaining`, `up_next_end` and `next_track_title`.
+#[cfg(unix)]
+type UpNext = (Vec<usize>, usize, Option<quickstream::queue::QueueEnd>, Option<String>);
+
+#[cfg(unix)]
+fn published_up_next(state: &NowPlayingState) -> UpNext {
+    (
+        state.up_next.iter().map(|item| item.index).collect(),
+        state.up_next_remaining,
+        state.up_next_end,
+        state.next_track_title.clone(),
+    )
+}
+
+/// The stream publishes Up Next with each track it starts, in the same write as the track and
+/// through the UI's own `publish_up_next` (wrapping, as the continuous stream plays on), so
+/// `/api/status` never lists the track now playing as the next one between the stream's write
+/// and the UI's next tick, and the UI's tick republishes the same values. A queue the UI has
+/// shortened since the stream took its copy is listed as published (#104).
+#[cfg(unix)]
+#[test]
+fn test_continuous_stream_publishes_up_next_with_its_track() {
+    common::isolate();
+    use quickstream::queue::QueueEnd;
+    let names = ["t0_live.wav", "t1_live.wav", "t2_live.wav", "t3_live.wav"];
+    let f = DecoderFixture::start("up_next_stream", &names, 0);
+    wait_until("the stream never published track 0", || {
+        f.state.read().unwrap().title == "Track 0"
+    });
+    // The UI's tick for track 0.
+    f.state.write().unwrap().publish_up_next(true);
+    assert_eq!(
+        published_up_next(&f.state.read().unwrap()),
+        (
+            vec![1, 2, 3],
+            3,
+            Some(QueueEnd::Reshuffles),
+            Some("Track 1".to_string())
+        )
+    );
+
+    f.controller.skip_to_index(2);
+    wait_until("the stream never published track 2", || {
+        f.state.read().unwrap().title == "Track 2"
+    });
+    {
+        let s = f.state.read().unwrap();
+        assert_eq!(
+            published_up_next(&s),
+            (vec![3], 1, Some(QueueEnd::Reshuffles), Some("Track 3".to_string()))
+        );
+        assert_ne!(s.next_track_title.as_deref(), Some(s.title.as_str()));
+        let mut ui = s.clone();
+        ui.publish_up_next(true);
+        assert_eq!(published_up_next(&ui), published_up_next(&s), "the UI's tick agrees");
+    }
+
+    // The UI drops the last two tracks from the queue it publishes; the stream starts track 1.
+    f.state.write().unwrap().queue.truncate(2);
+    f.controller.skip_to_index(1);
+    wait_until("the stream never published track 1", || {
+        f.state.read().unwrap().title == "Track 1"
+    });
+    let s = f.state.read().unwrap();
+    assert_eq!(published_up_next(&s), (vec![], 0, Some(QueueEnd::Reshuffles), None));
+}
+
 /// A skip that arrives as a track ends, while the stream waits to pick the next one, is not
 /// lost: the stream plays the track asked for, not the one after the track that ended (#106).
 #[cfg(unix)]

@@ -427,9 +427,24 @@
       font-size: 0.75rem;
       color: var(--text-dim);
       display: flex;
+      flex-direction: column;
+      gap: 0.2rem;
+      flex-shrink: 0;
+    }
+    .up-next-head {
+      display: flex;
       justify-content: space-between;
       align-items: center;
+    }
+    .up-next-item {
+      display: flex;
+      align-items: baseline;
+      gap: 0.5rem;
+      min-width: 0;
+    }
+    .up-next-num {
       flex-shrink: 0;
+      font-variant-numeric: tabular-nums;
     }
     .up-next-title {
       color: var(--text-muted);
@@ -437,7 +452,23 @@
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      max-width: 260px;
+      min-width: 0;
+    }
+    .up-next-artist {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+      flex: 1;
+    }
+    .up-next-note {
+      font-size: 0.7rem;
+      letter-spacing: 0.02em;
+    }
+    .up-next-len {
+      flex-shrink: 0;
+      margin-left: auto;
+      font-variant-numeric: tabular-nums;
     }
 
     /* Panel Header Common */
@@ -1105,6 +1136,7 @@
       .up-next {
         margin-top: 0.35rem;
         padding-top: 0.35rem;
+        gap: 0.1rem;
       }
     }
   </style>
@@ -1219,8 +1251,11 @@
       </div>
 
       <div class="up-next" id="upNextRow" style="display:none;">
-        <span>Up Next</span>
-        <span class="up-next-title" id="upNextTitle"></span>
+        <div class="up-next-head">
+          <span>Up Next</span>
+          <span class="up-next-count" id="upNextCount"></span>
+        </div>
+        <div class="up-next-list" id="upNextList"></div>
       </div>
     </div>
 
@@ -1572,15 +1607,7 @@
         document.getElementById('volumeSlider').value = data.volume;
       }
 
-      // Up Next
-      const upNextRow = document.getElementById('upNextRow');
-      const upNextTitle = document.getElementById('upNextTitle');
-      if (data.next_track_title) {
-        upNextRow.style.display = "flex";
-        upNextTitle.textContent = data.next_track_title;
-      } else {
-        upNextRow.style.display = "none";
-      }
+      renderUpNext(data);
 
       updateProgressUI();
 
@@ -1715,6 +1742,69 @@
     });
 
     // --- QUEUE MANAGEMENT ---
+    // A track length as tab [1] writes it: MM:SS under an hour, H:MM:SS from an hour.
+    function formatLength(seconds) {
+      const total = Math.floor(seconds);
+      if (total < 3600) return formatTime(total);
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      return `${h}:${String(m).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
+    }
+
+    // What happens at the end of the queue (`up_next_end`), in tab [1]'s UP NEXT words: `empty`
+    // when no track is listed before it, else after the last listed track ('' for none).
+    function upNextEndNote(end, empty) {
+      switch (end) {
+        case 'stops': return empty ? 'End of queue · playback stops after this track' : 'End of queue · playback stops';
+        case 'repeat_one': return empty ? 'Repeat one · this track repeats' : '';
+        case 'loops': return empty ? 'End of queue · repeats this track' : '';
+        case 'reshuffles': return 'End of queue · reshuffles and starts over';
+        default: return '';
+      }
+    }
+
+    // Up Next: the tracks that play after this one (`up_next`, from PlaybackQueue::upcoming, as
+    // tab [1] lists them) with their lengths, the count and total length of every remaining
+    // track, the wrap note where the server says loop mode runs past the end to the first track
+    // (`up_next_wraps_before`), and the end note once every remaining track is listed
+    // (`up_next_shows_end`).
+    function renderUpNext(data) {
+      const row = document.getElementById('upNextRow');
+      const list = document.getElementById('upNextList');
+      const end = data.up_next_end;
+      clearChildren(list);
+      if (!end) {
+        row.style.display = 'none';
+        return;
+      }
+      const items = data.up_next || [];
+      const remaining = data.up_next_remaining || 0;
+      const total = data.up_next_total_seconds;
+      let count = remaining > 0 ? `${remaining} remaining` : '';
+      if (count && typeof total === 'number' && total > 0) count += ` · ${formatLength(total)}`;
+      document.getElementById('upNextCount').textContent = count;
+      const note = (kind, text) => {
+        const n = el('div', 'up-next-note', text);
+        n.dataset.end = kind;
+        list.appendChild(n);
+      };
+      items.forEach((item, position) => {
+        if (position === data.up_next_wraps_before) note('wraps', 'End of queue · loops to 1');
+        const r = el('div', 'up-next-item');
+        r.dataset.index = String(item.index);
+        r.appendChild(el('span', 'up-next-num', (item.index + 1) + '.'));
+        r.appendChild(el('span', 'up-next-title', item.title || ''));
+        r.appendChild(el('span', 'up-next-artist', item.artist || ''));
+        if (item.duration_seconds > 0) r.appendChild(el('span', 'up-next-len', formatLength(item.duration_seconds)));
+        list.appendChild(r);
+      });
+      if (data.up_next_shows_end) {
+        const text = upNextEndNote(end, items.length === 0);
+        if (text) note(end, text);
+      }
+      row.style.display = 'flex';
+    }
+
     function renderQueue(data) {
       const queue = data.queue || [];
       document.getElementById('queueBadgeTab').textContent = queue.length;

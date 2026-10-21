@@ -288,7 +288,6 @@ impl ContinuousStreamController {
         path: &Path,
         duration: f64,
         position: f64,
-        queue_len: usize,
     ) {
         let Ok(mut s) = state.write() else {
             return;
@@ -313,10 +312,10 @@ impl ContinuousStreamController {
             s.is_playing = true;
             s.is_paused = false;
         }
-        if queue_len > 1 {
-            let next_idx = (index + 1) % queue_len;
-            s.next_track_title = s.queue.get(next_idx).map(|t| t.title.clone());
-        }
+        // Up Next for this track, in the same write and from the same published queue, index
+        // and mode, through the function the UI's tick uses (which then republishes the same
+        // values), so the track now playing is never also listed as the next one.
+        s.publish_up_next(true);
     }
 
     /// Run `binary` as the stream's ffmpeg instead of `ffmpeg` on `PATH` (the test seam for a
@@ -1844,16 +1843,7 @@ pub(super) fn serve_continuous_stream(
 
         // A file tried while nothing gives audio is shown once it gives some (below).
         if !tentative {
-            controller.publish_track(
-                state,
-                cid,
-                session,
-                track_index,
-                &track_path,
-                track_duration,
-                start_pos,
-                queue_len,
-            );
+            controller.publish_track(state, cid, session, track_index, &track_path, track_duration, start_pos);
         }
 
         crate::log_info!(
@@ -1961,7 +1951,6 @@ pub(super) fn serve_continuous_stream(
                                 &track_path,
                                 track_duration,
                                 start_pos,
-                                queue_len,
                             );
                         }
                     }

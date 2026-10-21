@@ -54,8 +54,10 @@ pub struct RemovedTrack {
     pub was_current: bool,
 }
 
-/// What happens once the tracks [`PlaybackQueue::upcoming`] lists have played.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What happens once the tracks [`PlaybackQueue::upcoming`] lists have played. Published to the
+/// web dashboard as `stops`, `repeat_one`, `loops` or `reshuffles`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum QueueEnd {
     /// Playback stops (stop mode).
     Stops,
@@ -81,6 +83,38 @@ pub struct Upcoming {
 }
 
 impl Upcoming {
+    /// What plays after track `current` of a queue of `len` tracks: the rule behind
+    /// [`PlaybackQueue::upcoming`], for a copy of the queue such as the web state's
+    /// (`NowPlayingState::publish_up_next` lists its Up Next from that).
+    pub fn after(current: usize, len: usize, mode: &str, wrap: bool) -> Upcoming {
+        let next = current + 1;
+        let to_end = len.saturating_sub(next);
+        let (left, end) = if len <= 1 {
+            let end = if mode == "repeat_one" && !wrap {
+                QueueEnd::RepeatOne
+            } else if mode == "loop" || wrap {
+                QueueEnd::Loops
+            } else {
+                QueueEnd::Stops
+            };
+            (0, end)
+        } else if wrap {
+            (to_end, QueueEnd::Reshuffles)
+        } else {
+            match mode {
+                "repeat_one" => (0, QueueEnd::RepeatOne),
+                "loop" => (len - 1, QueueEnd::Loops),
+                _ => (to_end, QueueEnd::Stops),
+            }
+        };
+        Self {
+            next,
+            queue_len: len,
+            left,
+            end,
+        }
+    }
+
     /// What happens once the listed tracks have played.
     pub fn end(&self) -> QueueEnd {
         self.end
@@ -296,33 +330,7 @@ impl PlaybackQueue {
     /// the tracks to the end of the queue; loop mode every other track, past the end to the
     /// first; repeat-one none, since the current track repeats.
     pub fn upcoming(&self, mode: &str, wrap: bool) -> Upcoming {
-        let len = self.tracks.len();
-        let next = self.current_index + 1;
-        let to_end = len.saturating_sub(next);
-        let (left, end) = if len <= 1 {
-            let end = if mode == "repeat_one" && !wrap {
-                QueueEnd::RepeatOne
-            } else if mode == "loop" || wrap {
-                QueueEnd::Loops
-            } else {
-                QueueEnd::Stops
-            };
-            (0, end)
-        } else if wrap {
-            (to_end, QueueEnd::Reshuffles)
-        } else {
-            match mode {
-                "repeat_one" => (0, QueueEnd::RepeatOne),
-                "loop" => (len - 1, QueueEnd::Loops),
-                _ => (to_end, QueueEnd::Stops),
-            }
-        };
-        Upcoming {
-            next,
-            queue_len: len,
-            left,
-            end,
-        }
+        Upcoming::after(self.current_index, self.tracks.len(), mode, wrap)
     }
 
     pub fn prev_track(&mut self) -> Option<&AudioMetadata> {
