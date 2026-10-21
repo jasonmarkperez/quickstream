@@ -148,7 +148,12 @@ impl Running {
 
 /// One whole pass with `reader`; the snapshot when it is done.
 fn one_pass(db_path: &Path, roots: Vec<PathBuf>, reader: IndexTagReader) -> IndexSnapshot {
-    let run = spawn(db_path, config(roots), reader);
+    one_pass_with(db_path, config(roots), reader)
+}
+
+/// One whole pass with `cfg` and `reader`; the snapshot when it is done.
+fn one_pass_with(db_path: &Path, cfg: IndexConfig, reader: IndexTagReader) -> IndexSnapshot {
+    let run = spawn(db_path, cfg, reader);
     run.wait_state(IndexState::Done);
     run.finish()
 }
@@ -602,48 +607,93 @@ fn a_paused_indexer_reads_nothing_until_resumed() {
     handle.join().unwrap();
 }
 
-/// A slow operation makes it back off before the next one; stop ends the backoff at once.
+/// A share that is slow but working (2-3 s tag reads over Wi-Fi) keeps being read at nearly its
+/// own speed (#146 review): the indexer backs off only after several slow operations in a row,
+/// for as long as the last one took, so every read slow costs at most a third more. One slow
+/// read among fast ones costs no wait at all.
 #[test]
-fn a_slow_read_backs_off_and_stop_ends_the_backoff() {
+fn a_slow_share_is_read_at_nearly_its_own_speed() {
     common::isolate();
-    let (lib, db_path) = scratch("backoff");
-    library_tree(&lib, 1, 2);
+    let (lib, db_path) = scratch("slow_share");
+    // Six tracks in one folder: their reads come one after another.
+    for t in 0..6 {
+        silent_wav(&lib.join(format!("{t:02} Song.wav")));
+    }
+    let read_time = Duration::from_millis(250);
     let slow: IndexTagReader = {
         let real = default_tag_reader();
         Arc::new(move |path: &Path, stamp| {
-            if path.ends_with("00 Song.wav") {
-                std::thread::sleep(Duration::from_millis(300));
-            }
+            std::thread::sleep(read_time);
             real(path, stamp)
         })
     };
     let cfg = IndexConfig {
         slow_op: Duration::from_millis(200),
-        backoff: Duration::from_millis(300),
+        slow_streak: 3,
+        backoff: Duration::from_secs(60),
         ..config(vec![lib.clone()])
     };
     let start = Instant::now();
-    let run = spawn(&db_path, cfg, slow.clone());
+    let run = spawn(&db_path, cfg.clone(), slow);
     run.wait_state(IndexState::Done);
-    assert!(start.elapsed() >= Duration::from_millis(600), "{:?}", start.elapsed());
+    let took = start.elapsed();
     let snap = run.finish();
-    assert_eq!((snap.backoffs, snap.read), (1, 3));
+    assert_eq!((snap.read, snap.backoffs), (6, 2), "{snap:?}");
+    // Six reads of 250 ms and two waits of about as long; a fixed backoff would take minutes.
+    assert!(took >= read_time * 8, "{took:?}");
+    assert!(took < read_time * 16, "{took:?}");
 
-    // A long backoff ends as soon as stop is raised.
-    let (lib2, db2) = scratch("backoff_stop");
-    library_tree(&lib2, 1, 2);
-    let cfg = IndexConfig {
-        slow_op: Duration::from_millis(200),
-        backoff: Duration::from_secs(60),
-        ..config(vec![lib2])
+    // One slow read among fast ones: no wait.
+    let (lib2, db2) = scratch("one_slow");
+    library_tree(&lib2, 1, 5);
+    let one_slow: IndexTagReader = {
+        let real = default_tag_reader();
+        Arc::new(move |path: &Path, stamp| {
+            if path.ends_with("02 Song.wav") {
+                std::thread::sleep(read_time);
+            }
+            real(path, stamp)
+        })
     };
-    let run = spawn(&db2, cfg, slow);
+    let snap = one_pass_with(
+        &db2,
+        IndexConfig {
+            roots: vec![lib2],
+            ..cfg
+        },
+        one_slow,
+    );
+    assert_eq!((snap.read, snap.backoffs), (6, 0), "{snap:?}");
+}
+
+/// One operation that takes as long as the backoff cap (a stalled share) backs off at once, for
+/// at most the cap; stop ends the backoff at once.
+#[test]
+fn a_stall_backs_off_at_once_and_stop_ends_the_backoff() {
+    common::isolate();
+    let (lib, db_path) = scratch("backoff_stop");
+    library_tree(&lib, 1, 2);
+    let stall: IndexTagReader = {
+        let real = default_tag_reader();
+        Arc::new(move |path: &Path, stamp| {
+            if path.ends_with("00 Song.wav") {
+                std::thread::sleep(Duration::from_millis(1500));
+            }
+            real(path, stamp)
+        })
+    };
+    let cfg = IndexConfig {
+        slow_op: Duration::from_millis(100),
+        backoff: Duration::from_millis(1200),
+        ..config(vec![lib])
+    };
+    let run = spawn(&db_path, cfg, stall);
     wait_for("the backoff", Duration::from_secs(10), || {
         run.progress.backoffs.load(Ordering::SeqCst) == 1
     });
     let stop = Instant::now();
     run.finish();
-    assert!(stop.elapsed() < Duration::from_secs(2), "{:?}", stop.elapsed());
+    assert!(stop.elapsed() < Duration::from_millis(600), "{:?}", stop.elapsed());
 }
 
 /// A reader stuck on a hung share neither keeps quitting waiting (the thread is detached after

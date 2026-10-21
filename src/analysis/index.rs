@@ -10,9 +10,12 @@
 //!
 //! The UI talks to it through atomics and one mutex only ([`IndexControl`], [`IndexProgress`]):
 //! `stop`, `paused` (while a mix gathers, a folder is read or a search scans) and a folder to
-//! walk next (`prioritise`, the folder a mix started in). A slow operation (a share that stalls)
-//! makes it back off; every wait ends early when `stop` is raised.
+//! walk next (`prioritise`, the folder a mix started in). Slow operations in a row (a share that
+//! struggles), or one that stalls, make it back off for as long as the last one took, so a share
+//! that is slow but working is still read at nearly its own speed; every wait ends early when
+//! `stop` is raised.
 
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -35,7 +38,10 @@ pub struct IndexConfig {
     pub write_every: usize,
     /// A listing, stat or tag read that takes this long counts as slow.
     pub slow_op: Duration,
-    /// How long it waits after a slow operation before the next one.
+    /// After this many slow operations in a row it backs off.
+    pub slow_streak: usize,
+    /// The longest it backs off for. A backoff lasts as long as the slow operation before it
+    /// took, at most this; one operation that took this long or more backs off at once.
     pub backoff: Duration,
     /// How long it waits after a pass before walking everything again.
     pub rescan_interval: Duration,
@@ -50,6 +56,7 @@ impl IndexConfig {
             max_depth: 16,
             write_every: 32,
             slow_op: Duration::from_secs(2),
+            slow_streak: 3,
             backoff: Duration::from_secs(30),
             rescan_interval: Duration::from_secs(6 * 60 * 60),
             start_delay: Duration::from_secs(10),
@@ -254,6 +261,7 @@ pub fn run_library_index(
         progress,
         reader,
         walked: HashMap::new(),
+        slow_streak: Cell::new(0),
     };
     loop {
         let start = Instant::now();
@@ -324,6 +332,8 @@ struct Indexer<'a> {
     reader: IndexTagReader,
     /// Folders a prioritised walk did whole or not this pass, reused when the walk reaches them.
     walked: HashMap<PathBuf, bool>,
+    /// Slow operations in a row ([`Self::timed`]).
+    slow_streak: Cell<usize>,
 }
 
 impl Indexer<'_> {
@@ -343,21 +353,31 @@ impl Indexer<'_> {
         !self.control.is_stopped()
     }
 
-    /// Run `op`; if it was slow (a stalled share), back off before going on.
+    /// Run `op`, then back off if the share struggles: after `slow_streak` slow operations in a
+    /// row, or one that took `backoff` or longer (a stall), wait as long as it took, at most
+    /// `backoff`. A fast operation ends the streak, and so does a backoff.
     fn timed<T>(&self, what: &str, path: &Path, op: impl FnOnce() -> T) -> T {
         let start = Instant::now();
         let out = op();
         let took = start.elapsed();
-        if took >= self.cfg.slow_op {
-            self.progress.backoffs.fetch_add(1, Ordering::SeqCst);
-            crate::log_info!(
-                "index",
-                "Slow {what} of '{}' ({took:.1?}); waiting {:?}",
-                path.display(),
-                self.cfg.backoff
-            );
-            wait(self.control, self.cfg.backoff);
+        if took < self.cfg.slow_op {
+            self.slow_streak.set(0);
+            return out;
         }
+        let streak = self.slow_streak.get() + 1;
+        if streak < self.cfg.slow_streak.max(1) && took < self.cfg.backoff {
+            self.slow_streak.set(streak);
+            return out;
+        }
+        self.slow_streak.set(0);
+        let pause = took.min(self.cfg.backoff);
+        self.progress.backoffs.fetch_add(1, Ordering::SeqCst);
+        crate::log_info!(
+            "index",
+            "Slow {what} of '{}' ({took:.1?}, {streak} slow in a row); waiting {pause:.1?}",
+            path.display()
+        );
+        wait(self.control, pause);
         out
     }
 
