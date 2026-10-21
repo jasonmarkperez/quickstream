@@ -170,6 +170,17 @@ pub struct NowPlayingState {
     /// What happens once those tracks have played; `None` with nothing loaded.
     #[serde(default)]
     pub up_next_end: Option<crate::queue::QueueEnd>,
+    /// The position in `up_next` where loop mode runs past the end of the queue to its first
+    /// track (the dashboard's `End of queue · loops to 1` goes before it); `None` when it doesn't
+    /// within the listed tracks.
+    #[serde(default)]
+    pub up_next_wraps_before: Option<usize>,
+    /// `up_next` lists every remaining track, so what `up_next_end` says follows them.
+    #[serde(default)]
+    pub up_next_shows_end: bool,
+    /// The remaining tracks' total length, only when every one is known (tab [1]'s note).
+    #[serde(default)]
+    pub up_next_total_seconds: Option<f64>,
     #[serde(default)]
     pub queue: Vec<WebQueueItem>,
     #[serde(default)]
@@ -245,6 +256,9 @@ impl Default for NowPlayingState {
             up_next: Vec::new(),
             up_next_remaining: 0,
             up_next_end: None,
+            up_next_wraps_before: None,
+            up_next_shows_end: false,
+            up_next_total_seconds: None,
             queue: Vec::new(),
             devices: Vec::new(),
             queue_mode: "loop".to_string(),
@@ -267,38 +281,55 @@ impl Default for NowPlayingState {
 }
 
 impl NowPlayingState {
-    /// Publish what plays after the current track (`up_next`, `up_next_remaining`,
-    /// `up_next_end`, `next_track_title`) from `upcoming` (`None` with nothing loaded) and the
-    /// published `queue`, which its indices name. The UI thread and the continuous stream both
-    /// publish through this, so the two never disagree. At most [`WEB_UP_NEXT_LIMIT`] items are
-    /// built, however long the queue.
-    pub fn publish_up_next(&mut self, upcoming: Option<crate::queue::Upcoming>) {
-        use crate::queue::QueueEnd;
-        let Some(upcoming) = upcoming else {
-            self.up_next.clear();
+    /// Publish what plays after the current track (`up_next` and the other `up_next_*` fields,
+    /// `next_track_title`) from the published `queue`, `queue_index` and `queue_mode`, through
+    /// [`crate::queue::Upcoming::after`] as tab [1]'s UP NEXT lists them (`wrap` while the
+    /// continuous stream plays). Everything comes from that one snapshot, so the indices, count,
+    /// titles and end always agree; nothing is listed when `queue_index` names no track. Only the
+    /// UI thread publishes it (`AppUI::update_web_state`), once it has published the queue. At
+    /// most [`WEB_UP_NEXT_LIMIT`] items are built, however long the queue.
+    pub fn publish_up_next(&mut self, wrap: bool) {
+        use crate::queue::{QueueEnd, Upcoming};
+        self.up_next.clear();
+        self.up_next_wraps_before = None;
+        self.up_next_total_seconds = None;
+        if self.queue_index >= self.queue.len() {
             self.up_next_remaining = 0;
             self.up_next_end = None;
+            self.up_next_shows_end = false;
             self.next_track_title = None;
             return;
-        };
+        }
+        let upcoming = Upcoming::after(self.queue_index, self.queue.len(), &self.queue_mode, wrap);
         let end = upcoming.end();
         self.up_next_remaining = upcoming.len();
-        self.up_next = upcoming
-            .take(WEB_UP_NEXT_LIMIT)
-            .filter_map(|index| {
-                self.queue.get(index).map(|t| WebUpNextItem {
-                    index,
-                    title: t.title.clone(),
-                    artist: t.artist.clone(),
-                    duration_seconds: t.duration_seconds,
-                })
-            })
-            .collect();
         self.up_next_end = Some(end);
+        let mut total = Some(0.0);
+        for (position, index) in upcoming.enumerate() {
+            let t = &self.queue[index];
+            total = total
+                .filter(|_| t.duration_seconds > 0.0)
+                .map(|sum| sum + t.duration_seconds);
+            if position >= WEB_UP_NEXT_LIMIT {
+                continue;
+            }
+            // Only loop mode lists the first track after a later one.
+            if index == 0 && end == QueueEnd::Loops {
+                self.up_next_wraps_before = Some(position);
+            }
+            self.up_next.push(WebUpNextItem {
+                index,
+                title: t.title.clone(),
+                artist: t.artist.clone(),
+                duration_seconds: t.duration_seconds,
+            });
+        }
+        self.up_next_total_seconds = total.filter(|_| self.up_next_remaining > 0);
+        self.up_next_shows_end = self.up_next.len() == self.up_next_remaining;
         self.next_track_title = match (self.up_next.first(), end) {
             (Some(next), _) => Some(next.title.clone()),
             // Nothing else is listed: the current track plays again, or nothing is known.
-            (None, QueueEnd::RepeatOne | QueueEnd::Loops) => self.queue.get(self.queue_index).map(|t| t.title.clone()),
+            (None, QueueEnd::RepeatOne | QueueEnd::Loops) => Some(self.queue[self.queue_index].title.clone()),
             (None, QueueEnd::Stops | QueueEnd::Reshuffles) => None,
         };
     }

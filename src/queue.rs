@@ -84,8 +84,8 @@ pub struct Upcoming {
 
 impl Upcoming {
     /// What plays after track `current` of a queue of `len` tracks: the rule behind
-    /// [`PlaybackQueue::upcoming`], for a copy of the queue such as the web state's (the
-    /// continuous stream publishes its Up Next from that).
+    /// [`PlaybackQueue::upcoming`], for a copy of the queue such as the web state's
+    /// (`NowPlayingState::publish_up_next` lists its Up Next from that).
     pub fn after(current: usize, len: usize, mode: &str, wrap: bool) -> Upcoming {
         let next = current + 1;
         let to_end = len.saturating_sub(next);

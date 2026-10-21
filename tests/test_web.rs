@@ -1328,24 +1328,30 @@ fn test_web_server_streams_use_separate_pool_and_release_on_disconnect() {
 // Up Next (issue #104): /api/status names what plays next as tab [1]'s UP NEXT does
 // ---------------------------------------------------------------------------------------------
 
-/// An app with its web server on (loopback, any port) and four tagged tracks queued.
-fn up_next_app() -> quickstream::ui::AppUI {
+/// An app with its web server on (loopback, any port) and one tagged track `T<i>` queued per
+/// length (0 for an unknown one).
+fn up_next_app_with(lengths: &[f64]) -> quickstream::ui::AppUI {
     let mut settings_mgr = quickstream::settings::SettingsManager::new();
     settings_mgr.settings.web_server_enabled = true;
     settings_mgr.settings.web_server_lan = false;
     settings_mgr.settings.web_server_port = 0;
     let mut app = quickstream::ui::AppUI::new(Some(std::env::temp_dir()), settings_mgr);
     assert!(app.web_server.is_some(), "web server did not start");
-    for i in 0..4 {
+    for (i, &length) in lengths.iter().enumerate() {
         app.queue.add_track(quickstream::metadata::AudioMetadata {
             filepath: PathBuf::from(format!("/music/t{i}.flac")),
             title: format!("T{i}"),
             artist: "Mira Lenz".to_string(),
-            duration_seconds: 200.0 + f64::from(i),
+            duration_seconds: length,
             ..Default::default()
         });
     }
     app
+}
+
+/// Four tracks of 200, 201, 202 and 203 seconds.
+fn up_next_app() -> quickstream::ui::AppUI {
+    up_next_app_with(&[200.0, 201.0, 202.0, 203.0])
 }
 
 /// Publish the app's state and read `/api/status` back.
@@ -1356,31 +1362,48 @@ fn up_next_status(app: &mut quickstream::ui::AppUI) -> serde_json::Value {
     serde_json::from_slice(&body).expect("status JSON")
 }
 
-/// `/api/status`'s Up Next against `PlaybackQueue::upcoming` with tab [1]'s mode and `wrap`:
-/// the listed indices (the first few; `up_next_remaining` counts every one), the end, and the
-/// older `next_track_title` (the first listed track, else the current one when it plays again).
-fn assert_up_next_matches(app: &mut quickstream::ui::AppUI, wrap: bool, want_end: &str, want_next: Option<&str>) {
-    let mode = app.settings_mgr.settings.queue_mode.clone();
-    let what = format!("{mode}, track {}, wrap {wrap}", app.queue.current_index());
+/// What `/api/status` should say plays next, written out per case.
+struct WantUpNext<'a> {
+    /// The queue indices `up_next` lists (each track `T<i>`, its artist and length).
+    listed: &'a [usize],
+    remaining: usize,
+    end: &'a str,
+    /// `next_track_title`: the first listed track, else the current one when it plays again.
+    next: Option<&'a str>,
+    /// The position in `up_next` where the queue starts over at its first track.
+    wraps_before: Option<usize>,
+    /// Every remaining track is listed, so the end note follows them.
+    shows_end: bool,
+    /// The remaining tracks' total length, when every one is known.
+    total: Option<f64>,
+}
+
+fn assert_up_next(app: &mut quickstream::ui::AppUI, what: &str, want: WantUpNext) {
     let status = up_next_status(app);
-    let upcoming = app.queue.upcoming(&mode, wrap);
-    let remaining = upcoming.len();
-    let want: Vec<serde_json::Value> = upcoming
-        .take(quickstream::web::WEB_UP_NEXT_LIMIT)
-        .map(|i| {
-            let t = &app.queue.tracks()[i];
+    let lengths: Vec<f64> = app.queue.tracks().iter().map(|t| t.duration_seconds).collect();
+    let items: Vec<serde_json::Value> = want
+        .listed
+        .iter()
+        .map(|&i| {
             serde_json::json!({
                 "index": i,
-                "title": t.title,
-                "artist": t.artist,
-                "duration_seconds": t.duration_seconds,
+                "title": format!("T{i}"),
+                "artist": "Mira Lenz",
+                "duration_seconds": lengths[i],
             })
         })
         .collect();
-    assert_eq!(status["up_next"], serde_json::Value::Array(want), "{what}: {status}");
-    assert_eq!(status["up_next_remaining"], remaining, "{what}");
-    assert_eq!(status["up_next_end"], want_end, "{what}");
-    assert_eq!(status["next_track_title"].as_str(), want_next, "{what}");
+    assert_eq!(status["up_next"], serde_json::Value::Array(items), "{what}: {status}");
+    assert_eq!(status["up_next_remaining"], want.remaining, "{what}: {status}");
+    assert_eq!(status["up_next_end"], want.end, "{what}: {status}");
+    assert_eq!(status["next_track_title"].as_str(), want.next, "{what}: {status}");
+    assert_eq!(
+        status["up_next_wraps_before"].as_u64(),
+        want.wraps_before.map(|p| p as u64),
+        "{what}: {status}"
+    );
+    assert_eq!(status["up_next_shows_end"], want.shows_end, "{what}: {status}");
+    assert_eq!(status["up_next_total_seconds"].as_f64(), want.total, "{what}: {status}");
 }
 
 fn stop_up_next_app(mut app: quickstream::ui::AppUI) {
@@ -1395,9 +1418,75 @@ fn test_status_up_next_in_stop_mode_ends_where_playback_stops() {
     let mut app = up_next_app();
     app.settings_mgr.settings.queue_mode = "stop".to_string();
     app.queue.set_current_index(1);
-    assert_up_next_matches(&mut app, false, "stops", Some("T2"));
+    assert_up_next(
+        &mut app,
+        "stop, track 1",
+        WantUpNext {
+            listed: &[2, 3],
+            remaining: 2,
+            end: "stops",
+            next: Some("T2"),
+            wraps_before: None,
+            shows_end: true,
+            total: Some(405.0),
+        },
+    );
     app.queue.set_current_index(3);
-    assert_up_next_matches(&mut app, false, "stops", None);
+    assert_up_next(
+        &mut app,
+        "stop, last track",
+        WantUpNext {
+            listed: &[],
+            remaining: 0,
+            end: "stops",
+            next: None,
+            wraps_before: None,
+            shows_end: true,
+            total: None,
+        },
+    );
+    stop_up_next_app(app);
+}
+
+/// More tracks remain than `up_next` lists: the end isn't shown yet, and the total counts every
+/// remaining track, not only the listed ones; one unknown length leaves the total out.
+#[test]
+fn test_status_up_next_lists_the_first_tracks_and_totals_them_all() {
+    common::isolate();
+    let mut app = up_next_app_with(&[100.0, 10.0, 20.0, 30.0, 40.0, 50.0]);
+    app.settings_mgr.settings.queue_mode = "stop".to_string();
+    app.queue.set_current_index(0);
+    assert_up_next(
+        &mut app,
+        "stop, track 0 of 6",
+        WantUpNext {
+            listed: &[1, 2, 3],
+            remaining: 5,
+            end: "stops",
+            next: Some("T1"),
+            wraps_before: None,
+            shows_end: false,
+            total: Some(150.0),
+        },
+    );
+    stop_up_next_app(app);
+
+    let mut app = up_next_app_with(&[100.0, 10.0, 20.0, 30.0, 40.0, 0.0]);
+    app.settings_mgr.settings.queue_mode = "stop".to_string();
+    app.queue.set_current_index(0);
+    assert_up_next(
+        &mut app,
+        "stop, an unknown length after the listed tracks",
+        WantUpNext {
+            listed: &[1, 2, 3],
+            remaining: 5,
+            end: "stops",
+            next: Some("T1"),
+            wraps_before: None,
+            shows_end: false,
+            total: None,
+        },
+    );
     stop_up_next_app(app);
 }
 
@@ -1408,15 +1497,52 @@ fn test_status_up_next_in_loop_mode_wraps_to_the_first_track() {
     app.settings_mgr.settings.queue_mode = "loop".to_string();
     // Three tracks follow track 2: track 3, then past the end tracks 0 and 1.
     app.queue.set_current_index(2);
-    assert_up_next_matches(&mut app, false, "loops", Some("T3"));
+    assert_up_next(
+        &mut app,
+        "loop, track 2",
+        WantUpNext {
+            listed: &[3, 0, 1],
+            remaining: 3,
+            end: "loops",
+            next: Some("T3"),
+            wraps_before: Some(1),
+            shows_end: true,
+            total: Some(604.0),
+        },
+    );
+    // On the last track the queue starts over at once.
     app.queue.set_current_index(3);
-    assert_up_next_matches(&mut app, false, "loops", Some("T0"));
+    assert_up_next(
+        &mut app,
+        "loop, last track",
+        WantUpNext {
+            listed: &[0, 1, 2],
+            remaining: 3,
+            end: "loops",
+            next: Some("T0"),
+            wraps_before: Some(0),
+            shows_end: true,
+            total: Some(603.0),
+        },
+    );
     // A single looping track plays again.
     while app.queue.len() > 1 {
         app.queue.remove(1);
     }
     app.queue.set_current_index(0);
-    assert_up_next_matches(&mut app, false, "loops", Some("T0"));
+    assert_up_next(
+        &mut app,
+        "loop, single track",
+        WantUpNext {
+            listed: &[],
+            remaining: 0,
+            end: "loops",
+            next: Some("T0"),
+            wraps_before: None,
+            shows_end: true,
+            total: None,
+        },
+    );
     stop_up_next_app(app);
 }
 
@@ -1425,11 +1551,30 @@ fn test_status_up_next_in_repeat_one_names_the_current_track() {
     common::isolate();
     let mut app = up_next_app();
     app.settings_mgr.settings.queue_mode = "repeat_one".to_string();
-    app.queue.set_current_index(1);
-    assert_up_next_matches(&mut app, false, "repeat_one", Some("T1"));
-    app.queue.set_current_index(3);
-    assert_up_next_matches(&mut app, false, "repeat_one", Some("T3"));
+    for (current, title) in [(1, "T1"), (3, "T3")] {
+        app.queue.set_current_index(current);
+        assert_up_next(
+            &mut app,
+            &format!("repeat one, track {current}"),
+            WantUpNext {
+                listed: &[],
+                remaining: 0,
+                end: "repeat_one",
+                next: Some(title),
+                wraps_before: None,
+                shows_end: true,
+                total: None,
+            },
+        );
+    }
     stop_up_next_app(app);
+}
+
+/// Mark the app's continuous stream as playing track `index`.
+fn stream_plays(app: &quickstream::ui::AppUI, index: usize) {
+    let continuous = &app.web_server.as_ref().unwrap().stream_state().continuous;
+    continuous.is_active.store(true, std::sync::atomic::Ordering::SeqCst);
+    *continuous.current_track_index.lock().unwrap() = index;
 }
 
 /// While the UPnP continuous stream plays, the queue plays on to its end whatever the mode, then
@@ -1438,20 +1583,74 @@ fn test_status_up_next_in_repeat_one_names_the_current_track() {
 fn test_status_up_next_follows_the_continuous_stream() {
     common::isolate();
     let mut app = up_next_app();
-    app.web_server
-        .as_ref()
-        .unwrap()
-        .stream_state()
-        .continuous
-        .is_active
-        .store(true, std::sync::atomic::Ordering::SeqCst);
     for mode in ["stop", "loop", "repeat_one"] {
         app.settings_mgr.settings.queue_mode = mode.to_string();
         app.queue.set_current_index(1);
-        assert_up_next_matches(&mut app, true, "reshuffles", Some("T2"));
+        stream_plays(&app, 1);
+        assert_up_next(
+            &mut app,
+            &format!("{mode}, stream on track 1"),
+            WantUpNext {
+                listed: &[2, 3],
+                remaining: 2,
+                end: "reshuffles",
+                next: Some("T2"),
+                wraps_before: None,
+                shows_end: true,
+                total: Some(405.0),
+            },
+        );
         app.queue.set_current_index(3);
-        assert_up_next_matches(&mut app, true, "reshuffles", None);
+        stream_plays(&app, 3);
+        assert_up_next(
+            &mut app,
+            &format!("{mode}, stream on the last track"),
+            WantUpNext {
+                listed: &[],
+                remaining: 0,
+                end: "reshuffles",
+                next: None,
+                wraps_before: None,
+                shows_end: true,
+                total: None,
+            },
+        );
     }
+    stop_up_next_app(app);
+}
+
+/// The stream has started a later track than the UI's queue names (it follows at its next tick):
+/// the dashboard shows the stream's track and what follows it, all from one index (#104).
+#[test]
+fn test_status_up_next_takes_the_stream_index_ahead_of_the_ui() {
+    common::isolate();
+    let mut app = up_next_app();
+    app.settings_mgr.settings.queue_mode = "stop".to_string();
+    app.queue.set_current_index(0);
+    stream_plays(&app, 2);
+    assert_up_next(
+        &mut app,
+        "stream on track 2, UI on track 0",
+        WantUpNext {
+            listed: &[3],
+            remaining: 1,
+            end: "reshuffles",
+            next: Some("T3"),
+            wraps_before: None,
+            shows_end: true,
+            total: Some(203.0),
+        },
+    );
+    let status = up_next_status(&mut app);
+    assert_eq!(status["queue_index"], 2, "{status}");
+    assert_eq!(status["title"], "T2", "{status}");
+    let current: Vec<bool> = status["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["is_current"].as_bool().unwrap())
+        .collect();
+    assert_eq!(current, [false, false, true, false], "{status}");
     stop_up_next_app(app);
 }
 
@@ -1464,5 +1663,58 @@ fn test_status_up_next_is_empty_with_nothing_queued() {
     assert_eq!(status["up_next"], serde_json::json!([]));
     assert_eq!(status["up_next_end"], serde_json::Value::Null);
     assert_eq!(status["next_track_title"], serde_json::Value::Null);
+    assert_eq!(status["up_next_shows_end"], false);
     stop_up_next_app(app);
+}
+
+fn web_queue(n: usize) -> Vec<WebQueueItem> {
+    (0..n)
+        .map(|i| WebQueueItem {
+            index: i,
+            title: format!("Q{i}"),
+            artist: String::new(),
+            album: String::new(),
+            duration_seconds: 60.0,
+            filepath: format!("/music/q{i}.flac"),
+            is_current: i == 0,
+        })
+        .collect()
+}
+
+/// Up Next comes from the queue the state publishes, whatever queue was published before it:
+/// indices, count, titles and end from one snapshot, never a length taken from another (#104).
+#[test]
+fn test_publish_up_next_comes_from_the_published_queue() {
+    common::isolate();
+    let mut state = NowPlayingState {
+        queue: web_queue(6),
+        queue_index: 1,
+        queue_mode: "stop".to_string(),
+        ..Default::default()
+    };
+    state.publish_up_next(false);
+    let listed = |s: &NowPlayingState| s.up_next.iter().map(|t| (t.index, t.title.clone())).collect::<Vec<_>>();
+    assert_eq!(
+        listed(&state),
+        [(2, "Q2".to_string()), (3, "Q3".to_string()), (4, "Q4".to_string())]
+    );
+    assert_eq!(state.up_next_remaining, 4);
+    assert!(!state.up_next_shows_end);
+    assert_eq!(state.up_next_total_seconds, Some(240.0));
+
+    // The queue shrinks under the same index: everything follows the new one.
+    state.queue = web_queue(3);
+    state.publish_up_next(false);
+    assert_eq!(listed(&state), [(2, "Q2".to_string())]);
+    assert_eq!(state.up_next_remaining, 1);
+    assert!(state.up_next_shows_end);
+    assert_eq!(state.up_next_total_seconds, Some(60.0));
+
+    // An index past the end of the published queue lists nothing and names no next track.
+    state.queue_index = 7;
+    state.publish_up_next(true);
+    assert!(state.up_next.is_empty());
+    assert_eq!(state.up_next_remaining, 0);
+    assert_eq!(state.up_next_end, None);
+    assert_eq!(state.next_track_title, None);
 }

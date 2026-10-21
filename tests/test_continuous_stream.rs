@@ -869,41 +869,68 @@ fn test_continuous_seek_on_the_last_track_sends_no_shuffle() {
     assert_eq!(*f.controller.current_track_index.lock().unwrap(), 1);
 }
 
-/// The Up Next the stream publishes with each track (`next_track_title`, `up_next`,
-/// `up_next_end`), as JSON so the old fields are read the way clients read them.
+/// `up_next`, `up_next_remaining`, `up_next_end` and `next_track_title`.
 #[cfg(unix)]
-fn published_up_next(f: &DecoderFixture, title: &str) -> serde_json::Value {
-    wait_until(&format!("the stream never published {title}"), || {
-        f.state.read().unwrap().title == title
-    });
-    serde_json::to_value(&*f.state.read().unwrap()).unwrap()
+type UpNext = (
+    Vec<quickstream::web::WebUpNextItem>,
+    usize,
+    Option<quickstream::queue::QueueEnd>,
+    Option<String>,
+);
+
+/// Up Next as the UI thread published it, for the stream to leave alone.
+#[cfg(unix)]
+fn ui_up_next() -> UpNext {
+    let item = quickstream::web::WebUpNextItem {
+        index: 1,
+        title: "from the UI".to_string(),
+        artist: String::new(),
+        duration_seconds: 0.0,
+    };
+    (
+        vec![item],
+        7,
+        Some(quickstream::queue::QueueEnd::Stops),
+        Some("from the UI".to_string()),
+    )
 }
 
-/// The stream publishes Up Next as the UI does while it plays (`PlaybackQueue::upcoming` with
-/// `wrap`): the tracks to the end of the queue, and on the last one no next track, since the
-/// queue is reshuffled before it starts over, never the first track (#104).
+#[cfg(unix)]
+fn published_up_next(state: &NowPlayingState) -> UpNext {
+    (
+        state.up_next.clone(),
+        state.up_next_remaining,
+        state.up_next_end,
+        state.next_track_title.clone(),
+    )
+}
+
+/// The stream never publishes Up Next: the UI thread does, every tick, from the queue it
+/// publishes and the stream's track index, so the list, count and end come from one queue and
+/// one index. A track the stream starts after the queue changed (its own copy of the queue
+/// taken before) leaves the UI's Up Next as it was (#104).
 #[cfg(unix)]
 #[test]
-fn test_continuous_stream_publishes_up_next_to_the_end_then_a_reshuffle() {
+fn test_continuous_stream_leaves_up_next_to_the_ui() {
     common::isolate();
     let names = ["t0_live.wav", "t1_live.wav", "t2_live.wav"];
-    let f = DecoderFixture::start("up_next_first", &names, 0);
-    let status = published_up_next(&f, "Track 0");
-    assert_eq!(status["next_track_title"], "Track 1", "{status}");
-    let listed: Vec<u64> = status["up_next"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|t| t["index"].as_u64()).collect())
-        .unwrap_or_default();
-    assert_eq!(listed, [1, 2], "{status}");
-    assert_eq!(status["up_next_end"], "reshuffles", "{status}");
-    drop(f);
+    let f = DecoderFixture::start("up_next_ui", &names, 0);
+    {
+        let mut s = f.state.write().unwrap();
+        (s.up_next, s.up_next_remaining, s.up_next_end, s.next_track_title) = ui_up_next();
+    }
+    wait_until("the stream never published track 0", || {
+        f.state.read().unwrap().title == "Track 0"
+    });
+    assert_eq!(published_up_next(&f.state.read().unwrap()), ui_up_next());
 
-    let f = DecoderFixture::start("up_next_last", &names, 2);
-    let status = published_up_next(&f, "Track 2");
-    assert_eq!(status["next_track_title"], serde_json::Value::Null, "{status}");
-    assert_eq!(status["up_next"], serde_json::json!([]), "{status}");
-    assert_eq!(status["up_next_remaining"], 0, "{status}");
-    assert_eq!(status["up_next_end"], "reshuffles", "{status}");
+    // The UI drops the last track from the queue it publishes; the stream starts track 1.
+    f.state.write().unwrap().queue.truncate(2);
+    f.controller.skip_to_index(1);
+    wait_until("the stream never published track 1", || {
+        f.state.read().unwrap().title == "Track 1"
+    });
+    assert_eq!(published_up_next(&f.state.read().unwrap()), ui_up_next());
 }
 
 /// A skip that arrives as a track ends, while the stream waits to pick the next one, is not
