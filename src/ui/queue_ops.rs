@@ -149,15 +149,19 @@ impl AppUI {
     /// Shuffle the queue (`z` / `Z`, the web dashboard's Shuffle, the continuous stream's
     /// reshuffle on a wrap): the current track goes in front and the cursor stays on the entry it
     /// was on (issue #123), as does the continuous stream. While the rest of a playlist `Enter`
-    /// started is still being checked, that rest is shuffled in when it arrives (issue #122).
-    /// `source` ends the status (`" (web)"`).
+    /// started is still being checked, that rest is shuffled in when it arrives (issue #122);
+    /// while it waits for its first track to start, the shuffle is kept for that start, even with
+    /// an empty queue (issue #135). `source` ends the status (`" (web)"`).
     pub(super) fn shuffle_queue(&mut self, source: &str) {
-        if self.queue.is_empty() {
+        let at_start = self.shuffle_playlist_at_start();
+        if self.queue.is_empty() && at_start.is_none() {
             return;
         }
-        let moved = self.queue.shuffle();
-        self.follow_queue_reorder(moved);
-        self.status_message = match self.shuffle_in_playlist_fill() {
+        if !self.queue.is_empty() {
+            let moved = self.queue.shuffle();
+            self.follow_queue_reorder(moved);
+        }
+        self.status_message = match at_start.or_else(|| self.shuffle_in_playlist_fill()) {
             Some(note) => format!("🔀 Queue shuffled{source}; {note}"),
             None => format!("🔀 Queue shuffled{source}"),
         };
