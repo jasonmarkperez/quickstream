@@ -1938,6 +1938,34 @@ fn test_continuous_stream_plays_the_next_file_while_a_check_hangs() {
     assert_eq!(hang.calls(&f.tracks[0]), 1);
 }
 
+/// A shuffle made while the stream waits on the check of the next file is followed, also when
+/// the next file in the new order is still being checked too: the stream goes on from the row
+/// the shuffle moved the ended track to, not the one it was on (merge of #127 and #132).
+#[cfg(unix)]
+#[test]
+fn test_continuous_shuffle_while_a_file_check_hangs_is_followed() {
+    common::isolate();
+    let hang = HeldPathCheck::default();
+    let names = ["t0_short.wav", "t1.wav", "t2.wav", "t3.wav", "t4.wav"];
+    let f = DecoderFixture::start_with("hung_shuffle", &names, 0, |c, tracks| {
+        hang.install(c, &[tracks[1].clone(), tracks[2].clone()])
+    });
+    let _release = hang.release_on_drop();
+    assert_eq!(f.run(1), (f.tracks[0].clone(), None));
+    // t0 ends after about 0.5 s; the look for t1 then waits on its check.
+    std::thread::sleep(Duration::from_millis(900));
+    assert_eq!(f.decoder.calls().len(), 1, "nothing decoded while t1's check hangs");
+    // New order t3, t4, t0, t2, t1: the track after t0 is t2, whose check hangs too.
+    publish_reorder(&f, &[2, 4, 3, 0, 1], |_| {});
+    std::thread::sleep(Duration::from_millis(300));
+    hang.release();
+    assert_eq!(
+        f.run(2),
+        (f.tracks[2].clone(), None),
+        "the track the shuffle put after the one that ended"
+    );
+}
+
 /// Checks that never answer (the share stays hung) don't pile up: one is in flight per path,
 /// however often the stream looks through the queue, also after the renderer reconnects; the
 /// stream sends silence at real time all along (#117).

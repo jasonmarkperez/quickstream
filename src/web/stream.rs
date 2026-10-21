@@ -289,10 +289,10 @@ impl ContinuousStreamController {
     }
 
     /// Where the stream goes on (`next`: a row and how many rows after it), after the reorders it
-    /// hasn't followed yet (taking them).
-    fn follow_next(&self, next: Option<(usize, usize)>) -> Option<usize> {
+    /// hasn't followed yet (taking them): the row moves with its track, the step stays.
+    fn follow_next(&self, next: Option<(usize, usize)>) -> Option<(usize, usize)> {
         let moved = self.reorder.lock().unwrap().take();
-        next.map(|(row, step)| moved.as_deref().map_or(row, |moved| follow_row(moved, row)) + step)
+        next.map(|(row, step)| (moved.as_deref().map_or(row, |moved| follow_row(moved, row)), step))
     }
 
     /// The skip or seek the stream hasn't acted on yet, if any.
@@ -1917,7 +1917,9 @@ pub(super) fn serve_continuous_stream(
                 // as playing until it gives some.
                 let tentative = request.is_none() && (silent_runs > 0 || nothing_playable.is_some());
                 // Followed whatever is asked: a reorder's rows are the queue's read here.
-                let next = controller.follow_next(next_index);
+                // Kept as followed, so a look still waiting on checks goes on from it next pass.
+                next_index = controller.follow_next(next_index);
+                let next = next_index.map(|(row, step)| row + step);
                 let index = match request {
                     Some(r) => r.index,
                     None => next.unwrap_or_else(|| *controller.current_track_index.lock().unwrap()),
