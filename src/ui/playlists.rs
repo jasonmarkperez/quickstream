@@ -103,11 +103,10 @@ struct StartedPlay {
 }
 
 /// A playlist play (`Enter`, the web's Play) whose worker is still looking for the first track
-/// that exists: nothing of it is queued yet.
+/// that exists: nothing of it is queued yet. One at a time, as for `queue_pending`; dropped once
+/// the play starts, finishes or is superseded.
 struct AwaitingStart {
-    /// [`PlaylistChecks::queue_generation`] when the play was asked for.
-    generation: u64,
-    /// The queue was shuffled meanwhile: the shuffle is meant for the playlist about to replace
+    /// The user shuffled the queue meanwhile: the shuffle is meant for the playlist about to replace
     /// it, so the start shuffles the rest in after the started track (issue #135).
     shuffled: bool,
 }
@@ -1979,10 +1978,7 @@ impl AppUI {
         self.status_message = format!("Checking {} in {}…", track_count_label(entries.len()), name);
         self.playlists.checks.queue_pending = Some(name.clone());
         let generation = self.playlists.checks.queue_generation;
-        self.playlists.checks.awaiting_start = play_from.map(|_| AwaitingStart {
-            generation,
-            shuffled: false,
-        });
+        self.playlists.checks.awaiting_start = play_from.map(|_| AwaitingStart { shuffled: false });
         // A restricted check also refuses files that exist, so its results don't go in the
         // session's missing-file cache.
         let records_exists = allowed_roots.is_none();
@@ -2087,12 +2083,6 @@ impl AppUI {
     /// `Enter`: the track to start on passed its check. Replace the queue with it and play it
     /// now; `apply_playlist_queue` puts the rest of the playlist around it once checked.
     fn start_playlist_play(&mut self, start: QueueStart) {
-        let shuffled = self
-            .playlists
-            .checks
-            .awaiting_start
-            .take()
-            .is_some_and(|awaiting| awaiting.shuffled && awaiting.generation == start.generation);
         if start.generation != self.playlists.checks.queue_generation {
             // The queue was replaced or playback started while this check ran.
             return;
@@ -2104,8 +2094,17 @@ impl AppUI {
             Some(0),
         );
         if plan.tracks.is_empty() {
+            // The shuffle mark stays for `apply_playlist_queue`, which then starts the play.
             return;
         }
+        // A shuffle while the play waited is used here (issue #135); a later one shuffles the
+        // rest in through `shuffle_in_playlist_fill`.
+        let shuffled = self
+            .playlists
+            .checks
+            .awaiting_start
+            .take()
+            .is_some_and(|awaiting| awaiting.shuffled);
         // Stop any autopilot scan and continuous stream, then the queue is this one track.
         self.reset_playback_session();
         self.enqueue_tracks(plan.tracks);
@@ -2221,19 +2220,13 @@ impl AppUI {
         }
     }
 
-    /// The queue is being shuffled: if a playlist play is waiting for its first track to start,
+    /// The user is shuffling the queue (`z` / `Z`, the web's Shuffle; never the continuous
+    /// stream's reshuffle): if a playlist play is waiting for its first track to start,
     /// the queue is about to be replaced by that playlist, so the shuffle is kept for it and the
     /// start shuffles the rest in (issue #135). The queue itself is still shuffled: if no
     /// track of the playlist exists, it stays. Returns what to add to the shuffle's status.
     pub(super) fn shuffle_playlist_at_start(&mut self) -> Option<String> {
-        let generation = self.playlists.checks.queue_generation;
-        let awaiting = self
-            .playlists
-            .checks
-            .awaiting_start
-            .as_mut()
-            .filter(|awaiting| awaiting.generation == generation)?;
-        awaiting.shuffled = true;
+        self.playlists.checks.awaiting_start.as_mut()?.shuffled = true;
         let name = self.playlists.checks.queue_pending.as_deref()?;
         Some(format!("{} plays shuffled once checked", name))
     }
@@ -2313,7 +2306,13 @@ impl AppUI {
     /// When `start_playlist_play` already started the first track, the rest is put around it.
     fn apply_playlist_queue(&mut self, result: QueueCheckResult) {
         self.playlists.checks.queue_pending = None;
-        self.playlists.checks.awaiting_start = None;
+        // Still set only when no start came first: a shuffle meant for the play.
+        let shuffle_at_start = self
+            .playlists
+            .checks
+            .awaiting_start
+            .take()
+            .is_some_and(|awaiting| awaiting.shuffled);
         let started = self.playlists.checks.started.take();
         // Fresh results update the session cache; they never change the playlist or its file.
         if result.records_exists {
@@ -2375,7 +2374,13 @@ impl AppUI {
                 self.reset_playback_session();
                 self.enqueue_tracks(tracks);
                 self.queue.set_current_index(start);
-                self.queue_cursor = start;
+                if shuffle_at_start {
+                    // Shuffled while it waited: the start in front, the rest shuffled after it.
+                    self.queue.shuffle();
+                    shuffled = true;
+                    shuffled_in = queued > 1;
+                }
+                self.queue_cursor = self.queue.current_index();
                 self.play_current_track()
             }
             _ => {
@@ -2429,6 +2434,8 @@ impl AppUI {
     /// action that replaces the queue or starts playback.
     pub fn supersede_playlist_queue(&mut self) {
         self.playlists.checks.queue_generation = self.playlists.checks.queue_generation.wrapping_add(1);
+        // A shuffle kept for the dropped play isn't kept for the next one.
+        self.playlists.checks.awaiting_start = None;
     }
 }
 

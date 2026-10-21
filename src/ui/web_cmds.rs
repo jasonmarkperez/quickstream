@@ -144,6 +144,10 @@ impl AppUI {
                 crate::web::WebCommand::Autopilot(target) => self.start_autopilot(target),
                 crate::web::WebCommand::AutopilotReshuffle(target) => self.reshuffle_autopilot(target),
                 crate::web::WebCommand::ShuffleQueue => {
+                    self.sync_continuous_stream_index();
+                    self.shuffle_queue_by_user(" (web)");
+                }
+                crate::web::WebCommand::StreamReshuffle => {
                     // The shuffle keeps the current track in front: for the continuous stream's
                     // wrap that is the track it plays next, which it may have named since this
                     // tick's sync.

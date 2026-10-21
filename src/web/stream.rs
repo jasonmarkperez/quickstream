@@ -2200,7 +2200,7 @@ pub(super) fn serve_continuous_stream(
                 // which would play again. A seek from here on is for that first track, since
                 // after the reshuffle no index names the track that ended.
                 *controller.current_track_index.lock().unwrap() = 0;
-                let _ = cmd_tx.send(WebCommand::ShuffleQueue);
+                let _ = cmd_tx.send(WebCommand::StreamReshuffle);
             }
             drop(pending);
             if wraps {
