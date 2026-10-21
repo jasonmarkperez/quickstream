@@ -577,6 +577,149 @@ fn a_prioritised_folder_deeper_down_is_walked_once() {
     assert!(db.index_dir(&lib).unwrap().1, "the whole tree is indexed");
 }
 
+/// A prioritised folder is walked only when the listing would reach it (#146 review): its path
+/// is normalized (`..` resolved) and must lie under a root, and no folder below the root on the
+/// way may be one the walk skips (hidden, `#recycle`) or a symlink. A hint that fails is
+/// ignored and the pass goes on as usual; one that normalizes into a root is taken.
+#[cfg(unix)]
+#[test]
+fn a_prioritised_folder_is_walked_only_where_the_listing_goes() {
+    common::isolate();
+    let (lib, db_path) = scratch("prioritise_checks");
+    library_tree(&lib, 8, 1);
+    let outside = lib.parent().unwrap().join("outside");
+    silent_wav(&outside.join("Album").join("elsewhere.wav"));
+    silent_wav(&lib.join(".hidden").join("Album").join("hidden.wav"));
+    silent_wav(&lib.join("#recycle").join("Album").join("binned.wav"));
+    std::os::unix::fs::symlink(&outside, lib.join("Linked")).unwrap();
+    std::os::unix::fs::symlink(&outside, lib.join("Artist 01").join("Linked")).unwrap();
+
+    let hints = [
+        lib.join(".hidden").join("Album"),
+        lib.join("#recycle").join("Album"),
+        lib.join("Linked").join("Album"),
+        lib.join("Artist 01").join("Linked").join("Album"),
+        lib.join("Artist 00")
+            .join("..")
+            .join("..")
+            .join("outside")
+            .join("Album"),
+        outside.join("Album"),
+    ];
+    for (i, hint) in hints.into_iter().enumerate() {
+        // A database of its own for each hint, so each walks the tree afresh.
+        let db_path = db_path.with_file_name(format!("hint{i}.db"));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let reader = counting_reader(Arc::new(AtomicUsize::new(0)), order.clone());
+        let run = {
+            let control = Arc::new(IndexControl::new());
+            control.prioritise(hint.clone());
+            let progress = Arc::new(IndexProgress::new());
+            let (c, p, path, root) = (control.clone(), progress.clone(), db_path.clone(), lib.clone());
+            let handle = std::thread::spawn(move || {
+                run_library_index(|| AnalysisDatabase::open_at(&path), config(vec![root]), &c, &p, reader)
+            });
+            Running {
+                control,
+                progress,
+                handle,
+            }
+        };
+        run.wait_state(IndexState::Done);
+        run.finish();
+        let order = order.lock().unwrap();
+        assert!(
+            order.iter().all(|p| p.starts_with(&lib)
+                && !p.starts_with(lib.join(".hidden"))
+                && !p.starts_with(lib.join("#recycle"))
+                && !p.to_string_lossy().contains("Linked")),
+            "{} was walked: {order:?}",
+            hint.display()
+        );
+        assert_eq!(order.len(), 9, "the pass went on as usual: {order:?}");
+        let db = AnalysisDatabase::open_at(&db_path).unwrap();
+        assert!(db.get_track(&outside.join("Album").join("elsewhere.wav")).is_none());
+        assert!(db.tracks_under(&lib.join("Linked"), 64).is_empty());
+    }
+
+    // `..` resolved into the root: Artist 06 first, keyed by its own path.
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let reader = counting_reader(Arc::new(AtomicUsize::new(0)), order.clone());
+    let control = Arc::new(IndexControl::new());
+    control.prioritise(lib.join("Artist 03").join("..").join("Artist 06"));
+    let progress = Arc::new(IndexProgress::new());
+    let (c, p, path, root) = (control.clone(), progress.clone(), db_path.clone(), lib.clone());
+    let handle = std::thread::spawn(move || {
+        run_library_index(|| AnalysisDatabase::open_at(&path), config(vec![root]), &c, &p, reader)
+    });
+    wait_for("Done", Duration::from_secs(20), || progress.state() == IndexState::Done);
+    control.stop();
+    handle.join().unwrap();
+    let order = order.lock().unwrap();
+    assert!(order[1].starts_with(lib.join("Artist 06")), "{order:?}");
+    assert!(order.iter().all(|p| !p.to_string_lossy().contains("..")), "{order:?}");
+}
+
+/// Roots are resolved on the indexer's thread before it walks them (#146 review): a Music Home
+/// that is a symlink to another one is walked once, and one that resolves to `/` (or the home
+/// folder, or above it) not at all.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_root_is_resolved_before_it_is_walked() {
+    common::isolate();
+    let (lib, db_path) = scratch("root_links");
+    let real = lib.join("Real");
+    let files = library_tree(&real, 2, 2);
+    let link = lib.join("Link To Real");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let slash = lib.join("Slash");
+    std::os::unix::fs::symlink("/", &slash).unwrap();
+
+    // Anything outside `real` would mean the boot disk is being walked: stop at once.
+    let control = Arc::new(IndexControl::new());
+    let progress = Arc::new(IndexProgress::new());
+    let count = Arc::new(AtomicUsize::new(0));
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let reader: IndexTagReader = {
+        let (control, real_dir, inner) = (
+            control.clone(),
+            real.clone(),
+            counting_reader(count.clone(), order.clone()),
+        );
+        Arc::new(move |path: &Path, stamp| {
+            if !path.starts_with(&real_dir) {
+                control.stop();
+            }
+            inner(path, stamp)
+        })
+    };
+    let (c, p, path) = (control.clone(), progress.clone(), db_path.clone());
+    let roots = vec![slash.clone(), real.clone(), link.clone()];
+    let handle = std::thread::spawn(move || {
+        run_library_index(|| AnalysisDatabase::open_at(&path), config(roots), &c, &p, reader)
+    });
+    wait_for("Done", Duration::from_secs(20), || {
+        progress.state() == IndexState::Done || control.is_stopped()
+    });
+    control.stop();
+    handle.join().unwrap();
+    let order = order.lock().unwrap();
+    assert!(order.iter().all(|p| p.starts_with(&real)), "{order:?}");
+    assert_eq!(count.load(Ordering::SeqCst), files.len(), "each file read once");
+    assert_eq!(progress.snapshot().top_total, 2, "{:?}", progress.snapshot());
+
+    // Only links: nothing to walk.
+    let progress = IndexProgress::new();
+    run_library_index(
+        || panic!("no database is opened without a folder"),
+        config(vec![slash]),
+        &IndexControl::new(),
+        &progress,
+        default_tag_reader(),
+    );
+    assert_eq!(progress.state(), IndexState::NoFolders);
+}
+
 // ---------- pacing ----------
 
 /// While paused it reads nothing and says so; unpaused it goes on.

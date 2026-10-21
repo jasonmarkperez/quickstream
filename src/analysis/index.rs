@@ -246,6 +246,15 @@ pub fn run_library_index(
     if !wait(control, cfg.start_delay) {
         return;
     }
+    let roots = walkable_roots(&cfg.roots);
+    if control.is_stopped() {
+        return;
+    }
+    if roots.is_empty() {
+        progress.set_state(IndexState::NoFolders);
+        return;
+    }
+    let cfg = IndexConfig { roots, ..cfg };
     let db = match open_db() {
         Ok(db) => db,
         Err(e) => {
@@ -287,6 +296,53 @@ pub fn run_library_index(
             return;
         }
     }
+}
+
+/// The roots a pass walks, from `roots` as the UI gave them (lexical, from memory), resolved on
+/// the indexer's thread: a root that resolves to `/`, the home folder or a folder above it (a
+/// Music Home that is a symlink to `/`, say) is dropped, and so is one that resolves to another
+/// root, or inside one, so nothing is walked twice. The kept roots are walked under the names
+/// the UI gave them, the ones the library shows and mixes look rows up by. A root that can't be
+/// resolved (a share not mounted) is kept as given: its listing fails and it stays incomplete.
+fn walkable_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let home = crate::web_access::home_dir().map(|h| std::fs::canonicalize(&h).unwrap_or(h));
+    let resolved: Vec<(&PathBuf, PathBuf)> = roots
+        .iter()
+        .filter_map(|root| {
+            let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+            if crate::web_access::is_acceptable_root(&canonical, home.as_deref()) {
+                Some((root, canonical))
+            } else {
+                crate::log_info!(
+                    "index",
+                    "Not indexing '{}': it is '{}'",
+                    root.display(),
+                    canonical.display()
+                );
+                None
+            }
+        })
+        .collect();
+    resolved
+        .iter()
+        .enumerate()
+        .filter(|&(i, (root, canonical))| {
+            let covered = resolved
+                .iter()
+                .enumerate()
+                .any(|(j, (_, other))| j != i && canonical.starts_with(other) && (canonical != other || j < i));
+            if covered {
+                crate::log_info!(
+                    "index",
+                    "Not indexing '{}': another folder indexed holds '{}'",
+                    root.display(),
+                    canonical.display()
+                );
+            }
+            !covered
+        })
+        .map(|(_, (root, _))| (*root).clone())
+        .collect()
 }
 
 /// Sleep `d` in short steps, ending early when `control` is stopped. Returns false if stopped.
@@ -638,10 +694,41 @@ impl Indexer<'_> {
         true
     }
 
+    /// `dir` (a mix's folder) as the walk would reach it, or `None` when it wouldn't: normalized
+    /// lexically (`..` resolved), under a root, and every folder below the root on the way a real
+    /// folder (not a symlink, `symlink_metadata`) with a UTF-8 name the walk doesn't skip
+    /// (`walk_skips`: hidden, `#recycle`, `$RECYCLE.BIN`).
+    fn walkable_hint(&self, dir: &Path) -> Option<PathBuf> {
+        let dir = crate::playlist::normalize_path(dir);
+        let root = self.cfg.roots.iter().find(|root| dir.starts_with(root))?;
+        let mut at = root.clone();
+        for component in dir.strip_prefix(root).ok()?.components() {
+            let std::path::Component::Normal(name) = component else {
+                return None;
+            };
+            let name = name.to_str().filter(|name| !walk_skips(name))?;
+            at.push(name);
+            if !std::fs::symlink_metadata(&at).ok()?.is_dir() {
+                return None;
+            }
+        }
+        Some(dir)
+    }
+
     /// Put `dir` first: a top-level folder still to walk moves to the front, a folder deeper
     /// under one is walked now (and reused when the walk gets there), a root's folders move to
-    /// the front. A folder under no root, or already walked, is left. Returns false if stopped.
+    /// the front. A folder the walk wouldn't reach ([`Self::walkable_hint`]), or already walked,
+    /// is left. Returns false if stopped.
     fn prioritise(&mut self, dir: &Path, queue: &mut VecDeque<(usize, PathBuf)>, plans: &[RootPlan]) -> bool {
+        let Some(dir) = self.walkable_hint(dir) else {
+            crate::log_info!(
+                "index",
+                "Not indexing '{}' first: the walk doesn't go there",
+                dir.display()
+            );
+            return true;
+        };
+        let dir = dir.as_path();
         if let Some(pos) = queue.iter().position(|(_, d)| d == dir) {
             if let Some(item) = queue.remove(pos) {
                 queue.push_front(item);
