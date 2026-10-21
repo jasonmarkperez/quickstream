@@ -58,6 +58,17 @@ struct ActionPayload {
 /// folder.
 pub const NO_TERMINAL_FOLDER: &str = "The terminal hasn't opened a folder yet";
 
+/// `playlist_add` / `seed_radio` with a path that isn't an audio file.
+const NOT_AN_AUDIO_FILE: &str = "Not an audio file";
+
+/// The allowed folders `roots`, canonicalized on first use: at most once per request.
+fn allowed_roots<'a>(
+    allowed: &'a mut Option<crate::web_access::AllowedRoots>,
+    roots: &[PathBuf],
+) -> &'a crate::web_access::AllowedRoots {
+    allowed.get_or_insert_with(|| crate::web_access::AllowedRoots::new(roots))
+}
+
 /// A JSON response for `/api/action`: status line and body.
 struct ActionResponse {
     status: &'static str,
@@ -119,7 +130,7 @@ fn edit_playlist_action(
                 return ActionResponse::ok();
             };
             if !canonical.is_file() || !crate::metadata::is_supported_audio_file(&canonical) {
-                return bad("Not an audio file");
+                return bad(NOT_AN_AUDIO_FILE);
             }
             // `allow` only accepts absolute paths. Store the form a terminal add would, but only
             // when it is the file that was checked: after a symlinked folder, text-only `..`
@@ -569,7 +580,8 @@ fn answer_request(
                 )
             };
             // Only folders inside the allowed roots (startup home, bookmarks, launch folder).
-            let allowed_dir = |p: &Path| crate::web_access::resolve_allowed_path(p, &roots).filter(|d| d.is_dir());
+            let reachable = crate::web_access::AllowedRoots::new(&roots);
+            let allowed_dir = |p: &Path| reachable.resolve_dir(p);
             let terminal_dir = if current_terminal_dir.is_empty() {
                 None
             } else {
@@ -584,7 +596,7 @@ fn answer_request(
                     .or_else(|| roots.iter().find_map(|r| allowed_dir(r))),
             };
             let Some(target_dir) = target_opt else {
-                crate::web_access::write_path_forbidden(&mut stream)?;
+                crate::web_access::write_path_forbidden(&mut stream, is_head)?;
                 return Ok(());
             };
 
@@ -694,17 +706,18 @@ fn answer_request(
             };
 
             // Paths must resolve inside the allowed folders; commands carry the resolved path.
-            let (roots, terminal_dir) = {
+            let (roots, terminal_dir, in_music_homes) = {
                 let current = state.read().unwrap();
-                (current.allowed_roots.clone(), current.terminal_dir.clone())
+                (
+                    current.allowed_roots.clone(),
+                    current.terminal_dir.clone(),
+                    current.in_music_homes,
+                )
             };
             let mut rejected: Option<PathBuf> = None;
-            // Canonicalized on first use, at most once per request.
             let mut allowed: Option<crate::web_access::AllowedRoots> = None;
             let mut allow = |p: PathBuf| -> Option<PathBuf> {
-                let resolved = allowed
-                    .get_or_insert_with(|| crate::web_access::AllowedRoots::new(&roots))
-                    .resolve(&p);
+                let resolved = allowed_roots(&mut allowed, &roots).resolve(&p);
                 if resolved.is_none() {
                     rejected = Some(p);
                 }
@@ -814,9 +827,28 @@ fn answer_request(
                             let _ = cmd_tx.send(WebCommand::SetMixProfile(profile_str));
                         }
                     }
+                    // The seed is an audio file inside the allowed folders, as `add_file` takes
+                    // it. The station scans the terminal's folder (as the terminal names it; none
+                    // in Music Homes, as for `r` there) when the web may reach it, else the seed's,
+                    // which the UI's scan worker picks between (issue #126). A terminal folder
+                    // outside them is not the request's, so it is passed over without a
+                    // `PathRejected`.
                     "seed_radio" => {
-                        if let Some(p) = payload.path.map(PathBuf::from).and_then(&mut allow) {
-                            let _ = cmd_tx.send(WebCommand::SeedRadio(p));
+                        if let Some(seed) = payload.path.map(PathBuf::from).and_then(&mut allow) {
+                            let reachable = allowed_roots(&mut allowed, &roots);
+                            if !seed.is_file() || !crate::metadata::is_supported_audio_file(&seed) {
+                                response = ActionResponse::refused("400 Bad Request", NOT_AN_AUDIO_FILE);
+                            } else if let Some(fallback) = seed.parent().and_then(|d| reachable.resolve_dir(d)) {
+                                let preferred =
+                                    terminal_dir.filter(|t| !in_music_homes && reachable.resolve_dir(t).is_some());
+                                let _ = cmd_tx.send(WebCommand::SeedRadio {
+                                    seed,
+                                    preferred,
+                                    fallback,
+                                });
+                            } else {
+                                rejected = Some(seed);
+                            }
                         }
                     }
                     "playlist_play" | "playlist_append" => {
@@ -833,7 +865,7 @@ fn answer_request(
 
             if let Some(path) = rejected {
                 let _ = cmd_tx.send(WebCommand::PathRejected(path));
-                crate::web_access::write_path_forbidden(&mut stream)?;
+                crate::web_access::write_path_forbidden(&mut stream, false)?;
                 return Ok(());
             }
 

@@ -267,6 +267,24 @@ impl PlaybackQueue {
         updated
     }
 
+    /// Give the tracks of `path` whose size is still unknown (0) the file's size, keeping the
+    /// rest of their metadata. Returns whether any track changed.
+    pub fn set_file_size(&mut self, path: &std::path::Path, size: u64) -> bool {
+        let mut updated = false;
+        for track in self
+            .tracks
+            .iter_mut()
+            .filter(|t| t.filepath == path && t.file_size == 0)
+        {
+            track.file_size = size;
+            updated = true;
+        }
+        if updated {
+            self.bump();
+        }
+        updated
+    }
+
     pub fn current_track(&self) -> Option<&AudioMetadata> {
         self.tracks.get(self.current_index)
     }

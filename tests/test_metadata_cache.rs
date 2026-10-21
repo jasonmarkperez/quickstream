@@ -80,7 +80,7 @@ fn test_browser_refresh_and_autopilot_share_the_cache() {
 
     // Results from background extraction land in the same shared map.
     let path = PathBuf::from("/qs-test-nonexistent/late.mp3");
-    app.metadata_tx.send(meta(&path, "Late Arrival")).unwrap();
+    app.metadata_tx.send(meta(&path, "Late Arrival").into()).unwrap();
     app.poll_background_metadata();
     assert_eq!(handle.get(&path).unwrap().title, "Late Arrival");
 }
@@ -171,4 +171,32 @@ fn folder_revision_moves_only_for_files_directly_in_the_folder() {
         cache.folder_revision(&PathBuf::from("/music/Never Seen")),
         "the subfolder has its own revision"
     );
+}
+
+/// The size a failed tag read found is kept apart from the entries (issue #124): no consumer of
+/// the cache mistakes it for tags, a clone sees it, and tags read later replace it.
+#[test]
+fn unreadable_sizes_are_not_entries_and_tags_replace_them() {
+    common::isolate();
+    let cache = MetadataCache::default();
+    let clone = cache.clone();
+    let path = PathBuf::from("/qs-test-nonexistent/garbage.ogg");
+    let (revision, folder) = (cache.revision(), cache.folder_revision(path.parent().unwrap()));
+
+    clone.insert_unreadable(&path, 4_096);
+    assert_eq!(cache.unreadable_size(&path), Some(4_096));
+    assert!(!cache.contains(&path) && cache.get(&path).is_none() && cache.is_empty());
+    assert_eq!(cache.revision(), revision, "no tags arrived");
+    assert_eq!(cache.folder_revision(path.parent().unwrap()), folder);
+
+    clone.insert_unreadable(&path, 8_192);
+    assert_eq!(
+        cache.unreadable_size(&path),
+        Some(8_192),
+        "a later failed read replaces it"
+    );
+
+    clone.insert(meta(&path, "Read At Last"));
+    assert_eq!(cache.unreadable_size(&path), None, "tags replace it");
+    assert_eq!(cache.get(&path).unwrap().title, "Read At Last");
 }

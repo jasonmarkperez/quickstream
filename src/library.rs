@@ -42,6 +42,10 @@ struct CacheShared {
     /// insert of a file directly inside it: values computed from one folder's files (its total
     /// length, its column widths) stay cached while tags arrive for other folders.
     folders: std::sync::Mutex<HashMap<PathBuf, u64>>,
+    /// Sizes found by tag reads that failed (issue #124), kept apart from the entries so nothing
+    /// takes them for tags: a file queued from the UI thread has no size otherwise. Kept for the
+    /// session like the entries, replaced by a later read of the file.
+    unreadable: std::sync::Mutex<HashMap<PathBuf, u64>>,
 }
 
 impl MetadataCache {
@@ -63,9 +67,11 @@ impl MetadataCache {
         f(&self.read())
     }
 
-    /// Insert or replace the entry for `meta.filepath`.
+    /// Insert or replace the entry for `meta.filepath` (and drop any size a failed read of the
+    /// file left, [`insert_unreadable`](Self::insert_unreadable)).
     pub fn insert(&self, meta: AudioMetadata) {
         let folder = meta.filepath.parent().map(Path::to_path_buf);
+        self.unreadable().remove(&meta.filepath);
         self.0
             .map
             .write()
@@ -80,6 +86,21 @@ impl MetadataCache {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(folder, revision);
         }
+    }
+
+    fn unreadable(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, u64>> {
+        self.0.unreadable.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record the size a tag read of `path` found when it couldn't read the tags. Not an entry:
+    /// `get` and `contains` don't see it, and neither revision moves.
+    pub fn insert_unreadable(&self, path: &Path, file_size: u64) {
+        self.unreadable().insert(path.to_path_buf(), file_size);
+    }
+
+    /// The size a failed tag read found for `path`, if one did and no later read replaced it.
+    pub fn unreadable_size(&self, path: &Path) -> Option<u64> {
+        self.unreadable().get(path).copied()
     }
 
     /// Changes whenever an entry is inserted or replaced (through any clone).
@@ -120,6 +141,7 @@ impl From<HashMap<PathBuf, AudioMetadata>> for MetadataCache {
             map: std::sync::RwLock::new(map),
             revision: AtomicU64::new(0),
             folders: Default::default(),
+            unreadable: Default::default(),
         }))
     }
 }

@@ -294,8 +294,8 @@ pub struct AppUI {
     pub settings_mgr: SettingsManager,
     /// Shared with background scanners; clone the handle, never the map (issue #4).
     pub metadata_cache: crate::library::MetadataCache,
-    pub metadata_tx: std::sync::mpsc::Sender<crate::metadata::AudioMetadata>,
-    pub metadata_rx: std::sync::mpsc::Receiver<crate::metadata::AudioMetadata>,
+    pub metadata_tx: std::sync::mpsc::Sender<tag_reads::TagUpdate>,
+    pub metadata_rx: std::sync::mpsc::Receiver<tag_reads::TagUpdate>,
     pub queue_add_tx: std::sync::mpsc::Sender<Vec<crate::metadata::AudioMetadata>>,
     pub queue_add_rx: std::sync::mpsc::Receiver<Vec<crate::metadata::AudioMetadata>>,
     pub metadata_worker_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -303,7 +303,8 @@ pub struct AppUI {
     pub queue_metadata_tx: Option<std::sync::mpsc::Sender<PathBuf>>,
     /// Tells the queue metadata pool to stop reading tags (set on shutdown).
     pub queue_metadata_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Paths already sent to the queue metadata workers this session.
+    /// Paths already sent to the queue metadata workers this session (a read that couldn't find
+    /// the file takes its path out again, so a later add reads it once more).
     pub queue_metadata_attempted: std::collections::HashSet<PathBuf>,
     /// Tag reads shared by the browser, queue and folder-add workers, so no two of them read
     /// the same file at once (issue #52).

@@ -240,73 +240,77 @@ max-width:32rem;margin:15vh auto;padding:0 1.25rem;line-height:1.5}a{color:#7aa2
 <b>Now Playing Web Server</b> in Quickstream under <b>[4] Settings</b>.</p>\
 <p><a href=\"/\">Retry</a></p></body></html>";
 
-/// Write the response for a non-`Allow` decision. `server_port` names the session cookie.
+/// Write the response for a non-`Allow` decision. `server_port` names the session cookie. A HEAD
+/// request (`is_head`) gets the head only, with the `Content-Length` a GET gets (issue #125).
 pub fn write_decision_response(
     out: &mut impl Write,
     decision: &AuthDecision,
     path: &str,
     token: &str,
     server_port: u16,
+    is_head: bool,
 ) -> std::io::Result<()> {
     let is_api = path_only(path).starts_with("/api/");
-    let (status, content_type, body, extra): (&str, &str, String, String) = match decision {
+    let cookie;
+    let (status, content_type, body, extra): (&str, &str, String, &[(&str, &str)]) = match decision {
         AuthDecision::Allow => return Ok(()),
-        AuthDecision::Pair => (
-            "303 See Other",
-            "text/plain; charset=utf-8",
-            String::new(),
-            format!(
-                "Location: /\r\nSet-Cookie: {}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n",
+        AuthDecision::Pair => {
+            cookie = format!(
+                "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000",
                 token_cookie_name(server_port),
                 token
-            ),
-        ),
+            );
+            (
+                "303 See Other",
+                "text/plain; charset=utf-8",
+                String::new(),
+                &[
+                    ("Location", "/"),
+                    ("Set-Cookie", cookie.as_str()),
+                    ("Cache-Control", "no-store"),
+                    ("Referrer-Policy", "no-referrer"),
+                ],
+            )
+        }
         AuthDecision::Unauthorized if is_api => (
             "401 Unauthorized",
             "application/json",
             r#"{"ok":false,"error":"unauthorized"}"#.to_string(),
-            "Cache-Control: no-store\r\n".to_string(),
+            &[("Cache-Control", "no-store")],
         ),
         AuthDecision::Unauthorized => (
             "401 Unauthorized",
             "text/html; charset=utf-8",
             UNAUTHORIZED_HTML.to_string(),
-            "Cache-Control: no-store\r\nX-Frame-Options: DENY\r\n".to_string(),
+            &[("Cache-Control", "no-store"), ("X-Frame-Options", "DENY")],
         ),
         AuthDecision::Forbidden(reason) if is_api => (
             "403 Forbidden",
             "application/json",
             serde_json::json!({ "ok": false, "error": reason }).to_string(),
-            "Cache-Control: no-store\r\n".to_string(),
+            &[("Cache-Control", "no-store")],
         ),
         AuthDecision::Forbidden(reason) if *reason == REMOTE_ACCESS_OFF => (
             "403 Forbidden",
             "text/html; charset=utf-8",
             REMOTE_ACCESS_OFF_HTML.to_string(),
-            "Cache-Control: no-store\r\nX-Frame-Options: DENY\r\n".to_string(),
+            &[("Cache-Control", "no-store"), ("X-Frame-Options", "DENY")],
         ),
         AuthDecision::Forbidden(reason) => (
             "403 Forbidden",
             "text/plain; charset=utf-8",
             format!("Forbidden: {}", reason),
-            "Cache-Control: no-store\r\n".to_string(),
+            &[("Cache-Control", "no-store")],
         ),
     };
-    let header = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
-        status,
-        content_type,
-        extra,
-        body.len()
-    );
-    out.write_all(header.as_bytes())?;
-    out.write_all(body.as_bytes())?;
-    out.flush()
+    let mut headers = vec![("Content-Type", content_type)];
+    headers.extend_from_slice(extra);
+    crate::web::write_response(out, status, &headers, body.as_bytes(), is_head)
 }
 
 /// Authorize a request on `stream` with the process-wide token and `remote_access` (see
-/// [`authorize`]). Writes the refusal (or pairing redirect) and returns
-/// `false` when routing must stop.
+/// [`authorize`]). Writes the refusal (or pairing redirect; the head only for a HEAD request) and
+/// returns `false` when routing must stop.
 pub fn check_request(
     stream: &mut std::net::TcpStream,
     method: &str,
@@ -327,18 +331,20 @@ pub fn check_request(
     if decision == AuthDecision::Allow {
         return Ok(true);
     }
-    write_decision_response(stream, &decision, path, token, port)?;
+    write_decision_response(stream, &decision, path, token, port, method == "HEAD")?;
     Ok(false)
 }
 
-/// Write a JSON 403 for a request naming a path outside the allowed folders.
-pub fn write_path_forbidden(out: &mut impl Write) -> std::io::Result<()> {
+/// Write a JSON 403 for a request naming a path outside the allowed folders; the head only for a
+/// HEAD request (`is_head`).
+pub fn write_path_forbidden(out: &mut impl Write, is_head: bool) -> std::io::Result<()> {
     write_decision_response(
         out,
         &AuthDecision::Forbidden("path is outside the allowed folders"),
         "/api/",
         "",
         0,
+        is_head,
     )
 }
 
@@ -540,5 +546,10 @@ impl AllowedRoots {
             .iter()
             .any(|root| canonical.starts_with(root))
             .then_some(canonical)
+    }
+
+    /// [`resolve`](Self::resolve) `path`, if it is a folder.
+    pub fn resolve_dir(&self, path: &Path) -> Option<PathBuf> {
+        self.resolve(path).filter(|dir| dir.is_dir())
     }
 }
