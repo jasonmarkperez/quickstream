@@ -355,6 +355,12 @@ impl ContinuousStreamController {
         self.file_checks.set_check(Arc::new(check));
     }
 
+    /// Keep an answer that came after its deadline for `keep` instead of 60 s (the test seam for
+    /// a track that plays longer than that).
+    pub fn set_late_answer_keep(&self, keep: Duration) {
+        self.file_checks.set_late_answer_keep(keep);
+    }
+
     fn decoder(&self) -> PathBuf {
         self.decoder
             .lock()
@@ -1703,14 +1709,10 @@ pub(super) fn serve_continuous_stream(
             } else {
                 nothing_playable = None;
                 // The next look takes the answer to the check made as this track started when it
-                // found the file. A missing one is asked again: the track may have played for
-                // minutes, long enough for the share to come back.
+                // found the file. A missing one is asked again, even one that came late: the
+                // track may have played for minutes, long enough for the share to come back.
                 let next = Path::new(&tracks[(track_index + 1) % queue_len].0);
-                let since = if controller.file_checks.exists_since(next, decoder_started) {
-                    decoder_started
-                } else {
-                    Instant::now()
-                };
+                let since = controller.file_checks.since_for_track_end(next, decoder_started);
                 look = Some((since, seq));
             }
         } else {

@@ -64,7 +64,8 @@ pub(super) struct Look {
 enum Entry {
     /// Asked for at this time: on a helper, or waiting for one.
     InFlight(Instant),
-    /// `late`: given after `FILE_CHECK_DEADLINE`, and not used by a look yet.
+    /// `at`: when it was given (for a late answer `prefetch` kept for a track's end, when that
+    /// track started). `late`: given after `FILE_CHECK_DEADLINE`, and not used by a look yet.
     Answered { exists: bool, at: Instant, late: bool },
 }
 
@@ -108,6 +109,8 @@ struct Shared {
 pub(super) struct FileChecks {
     /// `None`: `Path::exists`.
     check: Mutex<Option<FileCheck>>,
+    /// `None`: `LATE_ANSWER_KEEP`.
+    late_answer_keep: Mutex<Option<Duration>>,
     shared: Arc<Shared>,
 }
 
@@ -121,6 +124,15 @@ impl FileChecks {
     /// Check files with `check` from now on.
     pub(super) fn set_check(&self, check: FileCheck) {
         *self.check.lock().unwrap() = Some(check);
+    }
+
+    /// Keep late answers for `keep` instead of `LATE_ANSWER_KEEP` from now on.
+    pub(super) fn set_late_answer_keep(&self, keep: Duration) {
+        *self.late_answer_keep.lock().unwrap() = Some(keep);
+    }
+
+    fn late_answer_keep(&self) -> Duration {
+        self.late_answer_keep.lock().unwrap().unwrap_or(LATE_ANSWER_KEEP)
     }
 
     fn check(&self) -> FileCheck {
@@ -156,10 +168,11 @@ impl FileChecks {
         use_up: bool,
     ) -> Look {
         let check = self.check();
+        let keep = self.late_answer_keep();
         let mut tried_spawning = false;
         let mut checks = self.shared.checks.lock().unwrap();
         loop {
-            let (look, late) = walk(&mut checks, len, &path_at, since, &check);
+            let (look, late) = walk(&mut checks, len, &path_at, since, keep, &check);
             if look.outcome != LookOutcome::Pending {
                 // A late answer counts once: the next look asks afresh.
                 for p in late.into_iter().filter(|_| use_up) {
@@ -197,18 +210,39 @@ impl FileChecks {
 
     /// Start checking `path` unless an answer given since `since` is known or a check is in
     /// flight, without waiting for it: the stream asks for the next file as a track starts, so
-    /// the answer is there when the track ends. A late answer is left for the look as the track
-    /// ends.
+    /// the answer is there when the track ends. A late answer that found the file is kept for the
+    /// look as the track ends, however long the track plays: it counts from `since` on, as if
+    /// given then (and isn't used up here).
     pub(super) fn prefetch(&self, path: &Path, since: Instant) {
+        let keep = self.late_answer_keep();
+        if let Some(Entry::Answered {
+            exists: true,
+            at,
+            late: true,
+        }) = self.shared.checks.lock().unwrap().entries.get_mut(path)
+        {
+            if *at < since && since.duration_since(*at) < keep {
+                *at = since;
+            }
+        }
         self.look_using(1, |_| path, since, Instant::now(), false);
     }
 
-    /// Whether an answer given since `since` says `path` exists.
-    pub(super) fn exists_since(&self, path: &Path, since: Instant) -> bool {
-        matches!(
-            self.shared.checks.lock().unwrap().entries.get(path),
-            Some(Entry::Answered { exists: true, at, .. }) if *at >= since
-        )
+    /// The `since` for the look as a track that started at `track_started` ends, for the file
+    /// after it, `path`: `track_started` when an answer given since then (or kept for it by
+    /// `prefetch`) found the file, so the look uses it. Otherwise now, and an answer that found
+    /// the file missing, late or not, is dropped, so the look checks it again: the track may have
+    /// played for minutes, long enough for the share to come back.
+    pub(super) fn since_for_track_end(&self, path: &Path, track_started: Instant) -> Instant {
+        let mut checks = self.shared.checks.lock().unwrap();
+        match checks.entries.get(path) {
+            Some(Entry::Answered { exists: true, at, .. }) if *at >= track_started => track_started,
+            Some(Entry::Answered { exists: false, .. }) => {
+                checks.entries.remove(path);
+                Instant::now()
+            }
+            _ => Instant::now(),
+        }
     }
 
     /// Start a helper thread, which takes the queued checks. Returns whether it started.
@@ -228,6 +262,7 @@ fn walk<'p>(
     len: usize,
     path_at: &impl Fn(usize) -> &'p Path,
     since: Instant,
+    keep: Duration,
     check: &FileCheck,
 ) -> (Look, Vec<usize>) {
     let now = Instant::now();
@@ -239,9 +274,7 @@ fn walk<'p>(
     for p in 0..len {
         let path = path_at(p);
         let status = match checks.entries.get(path) {
-            Some(Entry::Answered { exists, at, late })
-                if *at >= since || (*late && now.duration_since(*at) < LATE_ANSWER_KEEP) =>
-            {
+            Some(Entry::Answered { exists, at, late }) if *at >= since || (*late && now.duration_since(*at) < keep) => {
                 if *late {
                     late_used.push(p);
                 }

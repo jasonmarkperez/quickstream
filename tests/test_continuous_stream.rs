@@ -1913,6 +1913,111 @@ fn test_continuous_late_answer_is_not_used_up_by_the_check_ahead() {
     assert_eq!(slow.started(&f.tracks[1]), 1, "not checked again");
 }
 
+/// A late answer the check ahead found as the track before its file started is kept for that
+/// track's end however long the track plays, not only while it is younger than the keep (here
+/// 1 s, under the 3 s track), so the file plays rather than being checked again only to miss the
+/// deadline once more (#117).
+#[cfg(unix)]
+#[test]
+fn test_continuous_late_answer_is_kept_for_a_track_longer_than_the_keep() {
+    common::isolate();
+    let slow = SlowPathCheck::default();
+    let f = DecoderFixture::start_with(
+        "late_kept",
+        &["a_longones.wav", "b_live.wav", "c_live.wav"],
+        1,
+        |c, t| {
+            c.set_late_answer_keep(Duration::from_secs(1));
+            slow.install(c, &t[1..2], Duration::from_millis(2500))
+        },
+    );
+    assert_eq!(f.run(1), (f.tracks[2].clone(), None), "passed over while unanswered");
+    wait_until("the slow check never answered", || slow.answered(&f.tracks[1]) == 1);
+    f.controller.skip_to_index(0);
+    assert_eq!(f.run(2), (f.tracks[0].clone(), None));
+    assert_eq!(f.run(3), (f.tracks[1].clone(), None), "played on its late answer");
+    assert_eq!(slow.started(&f.tracks[1]), 1, "not checked again");
+}
+
+/// A next file whose check ahead answered late that it was missing is checked again as the track
+/// before it ends, like one found missing in time: one back on the share by then plays (#117).
+#[cfg(unix)]
+#[test]
+fn test_continuous_next_file_found_missing_late_is_checked_again_at_the_track_end() {
+    common::isolate();
+    let started = Arc::new(Mutex::new(0usize));
+    let f = DecoderFixture::start_with(
+        "late_missing",
+        &["a_longones.wav", "b_live.wav", "c_live.wav"],
+        0,
+        |c, t| {
+            std::fs::remove_file(&t[1]).unwrap();
+            let (b, started) = (t[1].clone(), started.clone());
+            c.set_path_check(move |path: &Path| {
+                if path != b {
+                    return path.exists();
+                }
+                let first = {
+                    let mut n = started.lock().unwrap();
+                    *n += 1;
+                    *n == 1
+                };
+                if first {
+                    // Past the deadline, then missing: the file is back just after it answers.
+                    std::thread::sleep(Duration::from_millis(2200));
+                    let exists = path.exists();
+                    std::fs::write(path, b"back").unwrap();
+                    return exists;
+                }
+                path.exists()
+            });
+        },
+    );
+    assert_eq!(f.run(1), (f.tracks[0].clone(), None));
+    assert_eq!(
+        f.run(2),
+        (f.tracks[1].clone(), None),
+        "the file back on the share plays"
+    );
+    assert_eq!(*started.lock().unwrap(), 2, "checked again as the track before ended");
+}
+
+/// A late answer used by the look as a track ends counts once, like one used by any look: a
+/// later look asks afresh rather than reusing it (#117).
+#[cfg(unix)]
+#[test]
+fn test_continuous_late_answer_used_at_a_track_end_counts_once() {
+    common::isolate();
+    let started = Arc::new(Mutex::new(0usize));
+    let f = DecoderFixture::start_with(
+        "late_once",
+        &["a_longones.wav", "b_live.wav", "c_live.wav"],
+        0,
+        |c, t| {
+            let (b, started) = (t[1].clone(), started.clone());
+            c.set_path_check(move |path: &Path| {
+                if path == b {
+                    let first = {
+                        let mut n = started.lock().unwrap();
+                        *n += 1;
+                        *n == 1
+                    };
+                    if first {
+                        // Past the deadline, but in time for the track before to end.
+                        std::thread::sleep(Duration::from_millis(2200));
+                    }
+                }
+                path.exists()
+            });
+        },
+    );
+    assert_eq!(f.run(1), (f.tracks[0].clone(), None));
+    assert_eq!(f.run(2), (f.tracks[1].clone(), None), "played on its late answer");
+    f.controller.skip_to_index(1);
+    assert_eq!(f.run(3), (f.tracks[1].clone(), None));
+    assert_eq!(*started.lock().unwrap(), 2, "checked afresh for the skip");
+}
+
 /// Files whose checks hang are checked at the same time, not one deadline after another, so a
 /// file that answers later in the queue plays within about one deadline (#117).
 #[cfg(unix)]
