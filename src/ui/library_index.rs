@@ -277,8 +277,11 @@ impl AppUI {
         handle.control.set_paused(busy);
         let stopped_by_us = handle.control.is_stopped() && !self.library_index.restart_pending;
         if self.settings_mgr.settings.library_index && !stopped_by_us && handle.roots != roots {
+            // As `start_library_index` does: the row reads WAITING until the new thread starts,
+            // not READING with frozen counts while the old one is stuck on a hung share.
             handle.control.stop();
             self.library_index.restart_pending = true;
+            self.library_index.progress.set_state(IndexState::Waiting);
         }
         if self.library_index.restart_pending && handle.finished() {
             self.start_library_index();

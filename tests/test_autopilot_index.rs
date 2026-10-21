@@ -255,9 +255,9 @@ fn a_library_the_indexer_walked_is_mixed_without_reading_tags() {
             tag.save_to_path(&path, WriteOptions::default()).unwrap();
         }
     }
-    // A folder changed in the second it is listed reads as changed (the mix walks it): let the
-    // clock move past the tree's mtimes first.
-    std::thread::sleep(Duration::from_millis(1100));
+    // A folder whose mtime is within the indexer's 2 s tick of its listing gets no subtree mark
+    // (the mix walks it): let the clock move past the tree's mtimes first.
+    std::thread::sleep(Duration::from_millis(2100));
     let db_path = lib.with_extension("db");
     let _ = fs::remove_file(&db_path);
 

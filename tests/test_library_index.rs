@@ -85,10 +85,14 @@ fn library_tree(lib: &Path, artists: usize, per_album: usize) -> Vec<PathBuf> {
     files
 }
 
+/// The tests' pacing: no start delay, and folder mtimes taken as exact, so a tree made just
+/// before the pass gets its subtree marks (`a_folder_changed_as_it_is_listed_gets_no_mark` keeps
+/// the app's 2 s tick).
 fn config(roots: Vec<PathBuf>) -> IndexConfig {
     IndexConfig {
         start_delay: Duration::ZERO,
         rescan_interval: Duration::from_secs(3600),
+        mtime_tick: Duration::ZERO,
         ..IndexConfig::new(roots)
     }
 }
@@ -1257,6 +1261,54 @@ fn turned_on_again_while_the_old_thread_finishes_it_reads_waiting() {
     poll_until(&mut app, "Done", |_| progress.state() == IndexState::Done);
 }
 
+/// A Music Home added while the old thread is stuck (a read on a hung share) restarts it once
+/// that thread has finished, and the row reads WAITING meanwhile, not READING with its counts
+/// frozen (#146 review).
+#[test]
+fn a_root_change_while_the_old_thread_is_held_reads_waiting() {
+    common::isolate();
+    let (lib, db_path) = scratch("app_root_waiting");
+    let a = lib.join("A");
+    let b = lib.join("B");
+    library_tree(&a, 1, 1);
+    library_tree(&b, 1, 1);
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let entered = Arc::new(AtomicUsize::new(0));
+    let reader: IndexTagReader = {
+        let (entered, release_rx, real) = (entered.clone(), Mutex::new(release_rx), default_tag_reader());
+        Arc::new(move |path: &Path, stamp| {
+            if entered.fetch_add(1, Ordering::SeqCst) == 0 {
+                let _ = release_rx.lock().unwrap().recv_timeout(Duration::from_secs(20));
+            }
+            real(path, stamp)
+        })
+    };
+    let mut app = index_app(&a, &db_path, reader);
+    app.start_library_index();
+    poll_until(&mut app, "the first read", |_| entered.load(Ordering::SeqCst) == 1);
+    let progress = app.library_index_progress();
+    assert_eq!(progress.state(), IndexState::Reading);
+
+    app.bookmarks.push(b.to_string_lossy().into_owned());
+    app.poll_library_index();
+    assert_eq!(app.library_index_starts(), 1, "the old thread is still held");
+    assert_eq!(progress.state(), IndexState::Waiting);
+    for _ in 0..10 {
+        app.poll_library_index();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        progress.state(),
+        IndexState::Waiting,
+        "while it waits for the old thread"
+    );
+
+    drop(release_tx);
+    poll_until(&mut app, "the restart", |app| app.library_index_starts() == 2);
+    poll_until(&mut app, "Done", |_| progress.state() == IndexState::Done);
+    assert_eq!(rows_under(&db_path, &b).len(), 2, "the new home is indexed");
+}
+
 /// The folders to index are worked out again only when the Music Homes or the startup home
 /// change, not on every tick (#146 review).
 #[test]
@@ -1381,6 +1433,71 @@ fn a_rewalked_folder_is_not_whole_until_its_subtree_is_walked_again() {
 
     one_pass(&db_path, vec![lib.clone()], default_tag_reader());
     assert!(trusted(&db, &artist), "walked whole again");
+}
+
+/// On a share with coarse mtimes (HFS+ 1 s, FAT32 2 s, SMB servers keeping whole seconds) an
+/// entry added in the same tick as the listing, after it, leaves the folder's mtime as it was
+/// (#146 review). So a folder whose mtime is within the tick of its listing gets no subtree mark
+/// (a mix walks it), and neither does anything above it; one whose mtime is older does.
+#[test]
+fn a_folder_changed_as_it_is_listed_gets_no_mark() {
+    common::isolate();
+    let (lib, db_path) = scratch("mtime_tick");
+    library_tree(&lib, 2, 1);
+    let cfg = IndexConfig {
+        mtime_tick: Duration::from_secs(2),
+        ..config(vec![lib.clone()])
+    };
+    assert_eq!(cfg.mtime_tick, IndexConfig::default().mtime_tick, "the app's tick");
+    let artists: Vec<PathBuf> = (0..2).map(|a| lib.join(format!("Artist {a:02}"))).collect();
+    let albums: Vec<PathBuf> = artists.iter().map(|a| a.join("Album")).collect();
+
+    // Every folder was made just now: none is trusted, though every file is read.
+    let snap = one_pass_with(&db_path, cfg.clone(), default_tag_reader());
+    assert_eq!(snap.read, 3);
+    {
+        let db = AnalysisDatabase::open_at(&db_path).unwrap();
+        for dir in std::iter::once(&lib).chain(&artists).chain(&albums) {
+            assert!(!trusted(&db, dir), "{} changed as it was listed", dir.display());
+            assert!(db.index_dir(dir).is_some(), "{} is recorded", dir.display());
+        }
+    }
+
+    // An hour on, only the root changed in the last tick: everything under it is trusted, the
+    // root isn't.
+    let old = SystemTime::now() - Duration::from_secs(3600);
+    for dir in artists.iter().chain(&albums) {
+        fs::File::open(dir).unwrap().set_modified(old).unwrap();
+    }
+    fs::File::open(&lib).unwrap().set_modified(SystemTime::now()).unwrap();
+    one_pass_with(&db_path, cfg.clone(), default_tag_reader());
+    {
+        let db = AnalysisDatabase::open_at(&db_path).unwrap();
+        for dir in artists.iter().chain(&albums) {
+            assert!(trusted(&db, dir), "{} is older than the tick", dir.display());
+        }
+        assert!(!trusted(&db, &lib), "the root changed as it was listed");
+    }
+
+    fs::File::open(&lib).unwrap().set_modified(old).unwrap();
+    one_pass_with(&db_path, cfg.clone(), default_tag_reader());
+    {
+        let db = AnalysisDatabase::open_at(&db_path).unwrap();
+        assert!(trusted(&db, &lib), "older than the tick: trusted");
+    }
+
+    // An album that changed as it was listed takes the marks above it away too, until it settles.
+    fs::File::open(&albums[0])
+        .unwrap()
+        .set_modified(SystemTime::now())
+        .unwrap();
+    one_pass_with(&db_path, cfg, default_tag_reader());
+    let db = AnalysisDatabase::open_at(&db_path).unwrap();
+    assert!(!trusted(&db, &albums[0]) && !trusted(&db, &artists[0]) && !trusted(&db, &lib));
+    assert!(
+        trusted(&db, &artists[1]) && trusted(&db, &albums[1]),
+        "the other artist keeps its"
+    );
 }
 
 /// A pass over a library that hasn't changed takes no mark away while it runs (#146 review):

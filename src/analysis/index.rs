@@ -47,6 +47,11 @@ pub struct IndexConfig {
     pub rescan_interval: Duration,
     /// How long it waits before its first pass (startup stays quiet).
     pub start_delay: Duration,
+    /// How coarse a folder mtime may be (HFS+ 1 s, FAT32 2 s, SMB servers that keep whole
+    /// seconds). An entry added in the same tick as the listing, after it, leaves the folder's
+    /// mtime as it was, so a folder whose mtime is within this of the time it was listed gets no
+    /// subtree mark this pass (mixes walk it).
+    pub mtime_tick: Duration,
 }
 
 impl IndexConfig {
@@ -60,6 +65,7 @@ impl IndexConfig {
             backoff: Duration::from_secs(30),
             rescan_interval: Duration::from_secs(6 * 60 * 60),
             start_delay: Duration::from_secs(10),
+            mtime_tick: Duration::from_secs(2),
         }
     }
 }
@@ -507,7 +513,8 @@ impl Indexer<'_> {
     }
 
     /// Read the tags of `files` (a folder's own audio files) that changed and record the folder.
-    /// `listed_ok` is false when the listing failed (the folder can't be complete). Returns
+    /// `listed_ok` is false when the listing failed or may have missed an entry (the folder can't
+    /// be complete). Returns
     /// whether every file has a current row (or failed the same way on an earlier pass), `None`
     /// when stopped part-way (the rows read so far are kept and the folder recorded as
     /// incomplete).
@@ -608,8 +615,12 @@ impl Indexer<'_> {
         if !self.hold() {
             return None;
         }
-        // The folder's mtime first, then its listing: an entry added after the stat changes the
-        // mtime again, so the recorded one never vouches for an entry the listing missed.
+        // The folder's mtime before and after its listing. An entry added during or after the
+        // listing changes the mtime, but only to the filesystem's tick (HFS+ 1 s, FAT32 2 s, SMB
+        // servers keeping whole seconds): one added in the same tick leaves it as it was. So the
+        // folder vouches for its listing only when both reads agree and the mtime is more than
+        // `mtime_tick` from the time of the listing; otherwise it is recorded incomplete, without
+        // a subtree mark, and mixes walk it.
         let mtime = self.timed("stat", dir, || folder_mtime(dir));
         let listed_at = now_secs();
         let (listing, ok) = match self.list(dir) {
@@ -622,6 +633,19 @@ impl Indexer<'_> {
         if self.control.is_stopped() {
             return None;
         }
+        let settled = mtime.is_some_and(|before| {
+            let after = self.timed("stat", dir, || folder_mtime(dir));
+            let tick = u64::try_from(self.cfg.mtime_tick.as_nanos()).unwrap_or(u64::MAX);
+            let listed = mtime_nanos(std::time::SystemTime::now());
+            after == Some(before) && listed.is_some_and(|listed| listed.abs_diff(before) >= tick)
+        });
+        if ok && !settled {
+            crate::log_info!(
+                "index",
+                "'{}' changed as it was listed (or its mtime can't be read): no subtree mark this pass",
+                dir.display()
+            );
+        }
         if listing.unindexable {
             crate::log_info!(
                 "index",
@@ -629,8 +653,8 @@ impl Indexer<'_> {
                 dir.display()
             );
         }
-        let own = self.index_files(dir, &listing.files, listed_at, ok && !listing.unindexable)?;
-        Some((listing, own && mtime.is_some(), mtime))
+        let own = self.index_files(dir, &listing.files, listed_at, ok && settled && !listing.unindexable)?;
+        Some((listing, own, mtime))
     }
 
     /// Record whether `dir` and everything under it are indexed: whole as of the folder mtime
