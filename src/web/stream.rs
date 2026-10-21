@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use super::file_checks::{FileChecks, LookOutcome};
 use super::server::{write_not_found, write_server_error};
 use super::state::{NowPlayingState, WebCommand};
 
@@ -77,6 +78,9 @@ pub struct ContinuousStreamController {
     /// The skip or seek the stream hasn't acted on yet. Set before the decoder is killed and
     /// taken in one step when the stream picks its next track, so none is lost or applied twice.
     request: Mutex<Option<StreamRequest>>,
+    /// Bumped with `request` held whenever anyone but the stream sets or clears it, so the stream
+    /// tells a new request from the one it is looking for, the same skip asked again too.
+    request_seq: AtomicU64,
     /// The ffmpeg the stream runs (`None`: `ffmpeg` on `PATH`); see [`Self::set_decoder`].
     decoder: Mutex<Option<PathBuf>>,
     session: Mutex<Option<ContinuousSession>>,
@@ -84,6 +88,9 @@ pub struct ContinuousStreamController {
     /// the two always name the same track (lock order: the web state, then `current_duration`,
     /// then this).
     decoding: Mutex<Option<(usize, PathBuf)>>,
+    /// Whether the queue's files are there, checked off the stream's write path (#117); see
+    /// [`Self::set_path_check`].
+    file_checks: FileChecks,
     /// Where each queued track went in reorders the stream hasn't followed yet: entry `i` is the
     /// new row of the track that was at row `i`. Set by [`Self::queue_reordered`], taken by the
     /// stream wherever it holds a row of its own (lock order: the web state, then `request`,
@@ -102,7 +109,7 @@ impl ContinuousStreamController {
         let nonce = crate::web_access::generate_token();
         let path = format!("{}{}{}", CONTINUOUS_PREFIX, nonce, CONTINUOUS_SUFFIX);
         *self.session.lock().unwrap() = Some(ContinuousSession { nonce, peer: None });
-        *self.request.lock().unwrap() = None;
+        self.set_request(None);
         *self.reorder.lock().unwrap() = None;
         path
     }
@@ -111,7 +118,13 @@ impl ContinuousStreamController {
     /// acted on goes with it.
     pub fn disarm_session(&self) {
         *self.session.lock().unwrap() = None;
-        *self.request.lock().unwrap() = None;
+        self.set_request(None);
+    }
+
+    fn set_request(&self, request: Option<StreamRequest>) {
+        let mut pending = self.request.lock().unwrap();
+        *pending = request;
+        self.request_seq.fetch_add(1, Ordering::SeqCst);
     }
 
     /// The URL path of the armed session, if any.
@@ -208,6 +221,7 @@ impl ContinuousStreamController {
         {
             let mut request = self.request.lock().unwrap();
             *request = Some(StreamRequest { index, position: 0.0 });
+            self.request_seq.fetch_add(1, Ordering::SeqCst);
             *self.current_track_index.lock().unwrap() = index;
         }
         self.kill_active_decoder();
@@ -215,10 +229,16 @@ impl ContinuousStreamController {
 
     /// Restart the track at `position` seconds: the track skipped to when a skip is pending,
     /// else the one `current_track_index` names, so a seek that arrives as a track ends is never
-    /// applied to the next one.
+    /// applied to the next one. A position below 0 or not a number starts it from 0.
     pub fn seek_to(&self, position: f64) {
+        let position = if position.is_finite() && position > 0.0 {
+            position
+        } else {
+            0.0
+        };
         {
             let mut request = self.request.lock().unwrap();
+            self.request_seq.fetch_add(1, Ordering::SeqCst);
             match request.as_mut() {
                 Some(pending) => pending.position = position,
                 None => {
@@ -269,10 +289,10 @@ impl ContinuousStreamController {
     }
 
     /// Where the stream goes on (`next`: a row and how many rows after it), after the reorders it
-    /// hasn't followed yet (taking them).
-    fn follow_next(&self, next: Option<(usize, usize)>) -> Option<usize> {
+    /// hasn't followed yet (taking them): the row moves with its track, the step stays.
+    fn follow_next(&self, next: Option<(usize, usize)>) -> Option<(usize, usize)> {
         let moved = self.reorder.lock().unwrap().take();
-        next.map(|(row, step)| moved.as_deref().map_or(row, |moved| follow_row(moved, row)) + step)
+        next.map(|(row, step)| (moved.as_deref().map_or(row, |moved| follow_row(moved, row)), step))
     }
 
     /// The skip or seek the stream hasn't acted on yet, if any.
@@ -308,7 +328,11 @@ impl ContinuousStreamController {
         let _ = child.kill();
         let _ = child.wait();
         if let Some(taken) = taken {
-            self.request.lock().unwrap().get_or_insert(taken);
+            let mut pending = self.request.lock().unwrap();
+            if pending.is_none() {
+                *pending = Some(taken);
+                self.request_seq.fetch_add(1, Ordering::SeqCst);
+            }
         }
         false
     }
@@ -374,6 +398,18 @@ impl ContinuousStreamController {
     /// fake decoder).
     pub fn set_decoder(&self, binary: impl Into<PathBuf>) {
         *self.decoder.lock().unwrap() = Some(binary.into());
+    }
+
+    /// Tell whether a queued file is there with `check` instead of `Path::exists` (the test seam
+    /// for a share that hangs). It runs on a helper thread, at most once at a time per path.
+    pub fn set_path_check(&self, check: impl Fn(&Path) -> bool + Send + Sync + 'static) {
+        self.file_checks.set_check(Arc::new(check));
+    }
+
+    /// Keep an answer that came after its deadline for `keep` instead of 60 s (the test seam for
+    /// a track that plays longer than that).
+    pub fn set_late_answer_keep(&self, keep: Duration) {
+        self.file_checks.set_late_answer_keep(keep);
     }
 
     fn decoder(&self) -> PathBuf {
@@ -1632,6 +1668,12 @@ const SILENCE_LEAD: Duration = Duration::from_millis(100);
 const SILENCE_MAX_BURST: Duration = Duration::from_secs(1);
 /// How often a queue whose files are all missing is looked through again.
 const MISSING_RECHECK: Duration = Duration::from_secs(1);
+/// The longest one pass waits for file checks before it sends silence instead (#117).
+const FILE_CHECK_WAIT: Duration = Duration::from_millis(20);
+// A pass's wait on file checks comes out of its tick, so silence still goes out every tick, well
+// before the lead runs out.
+const _: () = assert!(FILE_CHECK_WAIT.as_millis() < SILENCE_TICK.as_millis());
+const _: () = assert!(SILENCE_TICK.as_millis() < SILENCE_LEAD.as_millis());
 
 /// The PCM bytes in `duration`, whole 4-byte frames.
 fn pcm_bytes(duration: Duration) -> u64 {
@@ -1639,7 +1681,8 @@ fn pcm_bytes(duration: Duration) -> u64 {
 }
 
 /// Sends silence at the stream's real-time byte rate while there is nothing to decode (empty
-/// queue, every file missing). Measured from when it started, so sleep overshoot doesn't add up.
+/// queue, every file missing, a file check not answered yet). Measured from when it started, so
+/// sleep overshoot doesn't add up.
 struct SilencePacer {
     started: Instant,
     sent: u64,
@@ -1653,11 +1696,14 @@ impl SilencePacer {
         }
     }
 
-    /// Write the silence due by now (plus `SILENCE_LEAD`), then wait one tick. Returns the write
-    /// error, which means the renderer has gone.
-    fn send(&mut self, stream: &mut impl Write) -> std::io::Result<()> {
+    /// Write the silence due by now (plus `SILENCE_LEAD`), then wait until one tick after
+    /// `pass_started`, so time the pass spent waiting on file checks doesn't add to the gap
+    /// between writes. Returns the bytes written, or the write error, which means the renderer
+    /// has gone.
+    fn send(&mut self, stream: &mut impl Write, pass_started: Instant) -> std::io::Result<u64> {
         let due = pcm_bytes(self.started.elapsed() + SILENCE_LEAD);
         let mut owed = due.saturating_sub(self.sent).min(pcm_bytes(SILENCE_MAX_BURST));
+        let written = owed;
         self.sent = due;
         let chunk = [0u8; 8820];
         while owed > 0 {
@@ -1665,9 +1711,20 @@ impl SilencePacer {
             stream.write_all(&chunk[..n])?;
             owed -= n as u64;
         }
-        std::thread::sleep(SILENCE_TICK);
-        Ok(())
+        wait_out_tick(pass_started);
+        Ok(written)
     }
+}
+
+/// Sleep until one `SILENCE_TICK` after `pass_started`.
+fn wait_out_tick(pass_started: Instant) {
+    std::thread::sleep((pass_started + SILENCE_TICK).saturating_duration_since(Instant::now()));
+}
+
+/// How far the PCM written since `connected` (`written` bytes, audio and silence) runs ahead of
+/// a renderer that has played it at real time since then: what its buffers still hold.
+fn renderer_lead(connected: Instant, written: u64) -> Duration {
+    Duration::from_secs_f64(written as f64 / PCM_BYTES_PER_SEC).saturating_sub(connected.elapsed())
 }
 
 /// Serve a continuous 16-bit 44.1kHz PCM WAV stream to DLNA renderers.
@@ -1754,6 +1811,9 @@ pub(super) fn serve_continuous_stream(
     let wav_hdr = make_continuous_wav_header();
     stream.write_all(&wav_hdr)?;
     stream.flush()?;
+    // The PCM written since the connection began (audio and silence), for `renderer_lead`.
+    let connected = Instant::now();
+    let mut written: u64 = 0;
 
     // Silence paced at real time while there is nothing to decode; `None` while audio plays.
     let mut silence: Option<SilencePacer> = None;
@@ -1776,8 +1836,17 @@ pub(super) fn serve_continuous_stream(
     let mut streamed_since_wrap = false;
     // Whether a decoder that couldn't start (no ffmpeg) was logged since audio last went out.
     let mut spawn_failure_logged = false;
+    // The look through the queue still waiting on a file check: answers given since its
+    // `Instant` are used as the stream looks again on the next passes, until a request newer than
+    // its `request_seq` comes (which starts a fresh look). Set as a track ends too: from when its
+    // decoder started (when the next file's check was made) if that check found the file, else
+    // from the end. `None`: no look is waiting.
+    let mut look: Option<(Instant, u64)> = None;
 
-    while controller.is_active.load(Ordering::SeqCst) {
+    'pass: while controller.is_active.load(Ordering::SeqCst) {
+        let pass_started = Instant::now();
+        // Whether this pass's look is still waiting on a file check.
+        let mut waiting_on_checks = false;
         if !controller.is_session(session) {
             crate::log_info!(
                 "web",
@@ -1799,10 +1868,10 @@ pub(super) fn serve_continuous_stream(
         // 1. Pick the track: the first from the requested (else the next) index whose file
         // exists, and where to start it. `None`: nothing to decode yet, so send silence.
         let picked = 'pick: {
-            let (index, request, tracks, tentative, queue_changed) = {
+            let (index, request, seq, tracks, tentative, queue_changed) = {
                 let s = state.read().unwrap();
-                // The connection is checked under the lock the request is taken with, so one a
-                // reconnect has superseded never takes the request meant for the new one.
+                // A connection a reconnect has superseded stops here (and is checked again as the
+                // request is taken below), so it never takes the request meant for the new one.
                 let mut pending = controller.request.lock().unwrap();
                 if !controller.owns(cid) {
                     crate::log_info!("web", "Continuous stream connection {} superseded, closing", cid);
@@ -1815,7 +1884,14 @@ pub(super) fn serve_continuous_stream(
                     *controller.current_track_index.lock().unwrap() = 0;
                     controller.follow_next(None);
                     next_index = None;
+                    look = None;
                     break 'pick None;
+                }
+                // A request that came since the look began starts a fresh one: answers given
+                // during a long look are not trusted for it (a share remounted meanwhile).
+                let seq = controller.request_seq.load(Ordering::SeqCst);
+                if look.is_some_and(|(_, look_seq)| look_seq != seq) {
+                    look = None;
                 }
                 let mut queue_changed = false;
                 if let Some((paths, checked)) = &nothing_playable {
@@ -1825,13 +1901,14 @@ pub(super) fn serve_continuous_stream(
                     // the whole queue.
                     queue_changed = s.queue.len() != paths.len()
                         || ((recheck || pending.is_some()) && !s.queue.iter().map(|t| &t.filepath).eq(paths.iter()));
-                    if !queue_changed && !recheck && pending.is_none() {
+                    if !queue_changed && !recheck && pending.is_none() && look.is_none() {
                         break 'pick None;
                     }
                 }
-                // Taken in one step with the decision it drives, so a request that arrives later
-                // stays pending for the next pass.
-                let request = pending.take();
+                // Read here and taken once the look through the queue below has decided (the
+                // look can take several passes while file checks answer), so it shows as pending
+                // until then.
+                let request = *pending;
                 // A changed queue or a request gets every file tried again.
                 if queue_changed || request.is_some() {
                     silent_runs = 0;
@@ -1840,7 +1917,9 @@ pub(super) fn serve_continuous_stream(
                 // as playing until it gives some.
                 let tentative = request.is_none() && (silent_runs > 0 || nothing_playable.is_some());
                 // Followed whatever is asked: a reorder's rows are the queue's read here.
-                let next = controller.follow_next(next_index);
+                // Kept as followed, so a look still waiting on checks goes on from it next pass.
+                next_index = controller.follow_next(next_index);
+                let next = next_index.map(|(row, step)| row + step);
                 let index = match request {
                     Some(r) => r.index,
                     None => next.unwrap_or_else(|| *controller.current_track_index.lock().unwrap()),
@@ -1852,19 +1931,57 @@ pub(super) fn serve_continuous_stream(
                     .iter()
                     .map(|t| (t.filepath.clone(), t.duration_seconds))
                     .collect();
-                (index, request, tracks, tentative, queue_changed)
+                (index, request, seq, tracks, tentative, queue_changed)
             };
             // The paths were copied out, so a slow share never holds the web state's lock.
             let queue_len = tracks.len();
             // Logged once per queue, not again while the stream idles on it.
             let quiet = nothing_playable.is_some() && !queue_changed;
-            let found = (0..queue_len).map(|step| (index + step) % queue_len).find(|&i| {
-                let exists = Path::new(&tracks[i].0).exists();
-                if !exists && !quiet {
-                    crate::log_warn!("web", "Continuous stream track missing: {}", tracks[i].0);
+            // Files are checked on helper threads (a share that hangs can take seconds to stat),
+            // waited for `FILE_CHECK_WAIT` at most per pass so the silence stays paced. A check
+            // still unanswered then leaves the look to the next pass, the request (if any) still
+            // pending; the answers given meanwhile carry over. The files after a slow one are
+            // checked ahead, so hung ones cost about one deadline together, not one each.
+            let since = look.get_or_insert((Instant::now(), seq)).0;
+            let wait_until = Instant::now() + FILE_CHECK_WAIT;
+            let at = |p: usize| (index + p) % queue_len;
+            let result = controller
+                .file_checks
+                .look(queue_len, |p| Path::new(&tracks[at(p)].0), since, wait_until);
+            let found = match result.outcome {
+                LookOutcome::Found(p) => Some(at(p)),
+                LookOutcome::NoneFound => None,
+                LookOutcome::Pending => {
+                    waiting_on_checks = true;
+                    break 'pick None;
                 }
-                exists
-            });
+            };
+            {
+                // Taken in one step with the decision it drives, so a request that arrives later
+                // stays pending for the next pass. One that replaced it during the look gets a
+                // fresh look. The connection is checked under the same lock, so one a reconnect
+                // has superseded never takes the new one's request.
+                let mut pending = controller.request.lock().unwrap();
+                if !controller.owns(cid) {
+                    crate::log_info!("web", "Continuous stream connection {} superseded, closing", cid);
+                    return Ok(());
+                }
+                if controller.request_seq.load(Ordering::SeqCst) != seq {
+                    look = None;
+                    continue 'pass;
+                }
+                *pending = None;
+            }
+            look = None;
+            if !quiet {
+                for (i, unanswered) in result.passed_over.into_iter().map(|(p, u)| (at(p), u)) {
+                    if unanswered {
+                        crate::log_warn!("web", "Continuous stream track not answering: {}", tracks[i].0);
+                    } else {
+                        crate::log_warn!("web", "Continuous stream track missing: {}", tracks[i].0);
+                    }
+                }
+            }
             let Some(found) = found else {
                 if !quiet {
                     crate::log_warn!(
@@ -1889,9 +2006,22 @@ pub(super) fn serve_continuous_stream(
             Some((found, path, duration, start_pos, request, tentative, tracks))
         };
         let Some((mut track_index, track_path, track_duration, start_pos, request, tentative, tracks)) = picked else {
-            if let Err(e) = silence.get_or_insert_with(SilencePacer::new).send(&mut stream) {
-                crate::log_info!("web", "Continuous stream socket closed while idle: {}", e);
-                return Ok(());
+            // A check that is merely slow (a track's end on a slow share) writes no silence while
+            // the renderer still has the audio before it to play: silence only as that runs out,
+            // so the next track follows gaplessly once the check answers.
+            if waiting_on_checks && renderer_lead(connected, written) > SILENCE_LEAD + SILENCE_TICK {
+                wait_out_tick(pass_started);
+                continue;
+            }
+            match silence
+                .get_or_insert_with(SilencePacer::new)
+                .send(&mut stream, pass_started)
+            {
+                Ok(n) => written += n,
+                Err(e) => {
+                    crate::log_info!("web", "Continuous stream socket closed while idle: {}", e);
+                    return Ok(());
+                }
             }
             continue;
         };
@@ -1936,6 +2066,9 @@ pub(super) fn serve_continuous_stream(
         // without audio, like one that can't decode the file.
         let mut ended = false;
         let mut streamed = false;
+        // When the next file's check was asked for: answers given since then are used as this
+        // track ends.
+        let decoder_started = Instant::now();
         let mut stdout = match cmd.spawn() {
             Ok(mut child) => match child.stdout.take() {
                 Some(stdout) => {
@@ -1944,6 +2077,11 @@ pub(super) fn serve_continuous_stream(
                     if !controller.register_decoder(cid, child, request) {
                         return Ok(());
                     }
+                    // The next file is checked while this one plays, so a slow share has answered
+                    // by the time it ends (#117).
+                    controller
+                        .file_checks
+                        .prefetch(Path::new(&tracks[(track_index + 1) % queue_len].0), decoder_started);
                     Some(stdout)
                 }
                 None => {
@@ -2018,6 +2156,7 @@ pub(super) fn serve_continuous_stream(
                         return Ok(());
                     }
                     bytes_streamed += n as u64;
+                    written += n as u64;
 
                     if last_pos_update.elapsed() >= Duration::from_millis(250) {
                         last_pos_update = std::time::Instant::now();
@@ -2050,6 +2189,7 @@ pub(super) fn serve_continuous_stream(
         // The UI may have reordered the queue while the track played.
         let track_index = controller.follow_reorder(track_index);
         if ended && pending.is_none() {
+            let seq = controller.request_seq.load(Ordering::SeqCst);
             let wraps = track_index + 1 >= queue_len;
             // Reshuffle once per wrap that played something, and only from the current
             // connection of the armed session.
@@ -2084,6 +2224,12 @@ pub(super) fn serve_continuous_stream(
                 nothing_playable = Some((tracks.into_iter().map(|(path, _)| path).collect(), Instant::now()));
             } else {
                 nothing_playable = None;
+                // The next look takes the answer to the check made as this track started when it
+                // found the file. A missing one is asked again, even one that came late: the
+                // track may have played for minutes, long enough for the share to come back.
+                let next = Path::new(&tracks[(track_index + 1) % queue_len].0);
+                let since = controller.file_checks.since_for_track_end(next, decoder_started);
+                look = Some((since, seq));
             }
         } else {
             drop(pending);

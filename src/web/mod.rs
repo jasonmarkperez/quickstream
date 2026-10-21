@@ -4,8 +4,10 @@
 //! - `server`: the listener, connection limits and request parsing.
 //! - `api`: route dispatch, the REST API and the dashboard (`assets/index.html`).
 //! - `stream`: byte-range file streaming and the continuous WAV stream.
+//! - `file_checks`: the continuous stream's file checks, off its write path.
 
 mod api;
+mod file_checks;
 mod server;
 mod state;
 mod stream;
