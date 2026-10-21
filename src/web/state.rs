@@ -170,12 +170,17 @@ pub struct NowPlayingState {
     /// bookmarks.json. Never sent with `/api/status`.
     #[serde(skip)]
     pub bookmarks: Vec<String>,
-    /// The folder the terminal is browsing, as a path (non-UTF-8 names intact), for
-    /// `autopilot` / `autopilot_reshuffle` without a path and the folder `seed_radio` scans.
-    /// `None` until the UI publishes it.
+    /// The folder the terminal's `p` starts Autopilot in, as a path (non-UTF-8 names intact):
+    /// the one it browses, or in Music Homes the highlighted home. For `autopilot` /
+    /// `autopilot_reshuffle` without a path, and outside Music Homes the folder `seed_radio`
+    /// prefers. `None` until the UI publishes it.
     /// Never sent to clients.
     #[serde(skip)]
     pub terminal_dir: Option<PathBuf>,
+    /// The terminal shows Music Homes, where it browses no folder: Seed Radio then passes over
+    /// the terminal's folder, as the terminal's `r` there does. Never sent to clients.
+    #[serde(skip)]
+    pub in_music_homes: bool,
     /// `Settings::web_remote_access` (Web Remote Access and the web server both on). While it is
     /// off, network peers get only `/stream/*` (`web_access::authorize`), even when a renderer has
     /// the server on the LAN.
@@ -227,6 +232,7 @@ impl Default for NowPlayingState {
             allowed_roots: Vec::new(),
             bookmarks: Vec::new(),
             terminal_dir: None,
+            in_music_homes: false,
             remote_access: false,
             playlists: Arc::new(WebPlaylists::default()),
             playlists_version: 0,
@@ -261,12 +267,15 @@ pub enum WebCommand {
     AutopilotReshuffle(PathBuf),
     ShuffleQueue,
     SetMixProfile(String),
-    /// Start Seed Radio from `seed`, scanning `dir`: the folder the terminal is browsing
-    /// (`terminal_dir`) when it lies inside the allowed folders, else the seed's own folder,
-    /// both resolved by the web thread (issue #126).
+    /// Start Seed Radio from `seed` (an audio file inside the allowed folders), scanning
+    /// `preferred` if it is there, else `fallback`, as the terminal's `r` does: `preferred` is
+    /// the folder the terminal is browsing (as it published it; none in Music Homes) when it
+    /// resolves inside the allowed folders, `fallback` the seed's own folder, both checked by
+    /// the web thread (issue #126).
     SeedRadio {
         seed: PathBuf,
-        dir: PathBuf,
+        preferred: Option<PathBuf>,
+        fallback: PathBuf,
     },
     /// A web request named a path outside the allowed folders; it was ignored.
     PathRejected(PathBuf),

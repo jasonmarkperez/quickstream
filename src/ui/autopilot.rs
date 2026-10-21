@@ -422,10 +422,22 @@ impl AppUI {
         self.seed_radio_scan(seed_path, preferred, fallback);
     }
 
-    /// Seed Radio from the web dashboard: scans `dir`, which the web thread resolved inside the
-    /// allowed folders (issue #126), so nothing is checked here.
-    pub fn start_seed_radio_in(&mut self, seed_path: PathBuf, dir: PathBuf) {
-        self.seed_radio_scan(seed_path, None, dir);
+    /// Seed Radio from the web dashboard: `preferred` (the terminal's folder) and `fallback` (the
+    /// seed's) are the web thread's, both inside the allowed folders (issue #126). The scan's
+    /// worker checks `preferred` is still there, as for `r`.
+    pub fn start_seed_radio_in(&mut self, seed_path: PathBuf, preferred: Option<PathBuf>, fallback: PathBuf) {
+        self.seed_radio_scan(seed_path, preferred, fallback);
+    }
+
+    /// The folder `p` / `P` start Autopilot in: the browsed one, or in Music Homes the
+    /// highlighted home (the browsed one on the `..` row).
+    pub(super) fn autopilot_key_dir(&self) -> PathBuf {
+        if self.in_bookmarks_view && self.browser_cursor > 0 {
+            if let Some((_, home, _)) = self.browser_entries.get(self.browser_cursor) {
+                return home.clone();
+            }
+        }
+        self.browser_dir.clone()
     }
 
     fn seed_radio_scan(&mut self, seed_path: PathBuf, preferred: Option<PathBuf>, fallback: PathBuf) {

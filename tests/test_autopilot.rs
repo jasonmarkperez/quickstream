@@ -827,7 +827,8 @@ fn test_web_mix_profile_and_seed_radio_commands() {
     // 2. SeedRadio
     tx.send(WebCommand::SeedRadio {
         seed: seed_track.clone(),
-        dir: temp_dir.clone(),
+        preferred: None,
+        fallback: temp_dir.clone(),
     })
     .unwrap();
     app.handle_web_commands();

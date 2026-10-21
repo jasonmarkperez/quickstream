@@ -547,4 +547,9 @@ impl AllowedRoots {
             .any(|root| canonical.starts_with(root))
             .then_some(canonical)
     }
+
+    /// [`resolve`](Self::resolve) `path`, if it is a folder.
+    pub fn resolve_dir(&self, path: &Path) -> Option<PathBuf> {
+        self.resolve(path).filter(|dir| dir.is_dir())
+    }
 }
