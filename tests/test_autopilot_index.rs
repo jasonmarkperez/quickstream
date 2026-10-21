@@ -15,7 +15,13 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
+use lofty::config::WriteOptions;
+use lofty::prelude::*;
+use lofty::tag::{ItemKey, Tag, TagType};
 use quickstream::analysis::db::IndexedDir;
+use quickstream::analysis::index::{
+    default_tag_reader, run_library_index, IndexConfig, IndexControl, IndexProgress, IndexState,
+};
 use quickstream::analysis::{AnalysisDatabase, MixProfile, MoodType, TrackFeatures};
 use quickstream::library::{AutopilotEvent, LibraryManager, MetadataCache, ProfileScanLimits};
 use quickstream::metadata::AudioMetadata;
@@ -240,12 +246,6 @@ fn a_fully_indexed_chill_mix_reads_no_tags_and_walks_no_folders() {
 /// mixed from its rows, with no tag read and no folder walked.
 #[test]
 fn a_library_the_indexer_walked_is_mixed_without_reading_tags() {
-    use lofty::config::WriteOptions;
-    use lofty::prelude::*;
-    use lofty::tag::{ItemKey, Tag, TagType};
-    use quickstream::analysis::index::{default_tag_reader, run_library_index, IndexConfig, IndexControl};
-    use quickstream::analysis::index::{IndexProgress, IndexState};
-
     common::isolate();
     let lib = library("indexer_end_to_end");
     for a in 0..12 {

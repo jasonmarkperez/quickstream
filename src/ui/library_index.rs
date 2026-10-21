@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use super::AppUI;
 use crate::analysis::index::{
-    default_tag_reader, run_library_index, IndexConfig, IndexControl, IndexProgress, IndexTagReader,
+    default_tag_reader, run_library_index, IndexConfig, IndexControl, IndexProgress, IndexState, IndexTagReader,
 };
 use crate::analysis::AnalysisDatabase;
 
@@ -243,6 +243,7 @@ impl AppUI {
             self.start_library_index();
         } else {
             self.stop_library_index();
+            self.library_index.progress.set_state(IndexState::Off);
         }
     }
 }

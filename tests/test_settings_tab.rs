@@ -1181,7 +1181,7 @@ fn library_index_row_shows_the_indexers_progress_at_every_size() {
 fn library_index_row_names_each_state_and_leaves_out_what_is_unknown_or_zero() {
     common::isolate();
     let mut app = settings_app("index_states");
-    let mut value = |app: &mut AppUI| {
+    let value = |app: &mut AppUI| {
         // Wide enough for every value whole beside the option panel.
         let buf = tui::render(app, 200, 40);
         index_row(&buf)

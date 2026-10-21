@@ -330,6 +330,10 @@ impl Indexer<'_> {
             while self.control.is_paused() && !self.control.is_stopped() {
                 std::thread::sleep(Duration::from_millis(20));
             }
+            if self.control.is_stopped() {
+                // Stopped while paused: the state is the UI's now (`Off`, or a new thread's).
+                return false;
+            }
             self.progress.set_state(IndexState::Reading);
         }
         !self.control.is_stopped()
