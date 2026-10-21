@@ -1984,7 +1984,8 @@ pub(super) fn serve_continuous_stream(
     // Whether audio went out since the stream last wrapped: a wrap without any asks for no
     // reshuffle, so a queue that gives no audio is not reshuffled on every pass.
     let mut streamed_since_wrap = false;
-    // Whether a decoder that couldn't start (no ffmpeg) was logged since audio last went out.
+    // Whether a decoder that couldn't start (no ffmpeg), or a reader thread for it, was logged
+    // since audio last went out.
     let mut spawn_failure_logged = false;
     // The look through the queue still waiting on a file check: answers given since its
     // `Instant` are used as the stream looks again on the next passes, until a request newer than
@@ -2257,8 +2258,30 @@ pub(super) fn serve_continuous_stream(
         let output = match stdout.map(spawn_decoder_reader) {
             Some(Ok(output)) => Some(output),
             Some(Err(e)) => {
-                crate::log_warn!("web", "Couldn't start reading the continuous stream's decoder: {}", e);
-                ended = true;
+                // No thread to read it (the system is short of them): the decoder may well decode
+                // the file, so the track is tried again (below, as after a read error), not
+                // counted as one that gave no audio. Once a tick has passed, with silence if the
+                // renderer is running out, so the tries are paced.
+                if !spawn_failure_logged {
+                    crate::log_warn!(
+                        "web",
+                        "Couldn't start reading the continuous stream's decoder, trying again: {}",
+                        e
+                    );
+                    spawn_failure_logged = true;
+                }
+                if !lead.running_dry() {
+                    wait_out_tick(pass_started);
+                } else if !send_silence(
+                    &mut silence,
+                    &mut stream,
+                    &mut lead,
+                    pass_started,
+                    "while the decoder can't be read",
+                ) {
+                    controller.kill_decoder_of(cid);
+                    return Ok(());
+                }
                 None
             }
             None => None,
@@ -2462,7 +2485,8 @@ pub(super) fn serve_continuous_stream(
             }
         } else {
             drop(pending);
-            // The next pass takes the request, or after a read error tries the track again.
+            // The next pass takes the request, or after a read error (or a reader that couldn't
+            // start) tries the track again.
             next_index = Some((track_index, 0));
             nothing_playable = None;
         }
