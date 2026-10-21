@@ -905,6 +905,13 @@ fn continuous_stream_plays(app: &mut AppUI) {
     app.web_server = Some(handle);
 }
 
+/// Stop the web server [`continuous_stream_plays`] gave the app.
+fn stop_continuous_stream(app: &mut AppUI) {
+    if let Some(handle) = app.web_server.take() {
+        handle.stop();
+    }
+}
+
 /// With the UPnP continuous stream the queue plays on to its end whatever the mode, then the
 /// stream reshuffles it and starts over: UP NEXT never says playback stops.
 #[test]
@@ -930,9 +937,7 @@ fn test_now_playing_up_next_follows_the_continuous_stream() {
             "{mode}: {lines:#?}"
         );
     }
-    if let Some(handle) = app.web_server.take() {
-        handle.stop();
-    }
+    stop_continuous_stream(&mut app);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -958,9 +963,7 @@ fn test_now_playing_up_next_single_track_under_the_continuous_stream_repeats() {
             assert!(line_with(&lines, "STOPS").is_none(), "{mode} {w}x{h}: {lines:#?}");
         }
     }
-    if let Some(handle) = app.web_server.take() {
-        handle.stop();
-    }
+    stop_continuous_stream(&mut app);
     let _ = fs::remove_dir_all(&dir);
 }
 

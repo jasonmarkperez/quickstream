@@ -65,11 +65,25 @@ pub enum QueueEnd {
     RepeatOne,
     /// The queue loops: after the listed tracks (which already wrap past the end to the first
     /// track) the current one plays again. With a single track it simply repeats, in loop mode
-    /// and under the UPnP continuous stream alike (the stream doesn't reshuffle one track).
+    /// and under the UPnP continuous stream alike (the stream doesn't reshuffle one track; if
+    /// that file is missing or won't decode, the stream sends silence instead).
     Loops,
     /// The UPnP continuous stream reshuffles the queue and starts over, so what follows the
-    /// listed tracks isn't known yet. Only for a queue of two or more tracks.
+    /// listed tracks isn't known yet. Only for a queue of two or more tracks
+    /// ([`reshuffles_on_wrap`]), and only when the queue gave audio: the stream skips the
+    /// reshuffle when nothing streamed since the last wrap (every file missing or undecodable;
+    /// it then sends silence) or when the connection doesn't own the session.
     Reshuffles,
+}
+
+/// Whether the UPnP continuous stream reshuffles a queue of `len` tracks when it wraps past the
+/// end: only two or more tracks have an order to change, so a single track just plays again.
+/// The stream also skips the reshuffle when nothing gave audio since the last wrap or the
+/// connection doesn't own the session; this is only the queue-length rule.
+/// The stream's wrap and [`Upcoming::after`] (Up Next's [`QueueEnd::Reshuffles`]) both ask this,
+/// so they can't disagree.
+pub fn reshuffles_on_wrap(len: usize) -> bool {
+    len > 1
 }
 
 /// The indices of the tracks that play after the current one, in play order, from
@@ -90,7 +104,9 @@ impl Upcoming {
     pub fn after(current: usize, len: usize, mode: &str, wrap: bool) -> Upcoming {
         let next = current + 1;
         let to_end = len.saturating_sub(next);
-        let (left, end) = if len <= 1 {
+        let (left, end) = if wrap && reshuffles_on_wrap(len) {
+            (to_end, QueueEnd::Reshuffles)
+        } else if len <= 1 {
             let end = if mode == "repeat_one" && !wrap {
                 QueueEnd::RepeatOne
             } else if mode == "loop" || wrap {
@@ -99,8 +115,6 @@ impl Upcoming {
                 QueueEnd::Stops
             };
             (0, end)
-        } else if wrap {
-            (to_end, QueueEnd::Reshuffles)
         } else {
             match mode {
                 "repeat_one" => (0, QueueEnd::RepeatOne),
@@ -327,8 +341,9 @@ impl PlaybackQueue {
 
     /// The tracks that play after the current one, as [`Self::next_track`] in `mode` will play
     /// them (`wrap: false`), or as the UPnP continuous stream does (`wrap: true`): it plays on to
-    /// the end of the queue whatever the mode, then reshuffles and starts over (a single track
-    /// has nothing to reshuffle and just repeats: [`QueueEnd::Loops`]). Stop mode lists
+    /// the end of the queue whatever the mode, then starts over, reshuffled when the queue gave
+    /// audio (a single track has nothing to reshuffle and just repeats: [`QueueEnd::Loops`]).
+    /// Stop mode lists
     /// the tracks to the end of the queue; loop mode every other track, past the end to the
     /// first; repeat-one none, since the current track repeats.
     pub fn upcoming(&self, mode: &str, wrap: bool) -> Upcoming {

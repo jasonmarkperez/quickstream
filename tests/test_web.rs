@@ -1625,10 +1625,10 @@ fn test_status_up_next_follows_the_continuous_stream() {
 fn test_status_up_next_single_track_under_the_continuous_stream_repeats() {
     common::isolate();
     let mut app = up_next_app_with(&[200.0]);
+    app.queue.set_current_index(0);
+    stream_plays(&app, 0);
     for mode in ["stop", "loop", "repeat_one"] {
         app.settings_mgr.settings.queue_mode = mode.to_string();
-        app.queue.set_current_index(0);
-        stream_plays(&app, 0);
         assert_up_next(
             &mut app,
             &format!("{mode}, stream on the only track"),

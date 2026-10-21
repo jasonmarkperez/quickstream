@@ -104,3 +104,27 @@ fn test_upcoming_single_track_under_the_continuous_stream_repeats() {
         assert_eq!(single.end(), QueueEnd::Loops, "{mode}");
     }
 }
+
+/// One rule says whether the continuous stream reshuffles a queue at its wrap
+/// (`queue::reshuffles_on_wrap`, which the stream asks too): Up Next's end under the stream is
+/// `Reshuffles` exactly when it holds, so the two can't disagree (#134).
+#[test]
+fn test_upcoming_under_the_stream_follows_reshuffles_on_wrap() {
+    common::isolate();
+    use quickstream::queue::{reshuffles_on_wrap, Upcoming};
+    assert!(!reshuffles_on_wrap(0));
+    assert!(!reshuffles_on_wrap(1));
+    assert!(reshuffles_on_wrap(2));
+    assert!(reshuffles_on_wrap(60));
+    for mode in ["stop", "loop", "repeat_one"] {
+        for len in 0usize..=4 {
+            let last = len.saturating_sub(1);
+            let end = Upcoming::after(last, len, mode, true).end();
+            assert_eq!(
+                end == QueueEnd::Reshuffles,
+                reshuffles_on_wrap(len),
+                "{mode}, {len} tracks: {end:?}"
+            );
+        }
+    }
+}
