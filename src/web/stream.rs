@@ -305,6 +305,29 @@ impl ContinuousStreamController {
         cid == 0 || self.active_conn_id.load(Ordering::SeqCst) == cid
     }
 
+    /// Whether connection `cid` still serves `session`: the session is still the armed one and
+    /// no newer connection has taken over. Logs why not, as the connection then closes.
+    fn still_serves(&self, cid: u64, session: &str) -> bool {
+        if !self.is_session(session) {
+            crate::log_info!(
+                "web",
+                "Continuous stream connection {} outlived its session, closing",
+                cid
+            );
+            return false;
+        }
+        if !self.owns(cid) {
+            crate::log_info!(
+                "web",
+                "Continuous stream connection {} superseded by newer connection {}, closing older stream",
+                cid,
+                self.active_conn_id.load(Ordering::SeqCst)
+            );
+            return false;
+        }
+        true
+    }
+
     /// Register `child` as connection `cid`'s decoder. A decoder of a connection `cid` has
     /// superseded is stopped first, never left running. If `cid` has been superseded itself,
     /// `child` is stopped instead, `taken` (the request this pass took) is handed back for the
@@ -1998,21 +2021,7 @@ pub(super) fn serve_continuous_stream(
         let pass_started = Instant::now();
         // Whether this pass's look is still waiting on a file check.
         let mut waiting_on_checks = false;
-        if !controller.is_session(session) {
-            crate::log_info!(
-                "web",
-                "Continuous stream connection {} outlived its session, closing",
-                cid
-            );
-            return Ok(());
-        }
-        if !controller.owns(cid) {
-            crate::log_info!(
-                "web",
-                "Continuous stream connection {} superseded by newer connection {}, closing older stream",
-                cid,
-                controller.active_conn_id.load(Ordering::SeqCst)
-            );
+        if !controller.still_serves(cid, session) {
             return Ok(());
         }
 
@@ -2303,17 +2312,7 @@ pub(super) fn serve_continuous_stream(
                 return Ok(());
             }
 
-            if !controller.is_session(session) {
-                crate::log_info!(
-                    "web",
-                    "Continuous stream connection {} outlived its session, closing",
-                    cid
-                );
-                controller.kill_decoder_of(cid);
-                return Ok(());
-            }
-
-            if !controller.owns(cid) {
+            if !controller.still_serves(cid, session) {
                 controller.kill_decoder_of(cid);
                 return Ok(());
             }
